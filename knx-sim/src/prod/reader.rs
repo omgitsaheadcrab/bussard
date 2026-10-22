@@ -66,7 +66,7 @@ pub fn read_knxprod_bytes(
     let mut names: Vec<String> = Vec::new();
     for i in 0..zip.len() {
         let f = zip.by_index(i)?;
-        let name = f.name().to_string();
+        let name = f.name()?.into_owned();
         if name.ends_with(".xml") {
             names.push(name);
         }
