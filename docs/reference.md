@@ -1241,8 +1241,9 @@ One file per application program, generated from the archives in `products/` by 
 | W029 | a group's `secure` flag disagrees with the keyring: marked secure without a group key, or keyed in the keyring but not marked secure | warning |
 | W030 | the keyring does not read or decrypt; the key checks are skipped | warning |
 | I031 | `BUSSARD_KEYRING_PASSWORD` is not set; the key checks are skipped | info |
+| W034 | a secured GA (`secure = true`, keyed in the store) has no device sender, so only tunnel clients can write it, and a Secure device linked to it admits none of the store's tunnelling addresses (no `secure_senders` listing one, no keyring interface group entry for the GA): set `admit_tunnel_senders = true` under `[connection]` and apply the device, or assign the GA to a tunnelling connection in ETS. `knx_plan_device` adds the same sentence as a note for that device while the option is off (issue #297) | warning |
 
-`validate` runs E027 to I031 with `BUSSARD_KEYRING`, else the key store `bussard.keys`, else `connection.keyring` (the same codes for a store and an export); `knx_validate` runs them with the server's keyring. The rules see addresses only, never a key.
+`validate` runs E027 to I031 and W034 with `BUSSARD_KEYRING`, else the key store `bussard.keys`, else `connection.keyring` (the same codes for a store and an export); `knx_validate` runs them with the server's keyring. The rules see addresses only, never a key.
 
 These rules are opt-in and run only when `bussard.toml` carries a [`[lint]` table](#bussardtoml):
 

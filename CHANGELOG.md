@@ -75,6 +75,12 @@ directory or a script from before these changes needs:
   `knx_apply_device` records the PID 54 table it wrote as the device's
   `secure_senders` in `bussard.lock`, so the next secured write is checked
   against it without an `adopt`.
+- Validation warning W034 (#297): a secured group address no device sends
+  on (only tunnel clients can write it) whose linked Secure device does not
+  admit the key store's tunnelling addresses. ETS does not admit them by
+  default, so `admit_tunnel_senders` stays off; the warning says when it
+  matters. `knx_plan_device` adds the same sentence as a note for that
+  device while the option is off.
 - `bussard restore --parameters <backup.json> <ADDRESS>` and the MCP tool
   `knx_restore_parameters` (#290) replay a parameter backup from
   `captures/backups/parameters/` with the parameter-only download `apply`

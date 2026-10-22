@@ -550,7 +550,12 @@ impl BussardMcp {
             .keyring
             .as_deref()
             .map(|path| bussard_service::secure::keyring_facts(path, "the server's keyring"));
-        let extra = bussard_model::validate_keyring(&model, facts.as_ref());
+        let mut extra = bussard_model::validate_keyring(&model, facts.as_ref());
+        // W034 (issue #297): secured GAs only tunnel clients can write.
+        extra.extend(bussard_service::admission::tunnel_gap_diagnostics(
+            &model,
+            facts.as_ref(),
+        ));
         ok(tools::validate_result_with(&model, extra))
     }
 

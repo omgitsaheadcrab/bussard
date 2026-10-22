@@ -537,6 +537,23 @@ impl BussardMcp {
         }
         let pending = self.session_edits().for_device(target);
         let mut device_plan = built.plan.clone();
+        // Issue #297: with `admit_tunnel_senders` off, say when only tunnel
+        // clients can write a secured GA of this device and it does not
+        // admit the tunnelling addresses.
+        if !bussard_service::admission::admit_tunnel_senders(Some(&model))
+            && let Some(keys) = material.group_keys.as_ref()
+            && let Ok(evidence) =
+                crate::secure_group::admission_evidence(self.state().keyring.as_deref())
+        {
+            for gap in bussard_service::admission::tunnel_gaps(
+                &model,
+                |ga| keys.contains_key(&ga),
+                &evidence,
+                Some(target),
+            ) {
+                device_plan.notes.push(gap.message());
+            }
+        }
         if let Some(line) = security
             .as_ref()
             .filter(|_| !tables_noop)

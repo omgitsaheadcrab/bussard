@@ -505,6 +505,126 @@ impl TunnelAdmission {
     }
 }
 
+/// A secured group address only tunnel clients can write, on devices that do
+/// not admit the tunnelling addresses (issue #297): validation warning W034
+/// and the `knx_plan_device` note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelGap {
+    /// The secured group address no device sends on.
+    pub ga: GroupAddress,
+    /// The Secure devices linked to it that admit none of the tunnelling
+    /// addresses, ascending.
+    pub devices: Vec<IndividualAddress>,
+}
+
+impl TunnelGap {
+    /// `secured 1/0/4 has no device sender; only tunnel clients can write it,
+    /// and 1.1.5 does not admit the tunnelling addresses (…)`.
+    pub fn message(&self) -> String {
+        let list: Vec<String> = self.devices.iter().map(ToString::to_string).collect();
+        let devices = list.join(", ");
+        let verb = if self.devices.len() == 1 {
+            "does"
+        } else {
+            "do"
+        };
+        format!(
+            "secured {ga} has no device sender; only tunnel clients can write it, and {devices} \
+             {verb} not admit the tunnelling addresses (set `admit_tunnel_senders = true` under \
+             [connection] and apply {devices}, or assign {ga} to a tunnelling connection in ETS)",
+            ga = self.ga
+        )
+    }
+}
+
+/// The secured group addresses only tunnel clients can write whose linked
+/// Secure devices do not admit the tunnelling addresses (issue #297).
+///
+/// A group address counts when the model marks it `secure`, `keyed` says the
+/// key store holds its key, and no device of the model sends on it. A linked
+/// device counts when it is Secure-activated (or has a recorded PID 54) and
+/// [`receiver_verdict`] admits none of the key store's tunnelling addresses
+/// on that group address. Nothing is reported without tunnelling addresses.
+/// `only` restricts the search to group addresses linked to that device.
+pub fn tunnel_gaps(
+    model: &Model,
+    keyed: impl Fn(GroupAddress) -> bool,
+    evidence: &AdmissionEvidence,
+    only: Option<IndividualAddress>,
+) -> Vec<TunnelGap> {
+    let tunnel = evidence.tunnel_addresses();
+    if tunnel.is_empty() {
+        return Vec::new();
+    }
+    let mut gaps = Vec::new();
+    for (ga, group) in &model.groups.groups {
+        if !group.secure || !keyed(*ga) {
+            continue;
+        }
+        let device_sender = model
+            .links
+            .links
+            .values()
+            .flatten()
+            .any(|l| l.send == Some(*ga));
+        if device_sender {
+            continue;
+        }
+        let devices: Vec<IndividualAddress> = model
+            .links
+            .links
+            .iter()
+            .filter(|(_, links)| links.iter().any(|l| l.listen.contains(ga)))
+            .map(|(ia, _)| *ia)
+            .filter(|ia| only.is_none_or(|o| o == *ia))
+            .filter(|ia| {
+                model
+                    .devices
+                    .get(ia)
+                    .and_then(|d| d.device.security.as_ref())
+                    .is_some_and(|s| s.activated || !s.secure_senders.is_empty())
+            })
+            .filter(|ia| {
+                !tunnel.iter().any(|t| {
+                    receiver_verdict(Some(model), *ia, *ga, *t, evidence)
+                        == ReceiverVerdict::Admitted
+                })
+            })
+            .collect();
+        if !devices.is_empty() {
+            gaps.push(TunnelGap { ga: *ga, devices });
+        }
+    }
+    gaps
+}
+
+/// Validation warning W034 (issue #297) for the keyring the caller checked:
+/// [`tunnel_gaps`] with the group keys it holds and its interface entries.
+/// Nothing unless the keyring loaded (`KeyringStatus::Loaded`).
+pub fn tunnel_gap_diagnostics(
+    model: &Model,
+    facts: Option<&bussard_model::KeyringFacts>,
+) -> Vec<bussard_model::Diagnostic> {
+    let Some(facts) = facts else {
+        return Vec::new();
+    };
+    let bussard_model::KeyringStatus::Loaded { group_keys, .. } = &facts.status else {
+        return Vec::new();
+    };
+    let Ok(evidence) = crate::secure::load_admission_evidence(&facts.path) else {
+        return Vec::new();
+    };
+    tunnel_gaps(model, |ga| group_keys.contains(&ga), &evidence, None)
+        .into_iter()
+        .map(|gap| bussard_model::Diagnostic {
+            code: "W034",
+            severity: bussard_model::Severity::Warning,
+            location: format!("groups.toml {}", gap.ga),
+            message: gap.message(),
+        })
+        .collect()
+}
+
 /// Why [`record_secure_senders`] could not update the lock.
 #[derive(Debug, thiserror::Error)]
 pub enum RecordSendersError {
@@ -839,6 +959,54 @@ mod tests {
         assert!(evidence.assigned(ia("1.1.200")?, ga("1/2/3")?));
         assert!(!evidence.assigned(ia("1.1.255")?, ga("1/2/3")?));
         Ok(())
+    }
+
+    #[test]
+    fn test_tunnel_gaps_flags_a_secured_ga_without_device_sender() -> TestResult {
+        let evidence = evidence("1.1.25", &[])?;
+        let keyed = |ga: GroupAddress| ga.to_string() == "1/0/4";
+        // 1.1.5 listens on the secured, keyed 1/0/4; nobody sends on it.
+        let model = model(&[])?;
+        let gaps = tunnel_gaps(&model, keyed, &evidence, None);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(
+            gaps[0].message(),
+            "secured 1/0/4 has no device sender; only tunnel clients can write it, and 1.1.5 \
+             does not admit the tunnelling addresses (set `admit_tunnel_senders = true` under \
+             [connection] and apply 1.1.5, or assign 1/0/4 to a tunnelling connection in ETS)"
+        );
+        assert_eq!(
+            tunnel_gaps(&model, keyed, &evidence, Some(ia("1.1.5")?)).len(),
+            1
+        );
+        assert!(tunnel_gaps(&model, keyed, &evidence, Some(ia("1.1.6")?)).is_empty());
+        // Not keyed in the store: nothing.
+        assert!(tunnel_gaps(&model, |_| false, &evidence, None).is_empty());
+        // A recorded table listing a tunnelling address: admitted.
+        let admitted = model_with_senders(&[("1.1.25", 0)])?;
+        assert!(tunnel_gaps(&admitted, keyed, &evidence, None).is_empty());
+        // An ETS assignment of 1/0/4 to the tunnelling address: admitted.
+        let assigned = super::tests::evidence("1.1.25", &["1/0/4"])?;
+        assert!(tunnel_gaps(&model, keyed, &assigned, None).is_empty());
+        // A device sends on it: the device can write it, no warning.
+        let mut sent = model.clone();
+        sent.links.links.insert(
+            ia("1.1.16")?,
+            vec![bussard_model::schema::Link {
+                object: 1,
+                name: None,
+                send: Some(ga("1/0/4")?),
+                listen: Vec::new(),
+            }],
+        );
+        assert!(tunnel_gaps(&sent, keyed, &evidence, None).is_empty());
+        // No tunnelling address in the store: nothing to name.
+        assert!(tunnel_gaps(&model, keyed, &AdmissionEvidence::default(), None).is_empty());
+        Ok(())
+    }
+
+    fn model_with_senders(senders: &[(&str, u64)]) -> Result<Model, Box<dyn std::error::Error>> {
+        model(senders)
     }
 
     #[test]

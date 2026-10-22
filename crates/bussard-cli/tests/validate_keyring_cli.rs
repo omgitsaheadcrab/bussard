@@ -211,3 +211,59 @@ fn test_validate_keyring_reads_the_key_store_first() -> TestResult {
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
+
+/// W034 (issue #297): 1/2/3 is secured and keyed, 1.1.10 listens on it and no
+/// device sends on it, so only tunnel clients can write it. With the
+/// synthetic keyring, whose tunnelling address 1.1.200 is assigned 1/2/3 (as
+/// ETS writes an assignment), it is admitted; with a key store copy without
+/// that assignment, validate warns.
+#[test]
+fn test_validate_warns_when_only_unadmitted_tunnel_clients_can_write_a_secured_ga() -> TestResult {
+    let link_listener = |dir: &Path| -> TestResult {
+        std::fs::write(
+            dir.join("devices").join("1.1.10.toml"),
+            "address = \"1.1.10\"\nname = \"Secure 1.1.10\"\n\n[security]\nactivated = true\n\n\
+             [links]\n22.listen = [\"1/2/3\"]\n",
+        )?;
+        Ok(())
+    };
+    // Assigned in the keyring: no warning.
+    let dir = model("w034-assigned", &keyring_path())?;
+    link_listener(&dir)?;
+    let diags = diagnostics(&validate(&dir, Some(PASSWORD))?)?;
+    assert!(!diags.iter().any(|d| d.0 == "W034"), "{diags:?}");
+    std::fs::remove_dir_all(&dir)?;
+
+    // A key store without the interface's group assignment.
+    let keyring =
+        bussard_project::parse_keyring(&std::fs::read_to_string(keyring_path())?, PASSWORD)?;
+    let mut store = bussard_project::KeyStore::new("Synthetic");
+    store.merge_keyring(&keyring);
+    for interface in &mut store.interfaces {
+        interface.gas.clear();
+    }
+    let stripped = std::env::temp_dir().join(format!(
+        "bussard-w034-{}-{}.keys",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    std::fs::write(&stripped, store.to_xml(PASSWORD)?)?;
+    let dir = model("w034-unassigned", &stripped)?;
+    link_listener(&dir)?;
+    let out = validate(&dir, Some(PASSWORD))?;
+    let diags = diagnostics(&out)?;
+    let w034: Vec<_> = diags.iter().filter(|d| d.0 == "W034").collect();
+    assert_eq!(w034.len(), 1, "{diags:?}");
+    assert_eq!(w034[0].1, "groups.toml 1/2/3");
+    assert_eq!(
+        w034[0].2,
+        "secured 1/2/3 has no device sender; only tunnel clients can write it, and 1.1.10 does \
+         not admit the tunnelling addresses (set `admit_tunnel_senders = true` under \
+         [connection] and apply 1.1.10, or assign 1/2/3 to a tunnelling connection in ETS)"
+    );
+    std::fs::remove_dir_all(&dir)?;
+    std::fs::remove_file(&stripped)?;
+    Ok(())
+}

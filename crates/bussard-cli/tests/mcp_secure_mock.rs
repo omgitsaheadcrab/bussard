@@ -307,6 +307,11 @@ impl Server {
     /// with the synthetic keyring and its password, and completes the
     /// handshake.
     fn start(dir: &Path, port: u16, extra: &[&str]) -> TestResult<Server> {
+        Server::start_with(dir, port, extra, &keyring_path())
+    }
+
+    /// [`Server::start`] with another keyring (or key store) file.
+    fn start_with(dir: &Path, port: u16, extra: &[&str], keyring: &Path) -> TestResult<Server> {
         let mut child = Command::new(env!("CARGO_BIN_EXE_bussard"))
             .arg("mcp")
             .arg("--dir")
@@ -314,7 +319,7 @@ impl Server {
             .arg("--gateway")
             .arg(format!("127.0.0.1:{port}"))
             .arg("--keyring")
-            .arg(keyring_path())
+            .arg(keyring)
             .arg("--no-model-edits")
             .args(extra)
             .env("BUSSARD_KEYRING_PASSWORD", PASSWORD)
@@ -644,6 +649,52 @@ fn test_mcp_apply_with_admit_tunnel_senders_writes_the_tunnel_address_into_pid54
     // The device now admits the tunnel: nothing left to do.
     let replan = server.call("knx_plan_device", json!({"address": "1.1.10"}))?;
     assert_eq!(replan["noop"], true, "replan: {replan}");
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// Issue #297: with `admit_tunnel_senders` off and a key store whose
+/// tunnelling address has no group assigned, `knx_plan_device` notes that
+/// only tunnel clients can write the secured 1/2/3 and 1.1.10 does not admit
+/// them.
+#[test]
+fn test_mcp_plan_notes_a_secured_ga_only_unadmitted_tunnel_clients_can_write() -> TestResult {
+    let rt = tokio::runtime::Runtime::new()?;
+    let log = Arc::new(Mutex::new(SecurityLog::default()));
+    let gw = rt.block_on(
+        MockGateway::builder()
+            .channel(0x57)
+            .keep_serving()
+            .idle_timeout(Duration::from_secs(120))
+            .device(secure_device_with(
+                Arc::clone(&log),
+                &["1/2/0", "1/2/3"],
+                &[(1, 20), (2, 22)],
+                &[12, 0],
+            )?)
+            .start(),
+    )?;
+    let dir = model_dir("gap")?;
+    let mut store = bussard_project::KeyStore::new("Synthetic");
+    store.merge_keyring(&keyring()?);
+    for interface in &mut store.interfaces {
+        interface.gas.clear();
+    }
+    let stripped = dir.join("stripped.keys");
+    std::fs::write(&stripped, store.to_xml(PASSWORD)?)?;
+    let mut server = Server::start_with(&dir, gw.port(), &["--allow-programming"], &stripped)?;
+    let plan = plan_when_connected(&mut server, "1.1.10")?;
+    assert_eq!(plan["ok"], true, "plan: {plan}");
+    let notes = plan["notes"].to_string();
+    assert!(
+        notes.contains(
+            "secured 1/2/3 has no device sender; only tunnel clients can write it, and 1.1.10 \
+             does not admit the tunnelling addresses (set `admit_tunnel_senders = true` under \
+             [connection] and apply 1.1.10, or assign 1/2/3 to a tunnelling connection in ETS)"
+        ),
+        "plan: {plan}"
+    );
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

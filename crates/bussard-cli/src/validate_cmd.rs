@@ -47,7 +47,14 @@ fn keyring_diagnostics(model: &Model, dir: &Path) -> Vec<Diagnostic> {
         crate::conn_cmd::resolve_keyring(None, env.keyring.as_deref(), dir).map(|resolved| {
             bussard_service::secure::keyring_facts(&resolved.path, resolved.source.describe())
         });
-    bussard_model::validate_keyring(model, facts.as_ref())
+    let mut diags = bussard_model::validate_keyring(model, facts.as_ref());
+    // W034 (issue #297): secured GAs only tunnel clients can write, on
+    // devices that do not admit the tunnelling addresses.
+    diags.extend(bussard_service::admission::tunnel_gap_diagnostics(
+        model,
+        facts.as_ref(),
+    ));
+    diags
 }
 
 /// Whether colour should be used: enabled on a terminal unless `NO_COLOR` is set.
