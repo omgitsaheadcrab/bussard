@@ -240,7 +240,7 @@ impl SecurityObject {
                 }
             }
             pid::GRP_KEY_TABLE => {
-                for row in value.chunks_exact(GRP_KEY_ROW) {
+                for row in value.as_chunks::<GRP_KEY_ROW>().0 {
                     let index = u16::from_be_bytes([row[0], row[1]]);
                     if index == 0 {
                         return rc::OUT_OF_MIN_RANGE;

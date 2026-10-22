@@ -73,7 +73,7 @@ pub fn cbc_mac(
     let mut enc = Aes128CbcEnc::new(key.into(), &zero_iv.into());
     // `encrypt_blocks_mut` operates in place over whole 16-byte blocks; `buf` is a
     // block multiple after `byte_pad`.
-    let blocks = buf.chunks_exact_mut(BLOCK);
+    let blocks = buf.as_chunks_mut::<BLOCK>().0.iter_mut();
     let mut last = [0u8; BLOCK];
     for chunk in blocks {
         let block = aes::cipher::generic_array::GenericArray::from_mut_slice(chunk);
@@ -189,7 +189,7 @@ mod tests {
         buf.extend_from_slice(payload);
         let buf = byte_pad(&buf);
         let mut prev = [0u8; 16];
-        for chunk in buf.chunks_exact(16) {
+        for chunk in buf.as_chunks::<16>().0 {
             let x = bytes_xor(&prev, chunk);
             let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(&x);
             cipher.encrypt_block(&mut block);

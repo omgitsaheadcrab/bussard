@@ -105,12 +105,11 @@ impl Device {
         // System 7 memory-mapped LSM control: a write to the LSM control address
         // is a load-event record, not a segment write (spec section 5). Decode and
         // drive the addressed LSM.
-        if let Some(s7) = &self.sys7 {
-            if s7.profile.lsm_access == profile::LsmAccess::MemoryMapped
-                && addr == s7.profile.mm_lsm.control_addr
-            {
-                return self.on_sys7_lsm_record(tool, payload);
-            }
+        if let Some(s7) = &self.sys7
+            && s7.profile.lsm_access == profile::LsmAccess::MemoryMapped
+            && addr == s7.profile.mm_lsm.control_addr
+        {
+            return self.on_sys7_lsm_record(tool, payload);
         }
 
         // Determine which object owns this address: strict — the address must be

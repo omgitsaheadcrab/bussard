@@ -94,11 +94,13 @@ pub fn read_knxprod_bytes(
 /// boundary. A non-ASCII byte simply fails the hex-digit test here.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let hi = hex_digit(pair[0])?;
             let lo = hex_digit(pair[1])?;

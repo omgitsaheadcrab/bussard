@@ -146,7 +146,9 @@ fn read_counted_body(memory: &Memory, base: u32, body_offset: u32, elem_size: us
 fn parse_address_table(memory: &Memory, base: u16) -> Vec<GroupAddress> {
     let bytes = read_counted_body(memory, u32::from(base), 1, 2);
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| GroupAddress(u16::from_be_bytes([c[0], c[1]])))
         .collect()
 }
@@ -155,7 +157,12 @@ fn parse_address_table(memory: &Memory, base: u16) -> Vec<GroupAddress> {
 /// `(TSAP, ASAP)` pairs.
 fn parse_association_table(memory: &Memory, base: u16) -> Vec<(u8, u8)> {
     let bytes = read_counted_body(memory, u32::from(base), 1, 2);
-    bytes.chunks_exact(2).map(|c| (c[0], c[1])).collect()
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| (c[0], c[1]))
+        .collect()
 }
 
 /// Parse the group-object table: `[CNT:1][RAM-flags ptr:2]` then per object a
@@ -166,7 +173,9 @@ fn parse_group_object_table(memory: &Memory, base: u16) -> Vec<(u16, u8)> {
     // 4-byte descriptors.
     let bytes = read_counted_body(memory, u32::from(base), 3, 4);
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| {
             let config = c[2];
             let type_code = c[3];

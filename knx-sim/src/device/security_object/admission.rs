@@ -25,7 +25,9 @@ impl SecurityObject {
     pub(crate) fn group_key_for_address_index(&self, index: u16) -> Option<crate::secure::Key16> {
         self.group_keys
             .bytes
-            .chunks_exact(GRP_KEY_ROW)
+            .as_chunks::<GRP_KEY_ROW>()
+            .0
+            .iter()
             .find(|row| u16::from_be_bytes([row[0], row[1]]) == index)
             .and_then(|row| <[u8; 16]>::try_from(&row[2..]).ok())
             .map(crate::secure::Key16::new)
@@ -43,7 +45,9 @@ impl SecurityObject {
     pub fn ia_table_sequence(&self, ia: u16) -> Option<u64> {
         self.ia_table
             .bytes
-            .chunks_exact(IA_ROW)
+            .as_chunks::<IA_ROW>()
+            .0
+            .iter()
             .take(self.ia_table.count())
             .find(|row| u16::from_be_bytes([row[0], row[1]]) == ia)
             .map(|row| {
