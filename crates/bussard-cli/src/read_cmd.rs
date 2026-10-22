@@ -12,13 +12,16 @@
 //! A secured GA (`secure: true` in the model, or a group key in `--keyring`) is
 //! read with a KNX Data Secure `GroupValueRead` and only a response whose MAC
 //! verifies under the group key is accepted (issue #172). A secured GA without
-//! a key is refused before anything is sent.
+//! a key is refused before anything is sent, and so is one whose responders
+//! are known not to admit the tunnel address (issue #297).
 
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use bussard_model::GroupAddress;
+use anyhow::Context;
+use bussard_model::{GroupAddress, IndividualAddress};
+use bussard_service::admission::{self, Admission, AdmissionEvidence, check_sender_admission};
 use bussard_service::{SecureGroupError, WritePolicy, group_key_for};
 
 use crate::conn_cmd::{ConnOverrides, load_model_optional, open_service, resolve_config};
@@ -57,21 +60,62 @@ pub fn run(
         },
     )?;
     let secured = key.is_some();
+    // Sender admission (issue #297): a secured read the responder does not
+    // admit is never answered.
+    let evidence = match (secured, keyring) {
+        (true, Some(path)) => bussard_service::secure::load_admission_evidence(path)
+            .with_context(|| format!("loading the interfaces of {}", path.display()))?,
+        _ => AdmissionEvidence::default(),
+    };
 
     let runtime = tokio::runtime::Runtime::new()?;
-    let outcome = runtime.block_on(async move {
+    let model_ref = model.as_ref();
+    let (outcome, admission, source) = runtime.block_on(async move {
         // A read never writes, so the service is read-only and ungated.
         let service = open_service(config, WritePolicy::ReadOnly).await?;
-        let result = service
-            .read_group(ga, dpt, key.as_ref(), READ_TIMEOUT)
-            .await;
+        let source = bussard_bus::ops::group_source(service.handle());
+        let admission = secured.then(|| check_sender_admission(model_ref, ga, source, &evidence));
+        let result = if admission.as_ref().is_some_and(Admission::is_refused) {
+            None
+        } else {
+            Some(
+                service
+                    .read_group(ga, dpt, key.as_ref(), READ_TIMEOUT)
+                    .await,
+            )
+        };
         // Close the bus cleanly (release the gateway tunnel slot) — issue #31.
         service.close().await;
-        anyhow::Ok(result)
+        anyhow::Ok((result, admission, source))
     })?;
+    let Some(outcome) = outcome else {
+        let admission = admission.as_ref();
+        let refusal = admission.and_then(Admission::refusal).unwrap_or_default();
+        let hint = admission
+            .and_then(Admission::admit_hint)
+            .unwrap_or_default();
+        if json {
+            crate::output::print(
+                crate::output::schema::READ,
+                &serde_json::json!({
+                    "ga": ga.to_string(),
+                    "name": ga_name,
+                    "answered": false,
+                    "secured": true,
+                    "sent": false,
+                    "admission": "refused",
+                    "error": refusal,
+                    "hint": hint,
+                }),
+            )?;
+        }
+        eprintln!("error: {refusal}\n{hint}");
+        return Ok(ExitCode::FAILURE);
+    };
+    let note = admission.as_ref().and_then(Admission::note);
 
     if json {
-        return print_json(ga, ga_name.as_deref(), secured, &outcome);
+        return print_json(ga, ga_name.as_deref(), secured, source, &outcome);
     }
     match outcome {
         Ok(Some(read)) => {
@@ -100,11 +144,13 @@ pub fn run(
         Ok(None) => {
             if secured {
                 eprintln!(
-                    "error: no verified secured response for {ga} within {}s (a device \
-                     answers a secured read only when bussard's source address is in its \
-                     security individual address table)",
+                    "error: {} ({}s)",
+                    admission::secured_read_timeout(ga, source),
                     READ_TIMEOUT.as_secs()
                 );
+                if let Some(note) = &note {
+                    eprintln!("note: {note}");
+                }
             } else {
                 eprintln!(
                     "error: no response for {ga} within {}s",
@@ -126,6 +172,7 @@ fn print_json(
     ga: GroupAddress,
     name: Option<&str>,
     secured: bool,
+    source: IndividualAddress,
     outcome: &Result<Option<bussard_service::GroupRead>, bussard_service::GroupSendError>,
 ) -> anyhow::Result<ExitCode> {
     let (body, code) = match outcome {
@@ -153,6 +200,7 @@ fn print_json(
                 "answered": false,
                 "secured": secured,
                 "timeout_seconds": READ_TIMEOUT.as_secs(),
+                "reason": secured.then(|| admission::secured_read_timeout(ga, source)),
             }),
             ExitCode::FAILURE,
         ),

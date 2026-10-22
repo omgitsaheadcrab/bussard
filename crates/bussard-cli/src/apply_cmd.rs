@@ -255,19 +255,26 @@ pub(crate) fn apply_desired(
     let desired = desired.clone();
     // A secured System B write also reprograms the security object (issue
     // #156): its group key table indexes the address table being written.
+    // `[connection] admit_tunnel_senders` (issue #297): the key store's
+    // tunnelling addresses join the security individual address table.
+    let tunnel = crate::secure_key::admitted_tunnel(model, tool_key_source, tool_key.is_some())?;
     let security = tool_key.as_ref().map(|_| {
         let empty = std::collections::HashMap::new();
         let keys = material.group_keys.as_ref().unwrap_or(&empty);
         let mut inputs = bussard_download::security_inputs_for(model, target, &desired, keys);
         // The security individual address table (issue #181): the secured
-        // senders this device receives from, plus `--secure-sender`.
+        // senders this device receives from, plus `--secure-sender` and the
+        // admitted tunnelling addresses.
+        let mut extra: Vec<IndividualAddress> = secure_sender.into_iter().collect();
+        extra.extend(tunnel.iter().copied());
         inputs.senders = bussard_download::secured_senders(
             model,
             target,
             keys,
             &material.device_sequences,
-            secure_sender.as_slice(),
+            &extra,
         );
+        inputs.admitted_tunnel = tunnel.iter().copied().filter(|ia| *ia != target).collect();
         inputs
     });
 
@@ -336,11 +343,14 @@ pub(crate) fn apply_desired(
                     ),
                     _ => None,
                 };
-                anyhow::Ok((read, identified, params))
+                // The device's PID 54, only to see whether it already admits
+                // the tunnelling addresses (issue #297).
+                let senders = plan_cmd::read_admission_table(l4, &read, &tunnel).await?;
+                anyhow::Ok((read, identified, params, senders))
             })
             .await
     });
-    let (read, identified, params) = read?;
+    let (read, identified, params, live_senders) = read?;
     let established = identified.established;
     let write_seed = crate::device_facts::seed_of(established.as_ref());
 
@@ -383,9 +393,12 @@ pub(crate) fn apply_desired(
     }
 
     let report = plan(live, &desired);
+    // `admit_tunnel_senders` (issue #297): the tunnelling addresses the
+    // device's PID 54 is missing, as a change of its own.
+    let admission = plan_cmd::tunnel_admission(target, &tunnel, sys7_live.is_some(), live_senders);
     // The model's plan, in its own words: the objects and parameters that
     // change. `restore` keeps the table rendering (its truth is a backup).
-    let built = match (origin, model) {
+    let mut built = match (origin, model) {
         (DesiredSource::Model, Some(model)) => Some(crate::device_plan::build(
             model,
             target,
@@ -397,6 +410,9 @@ pub(crate) fn apply_desired(
         )),
         _ => None,
     };
+    if let (Some(built), Some(admission)) = (built.as_mut(), admission.as_ref()) {
+        admission.add_to(&mut built.plan, &report);
+    }
     match &built {
         Some(built) => {
             if let Some(hash) = write.plan_hash
@@ -440,7 +456,11 @@ pub(crate) fn apply_desired(
     };
 
     // Zero-change: print nothing-to-do and exit 0 WITHOUT touching load states.
-    let tables_change = !report.is_noop();
+    // A missing tunnelling address rewrites the tables too: the security
+    // object is written inside the table download.
+    let admits =
+        matches!(origin, DesiredSource::Model) && admission.as_ref().is_some_and(|a| a.changes());
+    let tables_change = !report.is_noop() || admits;
     if !tables_change && partial.is_none() {
         return Ok(ExitCode::SUCCESS);
     }
@@ -560,6 +580,24 @@ pub(crate) fn apply_desired(
                 summary.association_state,
                 report.resulting_association_count,
             );
+            // The security object was written with this PID 54 table and the
+            // write verified: record it in the lock, as `adopt` does (issue
+            // #297), so the sender admission check sees it.
+            if let (Some(inputs), Some(_)) = (&security, model) {
+                match bussard_service::admission::record_secure_senders(
+                    dir,
+                    target,
+                    &inputs.senders,
+                ) {
+                    Ok(true) => println!(
+                        "recorded {target}'s security individual address table (PID 54, {} \
+                         sender(s)) in bussard.lock",
+                        inputs.senders.len()
+                    ),
+                    Ok(false) => {}
+                    Err(err) => eprintln!("warning: {err}"),
+                }
+            }
             if partial.is_some() {
                 let code = write_parameters(
                     &runtime,

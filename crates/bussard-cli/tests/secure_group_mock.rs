@@ -422,3 +422,154 @@ async fn test_monitor_keyring_decrypts_and_flags_secured_telegrams() -> TestResu
     assert!(lines[3].get("secured").is_none(), "{:?}", lines[3]);
     Ok(())
 }
+
+/// The secured 1/2/3's receiver 1.1.10 (issue #297): listening with object
+/// 22, its lock `secure_senders` set to `senders` (a recorded PID 54; empty
+/// writes no lock entry, the "not read back yet" case).
+fn admission_model(tag: &str, port: u16, senders: &[&str]) -> TestResult<PathBuf> {
+    let dir = model_dir(tag, port)?;
+    std::fs::write(
+        dir.join("devices").join("1.1.10.toml"),
+        "address = \"1.1.10\"\nname = \"Secure actuator\"\n\n[security]\nactivated = true\n\n\
+         [links]\n22.listen = [\"1/2/3\"]\n",
+    )?;
+    let lock = if senders.is_empty() {
+        "version = 3\n".to_string()
+    } else {
+        let entries: Vec<String> = senders
+            .iter()
+            .map(|s| format!("  {{ address = \"{s}\", sequence = 0 }},\n"))
+            .collect();
+        format!(
+            "version = 3\n\n[[device]]\naddress = \"1.1.10\"\nsecure_senders = [\n{}]\n",
+            entries.concat()
+        )
+    };
+    std::fs::write(dir.join("bussard.lock"), lock)?;
+    Ok(dir)
+}
+
+/// `bussard <verb> 1/2/3 [value]` against the mock with the synthetic keyring.
+async fn secured_command(verb: &str, dir: &Path, port: u16) -> TestResult<Output> {
+    let gateway = format!("127.0.0.1:{port}");
+    let keyring = keyring_path().to_string_lossy().to_string();
+    let dir = dir.to_string_lossy().to_string();
+    let mut list = vec![verb, "1/2/3"];
+    if verb == "write" {
+        list.extend(["50%", "--yes"]);
+    }
+    list.extend(["--dir", &dir, "--keyring", &keyring, "--gateway", &gateway]);
+    bussard(args(&list)).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_secured_ga_refused_when_the_receiver_does_not_admit_the_tunnel() -> TestResult {
+    let key = group_key()?;
+    let gw = MockGateway::builder().start().await?;
+    // 1.1.10's recorded PID 54 lists 1.1.20 only; the mock tunnel is 1.1.255.
+    let dir = admission_model("admit-refused", gw.port(), &["1.1.20"])?;
+    let out = secured_command("write", &dir, gw.port()).await?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "1.1.10 does not list the tunnel address 1.1.255 as a secure sender of 1/2/3; the \
+             actuator would discard the telegram. Admit the tunnel addresses (see below) or send \
+             plain only if the GA is not secured on the device."
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("admit_tunnel_senders = true"), "{stderr}");
+    let sent = gw.sent()?;
+    assert!(
+        !sent.iter().any(|f| unwrap_sent(f, &key).is_some()),
+        "a refused write must not be sent: {sent:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_secured_ga_admitted_reports_only_the_interface_confirmation() -> TestResult {
+    let key = group_key()?;
+    let gw = MockGateway::builder().start().await?;
+    let dir = admission_model("admit-ok", gw.port(), &["1.1.20", "1.1.255"])?;
+    let out = secured_command("write", &dir, gw.port()).await?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("KNX reports no application-level result"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("note: sent secured"), "{stderr}");
+    let sent = gw.sent()?;
+    assert_eq!(
+        sent.iter()
+            .filter(|f| unwrap_sent(f, &key).is_some())
+            .count(),
+        1,
+        "{sent:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_secured_ga_without_evidence_is_sent_with_the_unknown_note() -> TestResult {
+    let key = group_key()?;
+    let gw = MockGateway::builder().start().await?;
+    let dir = admission_model("admit-unknown", gw.port(), &[])?;
+    let out = secured_command("write", &dir, gw.port()).await?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "sent secured from 1.1.255; delivery to 1.1.10 is not confirmed by KNX; if nothing \
+             happens, 1.1.10 probably does not admit 1.1.255"
+        ),
+        "{stderr}"
+    );
+    let sent = gw.sent()?;
+    assert!(
+        sent.iter().any(|f| unwrap_sent(f, &key).is_some()),
+        "{sent:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_read_secured_ga_timeout_names_sender_admission() -> TestResult {
+    // Nobody answers: the receiver does not admit the tunnel.
+    let gw = MockGateway::builder().start().await?;
+    let dir = admission_model("admit-read-timeout", gw.port(), &[])?;
+    let out = secured_command("read", &dir, gw.port()).await?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("a timeout usually means the responder does not admit the sender 1.1.255"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("note: sent secured from 1.1.255"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_read_secured_ga_refused_when_the_responder_does_not_admit_the_tunnel() -> TestResult {
+    let key = group_key()?;
+    let gw = MockGateway::builder().start().await?;
+    let dir = admission_model("admit-read-refused", gw.port(), &["1.1.20"])?;
+    let out = secured_command("read", &dir, gw.port()).await?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("1.1.10 does not list the tunnel address 1.1.255"),
+        "{stderr}"
+    );
+    let sent = gw.sent()?;
+    assert!(
+        !sent.iter().any(|f| unwrap_sent(f, &key).is_some()),
+        "{sent:?}"
+    );
+    Ok(())
+}

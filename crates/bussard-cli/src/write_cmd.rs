@@ -8,6 +8,11 @@
 //! The exit code is honest: a send receipt failure (ACK exhaustion, staleness)
 //! exits non-zero (review A3).
 //!
+//! On a secured GA the tunnel's address is checked against the evidence that
+//! the devices on the GA admit it as a secure sender
+//! ([`bussard_service::admission`], issue #297) before anything is sent, and
+//! the result says only what KNX confirms: the interface's L_Data.con.
+//!
 //! Safety: a GA marked `protected: true` in `groups.toml` is refused unless
 //! `--force` is given (see the design document §8), and the service is opened
 //! under the non-loopback write gate (issue #74).
@@ -15,9 +20,10 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use bussard_bus::BusError;
-use bussard_model::{GroupAddress, IndividualAddress, Model};
+use bussard_model::{GroupAddress, Model};
+use bussard_service::admission::{self, Admission, AdmissionEvidence, check_sender_admission};
 use bussard_service::{
     DptOverridePolicy, PreparedWrite, WriteCheck, WritePolicy, WriteRefusal, WriteValue,
     prepare_group_write,
@@ -98,29 +104,64 @@ pub fn run(
     }
 
     let secured = write.is_secured();
-    let receivers = if secured {
-        secured_receivers(model.as_ref(), ga)
-    } else {
-        Vec::new()
+    // Sender admission (issue #297): the evidence besides the lock is the
+    // keyring's interface entries. Loaded from the same memoized decrypt as
+    // the group keys.
+    let evidence = match (secured, keyring) {
+        (true, Some(path)) => bussard_service::secure::load_admission_evidence(path)
+            .with_context(|| format!("loading the interfaces of {}", path.display()))?,
+        _ => AdmissionEvidence::default(),
     };
     let runtime = tokio::runtime::Runtime::new()?;
-    let (outcome, source) = runtime.block_on(async move {
+    let model_ref = model.as_ref();
+    let (outcome, admission) = runtime.block_on(async move {
         let service = open_service(config, WritePolicy::transmit(allow_remote_gateway)).await?;
-        let result = service.send_prepared(write).await;
+        // The tunnel's address is known once the tunnel is up: check that the
+        // devices on a secured GA admit it before anything is sent.
         let source = bussard_bus::ops::group_source(service.handle());
+        let admission = secured.then(|| check_sender_admission(model_ref, ga, source, &evidence));
+        let result = if admission.as_ref().is_some_and(Admission::is_refused) {
+            None
+        } else {
+            Some(service.send_prepared(write).await)
+        };
         // Close the bus cleanly (release the gateway tunnel slot) — issue #31.
         service.close().await;
-        anyhow::Ok((result, source))
+        anyhow::Ok((result, admission))
     })?;
-    if secured && outcome.is_ok() {
-        // Once per run (issue #197): bussard does not record which devices
-        // were programmed with `--secure-sender`, so it cannot tell whether
-        // the receivers admit its tunnel address.
-        eprintln!("{}", sender_admission_note(ga, source, &receivers));
-    }
+    let Some(outcome) = outcome else {
+        // Refused before sending: the devices would discard the telegram.
+        let admission = admission.as_ref();
+        let refusal = admission.and_then(Admission::refusal).unwrap_or_default();
+        let hint = admission
+            .and_then(Admission::admit_hint)
+            .unwrap_or_default();
+        if json {
+            crate::output::print(
+                crate::output::schema::WRITE,
+                &serde_json::json!({
+                    "ga": ga.to_string(),
+                    "secured": true,
+                    "gateway": gateway,
+                    "sent": false,
+                    "admission": "refused",
+                    "reason": refusal,
+                    "hint": hint,
+                }),
+            )?;
+        }
+        eprintln!("error: {refusal}\n{hint}");
+        return Ok(ExitCode::FAILURE);
+    };
+    let note = admission.as_ref().and_then(Admission::note);
 
     match outcome {
         Ok(sent) => {
+            let result = if sent.confirmed {
+                admission::WRITE_RESULT
+            } else {
+                admission::WRITE_RESULT_UNCONFIRMED
+            };
             if json {
                 let w = &sent.write;
                 let payload: String = w.payload.iter().map(|b| format!("{b:02x}")).collect();
@@ -135,6 +176,9 @@ pub fn run(
                         "secured": w.is_secured(),
                         "gateway": gateway,
                         "confirmed": sent.confirmed,
+                        "result": result,
+                        "admission": admission.as_ref().map(Admission::label),
+                        "note": note,
                     }),
                 )?;
             } else {
@@ -142,10 +186,12 @@ pub fn run(
                 // `3/0/4 Living Room Blind Move ← Down (1.008)`.
                 println!("{}", write_label(&sent.write));
             }
-            if !sent.confirmed {
-                // Not an error: KNX group writes are fire-and-forget. Note the
-                // missing confirmation on stderr so scripts still see success.
-                eprintln!("note: sent (no bus confirmation observed)");
+            // What KNX confirmed, exactly (issue #297): the interface's
+            // L_Data.con at most. Not an error when it is missing: group
+            // writes are fire-and-forget, so scripts still see success.
+            eprintln!("{result}");
+            if let Some(note) = &note {
+                eprintln!("note: {note}");
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -161,50 +207,6 @@ pub fn run(
         }
         Err(refusal) => Err(render_refusal(refusal)),
     }
-}
-
-/// The devices the model links to `ga` (listening, or sending on it): the
-/// receivers of a group write to it.
-fn secured_receivers(model: Option<&Model>, ga: GroupAddress) -> Vec<IndividualAddress> {
-    let Some(model) = model else {
-        return Vec::new();
-    };
-    model
-        .links
-        .links
-        .iter()
-        .filter(|(_, links)| {
-            links
-                .iter()
-                .any(|l| l.send == Some(ga) || l.listen.contains(&ga))
-        })
-        .map(|(ia, _)| *ia)
-        .collect()
-}
-
-/// The sender-admission warning of a secured `write` (issue #197): a
-/// receiver accepts a secured group telegram only from an address in its
-/// security individual address table (PID 54), and ETS lists only device
-/// senders there.
-fn sender_admission_note(
-    ga: GroupAddress,
-    source: IndividualAddress,
-    receivers: &[IndividualAddress],
-) -> String {
-    let who = if receivers.is_empty() {
-        format!("the receivers of {ga}")
-    } else {
-        let list: Vec<String> = receivers.iter().map(ToString::to_string).collect();
-        format!("the receivers of {ga} ({})", list.join(", "))
-    };
-    format!(
-        "note: {who} accept this secured write only if bussard's tunnel address {source} is in \
-         their security individual address table (PID 54); ETS lists only device senders there. \
-         bussard does not record whether that was done: if nothing reacted, program each \
-         receiver once with `bussard flash <device> --keyring <file> --secure-sender {source}` \
-         (or `apply --keyring --secure-sender {source}`), or send through a secured device. \
-         See docs/SAFETY.md (Secured group writes from bussard)."
-    )
 }
 
 /// `3/0/4 Living Room Blind Move ← Down (1.008)`: the GA (with its model name
@@ -279,6 +281,8 @@ pub(crate) fn protected_refusal(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    use bussard_model::IndividualAddress;
 
     use bussard_model::schema::{BussardConfig, Group, Groups, Links};
 
@@ -389,24 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sender_admission_note_names_receivers_and_tunnel() -> anyhow::Result<()> {
-        let ga: GroupAddress = "1/2/3".parse()?;
-        let tunnel: IndividualAddress = "1.1.200".parse()?;
-        let receiver: IndividualAddress = "1.1.5".parse()?;
-        let note = sender_admission_note(ga, tunnel, &[receiver]);
-        assert!(note.contains("receivers of 1/2/3 (1.1.5)"), "{note}");
-        assert!(note.contains("--secure-sender 1.1.200"), "{note}");
-        assert!(note.contains("PID 54"), "{note}");
-        let generic = sender_admission_note(ga, tunnel, &[]);
-        assert!(
-            generic.contains("the receivers of 1/2/3 accept"),
-            "{generic}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_secured_receivers_lists_linked_devices() -> anyhow::Result<()> {
+    fn test_linked_devices_lists_the_receivers_of_a_secured_write() -> anyhow::Result<()> {
         let ga: GroupAddress = "1/2/3".parse()?;
         let mut model = model_with(false, Some("1.001"));
         let listener: IndividualAddress = "1.1.5".parse()?;
@@ -431,10 +418,13 @@ mod tests {
             .links
             .links
             .insert(other, vec![link(Some("1/2/4".parse()?), Vec::new())]);
-        let mut receivers = secured_receivers(Some(&model), ga);
-        receivers.sort();
+        let tunnel: IndividualAddress = "1.1.255".parse()?;
+        let receivers = bussard_service::admission::linked_devices(Some(&model), ga, tunnel);
         assert_eq!(receivers, vec![listener, sender]);
-        assert!(secured_receivers(None, ga).is_empty());
+        // The sender itself is never its own receiver.
+        let without = bussard_service::admission::linked_devices(Some(&model), ga, sender);
+        assert_eq!(without, vec![listener]);
+        assert!(bussard_service::admission::linked_devices(None, ga, tunnel).is_empty());
         Ok(())
     }
 }

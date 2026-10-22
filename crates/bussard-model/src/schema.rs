@@ -123,6 +123,16 @@ pub struct Connection {
     /// committed model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyring: Option<std::path::PathBuf>,
+    /// Admit the key store's tunnelling addresses as secure senders (issue
+    /// #297): `plan`, `apply` and `knx_apply_device` on a KNX Data Secure
+    /// device add every tunnelling interface address of the keyring (or key
+    /// store) to the device's security individual address table (PID 54),
+    /// with sequence 0, so a secured group write or read bussard sends through
+    /// the tunnel is accepted. ETS does the same when group addresses are
+    /// assigned to the interface's tunnelling addresses. Off by default; off,
+    /// the table is exactly the one the model's links imply.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub admit_tunnel_senders: bool,
 }
 
 impl Connection {
@@ -146,6 +156,7 @@ impl Default for Connection {
             gateway: None,
             multicast: None,
             keyring: None,
+            admit_tunnel_senders: false,
         }
     }
 }

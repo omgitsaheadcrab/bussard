@@ -87,6 +87,15 @@ pub fn run(
     let activated = crate::secure_key::model_activated(model.as_ref(), target);
     let secure_material = crate::secure_key::resolve_material(target, tool_key_source, activated)?;
     let tool_key = secure_material.tool_key.clone();
+    // The extra secured senders of the security individual address table:
+    // `--secure-sender` and, with `admit_tunnel_senders` (issue #297), the key
+    // store's tunnelling addresses.
+    let mut extra_senders: Vec<IndividualAddress> = secure_sender.into_iter().collect();
+    extra_senders.extend(crate::secure_key::admitted_tunnel(
+        model.as_ref(),
+        tool_key_source,
+        tool_key.is_some(),
+    )?);
     // One send-sequence high-water mark for the whole command (spec §5.9): the
     // pre-flight probe, the flash, and every mid-flash reconnect share it, so no
     // session ever replays a sequence the device already accepted.
@@ -239,7 +248,7 @@ pub fn run(
             no_factory_reset,
             parameters_only,
             &secure_material,
-            secure_sender,
+            &extra_senders,
             &output,
         );
     }
@@ -651,17 +660,20 @@ pub fn run(
         plan.skip_factory_reset();
     }
     // A secured download also programs the security object (issue #156).
-    if let Err(err) = add_security_steps(
+    let written_senders = match add_security_steps(
         &mut plan,
         model.as_ref(),
         target,
         &table_images,
         &secure_material,
-        secure_sender,
+        &extra_senders,
     ) {
-        eprintln!("cannot flash: {err}");
-        return Ok(ExitCode::FAILURE);
-    }
+        Ok(senders) => senders,
+        Err(err) => {
+            eprintln!("cannot flash: {err}");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
 
     // The parameter-level plan (issue #109): what this flash changes in the
     // vendor's own words, before the memory-level plan. The current values were
@@ -825,6 +837,19 @@ pub fn run(
             for warning in &verify.warnings {
                 eprintln!("{warning}");
             }
+            // The verified flash wrote this PID 54 table: record it in the
+            // lock, as `adopt` does (issue #297).
+            if let (Some(senders), Some(_)) = (&written_senders, model.as_ref()) {
+                match bussard_service::admission::record_secure_senders(dir, target, senders) {
+                    Ok(true) => println!(
+                        "recorded {target}'s security individual address table (PID 54, {} \
+                         sender(s)) in bussard.lock",
+                        senders.len()
+                    ),
+                    Ok(false) => {}
+                    Err(err) => eprintln!("warning: {err}"),
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
         Ok(verify) => {
@@ -857,7 +882,7 @@ fn dry_run(
     no_factory_reset: bool,
     parameters_only: bool,
     secure_material: &crate::secure_key::SecureMaterial,
-    secure_sender: Option<IndividualAddress>,
+    extra_senders: &[IndividualAddress],
     output: &FlashOutput,
 ) -> anyhow::Result<ExitCode> {
     // No device to read the descriptor from: the plan is checked against the
@@ -908,7 +933,7 @@ fn dry_run(
         target,
         &table_images,
         secure_material,
-        secure_sender,
+        extra_senders,
     ) {
         eprintln!("cannot flash: {err}");
         return Ok(ExitCode::FAILURE);
@@ -947,7 +972,8 @@ fn dry_run(
 /// for the GAs in the address table this flash writes, and the group-object
 /// security flags sized to the group-object table it writes, and the security
 /// individual address table entries of the secured senders it receives from
-/// (issue #181; `secure_sender` adds bussard's own address). A plain flash (no
+/// (issue #181; `extra_senders` adds `--secure-sender` and the tunnelling
+/// addresses `admit_tunnel_senders` admits, issue #297). A plain flash (no
 /// tool key) is left untouched.
 fn add_security_steps(
     plan: &mut bussard_download::FlashPlan,
@@ -955,10 +981,10 @@ fn add_security_steps(
     target: IndividualAddress,
     table_images: &BTreeMap<u32, Vec<u8>>,
     material: &crate::secure_key::SecureMaterial,
-    secure_sender: Option<IndividualAddress>,
-) -> Result<(), bussard_download::SecurityPlanError> {
-    if material.tool_key.is_none() || plan.is_sys7() {
-        return Ok(());
+    extra_senders: &[IndividualAddress],
+) -> Result<Option<Vec<bussard_download::SecureSenderEntry>>, bussard_download::SecurityPlanError> {
+    if material.tool_key.is_none() || plan.is_sys7() || plan.has_security_program() {
+        return Ok(None);
     }
     let empty = std::collections::HashMap::new();
     let group_keys = material.group_keys.as_ref().unwrap_or(&empty);
@@ -994,10 +1020,11 @@ fn add_security_steps(
         target,
         group_keys,
         &material.device_sequences,
-        secure_sender.as_slice(),
+        extra_senders,
     );
+    let senders = program.senders.clone();
     plan.add_security_program(program);
-    Ok(())
+    Ok(Some(senders))
 }
 
 /// The device's parameter overrides re-keyed to app-relative `ParameterRef`

@@ -522,7 +522,7 @@ and `write --keyring` (and MCP, viz), and modelled by the knx-sim Secure device.
 | Inner APDU | the plain group APDU with TPCI bits zero: `00 00` GroupValueRead, `00 8v` small write, `00 40 …` large response | CONFIRMED (live, 2026-09-24) for the small/large GroupValueWrite form: the decrypted APDU decoded as a DPT 9.001 write of 22.12 °C |
 | Sender sequence | ms since 2018-01-05, strictly above the last sent by the process (`SequenceHighWater`) | CONFIRMED rule (§5.8) |
 | Receiver freshness | per sender IA; bussard's monitor only *warns* on a non-increasing sequence, it never drops | design choice |
-| Sender admission | a device accepts a secured group telegram only from an IA in its security individual address table (PID 54), with a sequence above that entry's | INFERRED (ETS lists every secured sender there, §11.1); the sim enforces it (issue #181) |
+| Sender admission | a device accepts a secured group telegram only from an IA in its security individual address table (PID 54), with a sequence above that entry's | INFERRED (ETS lists every secured sender there, §11.1); the sim enforces it (issue #181); consistent with the owner's 2026-10-22 observation (issue #297): a secured write to 1/0/4 from tunnel user 5 was confirmed by the interface (L_Data.con) and did nothing on 1.1.5, whose PID 54 lists only 1.1.16 |
 
 Known-answer vector (synthetic; bussard `group::tests` and knx-sim
 `GROUP_KAT_ASDU` agree, and so does `tools/knxtrace/datasecure.py`): key
@@ -532,6 +532,33 @@ Known-answer vector (synthetic; bussard `group::tests` and knx-sim
 SCF 0x10: 10 000000 00002a df59 49899fd3
 SCF 0x00: 00 000000 00002a 0081 2e51ca4a
 ```
+
+**Sender admission and the tunnel addresses (issue #297).** bussard sends
+from the tunnel address the gateway assigns to its tunnelling user. ETS puts a
+tunnelling address into a device's PID 54 only when group addresses are
+assigned to that tunnelling address; the keyring then carries the assignment
+as the interface's `<Group Address=… Senders=…>` children, where `Senders`
+lists the individual addresses the interface itself accepts on that group
+address (space separated). The reference installation's key store has eight
+tunnelling users (2 to 9, 1.1.22 to 1.1.29) with no group assigned, so no
+device admits them `[INFERRED from the keyring and the S3 captures, which
+show no tunnel address in any PID 54]`. bussard's rule:
+
+- before a secured `GroupValueWrite` or `GroupValueRead`, the tunnel address
+  is admitted by a device when its recorded PID 54 (`secure_senders` in the
+  lock, from `bussard adopt` or a verified secured download) lists it, or, without a recorded table, when the
+  keyring assigns the group address to that tunnelling address. All recorded
+  tables lacking it refuses the telegram; no evidence sends it with a note
+  that delivery is unconfirmed (`bussard_service::admission`);
+- `[connection] admit_tunnel_senders = true` adds every tunnelling address of
+  the key store to the PID 54 a secured download writes, with sequence 0,
+  entries in ascending IA after the link-derived senders' rule (§11.1). Every
+  tunnel user is admitted because bussard picks the user per connection and
+  host (#288). ETS parity: this is the table ETS writes when the group
+  addresses are assigned to the interface's tunnelling addresses `[INFERRED:
+  no capture of such a download in the reference installation]`. Off, the
+  table is byte-identical to before (the `--keyring` rows of
+  `scripts/campaign/95-offline-oracle.sh`).
 
 The SCF, key and inner-APDU rows were promoted on 2026-09-24 from a live
 `monitor --keyring` of the reference installation (one secured GroupValueWrite

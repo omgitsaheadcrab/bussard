@@ -74,15 +74,16 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::args::Parameters;
 use bussard_bus::BusHandle;
 use bussard_download::{
-    DesiredTables, LiveRead, LiveTables, PlanReport, SecurityInputs, Sys7TableImages,
-    desired_tables_for, plan, render_plan_text, sys7_table_images, write_pre_write_backup,
-    write_tables_secured,
+    DesiredTables, LiveRead, LiveTables, PlanReport, SecureSenderEntry, SecurityInputs,
+    Sys7TableImages, desired_tables_for, plan, render_plan_text, sys7_table_images,
+    write_pre_write_backup, write_tables_secured,
 };
 use bussard_mgmt::{Layer4Connection, LeaseChannel, MaskProfile, Timeouts, system_type};
 use bussard_model::history::{History, SnapshotReason};
 use bussard_model::identity::IdentityCheck;
 use bussard_model::{IndividualAddress, Model};
 use bussard_secure::{Key16, SequenceHighWater};
+use bussard_service::admission::TunnelAdmission;
 use bussard_service::params::{
     BuiltPlan, MissingProduct, ParamState, ProductSource, Selection, build_device_plan,
     resolve_product,
@@ -442,6 +443,22 @@ impl BussardMcp {
             .map_err(|err| chain(&err))
     }
 
+    /// The tunnelling addresses `[connection] admit_tunnel_senders` adds to
+    /// a Secure device's PID 54 (issue #297): every tunnelling interface of
+    /// the server's keyring or key store. Empty when the option is off or the
+    /// device is written in the clear.
+    fn admitted_tunnel(
+        &self,
+        model: &Model,
+        secured: bool,
+    ) -> Result<Vec<IndividualAddress>, String> {
+        if !secured || !bussard_service::admission::admit_tunnel_senders(Some(model)) {
+            return Ok(Vec::new());
+        }
+        let evidence = crate::secure_group::admission_evidence(self.state().keyring.as_deref())?;
+        Ok(evidence.tunnel_addresses())
+    }
+
     /// `knx_plan_device`'s body; `Err` is a refusal reason.
     async fn plan_device(&self, address: &str) -> Result<Value, String> {
         let target = parse_address(address)?;
@@ -459,6 +476,7 @@ impl BussardMcp {
 
         let material = self.plan_material(target, &model)?;
         let tool_key = material.tool_key.clone();
+        let tunnel = self.admitted_tunnel(&model, tool_key.is_some())?;
         // The product data the parameter half decodes with (issue #274): the
         // archive the lock pins for the device, as `bussard apply` resolves it.
         let product = product_for(&dir, &model, target);
@@ -475,6 +493,7 @@ impl BussardMcp {
             &dir,
             &model,
             product.source.as_ref(),
+            &tunnel,
         )
         .await?;
         drop(warm);
@@ -483,14 +502,15 @@ impl BussardMcp {
         let tables = live.tables();
         let report = plan(tables, &desired);
         refuse_protected(&model, &report)?;
-        let security = security_inputs(&model, target, &desired, &material, live)?;
+        let security = security_inputs(&model, target, &desired, &material, live, &tunnel)?;
         // A System 7 image that would not fit its memory region must refuse at
         // plan time, before the human is asked anything.
         if let Some(s7) = live.sys7() {
             sys7_table_images(s7, &desired, target.raw())
                 .map_err(|e| format!("computing the System 7 table images: {e}"))?;
         }
-        let built = built_plan(&model, target, &gateway, &dir, &read, &report, &product);
+        let mut built = built_plan(&model, target, &gateway, &dir, &read, &report, &product);
+        admit_in_plan(&mut built, target, &tunnel, &read, &report);
         if let Some(refusal) = &built.refusal {
             return Err(refusal.clone());
         }
@@ -505,7 +525,9 @@ impl BussardMcp {
         }
 
         let plan_text = render_plan_text(target, tables, &report);
-        let tables_noop = report.is_noop();
+        // A security-object change of its own rewrites the tables too (issue
+        // #297): the security object is written inside the table download.
+        let tables_noop = report.is_noop() && !built.plan.writes.security_object;
         let noop = tables_noop && built.partial.is_none();
         if noop {
             // The device already holds the model: nothing this session
@@ -515,6 +537,23 @@ impl BussardMcp {
         }
         let pending = self.session_edits().for_device(target);
         let mut device_plan = built.plan.clone();
+        // Issue #297: with `admit_tunnel_senders` off, say when only tunnel
+        // clients can write a secured GA of this device and it does not
+        // admit the tunnelling addresses.
+        if !bussard_service::admission::admit_tunnel_senders(Some(&model))
+            && let Some(keys) = material.group_keys.as_ref()
+            && let Ok(evidence) =
+                crate::secure_group::admission_evidence(self.state().keyring.as_deref())
+        {
+            for gap in bussard_service::admission::tunnel_gaps(
+                &model,
+                |ga| keys.contains_key(&ga),
+                &evidence,
+                Some(target),
+            ) {
+                device_plan.notes.push(gap.message());
+            }
+        }
         if let Some(line) = security
             .as_ref()
             .filter(|_| !tables_noop)
@@ -818,6 +857,7 @@ impl BussardMcp {
         // stays monotonic across both connections (spec §5.9).
         let material = self.plan_material(target, &model)?;
         let tool_key = material.tool_key.clone();
+        let tunnel = self.admitted_tunnel(&model, tool_key.is_some())?;
         let high_water = SequenceHighWater::new();
         let (source, read) = read_device(
             &handle,
@@ -827,13 +867,15 @@ impl BussardMcp {
             &dir,
             &model,
             product.source.as_ref(),
+            &tunnel,
         )
         .await?;
         let live = &read.live;
-        let security = security_inputs(&model, target, &desired, &material, live)?;
+        let security = security_inputs(&model, target, &desired, &material, live, &tunnel)?;
         let tables = live.tables();
         let report = plan(tables, &desired);
-        let built = built_plan(&model, target, &gateway, &dir, &read, &report, &product);
+        let mut built = built_plan(&model, target, &gateway, &dir, &read, &report, &product);
+        admit_in_plan(&mut built, target, &tunnel, &read, &report);
 
         // Re-derive the digest from what is true now; anything that moved since
         // the plan retires it.
@@ -886,7 +928,7 @@ impl BussardMcp {
         }
         // The plan is consumed from here on: one digest, one write.
         tier.plans().remove(digest);
-        let tables_change = !report.is_noop();
+        let tables_change = !report.is_noop() || built.plan.writes.security_object;
         let images = match live.sys7() {
             Some(s7) if tables_change => Some(
                 sys7_table_images(s7, &desired, target.raw())
@@ -983,6 +1025,7 @@ impl BussardMcp {
         let Prepared {
             target,
             gateway,
+            dir,
             handle,
             source,
             tool_key,
@@ -1000,7 +1043,7 @@ impl BussardMcp {
         } = p;
         let live = &read.live;
         let tables = live.tables();
-        let tables_change = !report.is_noop();
+        let tables_change = !report.is_noop() || built.plan.writes.security_object;
         let param_write = match (
             &built.partial,
             read.params.as_ref().and_then(|p| p.detail.as_ref()),
@@ -1087,6 +1130,23 @@ impl BussardMcp {
                     });
                 }
                 return result;
+            }
+            // The security object was written with this PID 54 table and the
+            // write verified: record it in the lock, as `adopt` does (issue
+            // #297), so the sender admission check sees it.
+            if let Some(inputs) = &security {
+                match bussard_service::admission::record_secure_senders(
+                    &dir,
+                    target,
+                    &inputs.senders,
+                ) {
+                    Ok(recorded) => result["secure_senders_recorded"] = json!(recorded),
+                    Err(err) => {
+                        tracing::warn!("{err}");
+                        result["secure_senders_recorded"] = json!(false);
+                        result["secure_senders_note"] = json!(err.to_string());
+                    }
+                }
             }
         }
 
@@ -1351,6 +1411,7 @@ fn security_inputs(
     desired: &DesiredTables,
     material: &SecureMaterial,
     live: &LiveTables,
+    tunnel: &[IndividualAddress],
 ) -> Result<Option<SecurityInputs>, String> {
     if material.tool_key.is_none() || live.sys7().is_some() {
         return Ok(None);
@@ -1358,13 +1419,16 @@ fn security_inputs(
     let empty = HashMap::new();
     let keys = material.group_keys.as_ref().unwrap_or(&empty);
     let mut inputs = bussard_download::security_inputs_for(Some(model), target, desired, keys);
+    // The tunnelling addresses `admit_tunnel_senders` admits (issue #297),
+    // sequence 0; empty when the option is off.
     inputs.senders = bussard_download::secured_senders(
         Some(model),
         target,
         keys,
         &material.device_sequences,
-        &[],
+        tunnel,
     );
+    inputs.admitted_tunnel = tunnel.iter().copied().filter(|ia| *ia != target).collect();
     bussard_download::build_security_program(
         target,
         &desired.addresses,
@@ -1482,6 +1546,10 @@ struct DeviceRead {
     check: Option<IdentityCheck>,
     /// The parameter read-back, when product data was at hand.
     params: Option<ParamState>,
+    /// The security individual address table (PID 54), read only when
+    /// `admit_tunnel_senders` has tunnelling addresses to admit (issue #297);
+    /// `None` otherwise or when the device refused the read.
+    senders: Option<Vec<SecureSenderEntry>>,
 }
 
 /// Checks the source address, then reads the device on one layer-4 session:
@@ -1491,6 +1559,7 @@ struct DeviceRead {
 ///
 /// With a tool key every APDU, the descriptor read included, rides
 /// `A_SecureData`; `None` is the unchanged plain path.
+#[allow(clippy::too_many_arguments)] // one read's context; a struct would only move it
 async fn read_device(
     handle: &BusHandle,
     target: IndividualAddress,
@@ -1499,6 +1568,7 @@ async fn read_device(
     dir: &std::path::Path,
     model: &Model,
     product: Option<&ProductSource>,
+    tunnel: &[IndividualAddress],
 ) -> Result<(IndividualAddress, DeviceRead), String> {
     let source = bussard_mgmt::checked_source(handle, false)
         .await
@@ -1525,9 +1595,9 @@ async fn read_device(
     {
         tracing::debug!("{target} authorize (free access) did not grant: {err}");
     }
-    let read = read_on(&mut l4, target, dir, model, product).await;
+    let read = read_on(&mut l4, target, dir, model, product, tunnel).await;
     let _ = l4.disconnect().await;
-    let (read, check, params) = read?;
+    let (read, check, params, senders) = read?;
     match read {
         LiveRead::Tables(live) => Ok((
             source,
@@ -1535,6 +1605,7 @@ async fn read_device(
                 live,
                 check,
                 params,
+                senders,
             },
         )),
         LiveRead::UnsupportedMask { address, mask } => Err(format!(
@@ -1553,7 +1624,16 @@ async fn read_on<Ch: bussard_mgmt::L4Channel>(
     dir: &std::path::Path,
     model: &Model,
     product: Option<&ProductSource>,
-) -> Result<(LiveRead, Option<IdentityCheck>, Option<ParamState>), String> {
+    tunnel: &[IndividualAddress],
+) -> Result<
+    (
+        LiveRead,
+        Option<IdentityCheck>,
+        Option<ParamState>,
+        Option<Vec<SecureSenderEntry>>,
+    ),
+    String,
+> {
     let facts = FactsCache::new(dir, false);
     let device = model.devices.get(&target).map(|d| &d.device);
     let identified = bussard_service::identify(l4, &facts, device)
@@ -1575,7 +1655,32 @@ async fn read_on<Ch: bussard_mgmt::L4Channel>(
         ),
         _ => None,
     };
-    Ok((read, identified.check, params))
+    // PID 54, for `admit_tunnel_senders` only (issue #297).
+    let senders = match &read {
+        LiveRead::Tables(live) if !tunnel.is_empty() && live.sys7().is_none() => {
+            bussard_download::read_security_sender_table(l4)
+                .await
+                .map_err(|e| chain(&e))?
+        }
+        _ => None,
+    };
+    Ok((read, identified.check, params, senders))
+}
+
+/// Adds the `admit_tunnel_senders` change (issue #297) to `built`: the
+/// tunnelling addresses `read`'s PID 54 is missing. Nothing on System 7 or
+/// without tunnelling addresses to admit.
+fn admit_in_plan(
+    built: &mut BuiltPlan,
+    target: IndividualAddress,
+    tunnel: &[IndividualAddress],
+    read: &DeviceRead,
+    report: &PlanReport,
+) {
+    if tunnel.is_empty() || read.live.sys7().is_some() {
+        return;
+    }
+    TunnelAdmission::new(target, tunnel, read.senders.as_deref()).add_to(&mut built.plan, report);
 }
 
 /// Refuses a device whose identity drifted from the lock, naming the
@@ -1704,6 +1809,12 @@ fn live_digest(read: &DeviceRead) -> [u8; 32] {
         }
         None => put(&mut h, b"no-parameters"),
     }
+    // PID 54 when it was read (issue #297); nothing otherwise, so the digest
+    // of a plain or option-off plan is unchanged.
+    if let Some(senders) = &read.senders {
+        put(&mut h, b"pid54");
+        put(&mut h, &bussard_download::sender_table_bytes(senders));
+    }
     h.finalize().into()
 }
 
@@ -1826,6 +1937,7 @@ mod tests {
             live: live_tables(addresses),
             check: None,
             params: None,
+            senders: None,
         }
     }
 

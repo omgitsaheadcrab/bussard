@@ -60,6 +60,8 @@ transport = "tunnel"            # "tunnel" | "routing"
 gateway = "192.168.1.74:3671"
 # multicast = "224.0.23.12:3671"
 # keyring = "house.knxkeys"   # deprecated: use the key store bussard.keys
+# admit_tunnel_senders = true   # Data Secure: admit the key store's tunnelling
+                                # addresses as secure senders (PID 54), issue #297
 
 [lint]
 [lint.topology]
@@ -87,6 +89,12 @@ Written by `init`. bussard never rewrites it, except to append a `[lint]`
 table when one is missing. `[lint]` configures the topology limits and the
 group-address convention that `validate` checks. `[import]` is optional;
 `language` overrides the language `import` derives texts and keys in.
+
+`admit_tunnel_senders` (issue #297, off by default) makes `plan`, `apply`,
+`flash` and `knx_apply_device` on a KNX Data Secure device add every
+tunnelling address of the key store to the device's security individual
+address table (PID 54), so a secured `write` or `read` from bussard is
+accepted. See [SAFETY.md](SAFETY.md#secured-group-writes-from-bussard).
 
 `[home_assistant]` is optional (issue #280). It names the Home Assistant
 instance (`url`), the environment variable that holds a long-lived access

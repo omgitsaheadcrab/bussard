@@ -162,7 +162,7 @@ pub fn run(
     let product_ref = product.as_ref();
 
     let facts = crate::device_facts::cache(dir, model.is_some(), overrides.refresh_facts);
-    let (read_result, params, identity) = crate::plan_cmd::read_device(
+    let (read_result, params, identity, _) = crate::plan_cmd::read_device(
         config,
         target,
         &overrides,
@@ -170,6 +170,7 @@ pub fn run(
         product_ref,
         model_ref,
         facts,
+        &[],
     )?;
     let live = match read_result {
         crate::plan_cmd::LiveRead::Tables(live) => live,
@@ -838,6 +839,7 @@ fn model_config(overrides: &ConnOverrides, dir: &Path) -> BussardConfig {
     // The keyring setting is the operator's, not derived from the connection
     // used: carry it over from the input model.
     let keyring = base.as_ref().and_then(|c| c.keyring.clone());
+    let admit_tunnel_senders = base.as_ref().is_some_and(|c| c.admit_tunnel_senders);
 
     let connection = match resolved {
         Ok(cfg) if cfg.transport == TransportKind::Routing => ModelConnection {
@@ -845,12 +847,14 @@ fn model_config(overrides: &ConnOverrides, dir: &Path) -> BussardConfig {
             gateway: None,
             multicast: Some(cfg.multicast.to_string()),
             keyring,
+            admit_tunnel_senders,
         },
         Ok(cfg) => ModelConnection {
             transport: ModelTransport::Tunnel,
             gateway: cfg.gateway.map(|g| g.to_string()),
             multicast: None,
             keyring,
+            admit_tunnel_senders,
         },
         // No override resolvable on its own (e.g. tunnel with no gateway flag):
         // fall back to whatever the input model had.
