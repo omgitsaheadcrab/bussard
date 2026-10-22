@@ -141,7 +141,9 @@ impl BussardMcp {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LookupArgs {
     /// Case-insensitive substring to search for across GA names/addresses,
-    /// device names/individual addresses, room names and com-object names.
+    /// device names/individual addresses, room names and com-object names;
+    /// for `capabilities`, the words of a function ("Helligkeit",
+    /// "Dämmerung") searched in the devices' parameter and choice texts.
     pub query: String,
     /// Maximum matches to return per category (default 50).
     #[serde(default)]
@@ -182,9 +184,10 @@ pub struct DeviceArgs {
 pub struct ShowDeviceArgs {
     /// An individual (physical) address like `"1.1.47"`.
     pub address: String,
-    /// A channel handle (`"a-1"`), channel id or vendor number to list in
-    /// detail, or `"device"` for the device-level parameters and objects.
-    /// Omit it to list the channels only.
+    /// A channel handle (`"a-1"`), channel id or vendor number, an ETS page
+    /// handle from `blocks` (`"universalkanal-c4-funktion"`), or `"device"`
+    /// for the device-level parameters and objects, to list in detail. Omit
+    /// it to list the channels and pages only.
     #[serde(default)]
     pub channel: Option<String>,
     /// Also return `toml`: the paste-ready device-file snippet, with
@@ -277,15 +280,16 @@ impl BussardMcp {
 
     /// `knx_model_lookup`.
     #[tool(
-        description = "Search the KNX model by a case-insensitive substring. Matches group-address names and addresses, device names and individual addresses, room names, com objects (the name the device file gives a linked object, and for every object the device has, linked or not, the vendor text, function and key) and channels (vendor text, name, handle). Returns matches grouped by kind (groups, devices, objects, channels); an object or channel names its device (`device_ia`), channel handle and object numbers, ready for knx_show_device and knx_add_link."
+        description = "Search the KNX model by a case-insensitive substring. Matches group-address names and addresses, device names and individual addresses, room names, com objects (the name the device file gives a linked object, and for every object the device has, linked or not, the vendor text, function and key) and channels (vendor text, name, handle). Returns matches grouped by kind (groups, devices, objects, channels); an object or channel names its device (`device_ia`), channel handle and object numbers, ready for knx_show_device and knx_add_link. `capabilities` searches what the installed devices could do: the parameter texts and enum choice texts of their product models (every word of the query must appear; umlauts may be spelled out). Each names the device, the ETS page or channel (`block_or_channel`, `handle`), the parameter, the matching choice and whether that page is active; `provides` matches come first, then `could provide` ones on inactive pages (spare capacity, with `enable`: the parameters to set, and `needs`), then other choices of active pages. Read knx_show_device with the `handle` for the candidates."
     )]
     async fn knx_model_lookup(
         &self,
         Parameters(args): Parameters<LookupArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let limit = args.limit.unwrap_or(50).clamp(1, 500) as usize;
-        ok(tools::model_lookup(
+        ok(tools::model_lookup_with_capabilities(
             &self.state.model.current(),
+            &self.state.dir,
             &args.query,
             limit,
         ))
@@ -312,7 +316,7 @@ impl BussardMcp {
 
     /// `knx_get_device`.
     #[tool(
-        description = "Get the full definition of one device by its individual address: identity, product, location, channels and generated com-object table, plus every link (com-object -> group addresses) on it."
+        description = "Get the full definition of one device by its individual address: identity, product, location, channels and generated com-object table, plus every link (com-object -> group addresses) on it. This is the configured state; for what the device can do (inactive channels and pages, functions, choices) use knx_show_device."
     )]
     async fn knx_get_device(
         &self,
@@ -327,12 +331,16 @@ impl BussardMcp {
 
     /// `knx_show_device`.
     #[tool(
-        description = "Show what one device offers, in its device file's words, from the lock and \
+        description = "Show what one device can do, in its device file's words, from the lock and \
         the product model under .bussard/models/ (no bus access): its channels (handle, vendor text, the \
-        user's name, counts); with `channel` (a handle like \"a-1\", or \"device\" for the \
+        user's name, counts); for an application without channels of its own, its ETS parameter \
+        pages (`blocks`, in ETS order); inactive pages and channels marked `inactive` with the \
+        parameters that enable them and the objects they would show, and a `summary` counting \
+        them. With `channel` (a handle like \"a-1\", a page handle, or \"device\" for the \
         device level), that scope's parameters (key, current value, enum choices or range, \
         whether at the vendor default) and objects (key, number, text/function, DPT, flags, \
-        what it sends and listens on). With `toml: true` also the paste-ready TOML for \
+        what it sends and listens on); for an inactive page, the ones it would show. This is \
+        what the device can do; knx_get_device is the configured state. With `toml: true` also the paste-ready TOML for \
         devices/<address>.toml. Use it before editing a device file: the keys it prints are the \
         ones the file accepts and knx_set_parameter takes, and `how_to_change` says how to edit \
         and push them. Without product data it says so, says what to run, and lists what the \

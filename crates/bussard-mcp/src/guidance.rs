@@ -196,7 +196,9 @@ impl Tiers {
              works with the live bus. Active tiers: {}. Start with knx_project_summary (its \
              `server` and `capabilities` fields say what this server may do), then \
              knx_model_lookup, knx_get_group, knx_get_device and knx_show_device to explore, \
-             and knx_validate and knx_audit to check the model.",
+             and knx_validate and knx_audit to check the model. To find a device that can \
+             provide a function, use knx_model_lookup with the function's words and read \
+             knx_show_device for the candidates.",
             self.names().join(", ")
         )];
         out.push(if self.passive {

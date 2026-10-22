@@ -22,6 +22,7 @@
 //! [`dpt_map`] and [`flag_map`] modules re-export them for stable paths.
 
 pub mod application;
+pub mod blocks;
 pub mod cache;
 mod container;
 pub mod dpt_map;

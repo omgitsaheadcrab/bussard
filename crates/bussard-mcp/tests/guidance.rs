@@ -399,7 +399,9 @@ const READ_INSTRUCTIONS: &str = "bussard: KNX as code over MCP. The installation
     bus. Active tiers: read. Start with knx_project_summary (its `server` and `capabilities` \
     fields say what this server may do), then knx_model_lookup, knx_get_group, \
     knx_get_device and knx_show_device to explore, and knx_validate and knx_audit to check \
-    the model. Observe with knx_recent_telegrams and knx_wait_for_telegram (the latter \
+    the model. To find a device that can provide a function, use \
+    knx_model_lookup with the function's words and read knx_show_device for the candidates. \
+    Observe with knx_recent_telegrams and knx_wait_for_telegram (the latter \
     enables 'press the button now' debugging); knx_read_group reads a value and \
     knx_describe_device introspects a device's interface objects over the bus. When a bus \
     tool says the bus is not connected, knx_bus_status says why (the last transport error, \
@@ -426,7 +428,9 @@ const PROGRAMMING_INSTRUCTIONS: &str = "bussard: KNX as code over MCP. The insta
     bus. Active tiers: read, programming. Start with knx_project_summary (its `server` and \
     `capabilities` fields say what this server may do), then knx_model_lookup, \
     knx_get_group, knx_get_device and knx_show_device to explore, and knx_validate and \
-    knx_audit to check the model. Observe with knx_recent_telegrams and \
+    knx_audit to check the model. To find a device that can provide a function, use \
+    knx_model_lookup with the function's words and read knx_show_device for the candidates. \
+    Observe with knx_recent_telegrams and \
     knx_wait_for_telegram (the latter enables 'press the button now' debugging); \
     knx_read_group reads a value and knx_describe_device introspects a device's interface \
     objects over the bus. When a bus tool says the bus is not connected, knx_bus_status says \

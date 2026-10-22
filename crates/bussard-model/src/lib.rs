@@ -12,7 +12,9 @@
 
 pub mod address;
 pub mod analysis;
+pub mod blocks;
 pub mod bundle;
+pub mod capabilities;
 pub mod change;
 pub mod codec;
 pub mod declare;
