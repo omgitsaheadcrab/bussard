@@ -236,8 +236,8 @@ impl Admission {
              [connection] in bussard.toml, then plan and apply {} (`bussard apply {receiver}`, \
              or knx_plan_device and knx_apply_device), which adds every tunnelling address \
              of the key store to its security individual address table (PID 54); or assign \
-             {ga} to the tunnelling addresses in ETS and download the device. Then `bussard \
-             adopt {receiver}` records the table so this check sees it.",
+             {ga} to the tunnelling addresses in ETS and download the device, then `bussard \
+             adopt {receiver}` to record the table ETS wrote.",
             devices.join(", ")
         ))
     }
@@ -503,6 +503,55 @@ impl TunnelAdmission {
             short_digest(&missing.join(","))
         );
     }
+}
+
+/// Why [`record_secure_senders`] could not update the lock.
+#[derive(Debug, thiserror::Error)]
+pub enum RecordSendersError {
+    /// The model did not load.
+    #[error("loading the model to record the secure senders: {0}")]
+    Load(#[from] bussard_model::LoadError),
+    /// The model did not save.
+    #[error("saving the secure senders to bussard.lock: {0}")]
+    Save(#[from] bussard_model::SaveError),
+}
+
+/// Records the security individual address table a verified secured write
+/// put on `device` (PID 54) as its lock `secure_senders`, the shape `bussard
+/// adopt` writes (issue #297). The next secured write to a GA of the device
+/// then sees the table and reports `admitted` without an `adopt`.
+///
+/// Call it only after the write verified. Loads the model from `dir`, changes
+/// only that device's `secure_senders` and saves (files whose contents do not
+/// change are not rewritten). Returns whether the lock changed; a device the
+/// model does not know is left alone (`false`).
+///
+/// # Errors
+///
+/// The model does not load or save.
+pub fn record_secure_senders(
+    dir: &std::path::Path,
+    device: IndividualAddress,
+    entries: &[SecureSenderEntry],
+) -> Result<bool, RecordSendersError> {
+    let mut model = Model::load(dir)?;
+    let Some(loaded) = model.devices.get_mut(&device) else {
+        return Ok(false);
+    };
+    let senders: Vec<bussard_model::schema::SecureSender> = entries
+        .iter()
+        .map(|e| bussard_model::schema::SecureSender {
+            address: e.address,
+            sequence: e.sequence,
+        })
+        .collect();
+    let security = loaded.device.security.get_or_insert_with(Default::default);
+    if security.secure_senders == senders {
+        return Ok(false);
+    }
+    security.secure_senders = senders;
+    model.save(dir)?;
+    Ok(true)
 }
 
 /// A short, stable digest of `text` (FNV-1a, 64 bits, hex), for the state

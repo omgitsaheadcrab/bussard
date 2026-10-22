@@ -660,7 +660,7 @@ pub fn run(
         plan.skip_factory_reset();
     }
     // A secured download also programs the security object (issue #156).
-    if let Err(err) = add_security_steps(
+    let written_senders = match add_security_steps(
         &mut plan,
         model.as_ref(),
         target,
@@ -668,9 +668,12 @@ pub fn run(
         &secure_material,
         &extra_senders,
     ) {
-        eprintln!("cannot flash: {err}");
-        return Ok(ExitCode::FAILURE);
-    }
+        Ok(senders) => senders,
+        Err(err) => {
+            eprintln!("cannot flash: {err}");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
 
     // The parameter-level plan (issue #109): what this flash changes in the
     // vendor's own words, before the memory-level plan. The current values were
@@ -834,6 +837,19 @@ pub fn run(
             for warning in &verify.warnings {
                 eprintln!("{warning}");
             }
+            // The verified flash wrote this PID 54 table: record it in the
+            // lock, as `adopt` does (issue #297).
+            if let (Some(senders), Some(_)) = (&written_senders, model.as_ref()) {
+                match bussard_service::admission::record_secure_senders(dir, target, senders) {
+                    Ok(true) => println!(
+                        "recorded {target}'s security individual address table (PID 54, {} \
+                         sender(s)) in bussard.lock",
+                        senders.len()
+                    ),
+                    Ok(false) => {}
+                    Err(err) => eprintln!("warning: {err}"),
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
         Ok(verify) => {
@@ -966,9 +982,9 @@ fn add_security_steps(
     table_images: &BTreeMap<u32, Vec<u8>>,
     material: &crate::secure_key::SecureMaterial,
     extra_senders: &[IndividualAddress],
-) -> Result<(), bussard_download::SecurityPlanError> {
-    if material.tool_key.is_none() || plan.is_sys7() {
-        return Ok(());
+) -> Result<Option<Vec<bussard_download::SecureSenderEntry>>, bussard_download::SecurityPlanError> {
+    if material.tool_key.is_none() || plan.is_sys7() || plan.has_security_program() {
+        return Ok(None);
     }
     let empty = std::collections::HashMap::new();
     let group_keys = material.group_keys.as_ref().unwrap_or(&empty);
@@ -1006,8 +1022,9 @@ fn add_security_steps(
         &material.device_sequences,
         extra_senders,
     );
+    let senders = program.senders.clone();
     plan.add_security_program(program);
-    Ok(())
+    Ok(Some(senders))
 }
 
 /// The device's parameter overrides re-keyed to app-relative `ParameterRef`

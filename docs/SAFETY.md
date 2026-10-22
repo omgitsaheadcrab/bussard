@@ -531,7 +531,8 @@ address the gateway assigned and the devices the model links to the GA, then
 weigh the evidence:
 
 - a device's recorded table (`secure_senders` in `bussard.lock`, read back by
-  `bussard adopt`) admits exactly the addresses it lists;
+  `bussard adopt` or written by a verified secured `apply`, `apply --line` or
+  `flash`) admits exactly the addresses it lists;
 - without one, an ETS assignment of the GA to that tunnelling address in the
   keyring or key store admits it;
 - otherwise bussard cannot tell.
@@ -570,8 +571,9 @@ that does not admit the sender.
    tunnel user is admitted, not just one, because bussard picks the
    tunnelling user per connection and host (issue #288). This is what ETS
    does when group addresses are assigned to the interface's tunnelling
-   addresses. Run `bussard adopt <device>` afterwards so the lock records the
-   table and the check above sees it.
+   addresses. The verified write records the table it wrote in the lock
+   (`secure_senders`, the shape `adopt` writes), so the check above reports
+   the next secured write as admitted.
 2. **`--secure-sender <tunnel IA>`** on `flash` or `apply` adds one address
    for one run, without the option.
 3. **Assign the group addresses to the tunnelling addresses in ETS** and

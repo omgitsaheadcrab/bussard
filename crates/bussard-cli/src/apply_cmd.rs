@@ -580,6 +580,24 @@ pub(crate) fn apply_desired(
                 summary.association_state,
                 report.resulting_association_count,
             );
+            // The security object was written with this PID 54 table and the
+            // write verified: record it in the lock, as `adopt` does (issue
+            // #297), so the sender admission check sees it.
+            if let (Some(inputs), Some(_)) = (&security, model) {
+                match bussard_service::admission::record_secure_senders(
+                    dir,
+                    target,
+                    &inputs.senders,
+                ) {
+                    Ok(true) => println!(
+                        "recorded {target}'s security individual address table (PID 54, {} \
+                         sender(s)) in bussard.lock",
+                        inputs.senders.len()
+                    ),
+                    Ok(false) => {}
+                    Err(err) => eprintln!("warning: {err}"),
+                }
+            }
             if partial.is_some() {
                 let code = write_parameters(
                     &runtime,

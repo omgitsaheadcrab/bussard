@@ -767,7 +767,20 @@ async fn visit_one(
     };
 
     match verified {
-        Ok((true, _)) => make(Some(mask), DeviceStatus::Applied(changes)),
+        Ok((true, _)) => {
+            // A verified secured System B write put this PID 54 table on the
+            // device: record it in the lock, as `adopt` does (issue #297).
+            if let (Some(inputs), None) = (&security, &sys7_live)
+                && let Err(err) = bussard_service::admission::record_secure_senders(
+                    dir,
+                    target.address,
+                    &inputs.senders,
+                )
+            {
+                eprintln!("warning: {}: {err}", target.address);
+            }
+            make(Some(mask), DeviceStatus::Applied(changes))
+        }
         Ok((false, detail)) => make(
             Some(mask),
             DeviceStatus::Failed(format!(

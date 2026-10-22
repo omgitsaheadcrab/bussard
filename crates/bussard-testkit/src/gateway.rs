@@ -147,6 +147,7 @@ pub struct GatewayBuilder {
     outage: Option<Outage>,
     interceptors: Vec<Interceptor>,
     confirm: Option<(Duration, ConfirmHook)>,
+    tunnel_ia: u16,
 }
 
 impl Default for GatewayBuilder {
@@ -166,6 +167,7 @@ impl Default for GatewayBuilder {
             outage: None,
             interceptors: Vec::new(),
             confirm: None,
+            tunnel_ia: crate::consts::TUNNEL_IA_RAW,
         }
     }
 }
@@ -174,6 +176,14 @@ impl GatewayBuilder {
     /// The channel id CONNECT_RESPONSE grants (default `0x21`).
     pub fn channel(mut self, channel: u8) -> Self {
         self.channel = channel;
+        self
+    }
+
+    /// The tunnel individual address CONNECT_RESPONSE assigns (default
+    /// 1.1.255, [`crate::consts::TUNNEL_IA_RAW`]), e.g. a keyring's
+    /// tunnelling address.
+    pub fn tunnel_address(mut self, ia: u16) -> Self {
+        self.tunnel_ia = ia;
         self
     }
 
@@ -329,6 +339,7 @@ impl GatewayBuilder {
             sock,
             port: addr.port(),
             channel: self.channel,
+            tunnel_ia: self.tunnel_ia,
             ack: self.ack,
             refuse: self.refuse,
             answer_heartbeats: self.answer_heartbeats,
@@ -520,6 +531,7 @@ struct Server {
     sock: UdpSocket,
     port: u16,
     channel: u8,
+    tunnel_ia: u16,
     ack: AckPolicy,
     refuse: Option<u8>,
     answer_heartbeats: bool,
@@ -757,10 +769,11 @@ impl Server {
             let reply = wire::frame(ServiceType::ConnectResponse, &connect_refusal_body(status));
             return self.send(&reply, from).await;
         }
-        let reply = wire::frame(
-            ServiceType::ConnectResponse,
-            &connect_response_body(self.channel, self.port),
-        );
+        let mut body = connect_response_body(self.channel, self.port);
+        // The CRD's last two octets are the assigned tunnel address.
+        let n = body.len();
+        body[n - 2..].copy_from_slice(&self.tunnel_ia.to_be_bytes());
+        let reply = wire::frame(ServiceType::ConnectResponse, &body);
         if matches!(self.send(&reply, from).await, Flow::Stop) {
             return Flow::Stop;
         }

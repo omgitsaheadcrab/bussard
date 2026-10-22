@@ -550,6 +550,9 @@ fn test_mcp_apply_with_admit_tunnel_senders_writes_the_tunnel_address_into_pid54
     let gw = rt.block_on(
         MockGateway::builder()
             .channel(0x56)
+            // The keyring's tunnelling user 2 (1.1.200), as the real
+            // interface assigns it.
+            .tunnel_address(0x11C8)
             .keep_serving()
             .idle_timeout(Duration::from_secs(120))
             .device(secure_device_with(
@@ -561,7 +564,7 @@ fn test_mcp_apply_with_admit_tunnel_senders_writes_the_tunnel_address_into_pid54
             .start(),
     )?;
     let dir = model_dir("admit")?;
-    let mut server = Server::start(&dir, gw.port(), &["--allow-programming"])?;
+    let mut server = Server::start(&dir, gw.port(), &["--allow-programming", "--allow-writes"])?;
 
     // Off (the default): nothing to write, PID 54 is not read.
     let plan = plan_when_connected(&mut server, "1.1.10")?;
@@ -617,6 +620,26 @@ fn test_mcp_apply_with_admit_tunnel_senders_writes_the_tunnel_address_into_pid54
         // After: 1.1.200 (0x11C8) with sequence 0.
         assert_eq!(log.pid54, vec![0x11, 0xC8, 0, 0, 0, 0, 0, 0], "{log:?}");
     }
+    // The verified write is recorded in the lock, as `adopt` records a read.
+    assert_eq!(applied["secure_senders_recorded"], true, "apply: {applied}");
+    let lock = std::fs::read_to_string(dir.join("bussard.lock"))?;
+    assert!(
+        lock.contains("secure_senders = [\n  { address = \"1.1.200\", sequence = 0 },\n]"),
+        "{lock}"
+    );
+    // So a secured write from the tunnel is admitted without an adopt.
+    let mut write = Value::Null;
+    for _ in 0..50 {
+        write = server.call("knx_write_group", json!({"ga": "1/2/3", "value": "50%"}))?;
+        if write["admission"] == "admitted" {
+            break;
+        }
+        // The server's model handle picks the lock change up on its next poll.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(write["ok"], true, "write: {write}");
+    assert_eq!(write["secured"], true, "write: {write}");
+    assert_eq!(write["admission"], "admitted", "write: {write}");
 
     // The device now admits the tunnel: nothing left to do.
     let replan = server.call("knx_plan_device", json!({"address": "1.1.10"}))?;

@@ -1008,6 +1008,7 @@ impl BussardMcp {
         let Prepared {
             target,
             gateway,
+            dir,
             handle,
             source,
             tool_key,
@@ -1112,6 +1113,23 @@ impl BussardMcp {
                     });
                 }
                 return result;
+            }
+            // The security object was written with this PID 54 table and the
+            // write verified: record it in the lock, as `adopt` does (issue
+            // #297), so the sender admission check sees it.
+            if let Some(inputs) = &security {
+                match bussard_service::admission::record_secure_senders(
+                    &dir,
+                    target,
+                    &inputs.senders,
+                ) {
+                    Ok(recorded) => result["secure_senders_recorded"] = json!(recorded),
+                    Err(err) => {
+                        tracing::warn!("{err}");
+                        result["secure_senders_recorded"] = json!(false);
+                        result["secure_senders_note"] = json!(err.to_string());
+                    }
+                }
             }
         }
 

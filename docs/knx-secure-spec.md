@@ -546,7 +546,7 @@ show no tunnel address in any PID 54]`. bussard's rule:
 
 - before a secured `GroupValueWrite` or `GroupValueRead`, the tunnel address
   is admitted by a device when its recorded PID 54 (`secure_senders` in the
-  lock, from `bussard adopt`) lists it, or, without a recorded table, when the
+  lock, from `bussard adopt` or a verified secured download) lists it, or, without a recorded table, when the
   keyring assigns the group address to that tunnelling address. All recorded
   tables lacking it refuses the telegram; no evidence sends it with a note
   that delivery is unconfirmed (`bussard_service::admission`);

@@ -71,7 +71,10 @@ directory or a script from before these changes needs:
   `writes.security_object`); the security-object summary names them. ETS does
   the same when group addresses are assigned to the interface's tunnelling
   addresses. Off by default; off, the security object is byte-identical to
-  before.
+  before. Every verified secured `apply`, `apply --line`, `flash` and
+  `knx_apply_device` records the PID 54 table it wrote as the device's
+  `secure_senders` in `bussard.lock`, so the next secured write is checked
+  against it without an `adopt`.
 - `bussard restore --parameters <backup.json> <ADDRESS>` and the MCP tool
   `knx_restore_parameters` (#290) replay a parameter backup from
   `captures/backups/parameters/` with the parameter-only download `apply`
