@@ -247,7 +247,9 @@ fn product_hits<'a>(product: &'a ProductModel, words: &[String]) -> Vec<Hit<'a>>
             .clone();
         let covered = |extra: &str| {
             words.iter().all(|w| {
-                page.contains(w.as_str()) || pfold.contains(w.as_str()) || extra.contains(w.as_str())
+                page.contains(w.as_str())
+                    || pfold.contains(w.as_str())
+                    || extra.contains(w.as_str())
             })
         };
         let choices: Vec<(i64, &str)> = def
@@ -259,9 +261,8 @@ fn product_hits<'a>(product: &'a ProductModel, words: &[String]) -> Vec<Hit<'a>>
             })
             .map(|(code, label)| (*code, label.as_str()))
             .collect();
-        let plain = choices.is_empty()
-            && covered("")
-            && words.iter().any(|w| pfold.contains(w.as_str()));
+        let plain =
+            choices.is_empty() && covered("") && words.iter().any(|w| pfold.contains(w.as_str()));
         if plain || !choices.is_empty() {
             out.push(Hit {
                 block,
@@ -283,12 +284,7 @@ fn product_hits<'a>(product: &'a ProductModel, words: &[String]) -> Vec<Hit<'a>>
 /// `limit` pages or channels, each with its matches: those where a device
 /// provides a match now first, then those on an inactive page (spare
 /// capacity), then active pages set to something else.
-pub fn capability_lookup(
-    model: &Model,
-    dir: &Path,
-    query: &str,
-    limit: usize,
-) -> Vec<Capability> {
+pub fn capability_lookup(model: &Model, dir: &Path, query: &str, limit: usize) -> Vec<Capability> {
     let words: Vec<String> = fold(query).split_whitespace().map(str::to_string).collect();
     if words.is_empty() || limit == 0 {
         return Vec::new();

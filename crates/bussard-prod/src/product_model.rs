@@ -216,8 +216,8 @@ pub fn complete_models(dir: &Path, only: Option<&str>) -> Vec<String> {
                 entry.applications.is_empty() || !entry.applications.iter().all(|a| has_current(a))
             }
         };
-        let only_outdated = !entry.applications.is_empty()
-            && entry.applications.iter().all(|a| has_model(a));
+        let only_outdated =
+            !entry.applications.is_empty() && entry.applications.iter().all(|a| has_model(a));
         if !wanted {
             continue;
         }
@@ -886,6 +886,30 @@ mod tests {
     }
 
     #[test]
+    fn test_complete_models_keeps_an_outdated_model_quietly_without_its_archive() -> TestResult {
+        let dir = scratch("outdated")?;
+        std::fs::write(
+            dir.join(bussard_model::loader::LOCK_FILE),
+            "version = 3\n\n[[product]]\nsha256 = \"00\"\nfile = \"products/a.knxprod\"\n\
+             origin = { kind = \"file\", path = \"a.knxprod\" }\napplications = [\"M-1\"]\n",
+        )?;
+        let models = dir.join(bussard_model::param_model::MODELS_DIR);
+        std::fs::create_dir_all(&models)?;
+        // Missing: the absent archive is worth a warning.
+        assert_eq!(complete_models(&dir, None).len(), 1);
+        // Outdated: the old model still serves, so no warning, and it stays.
+        std::fs::write(models.join("M-1.yaml"), "identity:\n  id: M-1\n")?;
+        assert!(complete_models(&dir, None).is_empty());
+        assert!(complete_models(&dir, Some("M-1")).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(models.join("M-1.yaml"))?,
+            "identity:\n  id: M-1\n"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn test_models_incomplete_checks_every_pinned_application() -> TestResult {
         let dir = scratch("incomplete")?;
         assert!(!models_incomplete(&dir), "no lock, nothing to complete");
@@ -898,9 +922,15 @@ mod tests {
         let models = dir.join(bussard_model::param_model::MODELS_DIR);
         std::fs::create_dir_all(&models)?;
         assert!(models_incomplete(&dir), "an empty models directory");
-        std::fs::write(models.join("M-1.yaml"), "")?;
+        let current = format!(
+            "# banner\nmodel_format: {}\n",
+            bussard_model::param_model::MODEL_FORMAT
+        );
+        std::fs::write(models.join("M-1.yaml"), &current)?;
         assert!(models_incomplete(&dir), "one model of two");
-        std::fs::write(models.join("M-2.yaml"), "")?;
+        std::fs::write(models.join("M-2.yaml"), "identity:\n  id: M-2\n")?;
+        assert!(models_incomplete(&dir), "a model of an older format");
+        std::fs::write(models.join("M-2.yaml"), &current)?;
         assert!(
             !models_incomplete(&dir),
             "every pinned application has its model"

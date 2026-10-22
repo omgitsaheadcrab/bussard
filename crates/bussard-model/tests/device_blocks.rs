@@ -52,7 +52,8 @@ channel-function = "Temperature sensor"
 brightness.send = "4/1/5"
 "#;
 
-const GROUPS: &str = "groups = [\n  { address = \"4/1/5\", name = \"Brightness\", dpt = \"9.004\" },\n]\n";
+const GROUPS: &str =
+    "groups = [\n  { address = \"4/1/5\", name = \"Brightness\", dpt = \"9.004\" },\n]\n";
 
 fn files() -> [(&'static str, &'static str); 4] {
     [
@@ -153,7 +154,11 @@ fn test_device_view_groups_a_channel_less_app_by_page() -> TestResult {
         .map(|o| (o.number, o.function.as_deref()))
         .collect();
     assert_eq!(shown, [(2, Some("Switch"))]);
-    assert!(inactive.needs.contains("bussard flash 1.1.30"), "{}", inactive.needs);
+    assert!(
+        inactive.needs.contains("bussard flash 1.1.30"),
+        "{}",
+        inactive.needs
+    );
 
     // C needs B first, then its own switch (a parameter the configuration
     // does not show yet, so no key).
@@ -167,7 +172,10 @@ fn test_device_view_groups_a_channel_less_app_by_page() -> TestResult {
         steps,
         [(Some("universal-channel-b-enable"), "yes"), (None, "yes")]
     );
-    assert_eq!(c.enable[1].text.as_deref(), Some("Universal channel C enable"));
+    assert_eq!(
+        c.enable[1].text.as_deref(),
+        Some("Universal channel C enable")
+    );
 
     let summary = view.summary.as_deref().ok_or("a summary")?;
     assert_eq!(
@@ -176,9 +184,14 @@ fn test_device_view_groups_a_channel_less_app_by_page() -> TestResult {
     );
 
     let text = view.render_table();
-    assert!(text.contains("pages (ETS parameter blocks, in ETS order):"), "{text}");
     assert!(
-        text.contains("inactive: set universal-channel-b-enable = \"yes\" (default \"no\"); shows 1 object(s)"),
+        text.contains("pages (ETS parameter blocks, in ETS order):"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "inactive: set universal-channel-b-enable = \"yes\" (default \"no\"); shows 1 object(s)"
+        ),
         "{text}"
     );
     assert!(text.contains(&format!("summary: {summary}")), "{text}");
@@ -204,7 +217,10 @@ fn test_device_view_details_an_inactive_page() -> TestResult {
     assert_eq!(
         params,
         [
-            ("channel-function", Some("Brightness sensor 1 .. 100 000 lx")),
+            (
+                "channel-function",
+                Some("Brightness sensor 1 .. 100 000 lx")
+            ),
             ("dusk-threshold-in-lx", Some("10")),
         ]
     );
@@ -250,21 +266,43 @@ fn test_capability_lookup_finds_a_choice_on_an_inactive_page() -> TestResult {
     assert_eq!(
         got,
         [
-            (Some("Universal channel B: function"), false, false, "could provide"),
-            (Some("Universal channel C: function"), false, false, "could provide"),
-            (Some("Universal channel A: function"), true, false, "could provide"),
+            (
+                Some("Universal channel B: function"),
+                false,
+                false,
+                "could provide"
+            ),
+            (
+                Some("Universal channel C: function"),
+                false,
+                false,
+                "could provide"
+            ),
+            (
+                Some("Universal channel A: function"),
+                true,
+                false,
+                "could provide"
+            ),
         ]
     );
     let b = &hits[0];
     assert_eq!(b.device_ia, "1.1.30");
     assert_eq!(b.parameter, "Channel function");
-    assert_eq!(b.choice.as_deref(), Some("Brightness sensor 1 .. 100 000 lx"));
+    assert_eq!(
+        b.choice.as_deref(),
+        Some("Brightness sensor 1 .. 100 000 lx")
+    );
     assert_eq!(b.handle.as_deref(), Some("universal-channel-b-function"));
     assert_eq!(
         b.enable.first().and_then(|e| e.key.as_deref()),
         Some("universal-channel-b-enable")
     );
-    assert!(b.needs.as_deref().is_some_and(|n| n.contains("bussard flash")));
+    assert!(
+        b.needs
+            .as_deref()
+            .is_some_and(|n| n.contains("bussard flash"))
+    );
 
     // A parameter text matches too, and an active one the device shows
     // provides it.

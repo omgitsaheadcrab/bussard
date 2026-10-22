@@ -253,8 +253,7 @@ pub fn model_lookup_with_capabilities(
     limit: usize,
 ) -> Value {
     let mut out = model_lookup(model, query, limit);
-    let capabilities =
-        bussard_model::capabilities::capability_lookup(model, dir, query, limit);
+    let capabilities = bussard_model::capabilities::capability_lookup(model, dir, query, limit);
     if let Some(map) = out.as_object_mut() {
         map.insert(
             "capabilities".to_string(),

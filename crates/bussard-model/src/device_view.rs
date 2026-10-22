@@ -10,6 +10,15 @@
 //! under `models/`; without a product model the view says so and lists what
 //! the lock has.
 //!
+//! For an application without channels of its own (none, or one generic
+//! channel) the view also lists the ETS parameter pages of the product
+//! model's `blocks` in ETS order, and for one with channels the channels its
+//! configuration does not show (issue #298). A page or channel the
+//! configuration does not show is marked inactive with the parameters that
+//! enable it, the objects it would show and how the change reaches the
+//! device; `summary` counts them. A page handle selects one page as the
+//! scope.
+//!
 //! [`DeviceView::render_table`] is the terminal rendering, and
 //! [`DeviceView::render_toml`] the paste-ready device-file snippet: what the
 //! file sets, plus commented lines `# key = "value"   # choice | choice` for
@@ -19,11 +28,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 
+use crate::address::IndividualAddress;
 use crate::blocks::{
     BlockDef, BlockKind, BlockState, block_states, object_number, parent_indexes, ref_param_id,
     subtree,
 };
-use crate::address::IndividualAddress;
 use crate::flags::Flags;
 use crate::loader::Model;
 use crate::param_model::{ParamDef, ParamKind, ProductModel, ProductModels, enum_label};
@@ -404,9 +413,10 @@ fn param_row(entry: &ParamEntry, product: Option<&ProductModel>) -> ParamRow {
 /// or the code of an enum label.
 fn value_number(def: Option<&ParamDef>, value: &str) -> Option<f64> {
     let v = value.trim();
-    v.parse::<f64>()
-        .ok()
-        .or_else(|| def.and_then(|d| crate::param_model::enum_code(&d.labels, v)).map(|c| c as f64))
+    v.parse::<f64>().ok().or_else(|| {
+        def.and_then(|d| crate::param_model::enum_code(&d.labels, v))
+            .map(|c| c as f64)
+    })
 }
 
 /// The enum codes of a parameter, in order (empty for other kinds).
@@ -617,7 +627,10 @@ impl<'a> Pages<'a> {
                     .map(|c| display_value(def, &c.to_string()))
                     .unwrap_or_else(|| g.test.clone());
                 EnableStep {
-                    key: self.entries.get(g.reference.as_str()).map(|e| e.key.clone()),
+                    key: self
+                        .entries
+                        .get(g.reference.as_str())
+                        .map(|e| e.key.clone()),
                     reference: g.reference.clone(),
                     text: def.and_then(|d| d.text.clone().or_else(|| d.name.clone())),
                     set_to,
@@ -645,6 +658,15 @@ impl<'a> Pages<'a> {
             would_show,
             needs,
         }
+    }
+
+    /// Whether the device has a parameter or object on active block `i` or a
+    /// block nested in it. A page of only internal parameters
+    /// (`Access="None"`, which the lock leaves out) shows nothing.
+    fn shows_something(&self, i: usize) -> bool {
+        let tree: HashSet<usize> = subtree(self.blocks, &self.parents, i).into_iter().collect();
+        self.param_block.values().any(|b| tree.contains(b))
+            || self.object_block.values().any(|b| tree.contains(b))
     }
 
     /// Whether block `i` (with its nested blocks) holds anything to show.
@@ -724,7 +746,10 @@ impl<'a> Pages<'a> {
             .iter()
             .enumerate()
             .filter(|(i, b)| {
-                b.kind == BlockKind::Block && !self.states[*i].parent_inactive && self.has_content(*i)
+                b.kind == BlockKind::Block
+                    && !self.states[*i].parent_inactive
+                    && self.has_content(*i)
+                    && (!self.states[*i].active || self.shows_something(*i))
             })
             .map(|(i, _)| i)
             .collect();
@@ -938,7 +963,12 @@ fn block_scope(
         .map(|(reference, def)| {
             let entry = ParamEntry {
                 reference: reference.to_string(),
-                key: crate::slug(def.text.as_deref().or(def.name.as_deref()).unwrap_or(reference)),
+                key: crate::slug(
+                    def.text
+                        .as_deref()
+                        .or(def.name.as_deref())
+                        .unwrap_or(reference),
+                ),
                 channel: None,
                 param: Some(ref_param_id(reference).to_string()),
                 stored: None,
@@ -1035,9 +1065,12 @@ pub fn device_view(
         .map(|p| Pages::new(device, p, &params));
     let channel_less = device.channels.len() <= 1;
     let listed: Vec<Listed> = match &pages {
-        Some(pg) if channel_less => {
-            pg.listed(&channels.iter().map(|c| c.handle.clone()).collect::<Vec<_>>())
-        }
+        Some(pg) if channel_less => pg.listed(
+            &channels
+                .iter()
+                .map(|c| c.handle.clone())
+                .collect::<Vec<_>>(),
+        ),
         _ => Vec::new(),
     };
     let blocks: Vec<BlockRow> = match &pages {
@@ -1291,10 +1324,7 @@ fn inactive_line(inactive: &Inactive) -> String {
         format!("set {}", steps.join(", then "))
     };
     if !inactive.would_show.is_empty() {
-        line.push_str(&format!(
-            "; shows {} object(s)",
-            inactive.would_show.len()
-        ));
+        line.push_str(&format!("; shows {} object(s)", inactive.would_show.len()));
     }
     line.push_str(&format!("; {}", inactive.needs));
     line

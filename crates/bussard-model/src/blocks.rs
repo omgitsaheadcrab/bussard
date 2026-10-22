@@ -225,10 +225,9 @@ pub fn block_states(
             b.parameters
                 .iter()
                 .any(|r| holders.get(r.as_str()) == Some(&1) && active_params.contains(r.as_str()))
-                || b.objects
-                    .iter()
-                    .chain(&b.other_objects)
-                    .any(|r| holders.get(r.as_str()) == Some(&1) && active_objects.contains(r.as_str()))
+                || b.objects.iter().chain(&b.other_objects).any(|r| {
+                    holders.get(r.as_str()) == Some(&1) && active_objects.contains(r.as_str())
+                })
         })
         .collect();
     // Children come after their parent: propagate evidence upwards.

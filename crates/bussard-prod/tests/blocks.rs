@@ -49,7 +49,10 @@ fn test_blocks_for_records_pages_gates_and_objects() -> TestResult {
     assert_eq!(a.name.as_deref(), Some("ChannelA"));
     assert_eq!(a.channel.as_deref(), Some("CH-0"));
     assert_eq!(a.when.len(), 1);
-    assert_eq!((a.when[0].reference.as_str(), a.when[0].test.as_str()), ("P-1_R-1", "1"));
+    assert_eq!(
+        (a.when[0].reference.as_str(), a.when[0].test.as_str()),
+        ("P-1_R-1", "1")
+    );
     assert_eq!(a.parameters, ["P-11_R-11", "P-12_R-12"]);
     assert_eq!(a.objects, ["O-1_R-1"]);
 
