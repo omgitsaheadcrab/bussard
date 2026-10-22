@@ -238,7 +238,10 @@ fn real_knxproj_smoke() -> Result<(), Box<dyn std::error::Error>> {
     let file = std::fs::File::open(&path)?;
     let mut zip = zip::ZipArchive::new(file)?;
 
-    let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+    let names: Vec<String> = zip
+        .file_names()
+        .map(|name| name.map(std::borrow::Cow::into_owned))
+        .collect::<Result<_, _>>()?;
     let app_entries: Vec<String> = names
         .iter()
         .filter(|n| {

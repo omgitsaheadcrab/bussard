@@ -151,11 +151,9 @@ impl Container {
     /// file name. Errors (listing the candidates) if it matches none.
     fn resolve_inner_selection(&self, selection: &str) -> Result<String> {
         let inners: Vec<String> = self
-            .archive
-            .file_names()
+            .entry_names()
             .take(MAX_WRAPPER_ENTRIES)
             .filter(|name| is_knxprod_entry(name))
-            .map(str::to_string)
             .collect();
         if let Some(hit) = inners.iter().find(|name| {
             name.as_str() == selection
@@ -186,11 +184,9 @@ impl Container {
 
         // Otherwise, look for inner `.knxprod` entries (capped scan).
         let inners: Vec<String> = self
-            .archive
-            .file_names()
+            .entry_names()
             .take(MAX_WRAPPER_ENTRIES)
             .filter(|name| is_knxprod_entry(name))
-            .map(str::to_string)
             .collect();
 
         match <[String; 1]>::try_from(inners) {
@@ -251,14 +247,22 @@ impl Container {
         Ok(())
     }
 
+    /// The archive's entry names in central-directory order. zip 9 returns a
+    /// name as a `Result` because it decodes non-UTF-8 names as CP437; that
+    /// decode is total, so dropping an `Err` never hides an entry zip 2 showed.
+    fn entry_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.archive
+            .file_names()
+            .filter_map(std::result::Result::ok)
+            .map(std::borrow::Cow::into_owned)
+    }
+
     /// Lists every manufacturer folder id (`M-XXXX`) present in the archive.
     pub fn manufacturer_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self
-            .archive
-            .file_names()
-            .filter_map(|name| name.split_once('/').map(|(dir, _)| dir))
+            .entry_names()
+            .filter_map(|name| name.split_once('/').map(|(dir, _)| dir.to_string()))
             .filter(|dir| is_manufacturer_dir(dir))
-            .map(str::to_string)
             .collect();
         ids.sort();
         ids.dedup();
@@ -269,10 +273,9 @@ impl Container {
     /// `P-XXXX/` project folder, or a `P-XXXX.zip` (encrypted) or
     /// `P-XXXX.signature` entry. A `.knxprod` has only `M-XXXX/` folders.
     pub fn has_project_folder(&self) -> bool {
-        self.archive
-            .file_names()
+        self.entry_names()
             .take(MAX_WRAPPER_ENTRIES)
-            .any(is_project_entry)
+            .any(|name| is_project_entry(&name))
     }
 
     /// Lists all ApplicationProgram entries across every manufacturer folder,
@@ -282,8 +285,7 @@ impl Container {
     /// excludes `Hardware.xml`, `Catalog.xml`, `Baggages.xml` and signatures.
     pub fn application_entries(&self) -> Vec<AppEntry> {
         let mut entries: Vec<AppEntry> = self
-            .archive
-            .file_names()
+            .entry_names()
             .filter_map(|name| {
                 let (dir, file) = name.split_once('/')?;
                 if !is_manufacturer_dir(dir) {

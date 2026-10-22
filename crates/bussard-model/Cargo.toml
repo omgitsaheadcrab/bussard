@@ -24,6 +24,8 @@ bitflags = { workspace = true }
 # Both are already workspace dependencies (bussard-ets/-prod/-project and
 # bussard-secure/-project), so the tree gains no new crate.
 zip = { workspace = true }
+# Selects zip's deflate backend (see the root Cargo.toml).
+flate2 = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]

@@ -349,7 +349,7 @@ impl Bundle {
         let mut total: u64 = 0;
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index)?;
-            let name = entry.name().to_string();
+            let name = entry.name()?.to_string();
             if entry.is_dir() {
                 continue;
             }
