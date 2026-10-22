@@ -538,10 +538,10 @@ impl DataSecureSession {
         // §5.9, resolved by the caller into `last`): a first frame must strictly
         // exceed the device's persisted starting sequence, so a from-clock seed
         // lower than the floor is stale.
-        if let Some(last) = last {
-            if got <= last {
-                return Err(SecureError::StaleSequence { got, last });
-            }
+        if let Some(last) = last
+            && got <= last
+        {
+            return Err(SecureError::StaleSequence { got, last });
         }
 
         let key = key.bytes();

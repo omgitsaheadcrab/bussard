@@ -986,6 +986,13 @@ directory or a script from before these changes needs:
   bytes, and a keyring password is read only from the environment.
 - `cargo-deny` gates licenses and sources in CI: no copyleft dependency, and
   crates.io only (#38).
+- Dependencies moved past the RustSec advisories of 2026-10-22: rustls
+  0.23.46 (RUSTSEC-2026-0346 to 0349), rustls-webpki 0.103.16
+  (RUSTSEC-2026-0382) and webpki-roots 1.0.10 (RUSTSEC-2026-0381) for the
+  HTTPS client, and zip 9 (RUSTSEC-2026-0367 to 0369). bussard never called
+  the affected `extract` APIs; it reads entries by name. zip keeps the
+  miniz_oxide deflate backend, so extracted product archives and `.bussard`
+  bundles are byte-identical to before.
 
 ### Known limitations
 

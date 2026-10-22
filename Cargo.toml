@@ -102,17 +102,24 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # `Stream` for axum's SSE responder (the `sync` feature wraps broadcast/watch).
 # MIT.
 tokio-stream = { version = "0.1", features = ["sync"] }
-# zip: reads `.knxprod`/`.knxproj` container entries (deflate only, no AES here —
-# encrypted `.knxproj` inner archives are handled inside bussard-project). Shared
-# by bussard-ets and bussard-prod. MIT licensed.
-zip = { version = "2.4", default-features = false, features = ["deflate"] }
+# zip: reads `.knxprod`/`.knxproj` container entries (deflate only, no AES here;
+# bussard-project adds `aes-crypto` for encrypted `.knxproj` inner archives).
+# Shared by bussard-ets and bussard-prod. Version 9 or later: 2.x carries
+# RUSTSEC-2026-0367/0368/0369. MIT licensed.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+# flate2: zip 9's `deflate` feature switched the backend to zlib-rs, whose output
+# differs from miniz_oxide. zip takes flate2 with no backend, so this pins the
+# pure-Rust miniz_oxide backend zip 2 used: written archives (product-store
+# extraction, `.bussard` bundles) stay byte-identical. MIT OR Apache-2.0.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # quick-xml: streaming XML (never builds a DOM) so 20+ MB application-program
 # files parse with bounded memory. MIT licensed.
 quick-xml = "0.41"
 # --- KNX Secure crypto (issue #71, Phase A) ---
 # aes: AES-128 block cipher, the core of KNX Secure's decomposed AES-CCM
-# (AES-CBC-MAC + AES-CTR, spec §3). Promoted from a transitive dep (via `zip`)
-# to a direct workspace dep. MIT OR Apache-2.0.
+# (AES-CBC-MAC + AES-CTR, spec §3). A direct workspace dep (zip 9 brings its
+# own `aes 0.9` for WinZip-AES; Cargo.lock holds that at 0.9.2 because 0.9.3
+# raised its floor to Rust 1.89, above the 1.88 MSRV). MIT OR Apache-2.0.
 aes = "0.8"
 # cbc: CBC block mode, used to build the KNX Secure CBC-MAC (the CCM tag,
 # spec §3.2). cipher-0.4 generation to match `aes 0.8` (0.2 is cipher-0.5 and

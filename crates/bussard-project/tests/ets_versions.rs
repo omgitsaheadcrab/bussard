@@ -103,12 +103,12 @@ fn build_ets6_protected(zip_password: &str) -> anyhow::Result<Vec<u8>> {
     let mut inner = Vec::new();
     {
         let mut zip = ZipWriter::new(Cursor::new(&mut inner));
-        let opts: FileOptions<'_, ()> =
+        let opts: FileOptions<'_, '_, ()> =
             FileOptions::default().with_aes_encryption(AesMode::Aes256, zip_password);
         zip.start_file("0.xml", opts).context("inner 0.xml")?;
         zip.write_all(project_0_xml(21).as_bytes())
             .context("write")?;
-        let opts2: FileOptions<'_, ()> =
+        let opts2: FileOptions<'_, '_, ()> =
             FileOptions::default().with_aes_encryption(AesMode::Aes256, zip_password);
         zip.start_file("project.xml", opts2)
             .context("inner project.xml")?;

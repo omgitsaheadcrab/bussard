@@ -128,7 +128,9 @@ fn read_counted_table(mem: &Memory, base: u16, elem_size: usize) -> Option<Vec<u
 pub(super) fn address_table(memory: &Memory, addr_base: u16) -> Vec<GroupAddress> {
     read_counted_table(memory, addr_base, 2)
         .unwrap_or_default()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| GroupAddress(u16::from_be_bytes([c[0], c[1]])))
         .collect()
 }
@@ -144,14 +146,18 @@ impl GroupComm {
         // Address table: count then `count` GAs.
         let addr_bytes = read_counted_table(memory, addr_base, 2).unwrap_or_default();
         let addresses: Vec<GroupAddress> = addr_bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| GroupAddress(u16::from_be_bytes([c[0], c[1]])))
             .collect();
 
         // Group-object table: count then `count` descriptor words.
         let go_bytes = read_counted_table(memory, comobj_base, 2).unwrap_or_default();
         let descriptors: Vec<u16> = go_bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
 
@@ -159,7 +165,7 @@ impl GroupComm {
 
         // Association table: count then `count` (TSAP, ASAP) pairs.
         let assoc_bytes = read_counted_table(memory, assoc_base, 4).unwrap_or_default();
-        for entry in assoc_bytes.chunks_exact(4) {
+        for entry in assoc_bytes.as_chunks::<4>().0 {
             let tsap = u16::from_be_bytes([entry[0], entry[1]]);
             let asap = u16::from_be_bytes([entry[2], entry[3]]);
             // TSAP is a 1-based index into the address table.
@@ -244,11 +250,11 @@ impl GroupComm {
         let mut updated = Vec::new();
         let asaps = self.by_ga.get(&ga.raw()).cloned().unwrap_or_default();
         for asap in asaps {
-            if let Some(obj) = self.objects.get_mut(&asap) {
-                if obj.is_writable() {
-                    obj.value = payload.to_vec();
-                    updated.push(asap);
-                }
+            if let Some(obj) = self.objects.get_mut(&asap)
+                && obj.is_writable()
+            {
+                obj.value = payload.to_vec();
+                updated.push(asap);
             }
         }
         updated
@@ -259,10 +265,10 @@ impl GroupComm {
     pub fn on_group_read(&self, ga: GroupAddress) -> Option<Vec<u8>> {
         let asaps = self.by_ga.get(&ga.raw())?;
         for asap in asaps {
-            if let Some(obj) = self.objects.get(asap) {
-                if obj.is_readable() {
-                    return Some(obj.value.clone());
-                }
+            if let Some(obj) = self.objects.get(asap)
+                && obj.is_readable()
+            {
+                return Some(obj.value.clone());
             }
         }
         None

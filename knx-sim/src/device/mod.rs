@@ -415,10 +415,10 @@ impl Device {
     /// Update the programming-mode bit and the object-0 `PID_PROGMODE` property
     /// together, emitting a [`Event::ProgModeChanged`] only on an actual change.
     fn sync_prog_mode(&mut self, on: bool) {
-        if let Some(device_object) = self.objects.get_mut(&0) {
-            if let Some(prop) = device_object.property_mut(PID_PROGMODE) {
-                prop.value = vec![u8::from(on)];
-            }
+        if let Some(device_object) = self.objects.get_mut(&0)
+            && let Some(prop) = device_object.property_mut(PID_PROGMODE)
+        {
+            prop.value = vec![u8::from(on)];
         }
         if self.prog_mode != on {
             self.prog_mode = on;

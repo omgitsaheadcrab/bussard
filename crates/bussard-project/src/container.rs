@@ -160,7 +160,9 @@ impl Container {
 /// Finds the project folder id (`P-XXXX`) by looking for a `P-XXXX.zip`,
 /// `P-XXXX/0.xml`, or `P-XXXX/project.xml` entry.
 fn find_project_id<R: Read + Seek>(archive: &ZipArchive<R>, path: &Path) -> Result<String> {
-    for name in archive.file_names() {
+    // zip 9 yields each name as a `Result` (non-UTF-8 names decode as CP437,
+    // which is total), so skipping an `Err` hides nothing zip 2 listed.
+    for name in archive.file_names().filter_map(std::result::Result::ok) {
         // Inner encrypted archive form: `P-XXXX.zip`.
         if let Some(stem) = name.strip_suffix(".zip")
             && stem.starts_with("P-")
@@ -170,7 +172,7 @@ fn find_project_id<R: Read + Seek>(archive: &ZipArchive<R>, path: &Path) -> Resu
         }
     }
     // Unencrypted form: `P-XXXX/0.xml` (or `project.xml`/`Project.xml` for ETS 4).
-    for name in archive.file_names() {
+    for name in archive.file_names().filter_map(std::result::Result::ok) {
         for suffix in ["/0.xml", "/project.xml", "/Project.xml"] {
             if let Some(prefix) = name.strip_suffix(suffix)
                 && prefix.starts_with("P-")
@@ -232,7 +234,7 @@ fn read_inner_project_entry(
 
     // Determine the index of the first acceptable entry inside the inner archive.
     let found = (0..inner.len()).find_map(|i| {
-        let name = inner.by_index_raw(i).ok().map(|f| f.name().to_string())?;
+        let name = inner.by_index_raw(i).ok()?.name().ok()?.into_owned();
         entries.iter().any(|e| *e == name).then_some((i, name))
     });
     let (idx, entry) = match found {

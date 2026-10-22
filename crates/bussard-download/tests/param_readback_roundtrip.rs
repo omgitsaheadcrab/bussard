@@ -124,7 +124,10 @@ fn product(dir: &Path, spec: &str, app_prefix: Option<&str>) -> Result<Option<Pr
         bytes = entry(&bytes, inner)?;
     }
     let mut archive = zip::ZipArchive::new(Cursor::new(&bytes))?;
-    let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+    let names: Vec<String> = archive
+        .file_names()
+        .map(|name| name.map(std::borrow::Cow::into_owned))
+        .collect::<Result<_, _>>()?;
     let mut applications = Vec::new();
     for name in &names {
         let Some((folder, file)) = name.split_once('/') else {
