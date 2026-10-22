@@ -81,6 +81,43 @@ pub(crate) async fn read_live_tables<Ch: L4Channel>(
     Ok(bussard_download::read_live_tables(l4).await?)
 }
 
+/// Reads the device's security individual address table (PID 54) when
+/// `admit_tunnel_senders` has tunnelling addresses to admit (`tunnel` not
+/// empty) and the device is System B (issue #297). `None` when it is not read
+/// or the device refuses the read.
+pub(crate) async fn read_admission_table<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    read: &LiveRead,
+    tunnel: &[IndividualAddress],
+) -> anyhow::Result<Option<Vec<bussard_download::SecureSenderEntry>>> {
+    match read {
+        LiveRead::Tables(live) if !tunnel.is_empty() && live.sys7().is_none() => {
+            Ok(bussard_download::read_security_sender_table(l4).await?)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The `admit_tunnel_senders` comparison of `target` (issue #297), or `None`
+/// when there is nothing to admit (the option is off, no tool key, no
+/// tunnelling address) or the device is System 7, whose security object a
+/// table write does not reprogram.
+pub(crate) fn tunnel_admission(
+    target: IndividualAddress,
+    tunnel: &[IndividualAddress],
+    sys7: bool,
+    live: Option<Vec<bussard_download::SecureSenderEntry>>,
+) -> Option<bussard_service::admission::TunnelAdmission> {
+    if tunnel.is_empty() || sys7 {
+        return None;
+    }
+    Some(bussard_service::admission::TunnelAdmission::new(
+        target,
+        tunnel,
+        live.as_deref(),
+    ))
+}
+
 /// Prints the friendly refusal for a mask no table reader speaks.
 ///
 /// The wording is derived from the central capability table
@@ -115,6 +152,7 @@ pub(crate) type DeviceRead = (
     LiveRead,
     Option<crate::param_readback::ParamState>,
     Option<bussard_model::identity::ReportedIdentity>,
+    Option<Vec<bussard_download::SecureSenderEntry>>,
 );
 
 /// Opens a read-only bus service, reads `target`'s live tables in one management
@@ -125,6 +163,7 @@ pub(crate) type DeviceRead = (
 /// read included, rides `A_SecureData`, so a KNX Data Secure device reports its
 /// real mask instead of the `FFFF` it answers in the clear. Without one the
 /// frames are exactly those of the plain path before KNX Secure existed.
+#[allow(clippy::too_many_arguments)] // one read's context; a struct would only move it
 pub(crate) fn read_device(
     config: ConnectionConfig,
     target: IndividualAddress,
@@ -133,6 +172,7 @@ pub(crate) fn read_device(
     product: Option<&ProductSource>,
     model: Option<&Model>,
     mut facts: bussard_service::FactsCache,
+    tunnel: &[IndividualAddress],
 ) -> anyhow::Result<DeviceRead> {
     let activated = crate::secure_key::model_activated(model, target);
     let tool_key = crate::secure_key::resolve(target, tool_key_source, activated)?;
@@ -179,7 +219,9 @@ pub(crate) fn read_device(
                         ),
                         _ => None,
                     };
-                    anyhow::Ok((read, params, identity))
+                    // PID 54, for `admit_tunnel_senders` only (issue #297).
+                    let senders = read_admission_table(l4, &read, tunnel).await?;
+                    anyhow::Ok((read, params, identity, senders))
                 })
                 .await;
             // Close the bus cleanly (release the gateway tunnel slot), issue #31.
@@ -254,7 +296,16 @@ pub fn run(
     let model_ref = &model;
     let product_ref = product.as_ref();
 
-    let (read, params, identity) = read_device(
+    // `admit_tunnel_senders` (issue #297): the tunnelling addresses to admit,
+    // when the device is written secured.
+    let secured = crate::secure_key::resolve(
+        target,
+        tool_key_source,
+        crate::secure_key::model_activated(Some(model_ref), target),
+    )?
+    .is_some();
+    let tunnel = crate::secure_key::admitted_tunnel(Some(model_ref), tool_key_source, secured)?;
+    let (read, params, identity, live_senders) = read_device(
         config,
         target,
         &overrides,
@@ -262,6 +313,7 @@ pub fn run(
         product_ref,
         Some(model_ref),
         crate::device_facts::cache(dir, true, overrides.refresh_facts),
+        &tunnel,
     )?;
     let live_tables = match read {
         LiveRead::Tables(live) => live,
@@ -273,7 +325,8 @@ pub fn run(
     let live = live_tables.tables();
 
     let report = plan(live, &desired);
-    let built = crate::device_plan::build(
+    let admission = tunnel_admission(target, &tunnel, live_tables.sys7().is_some(), live_senders);
+    let mut built = crate::device_plan::build(
         &model,
         target,
         &gateway,
@@ -282,6 +335,9 @@ pub fn run(
         &report,
         params.as_ref(),
     );
+    if let Some(admission) = &admission {
+        admission.add_to(&mut built.plan, &report);
+    }
     let identity = identity.map(|reported| {
         bussard_model::identity::IdentityCheck::compare(
             model.devices.get(&target).map(|d| &d.device),
@@ -354,6 +410,8 @@ fn to_json(
             .collect()
     };
     let question = (!device_plan.is_empty()).then(|| device_plan.question());
+    // The tables are rewritten for a security-object change too (issue #297).
+    let noop = report.is_noop() && !device_plan.writes.security_object;
     PlanJson {
         plan: device_plan,
         question,
@@ -367,7 +425,7 @@ fn to_json(
         resulting_address_count: report.resulting_address_count,
         resulting_association_count: report.resulting_association_count,
         load_steps: report.load_steps.iter().map(|s| s.to_string()).collect(),
-        noop: report.is_noop(),
+        noop,
         parameters: None,
         identity: None,
     }

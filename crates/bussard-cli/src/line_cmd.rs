@@ -633,6 +633,16 @@ async fn visit_one(
             Err(err) => return make(None, DeviceStatus::Failed(format!("{err:#}"))),
         };
     let tool_key = material.tool_key.clone();
+    // `admit_tunnel_senders` (issue #297): a line run keeps the tunnelling
+    // addresses in every table it reprograms, so it never drops them.
+    let tunnel = match crate::secure_key::admitted_tunnel(
+        Some(model),
+        tool_key_source,
+        tool_key.is_some(),
+    ) {
+        Ok(tunnel) => tunnel,
+        Err(err) => return make(None, DeviceStatus::Failed(format!("{err:#}"))),
+    };
     // A secured System B write reprograms the security object too (issue
     // #156); on a line walk the keyring is the source of the secured GAs. The
     // model's links name the secured senders of the IA table (issue #181).
@@ -645,8 +655,13 @@ async fn visit_one(
             target.address,
             keys,
             &material.device_sequences,
-            &[],
+            &tunnel,
         );
+        inputs.admitted_tunnel = tunnel
+            .iter()
+            .copied()
+            .filter(|ia| *ia != target.address)
+            .collect();
         inputs
     });
     let secure_seq = bussard_secure::SequenceHighWater::new();

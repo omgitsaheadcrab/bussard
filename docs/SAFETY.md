@@ -131,10 +131,13 @@ bussard sends from must be in it, or the device drops the telegram without a
 word (`write` then reports success, `read` times out). `flash --keyring` and
 `apply --keyring` write that table like ETS (the devices that send on a secured
 GA the device listens to) and leave bussard out of it unless you pass
-`--secure-sender <tunnel IA>`: that adds bussard's own address with sequence 0,
-so the device accepts `write --keyring` from it. It is off by default because
-it widens who the device trusts; the next ETS download of the device removes
-it again. `monitor --keyring` is read-only on the bus. See [Secured group
+`--secure-sender <tunnel IA>` or set `[connection] admit_tunnel_senders =
+true`: those add bussard's tunnel addresses with sequence 0, so the device
+accepts `write --keyring` from them. Both are off by default because they
+widen who the device trusts; the next ETS download of the device removes them
+again. Before a secured write or read bussard checks whether the devices on
+the GA admit its tunnel address and refuses when the recorded evidence says
+they do not (issue #297). `monitor --keyring` is read-only on the bus. See [Secured group
 writes from bussard](#secured-group-writes-from-bussard) for the workflow.
 
 **`apply <ADDRESS>`** writes the model to a device: its link tables (group
@@ -513,30 +516,77 @@ the file.
 ### Secured group writes from bussard
 
 A secured group write from bussard reaches a receiver only if the receiver
-admits bussard's tunnel address as a sender. ETS never does that on its own:
-the S3 captures of issue #90 show ETS lists only device senders in the
-security individual address table (PID 54), never a tunnel address. The
-recommended ways, in order:
+admits bussard's tunnel address as a sender: its security individual address
+table (PID 54) must list that address. ETS lists the devices that send on a
+secured GA the receiver listens to, and a tunnelling address only when group
+addresses are assigned to that tunnelling address in ETS (the keyring then
+carries the assignment as the interface's `<Group Address=… Senders=…>`). The
+reference installation assigns none, so its S3 captures (issue #90) show no
+tunnel address in any PID 54. A receiver that does not admit the sender drops
+the telegram without a word.
 
-1. **Admit the tunnel address on the receivers.** Find bussard's tunnel
-   address (the keyring's tunnelling user, or the address `write` names in its
-   note). Program each receiver of the secured GA once with
-   `bussard flash <device> --keyring <file> --secure-sender <tunnel IA>`, or
-   `bussard apply <device> --keyring <file> --secure-sender <tunnel IA>` for a
-   link-table-only update. The device then accepts that address with sequence
-   0 and tracks its sequence from the first write on. Use the same tunnelling
-   user (and so the same tunnel address) for later writes.
-2. **Send through a secured device.** Write to a plain GA that a secured
-   device (a logic module, a push button with a logic function) forwards to the
-   secured GA. The receivers keep their ETS sender list and bussard sends in
-   the clear.
+**What bussard checks before sending (issue #297).** `write`, `read`,
+`knx_write_group` and `knx_read_group` on a secured GA look up the tunnel
+address the gateway assigned and the devices the model links to the GA, then
+weigh the evidence:
 
-Either way the next ETS download of a receiver rewrites PID 54 without
-bussard's address, and `write --keyring` goes back to being dropped. The
-receiver gives no error: `write` reports success and nothing moves. bussard
-does not record which devices were programmed with `--secure-sender`, so after
-every secured write it prints a note with its tunnel address, the receivers
-the model links to the GA, and the command above.
+- a device's recorded table (`secure_senders` in `bussard.lock`, read back by
+  `bussard adopt`) admits exactly the addresses it lists;
+- without one, an ETS assignment of the GA to that tunnelling address in the
+  keyring or key store admits it;
+- otherwise bussard cannot tell.
+
+If every linked device has a recorded table and none lists the tunnel
+address, the write or read is refused before anything is sent:
+
+```
+1.1.5 does not list the tunnel address 1.1.25 as a secure sender of 1/0/4; the actuator would discard the telegram. Admit the tunnel addresses (see below) or send plain only if the GA is not secured on the device.
+```
+
+If the evidence is unknown (no read-back yet, no assignment), the telegram is
+sent and the result says so:
+
+```
+sent secured from 1.1.25; delivery to 1.1.5 is not confirmed by KNX; if nothing happens, 1.1.5 probably does not admit 1.1.25
+```
+
+Whatever the verdict, a write result says only what KNX confirms: "the
+interface acknowledged the telegram (L_Data.con); KNX reports no
+application-level result". A group write has no reply from the device, so
+neither bussard nor an assistant over MCP may report that the device executed
+it. A secured read that times out says that the usual cause is a responder
+that does not admit the sender.
+
+**Admitting the tunnel addresses.** In order of preference:
+
+1. **`admit_tunnel_senders`.** Set `admit_tunnel_senders = true` under
+   `[connection]` in `bussard.toml`. Then `plan`/`apply` (and
+   `knx_plan_device`/`knx_apply_device`) on a KNX Data Secure device read its
+   PID 54 and, when a tunnelling address of the key store is missing, list one
+   change (`+ the security individual address table (PID 54) admits the
+   tunnelling addresses …`); applying it rewrites the tables and the security
+   object with every tunnelling address of the key store at sequence 0 (the
+   device learns the clock-seeded sequence from the first telegram). Every
+   tunnel user is admitted, not just one, because bussard picks the
+   tunnelling user per connection and host (issue #288). This is what ETS
+   does when group addresses are assigned to the interface's tunnelling
+   addresses. Run `bussard adopt <device>` afterwards so the lock records the
+   table and the check above sees it.
+2. **`--secure-sender <tunnel IA>`** on `flash` or `apply` adds one address
+   for one run, without the option.
+3. **Assign the group addresses to the tunnelling addresses in ETS** and
+   download the receivers from ETS; re-import the keyring afterwards so the
+   key store carries the assignment.
+4. **Send through a secured device.** Write to a plain GA that a secured
+   device (a logic module, a push button with a logic function) forwards to
+   the secured GA. The receivers keep their ETS sender list and bussard sends
+   in the clear.
+
+The option widens who the device trusts, so it is off by default; off, the
+security object is written exactly as before, byte for byte. An ETS download
+of a receiver without the assignment in ETS rewrites PID 54 without the
+tunnel addresses, and the next `plan` with the option on lists the change
+again.
 
 ## The key store
 

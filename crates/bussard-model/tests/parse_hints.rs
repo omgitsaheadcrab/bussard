@@ -471,7 +471,7 @@ fn test_hint_unknown_field_connection() {
   |
 3 | gatway = "10.0.0.1:3671"
   | ^^^^^^
-unknown field `gatway`, expected one of `transport`, `gateway`, `multicast`, `keyring`
+unknown field `gatway`, expected one of `transport`, `gateway`, `multicast`, `keyring`, `admit_tunnel_senders`
 help: did you mean `gateway`?
 "##
     );

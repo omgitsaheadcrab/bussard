@@ -17,6 +17,42 @@ pub use bussard_service::secure::{
     KEYRING_PASSWORD_ENV, SecureKeyError, SecureMaterial, ToolKeySource, layer, model_activated,
 };
 
+/// The tunnelling addresses `[connection] admit_tunnel_senders` adds to a
+/// Secure device's security individual address table (issue #297): every
+/// tunnelling interface of the keyring or key store, ascending. Empty when the
+/// option is off, the device is written in the clear (`secured` false), or no
+/// keyring is given (a warning says so).
+///
+/// # Errors
+///
+/// A keyring that cannot be loaded.
+pub fn admitted_tunnel(
+    model: Option<&bussard_model::Model>,
+    source: ToolKeySource<'_>,
+    secured: bool,
+) -> anyhow::Result<Vec<IndividualAddress>> {
+    if !secured || !bussard_service::admission::admit_tunnel_senders(model) {
+        return Ok(Vec::new());
+    }
+    let Some(path) = source.keyring else {
+        eprintln!(
+            "warning: admit_tunnel_senders is set but no keyring or key store is given; no \
+             tunnelling address is admitted"
+        );
+        return Ok(Vec::new());
+    };
+    let evidence = bussard_service::secure::load_admission_evidence(path)
+        .with_context(|| format!("loading the interfaces of {}", path.display()))?;
+    let tunnel = evidence.tunnel_addresses();
+    if tunnel.is_empty() {
+        eprintln!(
+            "warning: admit_tunnel_senders is set but {} lists no tunnelling interface",
+            path.display()
+        );
+    }
+    Ok(tunnel)
+}
+
 /// [`bussard_service::secure::resolve`], timed as the `--timing` phase
 /// `tool keys` (issue #214).
 ///

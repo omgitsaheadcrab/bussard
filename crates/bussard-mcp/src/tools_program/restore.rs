@@ -189,6 +189,7 @@ impl BussardMcp {
             &dir,
             &model,
             Some(source),
+            &[],
         )
         .await?;
         refuse_drift(target, &read)?;

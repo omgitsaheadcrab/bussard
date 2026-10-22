@@ -447,6 +447,10 @@ pub struct SecurityInputs {
     /// element count of `PID_GO_SECURITY_FLAGS` (the highest object number the
     /// model knows).
     pub fallback_go_count: u16,
+    /// The tunnelling addresses `admit_tunnel_senders` added to
+    /// [`senders`](Self::senders) (issue #297), ascending; empty when the
+    /// option is off. Only for the summary: the entries are in `senders`.
+    pub admitted_tunnel: Vec<IndividualAddress>,
 }
 
 /// Derives the [`SecurityInputs`] for writing `desired` (an address and
@@ -529,13 +533,27 @@ impl SecurityInputs {
             .iter()
             .map(|e| format!("{} seq {}", e.address, e.sequence))
             .collect();
+        let tunnel = if self.admitted_tunnel.is_empty() {
+            String::new()
+        } else {
+            let list: Vec<String> = self
+                .admitted_tunnel
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            format!(" (tunnel addresses admitted: {})", list.join(", "))
+        };
         format!(
             "Data Secure: the security object is reprogrammed too (unload, security individual \
              address table: {}, group key table: {}, group-object flags: {}, complete)",
             if senders.is_empty() {
                 "no secured senders".to_string()
             } else {
-                format!("{} secured sender(s) {}", senders.len(), senders.join(", "))
+                format!(
+                    "{} secured sender(s) {}{tunnel}",
+                    senders.len(),
+                    senders.join(", ")
+                )
             },
             if keyed.is_empty() {
                 "no keys".to_string()
@@ -753,6 +771,33 @@ pub async fn read_security_object<Ch: L4Channel>(
         Err(err) => return Err(err),
     }
     Ok(readback)
+}
+
+/// Reads only the security individual address table (PID 54) of the
+/// security object, the way [`read_security_object`] reads it. `plan` and
+/// `apply` with `admit_tunnel_senders` (issue #297) use it to see whether the
+/// device already admits the tunnelling addresses. Read-only.
+///
+/// Returns `Ok(None)` when the device refuses the read (count 0, a malformed
+/// answer): the table is then unknown, not empty.
+///
+/// # Errors
+///
+/// A transport-level management error.
+pub async fn read_security_sender_table<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+) -> Result<Option<Vec<SecureSenderEntry>>, MgmtError> {
+    match property_ext::read_property_ext_table(
+        l4,
+        PropertyExtAddress::security(property_ext::PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE),
+        SecureSenderEntry::LEN,
+    )
+    .await
+    {
+        Ok(bytes) => Ok(Some(decode_sender_table(&bytes))),
+        Err(MgmtError::ServiceRejected { .. } | MgmtError::MalformedResponse { .. }) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 /// The note for group objects whose PID 61 octet is not one ETS writes, or

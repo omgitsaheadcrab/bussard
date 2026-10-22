@@ -64,6 +64,9 @@ pub enum ChangeSubject {
     Object,
     /// A parameter value (the parameter memory).
     Parameter,
+    /// The KNX Data Secure security object (the security individual address
+    /// table, PID 54), issue #297.
+    Security,
 }
 
 /// One line of a device plan.
@@ -107,12 +110,18 @@ pub struct PlanWrites {
     pub association_table: Option<usize>,
     /// How many parameter octets differ and are written.
     pub parameter_octets: usize,
+    /// The security object is reprogrammed for a change of its own (the
+    /// tunnelling addresses `admit_tunnel_senders` admits, issue #297); the
+    /// tables are then rewritten too, since the security object is written
+    /// inside the table download.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub security_object: bool,
 }
 
 impl PlanWrites {
     /// Whether nothing is written.
     pub fn is_empty(&self) -> bool {
-        self.address_table.is_none() && self.parameter_octets == 0
+        self.address_table.is_none() && self.parameter_octets == 0 && !self.security_object
     }
 
     /// `address table (4 entries), association table (5 entries), 1 parameter
@@ -124,6 +133,9 @@ impl PlanWrites {
         }
         if let Some(n) = self.association_table {
             parts.push(format!("association table ({})", entries(n)));
+        }
+        if self.security_object {
+            parts.push("security object (PID 54)".to_string());
         }
         if self.parameter_octets > 0 {
             parts.push(format!(
@@ -592,6 +604,7 @@ mod tests {
                 address_table: Some(3),
                 association_table: Some(3),
                 parameter_octets: 0,
+                security_object: false,
             },
             backup_dir: "knx/captures/backups/".to_string(),
             notes: Vec::new(),

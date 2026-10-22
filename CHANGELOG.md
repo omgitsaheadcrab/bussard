@@ -63,6 +63,15 @@ directory or a script from before these changes needs:
 
 ### Added
 
+- `[connection] admit_tunnel_senders = true` (#297): `plan`, `apply`,
+  `flash`, `apply --line`, `knx_plan_device` and `knx_apply_device` on a KNX
+  Data Secure device add every tunnelling address of the key store to its
+  security individual address table (PID 54) with sequence 0. `plan` reads
+  PID 54 and lists the missing addresses as one change (`subject: security`,
+  `writes.security_object`); the security-object summary names them. ETS does
+  the same when group addresses are assigned to the interface's tunnelling
+  addresses. Off by default; off, the security object is byte-identical to
+  before.
 - `bussard restore --parameters <backup.json> <ADDRESS>` and the MCP tool
   `knx_restore_parameters` (#290) replay a parameter backup from
   `captures/backups/parameters/` with the parameter-only download `apply`
@@ -773,6 +782,18 @@ directory or a script from before these changes needs:
 
 ### Fixed
 
+- A secured group write the actuator discarded was reported as confirmed
+  (#297). `write`, `read`, `knx_write_group` and `knx_read_group` on a secured
+  GA now check whether the devices on it admit bussard's tunnel address (the
+  lock's `secure_senders`, the key store's interface `Group`/`Senders`): a
+  write or read the recorded tables say would be discarded is refused before
+  sending ("1.1.5 does not list the tunnel address 1.1.25 as a secure sender
+  of 1/0/4; …"), and one without evidence is sent with a note that delivery
+  is not confirmed. A write result says only what KNX confirms ("the interface
+  acknowledged the telegram (L_Data.con); KNX reports no application-level
+  result"), and a secured read that times out names sender admission as the
+  usual cause. The key store import keeps the interface `Senders` as
+  admission evidence.
 - A DPT 9 parameter whose type spans the full raw range is written like ETS
   writes it (#294). The Zennio Flat 55 Display (`M-0071_A-5261-10`) types
   `ctrl[n].uCtrl.b2.float16.maxValue` as `float16_t (-671088.64, 670760.96)`

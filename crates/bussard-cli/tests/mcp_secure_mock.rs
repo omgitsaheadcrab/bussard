@@ -151,6 +151,11 @@ struct SecurityLog {
     controls: Vec<u8>,
     /// `A_PropertyExtValue_WriteCon` writes as `(pid, count, start, octets)`.
     writes: Vec<(u16, u8, u16, Vec<u8>)>,
+    /// The security individual address table (PID 54) the device holds,
+    /// 8 octets per entry, as the writes leave it (issue #297).
+    pid54: Vec<u8>,
+    /// How many times PID 54 was read.
+    pid54_reads: usize,
 }
 
 /// The security object header fields of an `A_PropertyExt*` payload:
@@ -166,10 +171,28 @@ fn ext_header(data: &[u8]) -> Option<(u16, u16)> {
 /// follows the load-state machine and accepts the property writes of a
 /// secured download, recording them in `log`.
 fn secure_device(log: Arc<Mutex<SecurityLog>>) -> TestResult<MockDevice> {
-    let mut address_table = 1u16.to_be_bytes().to_vec();
-    address_table.extend_from_slice(&ga("1/2/0")?.raw().to_be_bytes());
-    let mut association_table = 1u16.to_be_bytes().to_vec();
-    association_table.extend_from_slice(&[0, 1, 0, 20]);
+    // The synthetic application, Loaded, with its parameter segment holding
+    // threshold 7 (the model asks for 12) and the switch off.
+    secure_device_with(log, &["1/2/0"], &[(1, 20)], &[7, 0])
+}
+
+/// [`secure_device`] holding the address table `addresses`, the
+/// associations `associations` and the parameter octets `params`.
+fn secure_device_with(
+    log: Arc<Mutex<SecurityLog>>,
+    addresses: &[&str],
+    associations: &[(u16, u16)],
+    params: &[u8],
+) -> TestResult<MockDevice> {
+    let mut address_table = u16::try_from(addresses.len())?.to_be_bytes().to_vec();
+    for address in addresses {
+        address_table.extend_from_slice(&ga(address)?.raw().to_be_bytes());
+    }
+    let mut association_table = u16::try_from(associations.len())?.to_be_bytes().to_vec();
+    for (tsap, asap) in associations {
+        association_table.extend_from_slice(&tsap.to_be_bytes());
+        association_table.extend_from_slice(&asap.to_be_bytes());
+    }
     Ok(MockDevice::system_b(ia("1.1.10")?)
         .with_object_types(&[
             OT_DEVICE,
@@ -180,9 +203,7 @@ fn secure_device(log: Arc<Mutex<SecurityLog>>) -> TestResult<MockDevice> {
         ])
         .with_table(1, &address_table)
         .with_table(2, &association_table)
-        // The synthetic application, Loaded, with its parameter segment
-        // holding threshold 7 (the model asks for 12) and the switch off.
-        .with_table(APP_OBJECT, &[7, 0])
+        .with_table(APP_OBJECT, params)
         .with_property(
             APP_OBJECT,
             PID_PROGRAM_VERSION,
@@ -222,12 +243,42 @@ fn secure_device(log: Arc<Mutex<SecurityLog>>) -> TestResult<MockDevice> {
                     out.extend_from_slice(&GO_COUNT.to_be_bytes());
                     Some(Reaction::Answer(A_PROPERTY_EXT_VALUE_RESPONSE, out))
                 }
+                A_PROPERTY_EXT_VALUE_READ if pid == PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE => {
+                    let count = *data.get(5)?;
+                    let start = u16::from_be_bytes([*data.get(6)?, *data.get(7)?]);
+                    let mut log = log.lock().ok()?;
+                    log.pid54_reads += 1;
+                    let mut out = header;
+                    if start == 0 {
+                        let entries = u16::try_from(log.pid54.len() / 8).ok()?;
+                        out.extend_from_slice(&[1, 0, 0]);
+                        out.extend_from_slice(&entries.to_be_bytes());
+                    } else {
+                        let from = (usize::from(start) - 1) * 8;
+                        let to = (from + usize::from(count) * 8).min(log.pid54.len());
+                        let elements = log.pid54.get(from..to)?.to_vec();
+                        out.push(u8::try_from(elements.len() / 8).ok()?);
+                        out.extend_from_slice(&start.to_be_bytes());
+                        out.extend_from_slice(&elements);
+                    }
+                    Some(Reaction::Answer(A_PROPERTY_EXT_VALUE_RESPONSE, out))
+                }
                 A_PROPERTY_EXT_VALUE_WRITE_CON => {
                     let count = *data.get(5)?;
                     let start = u16::from_be_bytes([*data.get(6)?, *data.get(7)?]);
                     if let Ok(mut log) = log.lock() {
-                        log.writes
-                            .push((pid, count, start, data.get(8..).unwrap_or(&[]).to_vec()));
+                        let octets = data.get(8..).unwrap_or(&[]).to_vec();
+                        if pid == PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE {
+                            if start == 0 {
+                                // The count-0 clear.
+                                log.pid54.clear();
+                            } else {
+                                let from = (usize::from(start) - 1) * 8;
+                                log.pid54.truncate(from);
+                                log.pid54.extend_from_slice(&octets);
+                            }
+                        }
+                        log.writes.push((pid, count, start, octets));
                     }
                     let mut out = header;
                     out.push(count);
@@ -466,6 +517,110 @@ fn test_mcp_apply_on_a_keyring_listed_device_reprograms_the_security_object() ->
     let replan = server.call("knx_plan_device", json!({"address": "1.1.10"}))?;
     assert_eq!(replan["noop"], true, "replan: {replan}");
     assert!(replan["security_object"].is_null(), "replan: {replan}");
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// Plans `address`, retrying while the server's tunnel is still coming up.
+fn plan_when_connected(server: &mut Server, address: &str) -> TestResult<Value> {
+    let mut plan = Value::Null;
+    for _ in 0..50 {
+        plan = server.call("knx_plan_device", json!({"address": address}))?;
+        let waiting = plan["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("is not connected"));
+        if !waiting {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(plan)
+}
+
+/// `[connection] admit_tunnel_senders = true` (issue #297): a device whose
+/// tables and parameters already match the model gets a plan of one change,
+/// the keyring's tunnelling address 1.1.200 joining its PID 54, and the apply
+/// writes it there (sequence 0). Off, the same device plans as a no-op and
+/// PID 54 is not even read.
+#[test]
+fn test_mcp_apply_with_admit_tunnel_senders_writes_the_tunnel_address_into_pid54() -> TestResult {
+    let rt = tokio::runtime::Runtime::new()?;
+    let log = Arc::new(Mutex::new(SecurityLog::default()));
+    let gw = rt.block_on(
+        MockGateway::builder()
+            .channel(0x56)
+            .keep_serving()
+            .idle_timeout(Duration::from_secs(120))
+            .device(secure_device_with(
+                Arc::clone(&log),
+                &["1/2/0", "1/2/3"],
+                &[(1, 20), (2, 22)],
+                &[12, 0],
+            )?)
+            .start(),
+    )?;
+    let dir = model_dir("admit")?;
+    let mut server = Server::start(&dir, gw.port(), &["--allow-programming"])?;
+
+    // Off (the default): nothing to write, PID 54 is not read.
+    let plan = plan_when_connected(&mut server, "1.1.10")?;
+    assert_eq!(plan["ok"], true, "plan: {plan}");
+    assert_eq!(plan["noop"], true, "plan: {plan}");
+    assert_eq!(
+        log.lock().map_err(|_| "log poisoned")?.pid54_reads,
+        0,
+        "PID 54 is read only with admit_tunnel_senders"
+    );
+
+    // On: PID 54 (empty, as ETS left it) is missing the tunnel address.
+    std::fs::write(
+        dir.join("bussard.toml"),
+        "[connection]\ntransport = \"tunnel\"\ngateway = \"192.0.2.1:3671\"\n\
+         admit_tunnel_senders = true\n",
+    )?;
+    let plan = server.call("knx_plan_device", json!({"address": "1.1.10"}))?;
+    assert_eq!(plan["ok"], true, "plan: {plan}");
+    assert_eq!(plan["noop"], false, "plan: {plan}");
+    assert_eq!(plan["writes"]["security_object"], true, "plan: {plan}");
+    let sentences = plan["sentences"].as_str().unwrap_or_default();
+    assert!(
+        sentences.contains(
+            "+ the security individual address table (PID 54) admits the tunnelling address \
+             1.1.200 as secure sender (sequence 0, admit_tunnel_senders)"
+        ),
+        "{sentences}"
+    );
+    let security = &plan["security_object"];
+    assert_eq!(
+        security["secure_senders"],
+        json!([{"address": "1.1.200", "sequence": 0}]),
+        "plan: {plan}"
+    );
+    let summary = security["summary"].as_str().unwrap_or_default();
+    assert!(
+        summary.contains("tunnel addresses admitted: 1.1.200"),
+        "{summary}"
+    );
+    assert!(log.lock().map_err(|_| "log poisoned")?.pid54_reads > 0);
+    let digest = plan["plan_digest"].as_str().ok_or("no plan_digest")?;
+
+    let applied = server.call(
+        "knx_apply_device",
+        json!({"address": "1.1.10", "plan_digest": digest}),
+    )?;
+    assert_eq!(applied["ok"], true, "apply: {applied}");
+    assert_eq!(applied["verified"], true, "apply: {applied}");
+    {
+        let log = log.lock().map_err(|_| "log poisoned")?;
+        assert_eq!(log.controls, vec![0x04, 0x01, 0x02], "{log:?}");
+        // After: 1.1.200 (0x11C8) with sequence 0.
+        assert_eq!(log.pid54, vec![0x11, 0xC8, 0, 0, 0, 0, 0, 0], "{log:?}");
+    }
+
+    // The device now admits the tunnel: nothing left to do.
+    let replan = server.call("knx_plan_device", json!({"address": "1.1.10"}))?;
+    assert_eq!(replan["noop"], true, "replan: {replan}");
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

@@ -1220,6 +1220,7 @@ pub fn build_device_plan(
         address_table: tables_change.then_some(report.resulting_address_count),
         association_table: tables_change.then_some(report.resulting_association_count),
         parameter_octets,
+        security_object: false,
     };
     let root = backups_root(dir);
     let backup_dir = if parameter_octets > 0 {

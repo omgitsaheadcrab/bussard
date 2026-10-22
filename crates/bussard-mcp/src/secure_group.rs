@@ -47,6 +47,31 @@ pub(crate) fn group_keys(keyring: Option<&Path>) -> Result<Option<Arc<GroupKeys>
     Ok(Some(keys))
 }
 
+/// The sender admission evidence (issue #297) of the server's keyring: its
+/// interface entries. Empty without a keyring. The decrypt is memoized per
+/// process by the service, so this costs no second PBKDF2.
+///
+/// # Errors
+///
+/// A human reason (naming the file and the cause, never a key) when the
+/// keyring cannot be loaded.
+pub(crate) fn admission_evidence(
+    keyring: Option<&Path>,
+) -> Result<bussard_service::admission::AdmissionEvidence, String> {
+    let Some(path) = keyring else {
+        return Ok(Default::default());
+    };
+    bussard_service::secure::load_admission_evidence(path).map_err(|e| {
+        let mut reason = e.to_string();
+        let mut source = std::error::Error::source(&e);
+        while let Some(inner) = source {
+            reason.push_str(&format!(": {inner}"));
+            source = inner.source();
+        }
+        reason
+    })
+}
+
 /// The MCP words for a secured GA without a group key.
 pub(crate) fn no_key_reason(err: &SecureGroupError) -> String {
     match err {

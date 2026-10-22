@@ -452,6 +452,22 @@ pub fn load_group_keys(path: &Path) -> Result<crate::group::GroupKeys, SecureKey
     Ok(load_keyring(path)?.group_keys.clone())
 }
 
+/// Loads the keyring's (or key store's) **interface entries** as the sender
+/// admission evidence of a secured group write or read (issue #297): the
+/// tunnelling addresses and the group addresses ETS assigned to them, with
+/// their `Senders`. Addresses only. Shares the process memo with
+/// [`load_group_keys`], so it costs no second decrypt.
+///
+/// # Errors
+///
+/// A missing password, an unreadable file, or a keyring that does not decrypt.
+pub fn load_admission_evidence(
+    path: &Path,
+) -> Result<crate::admission::AdmissionEvidence, SecureKeyError> {
+    let keyring = load_keyring(path)?;
+    Ok(crate::admission::AdmissionEvidence::from_keyring(&keyring))
+}
+
 /// What `bussard validate` and `knx_validate` check against the model for the
 /// keyring at `path` (issue #205): missing, locked (no
 /// [`KEYRING_PASSWORD_ENV`]; never prompts), unreadable, or the devices and

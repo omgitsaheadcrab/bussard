@@ -20,6 +20,7 @@ use crate::args::Parameters;
 use bussard_bus::ops;
 use bussard_model::{GroupAddress, IndividualAddress};
 use bussard_monitor::{CaptureStore, Filter, QueryFilter};
+use bussard_service::admission::{Admission, check_sender_admission};
 use bussard_service::describe::walk_objects;
 use bussard_service::secure::ToolKeySource;
 use bussard_service::{
@@ -555,7 +556,9 @@ impl BussardMcp {
 
     /// `knx_read_group` (omitted in passive mode).
     #[tool(
-        description = "Transmit a GroupValueRead on the bus for a group address and return the decoded response value. Rate-limited (minimum 250ms between reads). Only available when the server is NOT in passive mode. Use sparingly: this actively sends on the KNX bus."
+        description = "Transmit a GroupValueRead on the bus for a group address and return the decoded response value. Rate-limited (minimum 250ms between reads). Only available when the server is NOT in passive mode. Use sparingly: this actively sends on the KNX bus. On a secured (KNX Data Secure) GA \
+        the read is refused when the responder is known not to admit the tunnel address, and a \
+        timeout usually means it does not admit it (see `reason` and `note`)."
     )]
     async fn knx_read_group(
         &self,
@@ -615,6 +618,28 @@ impl BussardMcp {
             }));
         }
 
+        // Sender admission (issue #297): a responder that does not admit the
+        // tunnel address never answers a secured read.
+        let sender = bussard_bus::ops::group_source(service.handle());
+        let admission = match &key {
+            Some(_) => {
+                let evidence =
+                    match crate::secure_group::admission_evidence(self.state.keyring.as_deref()) {
+                        Ok(evidence) => evidence,
+                        Err(reason) => {
+                            return ok(
+                                json!({ "ga": ga.to_string(), "ok": false, "reason": reason }),
+                            );
+                        }
+                    };
+                Some(check_sender_admission(Some(&model), ga, sender, &evidence))
+            }
+            None => None,
+        };
+        if let Some(refused) = admission.as_ref().filter(|a| a.is_refused()) {
+            return ok(admission_refusal_json(ga, refused));
+        }
+
         // Rate limit + concurrency cap. Hold the permit across the whole read.
         let _permit = self.state.read_limiter.acquire().await;
 
@@ -639,6 +664,7 @@ impl BussardMcp {
                     "dpt": outcome.dpt.map(|d| d.to_string()),
                     "source": outcome.source.to_string(),
                     "secured": read.secured,
+                    "admission": admission.as_ref().map(Admission::label),
                 }))
             }
             Ok(None) => ok(json!({
@@ -647,10 +673,12 @@ impl BussardMcp {
                 "timed_out": true,
                 "secured": key.is_some(),
                 "reason": if key.is_some() {
-                    "no verified secured response within timeout"
+                    bussard_service::admission::secured_read_timeout(ga, sender)
                 } else {
-                    "no response within timeout"
+                    "no response within timeout".to_string()
                 },
+                "admission": admission.as_ref().map(Admission::label),
+                "note": admission.as_ref().and_then(Admission::note),
             })),
             Err(err) => ok(json!({
                 "ga": ga.to_string(),
@@ -822,7 +850,14 @@ impl BussardMcp {
         against the group address's DPT (override with `dpt`). Rate-limited (minimum 250ms between \
         bus operations). Protected group addresses (safety-critical objects such as a wind alarm or \
         central functions) are REFUSED outright — there is no override via MCP. When you are \
-        uncertain whether a write is safe or intended, ASK THE HUMAN before calling this tool."
+        uncertain whether a write is safe or intended, ASK THE HUMAN before calling this tool. \
+        ok: true means only that the interface acknowledged the telegram (L_Data.con, the \
+        `result` field): KNX reports no application-level result, so never tell the human the \
+        device confirmed or executed it. On a secured (KNX Data Secure) GA the devices accept \
+        the telegram only if their security individual address table admits the tunnel \
+        address: a write the evidence says they would discard is refused (`refused: true`, \
+        with a `hint` on admitting the tunnel addresses), and one sent without evidence carries \
+        `admission: unknown` and a `note` to pass on."
     )]
     async fn knx_write_group(
         &self,
@@ -896,6 +931,25 @@ impl BussardMcp {
             }));
         }
 
+        // Sender admission (issue #297): refuse a secured write the devices on
+        // the GA would discard, before anything is sent.
+        let admission = if write.is_secured() {
+            let evidence =
+                match crate::secure_group::admission_evidence(self.state.keyring.as_deref()) {
+                    Ok(evidence) => evidence,
+                    Err(reason) => {
+                        return ok(json!({ "ga": ga.to_string(), "ok": false, "reason": reason }));
+                    }
+                };
+            let sender = bussard_bus::ops::group_source(service.handle());
+            Some(check_sender_admission(Some(&model), ga, sender, &evidence))
+        } else {
+            None
+        };
+        if let Some(refused) = admission.as_ref().filter(|a| a.is_refused()) {
+            return ok(admission_refusal_json(ga, refused));
+        }
+
         // Share the read rate limiter (spacing + concurrency cap) with writes.
         let _permit = self.state.read_limiter.acquire().await;
 
@@ -906,7 +960,16 @@ impl BussardMcp {
                 "ga": ga.to_string(),
                 "ok": true,
                 "confirmed": sent.confirmed,
+                // Exactly what KNX confirmed (issue #297): the interface's
+                // L_Data.con at most, never an effect on the device.
+                "result": if sent.confirmed {
+                    bussard_service::admission::WRITE_RESULT
+                } else {
+                    bussard_service::admission::WRITE_RESULT_UNCONFIRMED
+                },
                 "secured": sent.write.is_secured(),
+                "admission": admission.as_ref().map(Admission::label),
+                "note": admission.as_ref().and_then(Admission::note),
                 "written": {
                     "address": ga.to_string(),
                     "name": sent.write.name,
@@ -917,6 +980,21 @@ impl BussardMcp {
             Err(refusal) => ok(write_refusal_json(ga, &refusal)),
         }
     }
+}
+
+/// The result of a secured write or read refused for sender admission (issue
+/// #297): `ok: false`, `refused: true`, the refusal and how to admit the
+/// tunnel addresses. Nothing was sent.
+fn admission_refusal_json(ga: GroupAddress, admission: &Admission) -> Value {
+    json!({
+        "ga": ga.to_string(),
+        "ok": false,
+        "refused": true,
+        "sent": false,
+        "admission": admission.label(),
+        "reason": admission.refusal(),
+        "hint": admission.admit_hint(),
+    })
 }
 
 /// Renders a [`WriteRefusal`] as the `knx_write_group` result: `ok: false`, a

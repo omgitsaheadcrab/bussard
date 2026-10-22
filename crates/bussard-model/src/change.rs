@@ -590,6 +590,23 @@ fn describe_connection(old: &Model, new: &Model, out: &mut Vec<Change>) {
             .with_field("multicast", a.multicast.clone(), b.multicast.clone()),
         );
     }
+    if a.admit_tunnel_senders != b.admit_tunnel_senders {
+        let state = |on: bool| if on { "on" } else { "off" };
+        out.push(
+            Change::new(
+                ChangeKind::ConnectionChanged,
+                format!(
+                    "Admitting the tunnelling addresses as secure senders is now {}.",
+                    state(b.admit_tunnel_senders)
+                ),
+            )
+            .with_field(
+                "admit_tunnel_senders",
+                Some(state(a.admit_tunnel_senders).to_string()),
+                Some(state(b.admit_tunnel_senders).to_string()),
+            ),
+        );
+    }
 }
 
 /// The transport as a human reads it.

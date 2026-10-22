@@ -29,6 +29,9 @@
 //!   change, used by the long-lived MCP and viz servers, and
 //!   [`complete_product_models`], which fills in missing product models
 //!   before every load and reload.
+//! - [`admission`]: whether the devices on a secured group address admit
+//!   bussard's tunnel address as a secure sender (PID 54), and the plan change
+//!   of `admit_tunnel_senders` (issue #297).
 //! - [`adopt`]: what `bussard adopt` records for a KNX Data Secure-activated
 //!   device (links, `secure` flags, the security intent and lock facts).
 //! - [`describe`]: the interface-object walk and the PID / object-type name
@@ -39,6 +42,7 @@
 //! The crate never prints. Terminal prompts, JSON shapes and HTTP status codes
 //! stay with the surfaces.
 
+pub mod admission;
 pub mod adopt;
 pub mod bus;
 pub mod describe;
