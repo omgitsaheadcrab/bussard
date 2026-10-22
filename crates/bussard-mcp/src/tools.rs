@@ -241,6 +241,28 @@ pub fn model_lookup(model: &Model, query: &str, limit: usize) -> Value {
     })
 }
 
+/// `knx_model_lookup` with the capabilities (issue #298): [`model_lookup`]
+/// plus `capabilities`, the parameter texts and enum choice texts of the
+/// installed devices' product models that match, each with its device, page
+/// or channel, whether that is active, and what enables it when it is not
+/// ([`bussard_model::capabilities::capability_lookup`]).
+pub fn model_lookup_with_capabilities(
+    model: &Model,
+    dir: &std::path::Path,
+    query: &str,
+    limit: usize,
+) -> Value {
+    let mut out = model_lookup(model, query, limit);
+    let capabilities = bussard_model::capabilities::capability_lookup(model, dir, query, limit);
+    if let Some(map) = out.as_object_mut() {
+        map.insert(
+            "capabilities".to_string(),
+            serde_json::to_value(capabilities).unwrap_or_else(|_| json!([])),
+        );
+    }
+    out
+}
+
 /// `knx_get_group`: the group entry, every link touching it, and the last seen
 /// telegram from the ring (if any).
 pub fn get_group(model: &Model, ring: &TelegramRing, ga: GroupAddress) -> Value {

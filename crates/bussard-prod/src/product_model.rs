@@ -155,9 +155,10 @@ pub fn verified_archive(
     Ok(path)
 }
 
-/// Whether an application an archive in the lock pins lacks its model file:
-/// one `stat` per pinned application, no archive read. `false` when there is
-/// no lock.
+/// Whether an application an archive in the lock pins lacks its model file,
+/// or has one of an older [`bussard_model::param_model::MODEL_FORMAT`]: the
+/// first 4 KiB of each pinned application's model are read, no archive.
+/// `false` when there is no lock.
 pub fn models_incomplete(dir: &Path) -> bool {
     if !dir.join(bussard_model::loader::LOCK_FILE).is_file() {
         return false;
@@ -171,16 +172,20 @@ pub fn models_incomplete(dir: &Path) -> bool {
         .filter(|e| e.file.is_some())
         .any(|e| {
             e.applications.is_empty()
-                || e.applications
-                    .iter()
-                    .any(|app| !models_dir.join(format!("{app}.yaml")).is_file())
+                || e.applications.iter().any(|app| {
+                    !bussard_model::param_model::model_is_current(
+                        &models_dir.join(format!("{app}.yaml")),
+                    )
+                })
         })
 }
 
 /// Writes the product model of every application a pinned archive carries
-/// that `.bussard/models/` lacks, or only of `only` when given. An archive
-/// whose applications all have a model is not read. Returns one message per
-/// archive that could not be used (missing, changed, unreadable); the caller
+/// that `.bussard/models/` lacks or holds in an older format, or only of
+/// `only` when given. An archive whose applications all have a current model
+/// is not read. Returns one message per archive that could not be used
+/// (missing, changed, unreadable) for a model that is missing; an outdated
+/// model whose archive cannot be read stays as it is, silently. The caller
 /// reports them as warnings, since the command itself says what it cannot do
 /// without the model.
 ///
@@ -193,6 +198,11 @@ pub fn complete_models(dir: &Path, only: Option<&str>) -> Vec<String> {
     let models_dir = dir.join(bussard_model::param_model::MODELS_DIR);
     let _ = std::fs::create_dir_all(&models_dir);
     let has_model = |app: &str| models_dir.join(format!("{app}.yaml")).is_file();
+    // A model of an older format regenerates too (issue #298), quietly when
+    // its archive cannot be read: the old model still serves.
+    let has_current = |app: &str| {
+        bussard_model::param_model::model_is_current(&models_dir.join(format!("{app}.yaml")))
+    };
     let language = bussard_model::import_language(dir);
     let cache = cache_dir(dir);
     let mut warnings = Vec::new();
@@ -201,11 +211,13 @@ pub fn complete_models(dir: &Path, only: Option<&str>) -> Vec<String> {
             continue;
         }
         let wanted = match only {
-            Some(app) => entry.applications.iter().any(|a| a == app) && !has_model(app),
+            Some(app) => entry.applications.iter().any(|a| a == app) && !has_current(app),
             None => {
-                entry.applications.is_empty() || !entry.applications.iter().all(|a| has_model(a))
+                entry.applications.is_empty() || !entry.applications.iter().all(|a| has_current(a))
             }
         };
+        let only_outdated =
+            !entry.applications.is_empty() && entry.applications.iter().all(|a| has_model(a));
         if !wanted {
             continue;
         }
@@ -227,7 +239,9 @@ pub fn complete_models(dir: &Path, only: Option<&str>) -> Vec<String> {
             })?;
             write_product_models(&product, dir)
         });
-        if let Err(err) = written {
+        if let Err(err) = written
+            && !only_outdated
+        {
             warnings.push(err.to_string());
         }
     }
@@ -270,6 +284,9 @@ pub fn write_product_models(product: &ProductData, dir: &Path) -> Result<Vec<Str
 /// The top-level model file for one application program.
 #[derive(Debug, Serialize)]
 struct Model {
+    /// [`bussard_model::param_model::MODEL_FORMAT`]: a model of an older
+    /// format regenerates.
+    model_format: u32,
     identity: Identity,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     order_numbers: Vec<String>,
@@ -283,6 +300,14 @@ struct Model {
     parameters: Vec<ParameterModel>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     load_procedure: Vec<String>,
+    /// The ETS parameter pages and channels (issue #298).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blocks: Vec<bussard_model::blocks::BlockDef>,
+    /// The com-object refs the blocks name that `com_objects` does not
+    /// describe (a number's other refs, with their own text, function and
+    /// DPT), keyed by app-relative ref id.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    com_object_refs: BTreeMap<String, ComObjectModel>,
 }
 
 /// The identity block.
@@ -394,7 +419,11 @@ struct MemoryModel {
 
 /// Builds the model for one application program.
 fn build_model(app: &ApplicationProgram, product: &ProductData) -> Model {
+    let com_objects = com_objects_for(app);
+    let blocks = crate::blocks::blocks_for(app);
+    let com_object_refs = other_object_refs(app, &blocks, &com_objects);
     Model {
+        model_format: bussard_model::param_model::MODEL_FORMAT,
         identity: Identity {
             id: app.id.clone(),
             name: app.name.clone(),
@@ -406,9 +435,11 @@ fn build_model(app: &ApplicationProgram, product: &ProductData) -> Model {
         },
         order_numbers: order_numbers_for(app, product),
         bus_current_ma: bus_current_for(app, product),
-        com_objects: com_objects_for(app),
+        com_objects,
         parameters: parameters_for(app),
         load_procedure: load_procedure_summary(&app.load_procedures),
+        blocks,
+        com_object_refs,
     }
 }
 
@@ -454,6 +485,41 @@ fn com_objects_for(app: &ApplicationProgram) -> BTreeMap<u16, ComObjectModel> {
         }
     }
     map
+}
+
+/// The com-object refs `blocks` name whose number `com_objects` describes
+/// through another ref, keyed by app-relative ref id.
+fn other_object_refs(
+    app: &ApplicationProgram,
+    blocks: &[bussard_model::blocks::BlockDef],
+    com_objects: &BTreeMap<u16, ComObjectModel>,
+) -> BTreeMap<String, ComObjectModel> {
+    let mut out = BTreeMap::new();
+    let prefix = format!("{}_", app.id);
+    for reference in blocks
+        .iter()
+        .flat_map(|b| b.objects.iter().chain(&b.other_objects))
+    {
+        if out.contains_key(reference) {
+            continue;
+        }
+        let full = format!("{prefix}{reference}");
+        let Some(cref) = app.com_object_refs.get(&full) else {
+            continue;
+        };
+        let Some(base) = app.com_objects.get(&cref.ref_id) else {
+            continue;
+        };
+        let rc = ResolvedComObject { base, cref };
+        if com_objects
+            .get(&rc.number())
+            .is_some_and(|m| m.ref_id == full)
+        {
+            continue;
+        }
+        out.insert(reference.clone(), com_object_model(&rc));
+    }
+    out
 }
 
 fn com_object_model(rc: &ResolvedComObject<'_>) -> ComObjectModel {
@@ -820,6 +886,30 @@ mod tests {
     }
 
     #[test]
+    fn test_complete_models_keeps_an_outdated_model_quietly_without_its_archive() -> TestResult {
+        let dir = scratch("outdated")?;
+        std::fs::write(
+            dir.join(bussard_model::loader::LOCK_FILE),
+            "version = 3\n\n[[product]]\nsha256 = \"00\"\nfile = \"products/a.knxprod\"\n\
+             origin = { kind = \"file\", path = \"a.knxprod\" }\napplications = [\"M-1\"]\n",
+        )?;
+        let models = dir.join(bussard_model::param_model::MODELS_DIR);
+        std::fs::create_dir_all(&models)?;
+        // Missing: the absent archive is worth a warning.
+        assert_eq!(complete_models(&dir, None).len(), 1);
+        // Outdated: the old model still serves, so no warning, and it stays.
+        std::fs::write(models.join("M-1.yaml"), "identity:\n  id: M-1\n")?;
+        assert!(complete_models(&dir, None).is_empty());
+        assert!(complete_models(&dir, Some("M-1")).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(models.join("M-1.yaml"))?,
+            "identity:\n  id: M-1\n"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn test_models_incomplete_checks_every_pinned_application() -> TestResult {
         let dir = scratch("incomplete")?;
         assert!(!models_incomplete(&dir), "no lock, nothing to complete");
@@ -832,9 +922,15 @@ mod tests {
         let models = dir.join(bussard_model::param_model::MODELS_DIR);
         std::fs::create_dir_all(&models)?;
         assert!(models_incomplete(&dir), "an empty models directory");
-        std::fs::write(models.join("M-1.yaml"), "")?;
+        let current = format!(
+            "# banner\nmodel_format: {}\n",
+            bussard_model::param_model::MODEL_FORMAT
+        );
+        std::fs::write(models.join("M-1.yaml"), &current)?;
         assert!(models_incomplete(&dir), "one model of two");
-        std::fs::write(models.join("M-2.yaml"), "")?;
+        std::fs::write(models.join("M-2.yaml"), "identity:\n  id: M-2\n")?;
+        assert!(models_incomplete(&dir), "a model of an older format");
+        std::fs::write(models.join("M-2.yaml"), &current)?;
         assert!(
             !models_incomplete(&dir),
             "every pinned application has its model"

@@ -19,7 +19,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 /// One parsed product model file: its parameter definitions, indexed for lookup.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
 pub struct ProductModel {
     /// The bus current this product draws, in mA, as declared by the vendor's
     /// `Hardware.xml` (`BusCurrent`). Used by the `L002` topology lint to total
@@ -32,10 +32,54 @@ pub struct ProductModel {
     /// dropping its `_M-<m>_MI-<n>` module-instance selector and `_R-<r>`
     /// suffix; indexing app-relative lets the lookup ignore the app prefix.
     pub parameters: BTreeMap<String, ParamDef>,
+    /// The ETS parameter pages and channels of the application's Dynamic
+    /// section, in document order (issue #298). Empty for a model written
+    /// before [`MODEL_FORMAT`] 2.
+    pub blocks: Vec<crate::blocks::BlockDef>,
+    /// The com-objects by number: the vendor's text, function and DPT.
+    pub com_objects: BTreeMap<u16, ObjectDef>,
+    /// The com-object refs the blocks name that [`Self::com_objects`]
+    /// describes through another ref of the same number, keyed by
+    /// app-relative ref id (`O-32_R-454`).
+    pub com_object_refs: BTreeMap<String, ObjectDef>,
+}
+
+/// One com-object of a product model, reduced to what a view shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct ObjectDef {
+    /// The vendor's object text.
+    pub text: Option<String>,
+    /// The vendor's function text.
+    pub function: Option<String>,
+    /// The datapoint type, as written.
+    pub dpt: Option<String>,
+    /// The communication flags, as written.
+    pub flags: Option<String>,
+}
+
+/// The product-model format this build writes: `model_format:` at the top of
+/// the file. A model of an older format regenerates from its archive
+/// (format 2 adds `blocks:`, issue #298).
+pub const MODEL_FORMAT: u32 = 2;
+
+/// Whether the model file at `path` is of the current [`MODEL_FORMAT`]. Reads
+/// only the head of the file, where the emitter puts the key.
+pub fn model_is_current(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut bytes = Vec::with_capacity(4096);
+    if file.take(4096).read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+    let head = String::from_utf8_lossy(&bytes);
+    let wanted = format!("model_format: {MODEL_FORMAT}");
+    head.lines().any(|l| l.trim_end() == wanted)
 }
 
 /// A single parameter definition, reduced to what validation needs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct ParamDef {
     /// The parameter type/shape.
     pub kind: ParamKind,
@@ -58,7 +102,7 @@ pub struct ParamDef {
 }
 
 /// A parameter's type, mirroring the `type:` tag in the model YAML.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub enum ParamKind {
     /// A bounded integer (`int`).
     Int {
@@ -97,6 +141,24 @@ struct RawModel {
     bus_current_ma: Option<u32>,
     #[serde(default)]
     parameters: Vec<RawParam>,
+    #[serde(default)]
+    blocks: Vec<crate::blocks::BlockDef>,
+    #[serde(default)]
+    com_objects: BTreeMap<u16, RawComObject>,
+    #[serde(default)]
+    com_object_refs: BTreeMap<String, RawComObject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawComObject {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    function_text: Option<String>,
+    #[serde(default)]
+    dpt: Option<String>,
+    #[serde(default)]
+    flags: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +225,15 @@ struct RawEnumValue {
 }
 
 impl ProductModel {
+    /// The vendor's description of com-object ref `reference` (app-relative):
+    /// its own entry when the ref is not the one `com_objects` describes, else
+    /// that of its number.
+    pub fn object_def(&self, reference: &str) -> Option<&ObjectDef> {
+        self.com_object_refs.get(reference).or_else(|| {
+            crate::blocks::object_number(reference).and_then(|n| self.com_objects.get(&n))
+        })
+    }
+
     /// Parses a product model from YAML text (the emitter's banner is a comment
     /// and is ignored). `app_ref` is the application id, used to strip the
     /// prefix from each parameter id so lookups are app-relative.
@@ -195,9 +266,28 @@ impl ProductModel {
                 },
             );
         }
+        let object = |o: RawComObject| ObjectDef {
+            text: o.text,
+            function: o.function_text,
+            dpt: o.dpt,
+            flags: o.flags,
+        };
+        let com_objects = raw
+            .com_objects
+            .into_iter()
+            .map(|(n, o)| (n, object(o)))
+            .collect();
+        let com_object_refs = raw
+            .com_object_refs
+            .into_iter()
+            .map(|(r, o)| (r, object(o)))
+            .collect();
         Ok(ProductModel {
             bus_current_ma: raw.bus_current_ma,
             parameters,
+            blocks: raw.blocks,
+            com_objects,
+            com_object_refs,
         })
     }
 

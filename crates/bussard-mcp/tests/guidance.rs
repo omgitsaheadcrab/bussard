@@ -373,6 +373,55 @@ async fn test_show_device_says_how_to_change_it() -> TestResult {
     Ok(())
 }
 
+/// Issue #298: an assistant asked "can a device give me a dark bit" read the
+/// configured state (knx_get_device) and never what the device can do. The
+/// descriptions say which tool answers which, and the instructions say how
+/// to find a device that can provide a function.
+#[tokio::test]
+async fn test_descriptions_say_configured_state_versus_what_a_device_can_do() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    write_model(dir.path())?;
+    let (client, task) = serve(dir.path(), TIERS[1]).await?;
+    let tools = client.list_all_tools().await?;
+    let description = |name: &str| -> String {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.description.as_deref())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let get = description("knx_get_device");
+    assert!(
+        get.contains(
+            "This is the configured state; for what the device can do (inactive channels and \
+             pages, functions, choices) use knx_show_device."
+        ),
+        "{get}"
+    );
+    let show = description("knx_show_device");
+    assert!(
+        show.contains("This is what the device can do; knx_get_device is the configured state."),
+        "{show}"
+    );
+    assert!(show.contains("marked `inactive`"), "{show}");
+    let lookup = description("knx_model_lookup");
+    assert!(
+        lookup.contains("`capabilities` searches what the installed devices could do"),
+        "{lookup}"
+    );
+    assert!(
+        instructions(&client)?.contains(
+            "To find a device that can provide a function, use knx_model_lookup with the \
+             function's words and read knx_show_device for the candidates."
+        ),
+        "the instructions name the capability search"
+    );
+    client.cancel().await?;
+    task.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_instructions_read_and_programming_tiers_snapshot() -> TestResult {
     for (tier, expected) in [
@@ -399,7 +448,9 @@ const READ_INSTRUCTIONS: &str = "bussard: KNX as code over MCP. The installation
     bus. Active tiers: read. Start with knx_project_summary (its `server` and `capabilities` \
     fields say what this server may do), then knx_model_lookup, knx_get_group, \
     knx_get_device and knx_show_device to explore, and knx_validate and knx_audit to check \
-    the model. Observe with knx_recent_telegrams and knx_wait_for_telegram (the latter \
+    the model. To find a device that can provide a function, use \
+    knx_model_lookup with the function's words and read knx_show_device for the candidates. \
+    Observe with knx_recent_telegrams and knx_wait_for_telegram (the latter \
     enables 'press the button now' debugging); knx_read_group reads a value and \
     knx_describe_device introspects a device's interface objects over the bus. When a bus \
     tool says the bus is not connected, knx_bus_status says why (the last transport error, \
@@ -426,7 +477,9 @@ const PROGRAMMING_INSTRUCTIONS: &str = "bussard: KNX as code over MCP. The insta
     bus. Active tiers: read, programming. Start with knx_project_summary (its `server` and \
     `capabilities` fields say what this server may do), then knx_model_lookup, \
     knx_get_group, knx_get_device and knx_show_device to explore, and knx_validate and \
-    knx_audit to check the model. Observe with knx_recent_telegrams and \
+    knx_audit to check the model. To find a device that can provide a function, use \
+    knx_model_lookup with the function's words and read knx_show_device for the candidates. \
+    Observe with knx_recent_telegrams and \
     knx_wait_for_telegram (the latter enables 'press the button now' debugging); \
     knx_read_group reads a value and knx_describe_device introspects a device's interface \
     objects over the bus. When a bus tool says the bus is not connected, knx_bus_status says \

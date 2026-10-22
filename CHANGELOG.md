@@ -81,6 +81,22 @@ directory or a script from before these changes needs:
   default, so `admit_tunnel_senders` stays off; the warning says when it
   matters. `knx_plan_device` adds the same sentence as a note for that
   device while the option is off.
+- What a device can do (#298). `bussard device` and `knx_show_device` list an
+  application without channels of its own (a Theben Meteodata's one
+  `generic-0` channel) by ETS parameter page, in ETS order, and mark a page
+  the configuration does not show as `inactive`, with the parameters that
+  enable it, the objects it would show and whether that needs `bussard
+  flash <ia>`; a device with channels lists its inactive channels the same
+  way, and a `summary` line counts what is inactive ("7 Universalkanal C4:
+  Funktion .. Universalkanal C10: Funktion"). A page handle details one page.
+  `knx_model_lookup` gains `capabilities`: the parameter and enum choice texts
+  of the installed devices' product models, ranked `provides` first, then
+  `could provide` on inactive pages, cached under `.bussard/lookup/`. The
+  `knx_get_device` and `knx_show_device` descriptions say which answers
+  "what can this device do", and the server instructions how to find a
+  device that can provide a function. Product models gain `model_format: 2`
+  and the `blocks` of the Dynamic section; an older model regenerates from
+  its archive.
 - `bussard restore --parameters <backup.json> <ADDRESS>` and the MCP tool
   `knx_restore_parameters` (#290) replay a parameter backup from
   `captures/backups/parameters/` with the parameter-only download `apply`

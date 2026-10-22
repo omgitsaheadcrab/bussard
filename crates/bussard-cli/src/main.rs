@@ -1069,14 +1069,17 @@ enum Command {
     },
     /// List the model's history snapshots, oldest first.
     History {},
-    /// Show what a device offers, in its device file's words: its channels,
-    /// and for one channel its parameters (value, choices, default) and objects.
+    /// Show what a device can do, in its device file's words: its channels or
+    /// ETS parameter pages (inactive ones marked with what enables them), and
+    /// for one channel or page its parameters (value, choices, default) and
+    /// objects.
     Device {
         /// The device, e.g. `1.1.47`.
         #[arg(value_name = "ADDRESS")]
         address: String,
-        /// The channel to list in detail: its handle (`a-1`), id or number, or
-        /// `device` for the device-level parameters and objects.
+        /// The channel to list in detail: its handle (`a-1`), id or number, a
+        /// page handle, or `device` for the device-level parameters and
+        /// objects.
         #[arg(value_name = "CHANNEL")]
         channel: Option<String>,
         /// Print the paste-ready device-file TOML, with commented lines for

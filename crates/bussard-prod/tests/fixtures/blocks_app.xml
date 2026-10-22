@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Fabricated System 7 application (bussard's own work, MIT; no vendor data)
+     for issue #298: a weather-station-like program without channels of its
+     own whose universal channels A, B and C are ETS parameter pages behind
+     "enable" parameters, C behind B. Each channel's function can be a
+     brightness threshold with a 1-bit output object; channel B's objects sit
+     on a page of their own, behind the same switch. -->
+<KNX xmlns="http://knx.org/xml/project/23">
+  <ManufacturerData>
+    <Manufacturer RefId="M-00FA">
+      <ApplicationPrograms>
+        <ApplicationProgram Id="M-00FA_A-0298-10-0000" ApplicationNumber="298" ApplicationVersion="16"
+            MaskVersion="MV-0701" Name="bussard capability test app" LoadProcedureStyle="ProductProcedure">
+          <Static>
+            <Code>
+              <AbsoluteSegment Id="M-00FA_A-0298-10-0000_AS-4400" Address="17408" Size="8" />
+            </Code>
+            <ParameterTypes>
+              <ParameterType Id="M-00FA_A-0298-10-0000_PT-YesNo" Name="yesno"><TypeRestriction Base="Value" SizeInBit="1">
+                <Enumeration Text="no" Value="0" Id="M-00FA_A-0298-10-0000_PT-YesNo_EN-0" />
+                <Enumeration Text="yes" Value="1" Id="M-00FA_A-0298-10-0000_PT-YesNo_EN-1" />
+              </TypeRestriction></ParameterType>
+              <ParameterType Id="M-00FA_A-0298-10-0000_PT-Function" Name="function"><TypeRestriction Base="Value" SizeInBit="4">
+                <Enumeration Text="Brightness sensor 1 .. 100 000 lx" Value="1" Id="M-00FA_A-0298-10-0000_PT-Function_EN-1" />
+                <Enumeration Text="Temperature sensor" Value="2" Id="M-00FA_A-0298-10-0000_PT-Function_EN-2" />
+                <Enumeration Text="Wind sensor" Value="3" Id="M-00FA_A-0298-10-0000_PT-Function_EN-3" />
+              </TypeRestriction></ParameterType>
+              <ParameterType Id="M-00FA_A-0298-10-0000_PT-Lux" Name="lux"><TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="1" maxInclusive="200" /></ParameterType>
+              <ParameterType Id="M-00FA_A-0298-10-0000_PT-None" Name="none"><TypeNone /></ParameterType>
+            </ParameterTypes>
+            <Parameters>
+              <Parameter Id="M-00FA_A-0298-10-0000_P-1" Name="EnableA" Text="Universal channel A enable" ParameterType="M-00FA_A-0298-10-0000_PT-YesNo" Value="0"><Memory CodeSegment="M-00FA_A-0298-10-0000_AS-4400" Offset="0" BitOffset="0" /></Parameter>
+              <Parameter Id="M-00FA_A-0298-10-0000_P-2" Name="EnableB" Text="Universal channel B enable" ParameterType="M-00FA_A-0298-10-0000_PT-YesNo" Value="0"><Memory CodeSegment="M-00FA_A-0298-10-0000_AS-4400" Offset="0" BitOffset="1" /></Parameter>
+              <Parameter Id="M-00FA_A-0298-10-0000_P-3" Name="EnableC" Text="Universal channel C enable" ParameterType="M-00FA_A-0298-10-0000_PT-YesNo" Value="0"><Memory CodeSegment="M-00FA_A-0298-10-0000_AS-4400" Offset="0" BitOffset="2" /></Parameter>
+              <Parameter Id="M-00FA_A-0298-10-0000_P-10" Name="TitleA" Text="Universal channel A: function" ParameterType="M-00FA_A-0298-10-0000_PT-None" />
+              <Parameter Id="M-00FA_A-0298-10-0000_P-11" Name="FunctionA" Text="Channel function" ParameterType="M-00FA_A-0298-10-0000_PT-Function" Value="1"><Memory CodeSegment="M-00FA_A-0298-10-0000_AS-4400" Offset="1" BitOffset="0" /></Parameter>
+              <Parameter Id="M-00FA_A-0298-10-0000_P-12" Name="DuskA" Text="Dusk threshold in lx" ParameterType="M-00FA_A-0298-10-0000_PT-Lux" Value="10"><Memory CodeSegment="M-00FA_A-0298-10-0000_AS-4400" Offset="2" BitOffset="0" /></Parameter>
+              <Parameter Id="M-00FA_A-0298-10-0000_P-20" Name="TitleB" Text="Universal channel B: function" ParameterType="M-00FA_A-0298-10-0000_PT-None" />
+              <Parameter Id="M-00FA_A-0298-10-0000_P-21" Name="FunctionB" Text="Channel function" ParameterType="M-00FA_A-0298-10-0000_PT-Function" Value="1"><Memory CodeSegment="M-00FA_A-0298-10-0000_AS-4400" Offset="3" BitOffset="0" /></Parameter>
+              <Parameter Id="M-00FA_A-0298-10-0000_P-22" Name="DuskB" Text="Dusk threshold in lx" ParameterType="M-00FA_A-0298-10-0000_PT-Lux" Value="10"><Memory CodeSegment="M-00FA_A-0298-10-0000_AS-4400" Offset="4" BitOffset="0" /></Parameter>
+              <Parameter Id="M-00FA_A-0298-10-0000_P-23" Name="ObjectsB" Text="Objects" ParameterType="M-00FA_A-0298-10-0000_PT-None" />
+              <Parameter Id="M-00FA_A-0298-10-0000_P-30" Name="TitleC" Text="Universal channel C: function" ParameterType="M-00FA_A-0298-10-0000_PT-None" />
+              <Parameter Id="M-00FA_A-0298-10-0000_P-31" Name="FunctionC" Text="Channel function" ParameterType="M-00FA_A-0298-10-0000_PT-Function" Value="2"><Memory CodeSegment="M-00FA_A-0298-10-0000_AS-4400" Offset="5" BitOffset="0" /></Parameter>
+            </Parameters>
+            <ParameterRefs>
+              <ParameterRef Id="M-00FA_A-0298-10-0000_P-1_R-1" RefId="M-00FA_A-0298-10-0000_P-1" />
+              <ParameterRef Id="M-00FA_A-0298-10-0000_P-2_R-2" RefId="M-00FA_A-0298-10-0000_P-2" />
+              <ParameterRef Id="M-00FA_A-0298-10-0000_P-3_R-3" RefId="M-00FA_A-0298-10-0000_P-3" />
+              <ParameterRef Id="M-00FA_A-0298-10-0000_P-10_R-10" RefId="M-00FA_A-0298-10-0000_P-10" />
+              <ParameterRef Id="M-00FA_A-0298-10-0000_P-11_R-11" RefId="M-00FA_A-0298-10-0000_P-11" />
+              <ParameterRef Id="M-00FA_A-0298-10-0000_P-12_R-12" RefId="M-00FA_A-0298-10-0000_P-12" />
+              <ParameterRef Id="M-00FA_A-0298-10-0000_P-20_R-20" RefId="M-00FA_A-0298-10-0000_P-20" />
+              <ParameterRef Id="M-00FA_A-0298-10-0000_P-21_R-21" RefId="M-00FA_A-0298-10-0000_P-21" />
+              <ParameterRef Id="M-00FA_A-0298-10-0000_P-22_R-22" RefId="M-00FA_A-0298-10-0000_P-22" />
+              <ParameterRef Id="M-00FA_A-0298-10-0000_P-23_R-23" RefId="M-00FA_A-0298-10-0000_P-23" />
+              <ParameterRef Id="M-00FA_A-0298-10-0000_P-30_R-30" RefId="M-00FA_A-0298-10-0000_P-30" />
+              <ParameterRef Id="M-00FA_A-0298-10-0000_P-31_R-31" RefId="M-00FA_A-0298-10-0000_P-31" />
+            </ParameterRefs>
+            <ComObjects>
+              <ComObject Id="M-00FA_A-0298-10-0000_O-0" Number="0" Text="Brightness" FunctionText="Physical value" ObjectSize="2 Bytes" DatapointType="DPST-9-4" CommunicationFlag="Enabled" ReadFlag="Enabled" TransmitFlag="Enabled" />
+              <ComObject Id="M-00FA_A-0298-10-0000_O-1" Number="1" Text="A Universal channel" FunctionText="Switch" ObjectSize="1 Bit" DatapointType="DPST-1-1" CommunicationFlag="Enabled" ReadFlag="Enabled" TransmitFlag="Enabled" />
+              <ComObject Id="M-00FA_A-0298-10-0000_O-2" Number="2" Text="B Universal channel" FunctionText="Switch" ObjectSize="1 Bit" DatapointType="DPST-1-1" CommunicationFlag="Enabled" ReadFlag="Enabled" TransmitFlag="Enabled" />
+              <ComObject Id="M-00FA_A-0298-10-0000_O-3" Number="3" Text="C Universal channel" FunctionText="Switch" ObjectSize="1 Bit" DatapointType="DPST-1-1" CommunicationFlag="Enabled" ReadFlag="Enabled" TransmitFlag="Enabled" />
+            </ComObjects>
+            <ComObjectRefs>
+              <ComObjectRef Id="M-00FA_A-0298-10-0000_O-0_R-0" RefId="M-00FA_A-0298-10-0000_O-0" />
+              <ComObjectRef Id="M-00FA_A-0298-10-0000_O-1_R-1" RefId="M-00FA_A-0298-10-0000_O-1" />
+              <ComObjectRef Id="M-00FA_A-0298-10-0000_O-2_R-2" RefId="M-00FA_A-0298-10-0000_O-2" />
+              <ComObjectRef Id="M-00FA_A-0298-10-0000_O-2_R-3" RefId="M-00FA_A-0298-10-0000_O-2" FunctionText="Value" ObjectSize="1 Byte" DatapointType="DPST-5-10" />
+              <ComObjectRef Id="M-00FA_A-0298-10-0000_O-3_R-4" RefId="M-00FA_A-0298-10-0000_O-3" />
+            </ComObjectRefs>
+            <LoadProcedures>
+              <LoadProcedure>
+                <LdCtrlConnect />
+                <LdCtrlRestart />
+                <LdCtrlDisconnect />
+              </LoadProcedure>
+            </LoadProcedures>
+          </Static>
+          <Dynamic>
+            <Channel Id="M-00FA_A-0298-10-0000_CH-0" Name="Generic" Text="" Number="0">
+              <ComObjectRefRef RefId="M-00FA_A-0298-10-0000_O-0_R-0" />
+              <ParameterBlock Id="M-00FA_A-0298-10-0000_PB-1" Name="General" Text="General">
+                <ParameterRefRef RefId="M-00FA_A-0298-10-0000_P-1_R-1" />
+                <ParameterRefRef RefId="M-00FA_A-0298-10-0000_P-2_R-2" />
+                <choose ParamRefId="M-00FA_A-0298-10-0000_P-2_R-2">
+                  <when test="1"><ParameterRefRef RefId="M-00FA_A-0298-10-0000_P-3_R-3" /></when>
+                </choose>
+              </ParameterBlock>
+              <choose ParamRefId="M-00FA_A-0298-10-0000_P-1_R-1">
+                <when test="1">
+                  <ParameterBlock Id="M-00FA_A-0298-10-0000_PB-10" Name="ChannelA" ParamRefId="M-00FA_A-0298-10-0000_P-10_R-10">
+                    <ParameterRefRef RefId="M-00FA_A-0298-10-0000_P-11_R-11" />
+                    <choose ParamRefId="M-00FA_A-0298-10-0000_P-11_R-11">
+                      <when test="1">
+                        <ParameterRefRef RefId="M-00FA_A-0298-10-0000_P-12_R-12" />
+                        <ComObjectRefRef RefId="M-00FA_A-0298-10-0000_O-1_R-1" />
+                      </when>
+                    </choose>
+                  </ParameterBlock>
+                </when>
+              </choose>
+              <choose ParamRefId="M-00FA_A-0298-10-0000_P-2_R-2">
+                <when test="1">
+                  <ParameterBlock Id="M-00FA_A-0298-10-0000_PB-20" Name="ChannelB" ParamRefId="M-00FA_A-0298-10-0000_P-20_R-20">
+                    <ParameterRefRef RefId="M-00FA_A-0298-10-0000_P-21_R-21" />
+                    <choose ParamRefId="M-00FA_A-0298-10-0000_P-21_R-21">
+                      <when test="1"><ParameterRefRef RefId="M-00FA_A-0298-10-0000_P-22_R-22" /></when>
+                    </choose>
+                  </ParameterBlock>
+                  <ParameterBlock Id="M-00FA_A-0298-10-0000_PB-21" Name="ObjectsB" ParamRefId="M-00FA_A-0298-10-0000_P-23_R-23">
+                    <choose ParamRefId="M-00FA_A-0298-10-0000_P-21_R-21">
+                      <when test="1"><ComObjectRefRef RefId="M-00FA_A-0298-10-0000_O-2_R-2" /></when>
+                      <when default="true"><ComObjectRefRef RefId="M-00FA_A-0298-10-0000_O-2_R-3" /></when>
+                    </choose>
+                  </ParameterBlock>
+                  <choose ParamRefId="M-00FA_A-0298-10-0000_P-3_R-3">
+                    <when test="1">
+                      <ParameterBlock Id="M-00FA_A-0298-10-0000_PB-30" Name="ChannelC" ParamRefId="M-00FA_A-0298-10-0000_P-30_R-30">
+                        <ParameterRefRef RefId="M-00FA_A-0298-10-0000_P-31_R-31" />
+                        <ComObjectRefRef RefId="M-00FA_A-0298-10-0000_O-3_R-4" />
+                      </ParameterBlock>
+                    </when>
+                  </choose>
+                </when>
+              </choose>
+            </Channel>
+          </Dynamic>
+        </ApplicationProgram>
+      </ApplicationPrograms>
+    </Manufacturer>
+  </ManufacturerData>
+</KNX>
