@@ -757,3 +757,60 @@ async fn test_knx_last_apply_recovers_a_lost_reply_across_a_restart() -> anyhow:
     task.abort();
     h.stop().await
 }
+
+/// Issue #321: a value the file stores for a ref the configuration does not
+/// show (the "Wind" threshold while the function is "Helligkeit") is never
+/// written, and the plan says so instead of dropping it silently.
+#[tokio::test]
+async fn test_knx_plan_device_lists_a_value_on_an_unshown_ref_as_ignored() -> anyhow::Result<()> {
+    let h = Harness::start(Duration::from_secs(600)).await?;
+    let app = "M-00FA_A-0321-10-0000";
+    let dir = h.dir.path();
+    std::fs::create_dir_all(dir.join(".bussard/models"))?;
+    std::fs::write(
+        dir.join(format!(".bussard/models/{app}.yaml")),
+        format!(
+            "model_format: 3\nidentity:\n  id: {app}\n  name: branch test app\n  \
+             application_number: 321\n  application_version: 16\n  mask_version: '07B0'\n  \
+             load_procedure_style: ProductProcedure\n  schema_version: '23'\nparameters:\n\
+             - id: {app}_P-1\n  name: Function\n  text: Funktion des Kanals\n  type: !enum\n    \
+             values:\n    - value: 1\n      text: Helligkeit\n    - value: 3\n      text: Wind\n  \
+             default: '1'\n- id: {app}_P-2\n  name: Threshold\n  text: Schwelle\n  type: !int\n    \
+             min: 1\n    max: 1000\n    size: 16\n  default: '200'\nload_procedure:\n- connect\n\
+             - disconnect\nblocks:\n- id: PB-1\n  text: Funktion\n  parameters:\n  - P-1_R-1\n  \
+             - P-2_R-2\n  - P-2_R-5\n  parameter_when:\n    P-2_R-2:\n    - ref: P-1_R-1\n      \
+             test: '1'\n    P-2_R-5:\n    - ref: P-1_R-1\n      test: '3'\n"
+        ),
+    )?;
+    std::fs::write(
+        dir.join("bussard.lock"),
+        format!(
+            "version = 3\n\n[[device]]\naddress = \"1.1.4\"\nproduct = \"TST-1\"\n\
+             application = \"{app}\"\nmask = \"07B0\"\nparameters = [\n  \
+             {{ key = \"funktion-des-kanals\", ref = \"P-1_R-1\", param = \"P-1\" }},\n  \
+             {{ key = \"schwelle\", ref = \"P-2_R-2\", param = \"P-2\" }},\n  \
+             {{ key = \"schwelle@P-2_R-5\", ref = \"P-2_R-5\", param = \"P-2\" }},\n]\n"
+        ),
+    )?;
+    std::fs::write(
+        dir.join("devices").join("1.1.4.toml"),
+        "address = \"1.1.4\"\nname = \"Jalousie Wohnen\"\nproduct = \"TST-1\"\n\n\
+         [parameters]\n\"schwelle@P-2_R-5\" = \"500\"\n\n[links]\n\
+         20.send = \"1/2/0\"\n21.listen = [\"1/2/1\"]\n22.listen = [\"1/2/2\"]\n",
+    )?;
+
+    let plan = h
+        .call("knx_plan_device", json!({"address": "1.1.4"}))
+        .await?;
+    assert_eq!(plan["ok"], true, "plan: {plan}");
+    let line = "`schwelle@P-2_R-5` = 500 ignored: not shown under the current values (needs \
+                Funktion des Kanals = Wind)";
+    let notes: Vec<&str> = plan["notes"]
+        .as_array()
+        .map(|n| n.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(notes.contains(&line), "{plan}");
+    let sentences = plan["sentences"].as_str().unwrap_or_default();
+    assert!(sentences.contains(line), "{sentences}");
+    h.stop().await
+}

@@ -85,6 +85,13 @@ pub fn run(
     // is loaded first because it also says whether a device the keyring does
     // not list is security-activated (issue #189).
     let model = load_model_required(dir)?;
+    // Issue #321: a value the file stores for a parameter the configuration
+    // does not show is not in the image; say so before anything is planned.
+    if let Some(m) = model.as_ref() {
+        for line in bussard_service::params::ignored_override_notes(m, target, dir) {
+            eprintln!("note: {line}");
+        }
+    }
     let activated = crate::secure_key::model_activated(model.as_ref(), target);
     let secure_material = crate::secure_key::resolve_material(target, tool_key_source, activated)?;
     let tool_key = secure_material.tool_key.clone();

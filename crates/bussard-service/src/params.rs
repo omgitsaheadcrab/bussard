@@ -1096,6 +1096,29 @@ pub fn group_object_refusal(target: IndividualAddress, why: &str) -> String {
     )
 }
 
+/// The plan lines of the values the file of `target` stores for parameter
+/// refs the configuration does not show under its current values (issue
+/// #321): the image holds one slot per shown ref, so neither a parameter
+/// push nor a flash writes them. Each says "`key` = value ignored: not shown
+/// under the current values (needs …)", so a stored value that will not be
+/// written is never silent. Empty without the product model's pages.
+pub fn ignored_override_notes(model: &Model, target: IndividualAddress, dir: &Path) -> Vec<String> {
+    let app = model
+        .devices
+        .get(&target)
+        .and_then(|d| d.device.product.as_ref())
+        .and_then(|p| p.application_ref.as_deref());
+    let Some(app) = app else {
+        return Vec::new();
+    };
+    let products = bussard_model::ProductModels::load_apps(dir, [app]);
+    bussard_model::device_view::ignored_overrides(model, &products, target)
+        .unwrap_or_default()
+        .iter()
+        .map(bussard_model::device_view::IgnoredOverride::sentence)
+        .collect()
+}
+
 /// Builds the plan of writing the model to `target`.
 ///
 /// `params` is the parameter read-back, `None` when no product data was at
@@ -1234,6 +1257,7 @@ pub fn build_device_plan(
             }
         },
     }
+    notes.extend(ignored_override_notes(model, target, dir));
     sort_changes(&mut changes);
     let parameters_skipped = notes
         .iter()

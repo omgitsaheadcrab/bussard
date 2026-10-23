@@ -850,6 +850,18 @@ directory or a script from before these changes needs:
 
 ### Fixed
 
+- `knx_set_parameter` stored a value on a parameter ref the configuration
+  does not show, and nothing ever wrote it (#321). On a Meteodata, a value
+  set on the XOR-branch ref of "Eingangsgröße für Eingang 1" while the logic
+  channel was at UND was saved, indexed and listed by `knx_show_device` next
+  to the shown ref, but the image holds one slot per shown ref, so neither
+  the plan nor the flash carried it. Such a set is now refused with the
+  branch condition in words, the current value it tests, and the shown ref
+  to use instead. A bare parameter id (`P-6823`) or the vendor text names
+  the shown ref. `force: true` still stores the value for a branch you switch
+  to later; `knx_show_device` marks it `ignored`, and `knx_plan_device`,
+  `bussard plan`, `bussard apply` and `bussard flash` list it as "ignored:
+  not shown under the current values (needs ...)".
 - `knx_set_parameter` refused `universalkanal-c4-funktion.helligkeitsschwelle`
   on a Theben weather station with the same key listed twice as the choice.
   The page holds the threshold twice, once per branch of "Funktion des

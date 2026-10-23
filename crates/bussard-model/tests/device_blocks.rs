@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use bussard_model::capabilities::{cache_path, capability_lookup};
 use bussard_model::device_view::{
-    device_view, parameter_pages, parameter_visibility, unindexed_parameters,
+    device_view, ignored_overrides, parameter_pages, parameter_visibility, unindexed_parameters,
 };
 use bussard_model::{IndividualAddress, Model, ProductModel, ProductModels};
 
@@ -423,6 +423,54 @@ fn test_parameter_visibility_evaluates_the_conditions_inside_a_page() -> TestRes
     let seen = parameter_visibility(&model, &products, ia()?)?;
     assert_eq!(seen.get("P-12_R-12").map(|v| v.shown), Some(true));
     assert!(parameter_visibility(&model, &ProductModels::default(), ia()?)?.is_empty());
+    Ok(())
+}
+
+/// Issue #321: what an unshown ref needs, the values it tests, and the
+/// stored values that are never written.
+#[test]
+fn test_ignored_overrides_lists_stored_values_on_unshown_refs() -> TestResult {
+    let mut model = model()?;
+    let products = products()?;
+    let seen = parameter_visibility(&model, &products, ia()?)?;
+    let dusk = seen.get("P-12_R-12").ok_or("no P-12_R-12")?;
+    assert_eq!(
+        dusk.needs.as_deref(),
+        Some("Channel function = Brightness sensor 1 .. 100 000 lx")
+    );
+    assert_eq!(
+        dusk.now.as_deref(),
+        Some("Channel function is Temperature sensor")
+    );
+    let b = seen.get("P-21_R-21").ok_or("no P-21_R-21")?;
+    assert_eq!(b.needs.as_deref(), Some("Universal channel B enable = yes"));
+    assert_eq!(seen.get("P-11_R-11").and_then(|v| v.needs.as_deref()), None);
+    assert!(ignored_overrides(&model, &products, ia()?)?.is_empty());
+
+    // A value at the default is no override; another one is ignored.
+    let device = &mut model.devices.get_mut(&ia()?).ok_or("no device")?.device;
+    device.parameters.insert(
+        "dusk-threshold-in-lx@P-12_R-12".to_string(),
+        "10".to_string(),
+    );
+    assert!(ignored_overrides(&model, &products, ia()?)?.is_empty());
+    let device = &mut model.devices.get_mut(&ia()?).ok_or("no device")?.device;
+    device.parameters.insert(
+        "dusk-threshold-in-lx@P-12_R-12".to_string(),
+        "42".to_string(),
+    );
+    let ignored = ignored_overrides(&model, &products, ia()?)?;
+    assert_eq!(ignored.len(), 1, "{ignored:?}");
+    assert_eq!(ignored[0].reference, "P-12_R-12");
+    assert_eq!(ignored[0].value, "42");
+    assert!(
+        ignored[0].sentence().ends_with(
+            "= 42 ignored: not shown under the current values (needs Channel function = \
+             Brightness sensor 1 .. 100 000 lx)"
+        ),
+        "{}",
+        ignored[0].sentence()
+    );
     Ok(())
 }
 
