@@ -194,6 +194,30 @@ pub struct ShowDeviceArgs {
     /// commented lines for what the file does not set yet.
     #[serde(default)]
     pub toml: bool,
+    /// With `channel`: also return `inactive_pages`, the inactive pages and
+    /// channels with what enables each (`enable`, `also_needs`) and the
+    /// objects they would show. Without it a scoped call lists every page in
+    /// one line.
+    #[serde(default)]
+    pub inactive: bool,
+}
+
+/// Arguments for `knx_validate`.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ValidateArgs {
+    /// The least severe diagnostics to return: `"error"`, `"warning"`
+    /// (default: errors and warnings) or `"info"` (everything). `counts`
+    /// always counts all three.
+    #[serde(default)]
+    pub severity: Option<String>,
+    /// Only diagnostics about this device (`"1.1.4"`), or a line when it
+    /// ends with a dot (`"1.1."`).
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Only diagnostics about this group address (`"3/2/0"`), or a range
+    /// when it ends with a slash (`"3/"`).
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 /// Arguments for `knx_describe_device`.
@@ -339,12 +363,18 @@ impl BussardMcp {
         them. With `channel` (a handle like \"a-1\", a page handle, or \"device\" for the \
         device level), that scope's parameters (key, current value, enum choices or range, \
         whether at the vendor default) and objects (key, number, text/function, DPT, flags, \
-        what it sends and listens on); for an inactive page, the ones it would show. This is \
-        what the device can do; knx_get_device is the configured state. With `toml: true` also the paste-ready TOML for \
+        what it sends and listens on); for an inactive page, the ones it would show and its \
+        full enable chain. A scoped call lists the other pages one line each (handle, text, \
+        state, counts); `inactive: true` adds their enable detail as `inactive_pages`. Without \
+        a scope, a page whose enable chain repeats an earlier page's lists only its own switch \
+        plus `also_needs` (the earlier pages to enable first). This is what the device can do; \
+        knx_get_device is the configured state. With `toml: true` also the paste-ready TOML for \
         devices/<address>.toml. Use it before editing a device file: the keys it prints are the \
-        ones the file accepts and knx_set_parameter takes, and `how_to_change` says how to edit \
-        and push them. Without product data it says so, says what to run, and lists what the \
-        lock has."
+        ones the file accepts and knx_set_parameter takes (also as `<page or channel \
+        handle>.<key>`, `key@reference` or the bare reference), and the unscoped response's \
+        `how_to_change` says how to edit and push them (parameters with knx_set_parameter; \
+        push with knx_plan_device then knx_apply_device). Without product data it says so, \
+        says what to run, and lists what the lock has."
     )]
     async fn knx_show_device(
         &self,
@@ -367,21 +397,9 @@ impl BussardMcp {
         let view =
             bussard_model::device_view::device_view(&model, &products, ia, args.channel.as_deref())
                 .map_err(|e| invalid(e.to_string()))?;
-        let mut value = serde_json::to_value(&view).map_err(|e| {
+        let value = tools::show_device_result(view, args.inactive, args.toml).map_err(|e| {
             ErrorData::internal_error(format!("serializing the device view: {e}"), None)
         })?;
-        if let Some(map) = value.as_object_mut() {
-            map.insert(
-                "how_to_change".to_string(),
-                Value::String(crate::guidance::how_to_change(
-                    view.product_model,
-                    &view.notes,
-                )),
-            );
-            if args.toml {
-                map.insert("toml".to_string(), Value::String(view.render_toml()));
-            }
-        }
         ok(value)
     }
 
@@ -546,9 +564,25 @@ impl BussardMcp {
 
     /// `knx_validate`.
     #[tool(
-        description = "Run the bussard model validator and return every diagnostic as JSON (code, severity, message, location) plus counts of errors/warnings/infos. Use this to check whether the model (bussard.toml, groups.toml, devices/*.toml, bussard.lock) is internally consistent, and, with the server's keyring, whether security-activated devices have a tool key and the groups' secure flags match the keyring's group keys (addresses only, never a key)."
+        description = "Run the bussard model validator and return its diagnostics as JSON (code, severity, message, location). By default only errors and warnings; `severity: \"info\"` adds the infos (unlinked objects and similar notes), `severity: \"error\"` keeps errors only, and `address` (\"1.1.4\", or \"1.1.\" for a line) or `group` (\"3/2/0\", or \"3/\" for a range) narrow it to one device or group. `counts` always counts every error, warning and info in the model, and `note` says what the filter left out. Use this to check whether the model (bussard.toml, groups.toml, devices/*.toml, bussard.lock) is internally consistent, and, with the server's keyring, whether security-activated devices have a tool key and the groups' secure flags match the keyring's group keys (addresses only, never a key)."
     )]
-    async fn knx_validate(&self) -> Result<CallToolResult, ErrorData> {
+    async fn knx_validate(
+        &self,
+        Parameters(args): Parameters<ValidateArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let severity = match args.severity.as_deref() {
+            None => None,
+            Some(text) => Some(tools::parse_severity(text).ok_or_else(|| {
+                invalid(format!(
+                    "severity {text:?} is not one of \"error\", \"warning\", \"info\""
+                ))
+            })?),
+        };
+        let filter = tools::ValidateFilter {
+            severity,
+            address: args.address,
+            group: args.group,
+        };
         let model = self.state.model.current();
         // The keyring rules (issue #205) against the server's keyring: never
         // prompts; without BUSSARD_KEYRING_PASSWORD one info line says the
@@ -564,7 +598,7 @@ impl BussardMcp {
             &model,
             facts.as_ref(),
         ));
-        ok(tools::validate_result_with(&model, extra))
+        ok(tools::validate_filtered(&model, extra, &filter))
     }
 
     /// `knx_read_group` (omitted in passive mode).

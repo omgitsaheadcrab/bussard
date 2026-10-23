@@ -168,6 +168,11 @@ pub struct Inactive {
     pub would_show: Vec<ShownObject>,
     /// How the change reaches the device.
     pub needs: String,
+    /// The handles of earlier inactive pages or channels whose `enable`
+    /// steps this one needs too, when [`DeviceView::collapse_enable_chains`]
+    /// left only the steps of its own in `enable`. Enable those first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub also_needs: Vec<String>,
 }
 
 /// One ETS parameter page (`<ParameterBlock>`) of a channel-less
@@ -657,6 +662,7 @@ impl<'a> Pages<'a> {
             enable,
             would_show,
             needs,
+            also_needs: Vec::new(),
         }
     }
 
@@ -1225,6 +1231,108 @@ pub fn device_view(
     })
 }
 
+/// Leaves in each inactive row of `rows` only the `enable` steps of its own
+/// when an earlier inactive row's steps are a strict subset of them, and
+/// names that row and the ones it needs in turn in `also_needs`.
+fn collapse_rows(rows: &mut [BlockRow]) {
+    let full: Vec<Option<HashSet<String>>> = rows
+        .iter()
+        .map(|r| {
+            r.inactive
+                .as_ref()
+                .map(|i| i.enable.iter().map(|e| e.reference.clone()).collect())
+        })
+        .collect();
+    for i in 0..rows.len() {
+        let Some(mine) = &full[i] else { continue };
+        // The earlier row with the most steps that this row repeats.
+        let host = (0..i)
+            .filter(|j| {
+                full[*j]
+                    .as_ref()
+                    .is_some_and(|t| !t.is_empty() && t.len() < mine.len() && t.is_subset(mine))
+            })
+            .max_by_key(|j| full[*j].as_ref().map_or(0, HashSet::len));
+        let Some(j) = host else { continue };
+        let mut also = rows[j]
+            .inactive
+            .as_ref()
+            .map(|h| h.also_needs.clone())
+            .unwrap_or_default();
+        also.push(rows[j].handle.clone());
+        let theirs = full[j].clone().unwrap_or_default();
+        if let Some(inactive) = rows[i].inactive.as_mut() {
+            inactive.enable.retain(|e| !theirs.contains(&e.reference));
+            inactive.also_needs = also;
+        }
+    }
+}
+
+impl DeviceView {
+    /// Shortens the `enable` chains of inactive pages and channels that only
+    /// repeat an earlier one's (Theben's universal channel C10 behind C5 ..
+    /// C9): such a row keeps the steps of its own and names the earlier rows
+    /// in `also_needs`. A scope's own `inactive` keeps its full chain.
+    pub fn collapse_enable_chains(&mut self) {
+        collapse_rows(&mut self.blocks);
+        collapse_rows(&mut self.inactive_channels);
+    }
+}
+
+/// The ETS page handle (as [`DeviceView::blocks`] lists it) each parameter
+/// ref of `address` sits on, keyed by the app-relative `ParameterRef` id.
+/// Empty for a device whose view lists no pages (one with channels of its
+/// own, or without a product model).
+pub fn parameter_pages(
+    model: &Model,
+    products: &ProductModels,
+    address: IndividualAddress,
+) -> Result<BTreeMap<String, String>, ViewError> {
+    let device = &model
+        .devices
+        .get(&address)
+        .ok_or(ViewError::NoDevice(address))?
+        .device;
+    let mut out = BTreeMap::new();
+    let product = device
+        .product
+        .as_ref()
+        .and_then(|p| p.application_ref.as_deref())
+        .and_then(|a| products.get(a))
+        .filter(|p| !p.blocks.is_empty());
+    let Some(product) = product else {
+        return Ok(out);
+    };
+    if device.channels.len() > 1 {
+        return Ok(out);
+    }
+    let params = parameter_entries(device);
+    let pg = Pages::new(device, product, &params);
+    let taken: Vec<String> = device
+        .channels
+        .keys()
+        .map(|id| device.channel_handle(id))
+        .collect();
+    let listed = pg.listed(&taken);
+    let mut handle_of: HashMap<usize, &str> = HashMap::new();
+    for l in &listed {
+        for m in &l.members {
+            handle_of.entry(*m).or_insert(l.handle.as_str());
+        }
+    }
+    for (reference, block) in &pg.param_block {
+        let mut at = Some(*block);
+        while let Some(i) = at {
+            if let Some(handle) = handle_of.get(&i) {
+                out.insert((*reference).to_string(), (*handle).to_string());
+                break;
+            }
+            at = pg.parents[i];
+        }
+    }
+    Ok(out)
+}
+
 /// Pads `rows` into columns under `header`.
 fn table(header: &[&str], rows: &[Vec<String>]) -> String {
     let rows: Vec<Vec<String>> = rows
@@ -1323,6 +1431,9 @@ fn inactive_line(inactive: &Inactive) -> String {
     } else {
         format!("set {}", steps.join(", then "))
     };
+    if !inactive.also_needs.is_empty() {
+        line = format!("after {}: {line}", inactive.also_needs.join(", "));
+    }
     if !inactive.would_show.is_empty() {
         line.push_str(&format!("; shows {} object(s)", inactive.would_show.len()));
     }

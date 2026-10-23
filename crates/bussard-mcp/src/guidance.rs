@@ -372,9 +372,9 @@ pub fn how_to_change(product_model: bool, notes: &[String]) -> String {
                 the links and the parameter values that differ";
     if product_model {
         format!(
-            "parameters: knx_set_parameter with the key shown (add `channel` when the key \
-             repeats across channels) and a value from its choices or range; links: \
-             knx_add_link/knx_remove_link with the object number; {push}"
+            "parameters: knx_set_parameter with the key shown and a value from its choices or \
+             range; links: knx_add_link/knx_remove_link with the object number; {push}. {}.",
+            crate::param_keys::KEY_GRAMMAR
         )
     } else {
         let why = notes

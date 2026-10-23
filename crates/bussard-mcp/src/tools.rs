@@ -373,28 +373,197 @@ pub fn recent_telegrams(
     out
 }
 
+/// One page or channel of a scoped `knx_show_device` in one line: handle,
+/// text, state and counts.
+fn compact_row(row: &bussard_model::device_view::BlockRow) -> String {
+    let state = if row.active { "active" } else { "inactive" };
+    let text = row
+        .text
+        .as_deref()
+        .map(|t| format!(" {t:?}"))
+        .unwrap_or_default();
+    format!(
+        "{}{text}: {state}, {} parameters, {} objects",
+        row.handle, row.parameters, row.objects
+    )
+}
+
+/// `knx_show_device`'s result for `view` (issue #304). Without a scope: the
+/// view with the enable chains that repeat an earlier page's collapsed to
+/// `also_needs`, and `how_to_change`. With one: the scope in detail, the
+/// pages and inactive channels one line each, their `inactive` detail only
+/// with `inactive` (as `inactive_pages`), and no `how_to_change` (the tool
+/// description carries it). `toml` adds the paste-ready snippet.
+pub fn show_device_result(
+    mut view: bussard_model::device_view::DeviceView,
+    inactive: bool,
+    toml: bool,
+) -> Result<Value, serde_json::Error> {
+    let snippet = toml.then(|| view.render_toml());
+    view.collapse_enable_chains();
+    let scoped = view.scope.is_some();
+    let mut value = if scoped {
+        let blocks = std::mem::take(&mut view.blocks);
+        let channels = std::mem::take(&mut view.inactive_channels);
+        let mut value = serde_json::to_value(&view)?;
+        if let Some(map) = value.as_object_mut() {
+            if !blocks.is_empty() {
+                map.insert(
+                    "blocks".to_string(),
+                    json!(blocks.iter().map(compact_row).collect::<Vec<_>>()),
+                );
+            }
+            if !channels.is_empty() {
+                map.insert(
+                    "inactive_channels".to_string(),
+                    json!(channels.iter().map(compact_row).collect::<Vec<_>>()),
+                );
+            }
+            let detail: Vec<_> = blocks
+                .iter()
+                .chain(&channels)
+                .filter(|r| !r.active)
+                .collect();
+            if inactive && !detail.is_empty() {
+                map.insert("inactive_pages".to_string(), serde_json::to_value(detail)?);
+            }
+        }
+        value
+    } else {
+        let mut value = serde_json::to_value(&view)?;
+        if let Some(map) = value.as_object_mut() {
+            map.insert(
+                "how_to_change".to_string(),
+                Value::String(crate::guidance::how_to_change(
+                    view.product_model,
+                    &view.notes,
+                )),
+            );
+        }
+        value
+    };
+    if let (Some(map), Some(snippet)) = (value.as_object_mut(), snippet) {
+        map.insert("toml".to_string(), Value::String(snippet));
+    }
+    Ok(value)
+}
+
+/// Which diagnostics `knx_validate` returns (issue #304).
+#[derive(Debug, Clone, Default)]
+pub struct ValidateFilter {
+    /// The least severe diagnostic returned; `None` means warnings (errors
+    /// and warnings).
+    pub severity: Option<bussard_model::Severity>,
+    /// Only diagnostics about this device (`"1.1.4"`), or a line when it
+    /// ends with a dot (`"1.1."`).
+    pub address: Option<String>,
+    /// Only diagnostics about this group address (`"3/2/0"`), or a range
+    /// when it ends with a slash (`"3/"`).
+    pub group: Option<String>,
+}
+
+/// Parses `knx_validate`'s `severity` argument.
+pub fn parse_severity(text: &str) -> Option<bussard_model::Severity> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "error" | "errors" => Some(bussard_model::Severity::Error),
+        "warning" | "warnings" => Some(bussard_model::Severity::Warning),
+        "info" | "infos" => Some(bussard_model::Severity::Info),
+        _ => None,
+    }
+}
+
+/// How severe `s` is, most severe highest.
+fn rank(s: bussard_model::Severity) -> u8 {
+    match s {
+        bussard_model::Severity::Error => 2,
+        bussard_model::Severity::Warning => 1,
+        bussard_model::Severity::Info => 0,
+    }
+}
+
+/// The address-like tokens of `text`: runs of digits and `sep`, trimmed of
+/// `sep`, that hold `sep` exactly `parts - 1` times.
+fn address_tokens(text: &str, sep: char, parts: usize) -> Vec<&str> {
+    text.split(|c: char| !(c.is_ascii_digit() || c == sep))
+        .map(|t| t.trim_matches(sep))
+        .filter(|t| t.matches(sep).count() + 1 == parts)
+        .collect()
+}
+
+/// Whether `wanted` (exact, or a prefix when it ends with `sep`) names one
+/// of the addresses of kind (`sep`, `parts`) the diagnostic's location
+/// mentions, else, when the location mentions none, its message.
+fn mentions(d: &bussard_model::Diagnostic, wanted: &str, sep: char, parts: usize) -> bool {
+    let wanted = wanted.trim();
+    let hit = |t: &&str| {
+        if wanted.ends_with(sep) {
+            t.starts_with(wanted)
+        } else {
+            *t == wanted
+        }
+    };
+    let in_location = address_tokens(&d.location, sep, parts);
+    if in_location.is_empty() {
+        address_tokens(&d.message, sep, parts).iter().any(hit)
+    } else {
+        in_location.iter().any(hit)
+    }
+}
+
 /// `knx_validate`: diagnostics as JSON plus counts.
 pub fn validate_result(model: &Model) -> Value {
     validate_result_with(model, Vec::new())
 }
 
 /// [`validate_result`] with `extra` diagnostics merged in and sorted like
-/// the model's own (the keyring rules of issue #205).
+/// the model's own (the keyring rules of issue #205). Lists every
+/// diagnostic; `knx_validate` uses [`validate_filtered`].
 pub fn validate_result_with(model: &Model, extra: Vec<bussard_model::Diagnostic>) -> Value {
+    let all = ValidateFilter {
+        severity: Some(bussard_model::Severity::Info),
+        ..ValidateFilter::default()
+    };
+    validate_filtered(model, extra, &all)
+}
+
+/// `knx_validate` (issue #304): the diagnostics `filter` selects (by default
+/// errors and warnings), with `counts` per severity over the whole model,
+/// `shown` and a `note` naming what the filter left out.
+pub fn validate_filtered(
+    model: &Model,
+    extra: Vec<bussard_model::Diagnostic>,
+    filter: &ValidateFilter,
+) -> Value {
     let mut diags = bussard_model::validate(model);
     diags.extend(extra);
     diags.sort_by(|a, b| a.location.cmp(&b.location).then(a.code.cmp(b.code)));
     let mut errors = 0usize;
     let mut warnings = 0usize;
     let mut infos = 0usize;
+    for d in &diags {
+        match d.severity {
+            bussard_model::Severity::Error => errors += 1,
+            bussard_model::Severity::Warning => warnings += 1,
+            bussard_model::Severity::Info => infos += 1,
+        }
+    }
+    let floor = rank(filter.severity.unwrap_or(bussard_model::Severity::Warning));
     let items: Vec<Value> = diags
         .iter()
+        .filter(|d| rank(d.severity) >= floor)
+        .filter(|d| {
+            filter
+                .address
+                .as_deref()
+                .is_none_or(|a| mentions(d, a, '.', 3))
+        })
+        .filter(|d| {
+            filter
+                .group
+                .as_deref()
+                .is_none_or(|g| mentions(d, g, '/', 3) || mentions(d, g, '/', 2))
+        })
         .map(|d| {
-            match d.severity {
-                bussard_model::Severity::Error => errors += 1,
-                bussard_model::Severity::Warning => warnings += 1,
-                bussard_model::Severity::Info => infos += 1,
-            }
             json!({
                 "code": d.code,
                 "severity": d.severity.to_string(),
@@ -403,8 +572,8 @@ pub fn validate_result_with(model: &Model, extra: Vec<bussard_model::Diagnostic>
             })
         })
         .collect();
-
-    json!({
+    let shown = items.len();
+    let mut out = json!({
         "diagnostics": items,
         "counts": {
             "errors": errors,
@@ -412,8 +581,29 @@ pub fn validate_result_with(model: &Model, extra: Vec<bussard_model::Diagnostic>
             "infos": infos,
             "total": diags.len(),
         },
+        "shown": shown,
         "ok": errors == 0,
-    })
+    });
+    if shown < diags.len()
+        && let Some(map) = out.as_object_mut()
+    {
+        let mut why = Vec::new();
+        if floor > 0 {
+            why.push("pass `severity: \"info\"` for the infos".to_string());
+        }
+        if filter.address.is_some() || filter.group.is_some() {
+            why.push("drop `address`/`group` for the whole model".to_string());
+        }
+        map.insert(
+            "note".to_string(),
+            json!(format!(
+                "{shown} of {} diagnostics shown; `counts` covers all of them; {}",
+                diags.len(),
+                why.join(", ")
+            )),
+        );
+    }
+    out
 }
 
 /// Decodes a raw payload against a GA's DPT into a display string + typed JSON,
@@ -777,6 +967,111 @@ mod tests {
         // A well-formed fixture: `ok` reflects zero errors.
         let errors = v["counts"]["errors"].as_u64().ok_or("not a u64")?;
         assert_eq!(v["ok"], errors == 0);
+        Ok(())
+    }
+
+    fn diag(
+        code: &'static str,
+        severity: bussard_model::Severity,
+        location: &str,
+    ) -> bussard_model::Diagnostic {
+        bussard_model::Diagnostic {
+            code,
+            severity,
+            message: format!("{code} test"),
+            location: location.to_string(),
+        }
+    }
+
+    fn codes(v: &Value) -> Vec<String> {
+        v["diagnostics"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|d| d["code"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn test_validate_filtered_default_excludes_infos_but_counts_them() -> TestResult {
+        use bussard_model::Severity;
+        let m = model()?;
+        let extra = || {
+            vec![
+                diag("I909", Severity::Info, "devices/1.1.4.toml object 3"),
+                diag("W909", Severity::Warning, "groups.\"7/6/5\""),
+                diag("E909", Severity::Error, "links.\"1.1.9\"[0]"),
+            ]
+        };
+        let all = validate_filtered(
+            &m,
+            extra(),
+            &ValidateFilter {
+                severity: Some(Severity::Info),
+                ..ValidateFilter::default()
+            },
+        );
+        let v = validate_filtered(&m, extra(), &ValidateFilter::default());
+        assert!(
+            v["diagnostics"]
+                .as_array()
+                .is_some_and(|a| a.iter().all(|d| d["severity"] != "info")),
+            "{v}"
+        );
+        assert_eq!(v["counts"], all["counts"], "{v}");
+        assert!(v["counts"]["infos"].as_u64().is_some_and(|n| n >= 1), "{v}");
+        assert!(codes(&all).contains(&"I909".to_string()), "{all}");
+        assert!(codes(&v).contains(&"W909".to_string()), "{v}");
+        assert!(
+            v["note"].as_str().is_some_and(|n| n.contains("severity")),
+            "{v}"
+        );
+        assert_eq!(v["ok"], false);
+
+        let errors = validate_filtered(
+            &m,
+            extra(),
+            &ValidateFilter {
+                severity: parse_severity("error"),
+                ..ValidateFilter::default()
+            },
+        );
+        assert!(codes(&errors).contains(&"E909".to_string()), "{errors}");
+        assert!(!codes(&errors).contains(&"W909".to_string()), "{errors}");
+
+        let device = validate_filtered(
+            &m,
+            extra(),
+            &ValidateFilter {
+                severity: Some(Severity::Info),
+                address: Some("1.1.4".to_string()),
+                ..ValidateFilter::default()
+            },
+        );
+        assert!(codes(&device).contains(&"I909".to_string()), "{device}");
+        assert!(!codes(&device).contains(&"E909".to_string()), "{device}");
+        let line = validate_filtered(
+            &m,
+            extra(),
+            &ValidateFilter {
+                severity: Some(Severity::Info),
+                address: Some("1.1.".to_string()),
+                ..ValidateFilter::default()
+            },
+        );
+        assert!(codes(&line).contains(&"E909".to_string()), "{line}");
+
+        let group = validate_filtered(
+            &m,
+            extra(),
+            &ValidateFilter {
+                group: Some("7/".to_string()),
+                ..ValidateFilter::default()
+            },
+        );
+        assert_eq!(codes(&group), ["W909"], "{group}");
         Ok(())
     }
 

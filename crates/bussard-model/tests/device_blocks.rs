@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use bussard_model::capabilities::{cache_path, capability_lookup};
-use bussard_model::device_view::device_view;
+use bussard_model::device_view::{device_view, parameter_pages};
 use bussard_model::{IndividualAddress, Model, ProductModel, ProductModels};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -355,5 +355,50 @@ fn test_capability_lookup_caches_the_model_and_rebuilds_a_stale_cache() -> TestR
         .set_modified(future)?;
     let hits = capability_lookup(&model, scratch.path(), "anemometer", 50);
     assert_eq!(hits.len(), 3, "{hits:?}");
+    Ok(())
+}
+
+#[test]
+fn test_collapse_enable_chains_keeps_the_own_switch() -> TestResult {
+    let mut view = device_view(&model()?, &products()?, ia()?, None)?;
+    view.collapse_enable_chains();
+    let b = view.blocks[2].inactive.as_ref().ok_or("B is inactive")?;
+    assert_eq!(b.enable.len(), 1);
+    assert!(b.also_needs.is_empty());
+    let c = view.blocks[3].inactive.as_ref().ok_or("C is inactive")?;
+    let refs: Vec<&str> = c.enable.iter().map(|e| e.reference.as_str()).collect();
+    assert_eq!(refs, ["P-3_R-3"]);
+    assert_eq!(c.also_needs, ["universal-channel-b-function"]);
+    assert!(
+        view.render_table()
+            .contains("after universal-channel-b-function: set"),
+        "{}",
+        view.render_table()
+    );
+    // A scope keeps its full chain.
+    let mut scoped = device_view(
+        &model()?,
+        &products()?,
+        ia()?,
+        Some("universal-channel-c-function"),
+    )?;
+    scoped.collapse_enable_chains();
+    let scope = scoped.scope.as_ref().ok_or("no scope")?;
+    assert_eq!(scope.inactive.as_ref().map(|i| i.enable.len()), Some(2));
+    Ok(())
+}
+
+#[test]
+fn test_parameter_pages_maps_refs_to_page_handles() -> TestResult {
+    let pages = parameter_pages(&model()?, &products()?, ia()?)?;
+    assert_eq!(
+        pages.get("P-11_R-11").map(String::as_str),
+        Some("universal-channel-a-function")
+    );
+    assert_eq!(pages.get("P-1_R-1").map(String::as_str), Some("general"));
+    assert_eq!(
+        parameter_pages(&model()?, &ProductModels::default(), ia()?)?.len(),
+        0
+    );
     Ok(())
 }
