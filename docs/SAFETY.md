@@ -740,9 +740,22 @@ from the model, written by the same code the CLI runs (issue #274). It is off by
    `protected = true` GA is refused. There is no override over MCP.
 6. **Identity.** The device's application and mask are compared with what
    `bussard.lock` pins, as `bussard apply` does. A device that drifted is
-   refused with the `bussard flash` it needs, and so is a parameter change
-   that shows or hides a com-object (the group-object table changes, which a
-   parameter download does not rewrite).
+   refused with the `bussard flash` it needs.
+7. **A parameter that shows or hides a com-object** (issue #303) changes the
+   group-object table, which a parameter download does not rewrite. A
+   parameter that shows or hides com-objects is pushed by the same
+   knx_plan_device / knx_apply_device pair; the plan says `method: flash`,
+   the device restarts and is offline for the stated time (30 to 50 s). The
+   plan lists the com-objects that appear or disappear, the table sizes, the
+   parameter backup and the pinned archive (`product_sha256`), and its
+   question asks to flash the device, so the human's yes is a yes to the
+   flash. The flash is the one `bussard flash <ia> --yes` writes, built by the
+   same code from the same inputs, so the offline oracle covers it. It is
+   refused without an archive pinned in `bussard.lock`, for a device that
+   carries another application or whose load state cannot be read, and on
+   every gate above. The parameter memory is backed up to
+   `captures/backups/parameters/` before the download, where
+   `knx_restore_parameters` reads it.
 
 An apply then runs exactly the CLI rails: the pre-apply backups to
 `captures/backups/` (the tables, and the parameter memory when parameters
@@ -751,7 +764,8 @@ change; no backup, no write), a history snapshot
 line in `bussard history`), the table write when a link changes, then the
 parameter-only download of the differing octets, each verified by reading
 back. The result carries the verify outcome, what was written and the backup
-paths. One device per call; `flash` and `apply --line` stay CLI-only.
+paths. One device per call; `apply --line`, and a `flash` that loads a new
+application, stay CLI-only.
 
 **The apply job (issue #289).** A client bridge may cut a tool call at 60 s,
 which a secured apply with a restart and a read-back exceeds; the write then

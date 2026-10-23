@@ -33,13 +33,14 @@ use std::process::ExitCode;
 use anyhow::{Context, bail};
 use bussard_download::{
     CurrentMemory, FlashPlan, FlashStep, Freshness, ParamPlan, ParamValue, assess_freshness,
-    param_plan, plan_flash_with_object_flags, probe_resident_state,
-    read_current_parameter_memory_with_objects, select_application, trace,
+    param_plan, probe_resident_state, read_current_parameter_memory_with_objects,
+    select_application, trace,
 };
 use bussard_mgmt::load::WriteError;
 use bussard_mgmt::{Layer4Connection, LeaseChannel, MaskProfile, MgmtError};
 use bussard_model::IndividualAddress;
 use bussard_prod::{AppSelection, ApplicationProgram, ProductData};
+use bussard_service::flash::FlashInputs;
 use bussard_service::{
     Authorize, BusService, FactsSource, L4Options, Management, ServiceError, SourcePolicy,
 };
@@ -215,16 +216,27 @@ pub fn run(
     // the flash engine expects (the #46 contract: keys are `<slug>@<ref-id>`; the
     // part after `@` is the ETS-stable identity). The model is also the source of
     // the connection config.
-    let overrides_map = collect_parameter_overrides(model.as_ref(), target);
     // Module-instance base offsets persisted by the importer (issue #48): the
     // keys are module-instance selectors, byte-identical to what
     // compute_parameter_image expects, so per-channel parameter overrides place
     // at their real per-instance offsets.
-    let base_offsets = model
-        .as_ref()
-        .and_then(|m| m.devices.get(&target))
-        .map(|d| d.device.module_bases.clone())
-        .unwrap_or_default();
+    // The plan inputs that do not depend on the device: the master-template
+    // `Load` procedure for this app's mask, if the archive shipped a
+    // `knx_master.xml` (a merged application, e.g. KNX Virtual DA.tp, only
+    // carries its own app-segment blocks; the load-control ops for the table
+    // objects obj1/obj2/obj3 live in the template and are spliced in), and the
+    // computed table images (obj1 address, obj2 association, obj3 group-object)
+    // from the model links. A merged app's template writes these objects; a
+    // self-contained (thelsing) app's does not, so an empty map simply leaves
+    // the single-object flash untouched. The MCP tier's flash builds its image
+    // from the same inputs (issue #303).
+    let (inputs, malformed) =
+        FlashInputs::from_model(&product_data, app, address, model.as_ref(), target);
+    for warning in malformed {
+        eprintln!("{warning}");
+    }
+    let overrides_map = inputs.overrides();
+    let base_offsets = inputs.base_offsets();
 
     // `--dry-run` (the offline conformance oracle, #89): plan against the
     // application's own mask and stop. No gateway is resolved, no connection is
@@ -238,12 +250,8 @@ pub fn run(
         }
         return dry_run(
             target,
-            address,
-            &product_data,
-            app,
+            &inputs,
             model.as_ref(),
-            &overrides_map,
-            &base_offsets,
             dry.dump_images.as_deref(),
             no_factory_reset,
             parameters_only,
@@ -294,41 +302,15 @@ pub fn run(
     // `BusSession` closes the tunnel if the check refuses.
     let source = runtime.block_on(service.checked_source(overrides.skip_address_check))?;
 
-    // The plan inputs that do not depend on the device: the master-template
-    // `Load` procedure for this app's mask, if the archive shipped a
-    // `knx_master.xml` (a merged application, e.g. KNX Virtual DA.tp, only
-    // carries its own app-segment blocks; the load-control ops for the table
-    // objects obj1/obj2/obj3 live in the template and are spliced in), and the
-    // computed table images (obj1 address, obj2 association, obj3 group-object)
-    // from the model links. A merged app's template writes these objects; a
-    // self-contained (thelsing) app's does not, so an empty map simply leaves
-    // the single-object flash untouched. Computed before the pre-flight so the
-    // plan can be built on its connection as soon as the mask is known.
-    let template_ops = bussard_download::template_ops_for(&product_data, app);
-    let table_images =
-        bussard_download::build_table_images(model.as_ref(), target, app, &overrides_map);
-    let object_flags = bussard_download::linked_object_flags(model.as_ref(), target);
-    let plan_for_mask = |mask: u16| {
-        plan_flash_with_object_flags(
-            app,
-            address,
-            mask,
-            &overrides_map,
-            &base_offsets,
-            template_ops.as_deref(),
-            &table_images,
-            &object_flags,
-        )
-    };
+    // The plan is built on the pre-flight connection as soon as the mask is
+    // known.
+    let plan_for_mask = |mask: u16| inputs.plan(mask);
     // The plan for the mask the application declares, which is what a
     // matching device reports: built before the device connection opens, so
     // planning a large application never holds an idle Layer-4 connection
     // (a device drops one after 6 s of silence). A device reporting another
     // (compatible) mask is planned again once the mask is known.
-    let declared_mask = app
-        .mask_version
-        .as_deref()
-        .and_then(|m| u16::from_str_radix(m.trim(), 16).ok());
+    let declared_mask = inputs.declared_mask();
     let precomputed = declared_mask.map(|mask| (mask, plan_for_mask(mask)));
 
     // Phase A (read-only): read the device descriptor, probe what is already
@@ -605,8 +587,8 @@ pub fn run(
             json: output.json,
             app,
             plan: &plan,
-            overrides: &overrides_map,
-            base_offsets: &base_offsets,
+            overrides: overrides_map,
+            base_offsets,
             resident: resident.as_ref(),
             preread,
             facts,
@@ -649,22 +631,16 @@ pub fn run(
             reason: "the pre-flight probe did not run".to_string(),
         },
     };
+    // The factory reset the verdict asks for, then the security object of a
+    // secured download (issue #156): the shaping the MCP tier's flash shares
+    // (issue #303).
     let mut plan = plan;
-    if matches!(
-        freshness,
-        Freshness::Resident { .. } | Freshness::Unknown { .. }
-    ) {
-        plan.require_factory_reset();
-    }
-    if no_factory_reset {
-        plan.skip_factory_reset();
-    }
-    // A secured download also programs the security object (issue #156).
-    let written_senders = match add_security_steps(
+    let written_senders = match inputs.finish(
         &mut plan,
+        Some(&freshness),
+        no_factory_reset,
         model.as_ref(),
         target,
-        &table_images,
         &secure_material,
         &extra_senders,
     ) {
@@ -696,7 +672,7 @@ pub fn run(
             ..Default::default()
         }
     } else {
-        param_plan(app, &overrides_map, &base_offsets, &current_params)
+        param_plan(app, overrides_map, base_offsets, &current_params)
     };
     if skipped_for_force {
         // Replaces the "could not be read" note: nothing was attempted.
@@ -711,7 +687,7 @@ pub fn run(
             target,
             device_mask,
             &plan,
-            &overrides_map,
+            overrides_map,
             &params,
             output.verbose,
         );
@@ -765,12 +741,7 @@ pub fn run(
     //
     // A factory reset erases every object first, so nothing resident is left to
     // match: the differential download only applies with `--no-factory-reset`.
-    let skip_unchanged = !full
-        && !plan.has_factory_reset()
-        && matches!(
-            freshness,
-            Freshness::Fresh | Freshness::SameApplication { .. }
-        );
+    let skip_unchanged = bussard_service::flash::skip_unchanged(full, &plan, &freshness);
     if plan.has_factory_reset() {
         eprintln!(
             "factory reset: the device's application, parameters and links are erased \
@@ -785,11 +756,7 @@ pub fn run(
              skipped (pass --full to re-stream everything)"
         );
     }
-    let options = bussard_download::FlashOptions {
-        bcu_key,
-        verify_after_restart: true,
-        skip_matching_mcb: skip_unchanged,
-    };
+    let options = bussard_service::flash::flash_options(bcu_key, full, &plan, &freshness);
     // The same tunnel phase A used: the pre-flight's L4 session and its bus lease
     // are both released by now, so the write phase simply takes the lease again.
     let restart_started = std::cell::Cell::new(None);
@@ -872,12 +839,8 @@ pub fn run(
 #[allow(clippy::too_many_arguments)] // the planner's inputs, passed through 1:1
 fn dry_run(
     target: IndividualAddress,
-    address: &str,
-    product_data: &ProductData,
-    app: &ApplicationProgram,
+    inputs: &FlashInputs<'_>,
     model: Option<&bussard_model::Model>,
-    overrides_map: &BTreeMap<String, String>,
-    base_offsets: &BTreeMap<String, u32>,
     dump_images: Option<&Path>,
     no_factory_reset: bool,
     parameters_only: bool,
@@ -887,30 +850,16 @@ fn dry_run(
 ) -> anyhow::Result<ExitCode> {
     // No device to read the descriptor from: the plan is checked against the
     // mask the application declares, which is what a matching device reports.
-    let Some(device_mask) = app
-        .mask_version
-        .as_deref()
-        .and_then(|m| u16::from_str_radix(m.trim(), 16).ok())
-    else {
+    let app = inputs.app();
+    let Some(device_mask) = inputs.declared_mask() else {
         eprintln!(
             "cannot plan offline: application program {} declares no usable mask version",
             app.id
         );
         return Ok(ExitCode::FAILURE);
     };
-    let template_ops = bussard_download::template_ops_for(product_data, app);
-    let table_images = bussard_download::build_table_images(model, target, app, overrides_map);
-    let object_flags = bussard_download::linked_object_flags(model, target);
-    let plan = match plan_flash_with_object_flags(
-        app,
-        address,
-        device_mask,
-        overrides_map,
-        base_offsets,
-        template_ops.as_deref(),
-        &table_images,
-        &object_flags,
-    ) {
+    let (overrides_map, base_offsets) = (inputs.overrides(), inputs.base_offsets());
+    let plan = match inputs.plan(device_mask) {
         Ok(plan) => plan,
         Err(err) => {
             eprintln!("cannot flash: {err}");
@@ -921,20 +870,13 @@ fn dry_run(
     // own factory reset (a sparse, filled-segment download) shows, unless the
     // operator waived it.
     let mut plan = plan;
-    if no_factory_reset {
-        plan.skip_factory_reset();
-    }
+    bussard_service::flash::apply_freshness(&mut plan, None, no_factory_reset);
     if parameters_only {
         return crate::flash_params::dry_run(target, &plan, output.json);
     }
-    if let Err(err) = add_security_steps(
-        &mut plan,
-        model,
-        target,
-        &table_images,
-        secure_material,
-        extra_senders,
-    ) {
+    if let Err(err) =
+        inputs.add_security_steps(&mut plan, model, target, secure_material, extra_senders)
+    {
         eprintln!("cannot flash: {err}");
         return Ok(ExitCode::FAILURE);
     }
@@ -960,85 +902,17 @@ fn dry_run(
         );
     }
     if let Some(dir) = dump_images {
-        crate::flash_dump::write_dump(dir, &target.to_string(), device_mask, &plan, &table_images)?;
+        crate::flash_dump::write_dump(
+            dir,
+            &target.to_string(),
+            device_mask,
+            &plan,
+            inputs.table_images(),
+        )?;
         eprintln!("dry run: images written to {}", dir.display());
     }
     eprintln!("dry run: no connection opened, nothing written.");
     Ok(ExitCode::SUCCESS)
-}
-
-/// Adds the KNX Data Secure security-object steps to a full flash over a
-/// secured connection (issue #156): the group key table from the keyring's keys
-/// for the GAs in the address table this flash writes, and the group-object
-/// security flags sized to the group-object table it writes, and the security
-/// individual address table entries of the secured senders it receives from
-/// (issue #181; `extra_senders` adds `--secure-sender` and the tunnelling
-/// addresses `admit_tunnel_senders` admits, issue #297). A plain flash (no
-/// tool key) is left untouched.
-fn add_security_steps(
-    plan: &mut bussard_download::FlashPlan,
-    model: Option<&bussard_model::Model>,
-    target: IndividualAddress,
-    table_images: &BTreeMap<u32, Vec<u8>>,
-    material: &crate::secure_key::SecureMaterial,
-    extra_senders: &[IndividualAddress],
-) -> Result<Option<Vec<bussard_download::SecureSenderEntry>>, bussard_download::SecurityPlanError> {
-    if material.tool_key.is_none() || plan.is_sys7() || plan.has_security_program() {
-        return Ok(None);
-    }
-    let empty = std::collections::HashMap::new();
-    let group_keys = material.group_keys.as_ref().unwrap_or(&empty);
-    let links: &[bussard_model::schema::Link] = model
-        .and_then(|m| m.links.links.get(&target))
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let addresses = bussard_download::compute_tables(links).addresses;
-    // The group-object count is the count word of the obj3 image this flash
-    // writes (1333 for the 1.1.12 reference download, matching ETS's PID 61
-    // element count); without one, the highest group object the model knows.
-    let go_count = table_images
-        .get(&3)
-        .and_then(|img| img.get(..2))
-        .map(|w| u16::from_be_bytes([w[0], w[1]]))
-        .or_else(|| {
-            model
-                .and_then(|m| m.devices.get(&target))
-                .and_then(|d| d.device.com_objects.keys().max().copied())
-        })
-        .unwrap_or(0);
-    let view = bussard_download::device_security_view(model, target, group_keys);
-    let mut program = bussard_download::build_security_program(
-        target,
-        &addresses,
-        go_count,
-        &view.secure_objects,
-        &view.secure_gas,
-        group_keys,
-    )?;
-    program.senders = bussard_download::secured_senders(
-        model,
-        target,
-        group_keys,
-        &material.device_sequences,
-        extra_senders,
-    );
-    let senders = program.senders.clone();
-    plan.add_security_program(program);
-    Ok(Some(senders))
-}
-
-/// The device's parameter overrides re-keyed to app-relative `ParameterRef`
-/// ids ([`bussard_download::parameter_overrides`]), printing a warning for
-/// each malformed key.
-fn collect_parameter_overrides(
-    model: Option<&bussard_model::Model>,
-    target: IndividualAddress,
-) -> BTreeMap<String, String> {
-    let (out, malformed) = bussard_download::parameter_overrides(model, target);
-    for warning in malformed {
-        eprintln!("{warning}");
-    }
-    out
 }
 
 /// Resolves an application program from a hardware order number, requiring
@@ -1719,6 +1593,14 @@ fn recovery_notice(target: IndividualAddress) {
 
 #[cfg(test)]
 mod tests {
+    /// The overrides `bussard flash` plans with (the warnings dropped).
+    fn collect_parameter_overrides(
+        model: Option<&bussard_model::Model>,
+        target: IndividualAddress,
+    ) -> BTreeMap<String, String> {
+        bussard_download::parameter_overrides(model, target).0
+    }
+
     use super::*;
     use bussard_prod::parse_application_program;
 

@@ -690,6 +690,11 @@ pub struct BuiltPlan {
     /// Why this device cannot be written by `apply` (a parameter change that
     /// shows or hides a com-object needs a full `flash`).
     pub refusal: Option<String>,
+    /// Why writing the model's parameter values needs a full download: they
+    /// show, hide or reshape a com-object (`shows object(s) 35, 36`). The
+    /// MCP tier plans that download (`method: flash`, issue #303) where
+    /// `apply` refuses with [`BuiltPlan::refusal`].
+    pub needs_flash: Option<String>,
     /// Why the parameters were not compared or cannot be written, when they
     /// were not (also in the plan's notes).
     pub parameters_skipped: Option<String>,
@@ -1093,6 +1098,7 @@ pub fn build_device_plan(
     let mut unchanged_parameters = None;
     let mut partial = None;
     let mut refusal = None;
+    let mut needs_flash = None;
     let mut parameter_octets = 0;
     let mut parameters = Vec::new();
     let mut octet_ranges = Vec::new();
@@ -1171,6 +1177,7 @@ pub fn build_device_plan(
                 }
                 if let Some(why) = &detail.needs_flash {
                     refusal = Some(group_object_refusal(target, why));
+                    needs_flash = Some(why.clone());
                 } else {
                     match detail.plan.parameters_only(&detail.regions) {
                         Ok(p) => {
@@ -1258,6 +1265,7 @@ pub fn build_device_plan(
         partial,
         parameters,
         refusal,
+        needs_flash,
         parameters_skipped,
         octet_ranges,
     }

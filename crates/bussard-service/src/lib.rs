@@ -49,6 +49,7 @@ pub mod describe;
 pub mod download;
 pub mod error;
 pub mod facts;
+pub mod flash;
 pub mod group;
 /// The one wording per condition every surface reports (issue #228), from
 /// the transport crate so the libraries below this one share it.
