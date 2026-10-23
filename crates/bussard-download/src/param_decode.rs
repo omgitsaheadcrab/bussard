@@ -65,6 +65,12 @@ pub struct DecodedParameters {
     pub device_managed: Vec<ParamReading>,
     /// How many of the model's overrides could not be read back.
     pub unknown: usize,
+    /// The model's overrides whose `ParameterRef` the model's own
+    /// configuration does not reach (issue #319): the page or variant that
+    /// shows the ref is inactive, so no download writes the value and no
+    /// plan lists it as a change. Sorted, keyed like `overrides`. Always
+    /// empty for an application without a Dynamic-built image.
+    pub unshown: Vec<String>,
 }
 
 /// Decodes `current` (the parameter segments read off a device, keyed by
@@ -168,7 +174,32 @@ pub fn decode_parameters(
         differences,
         device_managed,
         unknown,
+        unshown: unshown_overrides(app, overrides, &keys),
     }
+}
+
+/// The override keys whose ref the Dynamic walk under `overrides` does not
+/// reach (see [`DecodedParameters::unshown`]). Keys that name no ref of the
+/// application are left out: they are another fault, reported elsewhere.
+fn unshown_overrides(
+    app: &ApplicationProgram,
+    overrides: &BTreeMap<String, String>,
+    keys: &KeyForms,
+) -> Vec<String> {
+    if !bussard_prod::uses_dynamic_image(app) {
+        return Vec::new();
+    }
+    let config = evaluate_dynamic(app, overrides);
+    let reached: std::collections::HashSet<String> = config
+        .parameters
+        .iter()
+        .map(|p| keys.key(config.module_instance_id(p.module), &p.param_ref_id))
+        .collect();
+    overrides
+        .keys()
+        .filter(|k| !reached.contains(*k) && !config.unresolved_overrides.contains(k))
+        .cloned()
+        .collect()
 }
 
 /// The placements the encoder writes for the configuration `values`.
@@ -1300,6 +1331,38 @@ mod tests {
         let decoded = decode_parameters(&app, &BTreeMap::new(), &BTreeMap::new(), &defaults);
         assert!(decoded.non_default.is_empty(), "{:?}", decoded.non_default);
         assert!(decoded.differences.is_empty());
+        Ok(())
+    }
+
+    /// Issue #319: a model value on a ref the model's configuration does not
+    /// show is never written, so it is in no difference either; it is listed
+    /// as unshown instead of vanishing.
+    #[test]
+    fn test_decode_parameters_lists_unshown_overrides() -> TestResult {
+        let app = app()?;
+        // Concept 0 hides `hidden` (P-2_R-2): its value 5 is never written.
+        let model = map(&[("P-1_R-1", "0"), ("P-2_R-2", "5"), ("UP-3_R-3", "2")]);
+        let current = device(&app, &model)?;
+        let decoded = decode_parameters(&app, &model, &BTreeMap::new(), &current);
+        assert!(decoded.differences.is_empty(), "{:?}", decoded.differences);
+        assert_eq!(decoded.unshown, ["P-2_R-2"]);
+
+        // Concept 1 shows every ref the round-trip model sets, module
+        // instances included.
+        let model = map(&[
+            ("P-1_R-1", "1"),
+            ("P-10_R-10", "12"),
+            ("UP-4_R-4", "9"),
+            ("P-2_R-2", "5"),
+            ("P-7_R-7", "1"),
+            ("P-5_R-5", "17.5"),
+            ("P-6_R-6", "90"),
+            ("MD-1_M-2_MI-1_P-2_R-5", "70"),
+            ("MD-1_M-1_MI-1_P-3_R-6", "8"),
+        ]);
+        let current = device(&app, &model)?;
+        let decoded = decode_parameters(&app, &model, &BTreeMap::new(), &current);
+        assert!(decoded.unshown.is_empty(), "{:?}", decoded.unshown);
         Ok(())
     }
 

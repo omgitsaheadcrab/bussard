@@ -798,10 +798,12 @@ pub struct Sys7Context {
     /// The data-driven mask profile: LSM realisation (memory-mapped vs property),
     /// authorize level, and the EEPROM/RAM mem-types for segment allocation.
     pub profile: bussard_mgmt::Sys7Profile,
-    /// Per-segment `<Mask>` payloads (segment id → mask bytes), where a segment
-    /// declares one (only the `0x4000` table region does in the corpus). A `0xFF`
-    /// mask byte means "this byte belongs to the image, write it"; any other value
-    /// means "device-owned, leave untouched" (`[system7-spec §4.2]`).
+    /// Per-segment write masks (segment id → mask bytes), where a segment
+    /// declares a `<Mask>`. A `0xFF` byte means "this byte belongs to the
+    /// image, write it"; any other value means "device-owned, leave
+    /// untouched" (`[system7-spec §4.2]`). On a parameter segment every octet
+    /// the plan placed a parameter in is `0xFF` too, whatever the product's
+    /// `<Mask>` says there (issue #320).
     pub segment_masks: BTreeMap<String, Vec<u8>>,
 }
 
@@ -993,8 +995,9 @@ impl FlashPlan {
     }
 
     /// The System 7 per-octet write mask for `segment_id`, when the segment
-    /// carries one (`0xFF` = written, anything else = device-owned, skipped).
-    /// Always `None` for a System B plan.
+    /// carries one (`0xFF` = written, anything else = device-owned, skipped):
+    /// the product's `<Mask>` with every octet a parameter is placed in set to
+    /// `0xFF` (issue #320). Always `None` for a System B plan.
     pub fn segment_mask(&self, segment_id: &str) -> Option<&[u8]> {
         self.sys7
             .as_ref()
@@ -1146,12 +1149,24 @@ pub enum Progress {
         /// A human label for the step.
         label: String,
     },
-    /// Bytes written so far within the current memory-write step.
+    /// How far the current memory-write step has got, in octets of its
+    /// image. A read-compare stream counts every octet it walked past, written
+    /// or not; [`Progress::Written`] says how many were written.
     Bytes {
-        /// Octets written of the current step.
+        /// Octets of the current step's image handled so far.
         written: usize,
-        /// Total octets in the current step.
+        /// Total octets in the current step's image.
         total: usize,
+    },
+    /// A System 7 segment stream finished (issue #320): how many octets it
+    /// wrote, of the octets its write mask lets it write. A read-compare
+    /// stream writes only the chunks that differ, so `written` can be far
+    /// below `writable`, and is `0` when the device already held the image.
+    Written {
+        /// Octets written to the device.
+        written: usize,
+        /// Octets of the segment the write mask lets the stream write.
+        writable: usize,
     },
 }
 

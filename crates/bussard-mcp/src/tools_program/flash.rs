@@ -48,6 +48,20 @@ pub(super) struct FlashImage {
     pub(super) object_table: Vec<(u8, u16)>,
     /// The plan's `flash` field.
     pub(super) summary: Value,
+    /// What the read-back after the flash compares against (issue #319),
+    /// set by the apply; `None` on a plan, which never writes.
+    pub(super) readback: Option<FlashReadback>,
+}
+
+/// The model and product a flash's parameter read-back decodes with (issue
+/// #319): the same inputs the plan's read used.
+pub(super) struct FlashReadback {
+    /// The model the plan was made from.
+    pub(super) model: std::sync::Arc<Model>,
+    /// The pinned product archive and the application it flashes.
+    pub(super) source: bussard_service::params::ProductSource,
+    /// The device's mask version, as the pre-flight read it.
+    pub(super) device_mask: u16,
 }
 
 /// The full download writing the model to `target`, when `built` says the
@@ -206,6 +220,7 @@ pub(super) fn flash_image(
         senders,
         object_table: detail.resident.object_table.clone(),
         summary,
+        readback: None,
     })
 }
 
@@ -300,10 +315,41 @@ impl BussardMcp {
             job,
             what: "download",
         };
-        let (outcome, _) =
-            bussard_service::download::flash_session(run, &image.plan, &mut observer, async |_| {})
-                .await;
-        let verified = matches!(&outcome, Ok(o) if o.ok());
+        // Issue #319: on the flash's last connection, read the parameter
+        // memory back and compare it with the model the way a plan does.
+        let readback = image.readback.as_ref();
+        let jobs = &tier.jobs;
+        let (outcome, flashed) =
+            bussard_service::download::flash_session(run, &image.plan, &mut observer, async |l4| {
+                let rb = readback?;
+                let app = rb.source.app()?;
+                jobs.step(
+                    job,
+                    format!(
+                        "reading {target}'s parameter memory back to compare it with the model"
+                    ),
+                );
+                Some(
+                    bussard_service::params::read_flashed_parameters(
+                        l4,
+                        &rb.source.product,
+                        app,
+                        Some(&rb.model),
+                        target,
+                        rb.device_mask,
+                    )
+                    .await,
+                )
+            })
+            .await;
+        let flashed = flashed.flatten();
+        // A parameter still differing fails the flash; a read-back that could
+        // not be made leaves `parameters.verified` false with its note.
+        let params_differ = flashed.as_ref().and_then(|f| f.failure());
+        let params_verified = flashed
+            .as_ref()
+            .is_some_and(bussard_service::params::FlashedParameters::verified);
+        let verified = matches!(&outcome, Ok(o) if o.ok()) && params_differ.is_none();
         tracing::info!(
             "audit: knx_apply_device {target} flash via {}: {}",
             ctx.gateway,
@@ -311,16 +357,36 @@ impl BussardMcp {
         );
         match outcome {
             Ok(done) if done.ok() => {
-                result["ok"] = json!(true);
-                result["verified"] = json!(true);
+                result["ok"] = json!(params_differ.is_none());
+                result["verified"] = json!(params_differ.is_none());
                 result["load_state"] = json!(done.load_state.to_string());
                 result["application"] = json!(image.plan.identity.id);
                 result["warnings"] = json!(done.warnings);
                 result["parameters"] = json!({
                     "written": true,
-                    "verified": true,
+                    "verified": params_verified,
                     "changed": ctx.changed,
                 });
+                if let Some(note) = flashed.as_ref().and_then(|f| f.note.as_ref()) {
+                    result["parameters"]["note"] = json!(format!("not compared: {note}"));
+                }
+                if let Some(failure) = &params_differ {
+                    // Issue #319: the application is loaded, but the device
+                    // does not hold the model's parameters. Say that first.
+                    result["reason"] = json!(failure);
+                    result["parameters"]["differences"] = json!(
+                        flashed
+                            .as_ref()
+                            .map(|f| f.differences.clone())
+                            .unwrap_or_default()
+                    );
+                    result["recovery"] = json!(format!(
+                        "The application is loaded on {target}, but the parameters listed \
+                         still differ from the model. Plan {target} again with \
+                         knx_plan_device to see what is left, and do not report the change \
+                         as done until a plan reports nothing to do."
+                    ));
+                }
                 // The verified flash wrote this PID 54 table: record it in
                 // the lock, as `bussard flash` does (issue #297).
                 if let Some(senders) = &image.senders {

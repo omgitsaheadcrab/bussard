@@ -862,6 +862,28 @@ directory or a script from before these changes needs:
   to later; `knx_show_device` marks it `ignored`, and `knx_plan_device`,
   `bussard plan`, `bussard apply` and `bussard flash` list it as "ignored:
   not shown under the current values (needs ...)".
+- A System 7 flash now writes every parameter the plan places (#320). The
+  writer skipped any octet whose product `<Mask>` byte is `0x00`, even when a
+  parameter sat there, so on the Theben Meteodata 140 S the whole C4 page
+  (14 of 19 changes in one flash) never reached the device. An octet is now
+  written when the mask owns it or a parameter is placed in it; this adds
+  exactly the octets ETS writes (on the Meteodata's `AS-4800`, 655 writable
+  octets instead of 625) and changes nothing else: the image, the write order
+  and the timing are the same, and a masked run that holds no parameter (the
+  `0x4000` table region, the tail of `AS-4C00`) is still left alone. The
+  parameter-only download and its read-back use the same rule. The job's
+  `octets` progress now counts the octets written, not how far the segment
+  walk got (that is `segment`).
+- `verified` after a flash now means the device matches the model (#319).
+  `bussard flash` and the MCP flash job read the parameter memory back on the
+  flash's own connection and compare it with the model the way a plan does.
+  A parameter that still differs makes the job end `verified: false` with
+  the parameter named in `reason` and listed in `parameters.differences`, and
+  makes `bussard flash` print it and exit non-zero. Before, `verified` only
+  said the load-state machines were Loaded. A plan also says when the model
+  sets a parameter the device's configuration does not show ("ignored: not
+  shown under the current values"), instead of dropping it silently.
+
 - `knx_set_parameter` refused `universalkanal-c4-funktion.helligkeitsschwelle`
   on a Theben weather station with the same key listed twice as the choice.
   The page holds the threshold twice, once per branch of "Funktion des

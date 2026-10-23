@@ -383,7 +383,8 @@ impl BussardMcp {
     #[tool(
         description = "Report one apply job started by knx_apply_device (issue #289): `state` \
         (running, done, or interrupted when the server stopped mid-write), `done`, the current \
-        `step`, `progress` (the table outcome, the parameter download step, octets written), \
+        `step`, `progress` (the table outcome, the download step, the segment position, the \
+        octets the last segment wrote of those it may write), \
         the backup paths and, once done, `result`: the same result knx_apply_device returns \
         inline (ok, verified, parameters, recovery). Reads only the server's job table and the \
         job record under .bussard/history; never touches the bus. Poll every few seconds while \
@@ -905,7 +906,7 @@ impl BussardMcp {
 
         let model = self.state().model.reload();
         let desired = desired_tables_for(&model, target).map_err(|e| e.to_string())?;
-        let product = product_for(&dir, &model, target);
+        let mut product = product_for(&dir, &model, target);
         // KNX Data Secure: the same material the plan resolved, one
         // high-water mark for the read and the write so the send sequence
         // stays monotonic across both connections (spec §5.9).
@@ -1068,6 +1069,15 @@ impl BussardMcp {
         };
         let backup_path = backup.display().to_string();
         let param_backup_path = param_backup.as_ref().map(|p| p.display().to_string());
+        // What the flash's read-back compares against (issue #319).
+        let flash = flash.map(|mut image| {
+            image.readback = product.source.take().map(|source| flash::FlashReadback {
+                model: std::sync::Arc::clone(&model),
+                source,
+                device_mask: tables.mask,
+            });
+            image
+        });
 
         let result = json!({
             "method": if flash.is_some() { "flash" } else { "apply" },
@@ -1469,10 +1479,21 @@ impl bussard_service::download::FlashObserver for JobObserver<'_> {
                     .progress(self.job, "download_step", json!(format!("{index}/{total}")));
             }
             bussard_download::Progress::Bytes { written, total } => {
+                // How far the segment walk got (a read-compare compares
+                // most chunks and writes few): not the octets written.
+                self.jobs.progress(
+                    self.job,
+                    "segment",
+                    json!({"position": written, "total": total}),
+                );
+            }
+            bussard_download::Progress::Written { written, writable } => {
+                // The octets the last System 7 segment stream wrote (issue
+                // #320).
                 self.jobs.progress(
                     self.job,
                     "octets",
-                    json!({"written": written, "total": total}),
+                    json!({"written": written, "writable": writable}),
                 );
             }
         }

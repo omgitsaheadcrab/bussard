@@ -317,3 +317,78 @@ fn test_sys7_profile_from_hawk_verify_mode_meteodata_master() {
         );
     }
 }
+
+/// Issue #320: the Meteodata's C4 page sits in a `0x00` run of the
+/// `AS-4800` `<Mask>`. The image builder places `P-2238` (C4 aktivieren) and
+/// the C4 page at offsets 128..131, and the plan's write mask owns exactly
+/// those placed octets: the run's unplaced octets and `AS-4C00`'s masked tail
+/// stay unwritten.
+#[test]
+fn test_compute_parameter_image_placed_meteodata_c4_page_is_writable() {
+    let Some(product) = meteodata_product() else {
+        eprintln!("BUSSARD_PRODUCT_CORPUS unset or Meteodata 140 S absent; skipping");
+        return;
+    };
+    let app = product
+        .applications
+        .iter()
+        .find(|a| a.id.starts_with("M-0048_A-140C"))
+        .expect("Meteodata app");
+    // C1..C3 active show the C4 switch; C4 active shows its page.
+    let overrides: BTreeMap<String, String> = BTreeMap::from([
+        ("P-2238_R-2238".to_string(), "1".to_string()),
+        ("P-7305_R-7305".to_string(), "19".to_string()),
+    ]);
+    let (_, placed) =
+        bussard_prod::compute_parameter_image_placed(app, &overrides, &BTreeMap::new())
+            .expect("Meteodata image");
+    let as4800 = placed
+        .iter()
+        .find(|(segment, _)| segment.ends_with("_AS-4800"))
+        .map(|(_, octets)| octets)
+        .expect("parameters placed in AS-4800");
+    for offset in 128..=131 {
+        assert!(
+            as4800.contains(&offset),
+            "offset {offset} placed: {as4800:?}"
+        );
+    }
+    let plan = plan_flash(
+        app,
+        "1.1.202",
+        0x0701,
+        &overrides,
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )
+    .expect("Meteodata plan");
+    let segment = |suffix: &str| {
+        placed
+            .keys()
+            .find(|s| s.ends_with(suffix))
+            .cloned()
+            .expect("segment id")
+    };
+    let mask4800 = plan
+        .segment_mask(&segment("_AS-4800"))
+        .expect("AS-4800 keeps a write mask");
+    assert!(
+        mask4800[128..=131].iter().all(|&b| b == 0xFF),
+        "the placed offsets 128..=131 are written"
+    );
+    let unplaced = (64..352)
+        .find(|i| !as4800.contains(i))
+        .expect("an unplaced octet");
+    assert_eq!(
+        mask4800[unplaced], 0x00,
+        "unplaced offset {unplaced} stays masked"
+    );
+    let mask4c00 = plan
+        .segment_mask(&segment("_AS-4C00"))
+        .expect("AS-4C00 keeps a write mask");
+    assert!(
+        mask4c00[32..].iter().all(|&b| b == 0x00),
+        "AS-4C00's masked tail carries no parameter and stays unwritten"
+    );
+}

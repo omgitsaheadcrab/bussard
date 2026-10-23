@@ -471,6 +471,9 @@ impl FlashDisplay {
                         *streaming = true;
                     }
                 }
+                // The bar follows the walk; the written count is in the
+                // plain trace and the MCP job (issue #320).
+                Progress::Written { .. } => {}
             },
         }
     }
@@ -510,6 +513,11 @@ fn plain_flash_line(progress: Progress) {
             if written == total {
                 eprintln!();
             }
+        }
+        // A System 7 segment stream's own count (issue #320): a read-compare
+        // walks the whole segment and writes only the chunks that differ.
+        Progress::Written { written, writable } => {
+            eprintln!("      {written} of {writable} writable octet(s) written");
         }
     }
 }
