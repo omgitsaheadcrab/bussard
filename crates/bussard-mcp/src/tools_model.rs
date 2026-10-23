@@ -34,7 +34,7 @@ use rmcp::{tool, tool_router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::param_keys::{KeyContext, index_parameter, resolve_parameter_key};
+use crate::param_keys::{KeyContext, index_parameter, resolve_parameter_key, unreached_refusal};
 use crate::server::BussardMcp;
 use crate::session_edits::Subject;
 
@@ -127,6 +127,13 @@ pub struct SetParameterArgs {
     pub channel: Option<String>,
     /// The new value: an enum label (`"Jalousie"`) or code, a number, or text.
     pub value: String,
+    /// Store the value even though the configuration does not show the
+    /// parameter under the device's current values (its page is inactive,
+    /// or it belongs to another branch of a choice). Such a value is never
+    /// written until the configuration shows it; use this only to prepare a
+    /// branch before switching to it.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// Arguments for `knx_remove_group`.
@@ -633,8 +640,13 @@ impl BussardMcp {
         length) changes the group-object table, which only a full download writes: the \
         result's `note` names the objects and how that download is pushed at this server's \
         tier (with --allow-programming, knx_plan_device plans it as `method: flash`), and \
-        knx_show_device lists the parameters and objects it reveals right away. Returns the \
-        change as sentences: quote them to the human."
+        knx_show_device lists the parameters and objects it reveals right away. A parameter \
+        the configuration does not show under the device's current values (its page is \
+        inactive, or it belongs to another branch of a choice) is refused with the condition \
+        that shows it and the ref that is shown instead, because the device would never get \
+        the value; `force: true` stores it anyway to prepare a branch before switching to it. \
+        A bare parameter id (`P-7305`) or the vendor text names the ref the configuration \
+        shows. Returns the change as sentences: quote them to the human."
     )]
     async fn knx_set_parameter(
         &self,
@@ -652,6 +664,7 @@ impl BussardMcp {
         let dir = self.state().dir.clone();
         let (wanted, value) = (args.parameter.clone(), args.value.clone());
         let channel = args.channel.clone();
+        let force = args.force;
         let label = vec![ia.to_string(), wanted.clone(), value.clone()];
 
         let tiers = crate::guidance::Tiers::of(self.state());
@@ -667,6 +680,12 @@ impl BussardMcp {
                 return Err(format!("{ia} is not a device in this model"));
             };
             let key = resolve_parameter_key(&loaded.device, &keys, &wanted, channel.as_deref())?;
+            // Issue #321: a value on a ref the configuration does not show is
+            // never written, so it is refused unless the caller prepares a
+            // branch on purpose.
+            if !force && let Some(why) = unreached_refusal(&loaded.device, &keys, &key) {
+                return Err(why);
+            }
             let value = check_parameter(&dir, loaded, &key, &value)?;
             // A parameter on a page that was inactive at import gets its lock
             // entry now, saved with the device file below.

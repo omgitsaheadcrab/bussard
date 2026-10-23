@@ -25,8 +25,9 @@ use bussard_model::{IndividualAddress, Model, param_mem_key, slug};
 pub const KEY_GRAMMAR: &str = "Parameter keys: the key knx_show_device lists \
      (`helligkeitsschwelle`, page-qualified `sollwerte.komfort`, or `key@reference`), that key \
      prefixed with its page or channel handle (`universalkanal-c4-funktion.helligkeitsschwelle`), \
-     or the bare reference (`P-7305_R-7305`); `channel` takes a channel handle, `device` or a \
-     page handle";
+     the bare reference (`P-7305_R-7305`), or the bare parameter id (`P-7305`) or vendor text \
+     for the ref the configuration shows; `channel` takes a channel handle, `device` or a page \
+     handle";
 
 /// What the resolver knows about a device beyond its lock: the ETS page each
 /// parameter ref sits on, the vendor text of each, and the parameters the
@@ -292,6 +293,18 @@ fn find<'a>(
     if !exact.is_empty() {
         return exact;
     }
+    // A bare parameter id (`P-6823`) names every ref of the parameter;
+    // [`prefer_shown`] picks the one the configuration shows (issue #321).
+    if looks_like_ref(wanted) {
+        let refs: Vec<&str> = all
+            .iter()
+            .filter(|c| ref_param_id(c.reference) == wanted && fits(c.reference))
+            .map(|c| c.reference)
+            .collect();
+        if !refs.is_empty() {
+            return refs;
+        }
+    }
     // `block.key`: the key on the page or channel `block`.
     if let Some((head, tail)) = wanted.split_once('.')
         && known_scope(device, ctx, head)
@@ -305,10 +318,18 @@ fn find<'a>(
     }
     // A page-qualified key by its last part, as the loader reads it.
     let tail = last_part(wanted);
-    all.iter()
+    let hits: Vec<&str> = all
+        .iter()
         .filter(|c| last_part(c.key) == tail && fits(c.reference))
         .map(|c| c.reference)
-        .collect()
+        .collect();
+    // The vendor text ("Eingangsgröße für Eingang 1") by its slug, the
+    // shape of the key the lock derives from it (issue #321).
+    let slugged = slug(wanted);
+    if hits.is_empty() && !wanted.contains('@') && slugged != wanted {
+        return find(device, ctx, &slugged, scopes);
+    }
+    hits
 }
 
 /// The in-memory key (`<slug>@<ref>`) of the parameter a caller names
@@ -377,6 +398,66 @@ pub fn resolve_parameter_key(
             distinct_keys(device, ctx, many).join(", ")
         )),
     }
+}
+
+/// The refusal of storing a value under the in-memory key `key` (as
+/// [`resolve_parameter_key`] returned it) when the configuration does not
+/// show its ref under the device's current values (issue #321): the image a
+/// flash or a parameter push writes holds one slot per shown ref, so the
+/// value would be stored and never written. The refusal names the condition
+/// in words, the current values it tests, and the ref of the same parameter
+/// the configuration shows, when there is one. `None` for a shown ref, a ref
+/// the product model's pages do not hold, or a hidden or label key.
+pub fn unreached_refusal(device: &Device, ctx: &KeyContext, key: &str) -> Option<String> {
+    if bussard_model::is_hidden_mem_key(key) || key.starts_with("label@") {
+        return None;
+    }
+    let reference = ref_of(key)?;
+    let seen = ctx.visibility.get(reference)?;
+    let needs = seen.needs.as_deref()?;
+    let named = match candidate(device, ctx, reference).map(|c| c.key) {
+        Some(k) if k.contains('@') => k.to_string(),
+        Some(k) => format!("{k}@{reference}"),
+        None => key.to_string(),
+    };
+    let now = seen.now.as_deref().unwrap_or("the current values differ");
+    let head = match seen.condition.as_deref() {
+        Some(branch) if !seen.on_branch && branch == needs => {
+            format!("`{named}` belongs to the branch {branch}; {now}")
+        }
+        Some(branch) if !seen.on_branch => format!(
+            "`{named}` belongs to the branch {branch} and is not shown under the current              values ({now}): it needs {needs}"
+        ),
+        _ => format!(
+            "`{named}` sits on a page the configuration does not show under the current              values ({now}): it needs {needs}"
+        ),
+    };
+    let param = ref_param_id(reference);
+    let shown: Vec<Candidate<'_>> = candidates(device, ctx)
+        .into_iter()
+        .filter(|c| {
+            c.reference != reference
+                && ref_param_id(c.reference) == param
+                && ctx.visibility.get(c.reference).is_some_and(|v| v.shown)
+        })
+        .collect();
+    let instead = match shown.as_slice() {
+        [c] => format!(
+            "The shown parameter is `{}` ({}): set that key instead, or set {needs} first",
+            c.key, c.reference
+        ),
+        [] => format!("Set {needs} first"),
+        many => format!(
+            "The shown refs of this parameter are {}: set one of those instead, or set {needs}              first",
+            many.iter()
+                .map(|c| format!("`{}` ({})", c.key, c.reference))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    Some(format!(
+        "{head}. The device does not carry it, so a value stored for it is never written.          {instead}. Pass `force: true` to store the value anyway (it stays unwritten until the          configuration shows it, and the plan lists it as ignored)."
+    ))
 }
 
 /// `hits` with the other refs of the same parameter on the same page, unless

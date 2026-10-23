@@ -98,6 +98,11 @@ pub struct ParamRow {
     /// The range of an integer, `min..max`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub range: Option<String>,
+    /// Set when the file stores a value the configuration does not reach
+    /// (issue #321): the value is never written to the device. Says why, as
+    /// [`IgnoredOverride::reason`] does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignored: Option<String>,
 }
 
 /// One object of a scope.
@@ -423,6 +428,7 @@ fn param_row(entry: &ParamEntry, product: Option<&ProductModel>) -> ParamRow {
         at_default,
         choices,
         range,
+        ignored: None,
     }
 }
 
@@ -661,6 +667,84 @@ impl<'a> Pages<'a> {
                     .iter()
                     .all(|g| g.holds(self.value_number(&g.reference)))
             })
+    }
+
+    /// Whether the configuration shows parameter ref `reference` of block
+    /// `i`, and what it needs when it does not (issue #321).
+    fn ref_visibility(&self, i: usize, reference: &str) -> RefVisibility {
+        let gates = self.blocks[i].parameter_when.get(reference);
+        let shown = self.shows_ref(i, reference);
+        let (needs, now) = if shown {
+            (None, None)
+        } else {
+            // The page that hides it: the block itself, or the enclosing
+            // block whose own conditions fail.
+            let mut page = i;
+            while self.states[page].parent_inactive
+                && let Some(p) = self.parents[page]
+            {
+                page = p;
+            }
+            let mut failing: Vec<&Gate> = if self.states[page].active {
+                Vec::new()
+            } else {
+                self.states[page]
+                    .failing
+                    .iter()
+                    .filter_map(|n| self.blocks[page].when.get(*n))
+                    .collect()
+            };
+            failing.extend(
+                gates
+                    .into_iter()
+                    .flatten()
+                    .filter(|g| !g.holds(self.value_number(&g.reference))),
+            );
+            let mut needs: Vec<String> = Vec::new();
+            let mut now: Vec<String> = Vec::new();
+            for g in failing {
+                let words = self.gate_words(g);
+                if !needs.contains(&words) {
+                    needs.push(words);
+                }
+                let def = self.product.parameters.get(ref_param_id(&g.reference));
+                let name = def
+                    .and_then(|d| d.text.clone().or_else(|| d.name.clone()))
+                    .unwrap_or_else(|| g.reference.clone());
+                let line = format!(
+                    "{name} is {}",
+                    self.current(&g.reference)
+                        .unwrap_or_else(|| "unset".to_string())
+                );
+                if !now.contains(&line) {
+                    now.push(line);
+                }
+            }
+            if needs.is_empty() {
+                let text = self.blocks[page]
+                    .text
+                    .clone()
+                    .unwrap_or_else(|| self.blocks[page].id.clone());
+                needs.push(format!("the page {text:?} active"));
+            }
+            (
+                Some(needs.join(" and ")),
+                (!now.is_empty()).then(|| now.join(", ")),
+            )
+        };
+        RefVisibility {
+            shown,
+            on_branch: self.on_branch(i, reference),
+            condition: gates.filter(|gates| !gates.is_empty()).map(|gates| {
+                gates
+                    .iter()
+                    .map(|g| self.gate_words(g))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            }),
+            needs,
+            now,
+        }
     }
 
     /// A condition in words: the controlling parameter's text and the values
@@ -1264,6 +1348,19 @@ pub fn device_view(
         }
     };
 
+    // Issue #321: a stored value the configuration does not reach is never
+    // written; the row says so next to its value.
+    let mut scope = scope;
+    if let (Some(pg), Some(scope)) = (&pages, scope.as_mut()) {
+        let ignored: HashMap<String, String> = ignored_in(device, pg)
+            .into_iter()
+            .map(|i| (i.reference.clone(), i.reason()))
+            .collect();
+        for row in &mut scope.parameters {
+            row.ignored = ignored.get(&row.reference).cloned();
+        }
+    }
+
     let mut notes = Vec::new();
     if product.is_none() {
         notes.push(match &application {
@@ -1554,6 +1651,14 @@ pub struct RefVisibility {
     /// joined with "and"; `None` for a ref outside any `<choose>` of its
     /// page.
     pub condition: Option<String>,
+    /// What the configuration needs to show it, in words: the failing
+    /// conditions of its page (or the enclosing page that hides it) and of
+    /// its branch ("Art der Verknüpfung = XOR"); `None` when it is shown
+    /// (issue #321).
+    pub needs: Option<String>,
+    /// The current values of the parameters those failing conditions test
+    /// ("Art der Verknüpfung is UND"); `None` when it is shown.
+    pub now: Option<String>,
 }
 
 /// Every parameter ref the product model's pages hold for device `address`,
@@ -1572,7 +1677,6 @@ pub fn parameter_visibility(
         .get(&address)
         .ok_or(ViewError::NoDevice(address))?
         .device;
-    let mut out: BTreeMap<String, RefVisibility> = BTreeMap::new();
     let product = device
         .product
         .as_ref()
@@ -1580,37 +1684,130 @@ pub fn parameter_visibility(
         .and_then(|a| products.get(a))
         .filter(|p| !p.blocks.is_empty());
     let Some(product) = product else {
-        return Ok(out);
+        return Ok(BTreeMap::new());
     };
     let params = parameter_entries(device);
     let pg = Pages::new(device, product, &params);
-    for (i, b) in pg.blocks.iter().enumerate() {
-        for reference in &b.parameters {
-            let seen = RefVisibility {
-                shown: pg.shows_ref(i, reference),
-                on_branch: pg.on_branch(i, reference),
-                condition: b
-                    .parameter_when
-                    .get(reference)
-                    .filter(|gates| !gates.is_empty())
-                    .map(|gates| {
-                        gates
-                            .iter()
-                            .map(|g| pg.gate_words(g))
-                            .collect::<Vec<_>>()
-                            .join(" and ")
-                    }),
-            };
-            match out.get_mut(reference) {
-                Some(v) if (seen.shown, seen.on_branch) > (v.shown, v.on_branch) => *v = seen,
-                Some(_) => {}
-                None => {
-                    out.insert(reference.clone(), seen);
+    Ok(pg.visibility())
+}
+
+impl Pages<'_> {
+    /// [`parameter_visibility`] of every ref the pages hold.
+    fn visibility(&self) -> BTreeMap<String, RefVisibility> {
+        let mut out: BTreeMap<String, RefVisibility> = BTreeMap::new();
+        for (i, b) in self.blocks.iter().enumerate() {
+            for reference in &b.parameters {
+                let seen = self.ref_visibility(i, reference);
+                match out.get_mut(reference) {
+                    Some(v) if (seen.shown, seen.on_branch) > (v.shown, v.on_branch) => *v = seen,
+                    Some(_) => {}
+                    None => {
+                        out.insert(reference.clone(), seen);
+                    }
                 }
             }
         }
+        out
     }
-    Ok(out)
+}
+
+/// A value the device file stores for a parameter ref the configuration
+/// does not reach under the device's current values (issue #321): the image
+/// a flash or a parameter push writes holds one slot per reached ref, so the
+/// value is never written until the configuration shows the ref.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IgnoredOverride {
+    /// The key the device file uses (the lock's, else the in-memory key).
+    pub key: String,
+    /// The app-relative `ParameterRef` id.
+    pub reference: String,
+    /// The stored value, rendered as the file writes it.
+    pub value: String,
+    /// What the configuration needs to show the ref, in words
+    /// ("Funktion des Kanals = Wind").
+    pub needs: String,
+}
+
+impl IgnoredOverride {
+    /// Why the value is ignored: "not shown under the current values (needs
+    /// …)".
+    pub fn reason(&self) -> String {
+        format!("not shown under the current values (needs {})", self.needs)
+    }
+
+    /// The plan line: "`key` = value ignored: not shown under the current
+    /// values (needs …)".
+    pub fn sentence(&self) -> String {
+        format!("`{}` = {} ignored: {}", self.key, self.value, self.reason())
+    }
+}
+
+/// Every value the file of device `address` stores for a parameter ref the
+/// configuration does not reach under its current values, by ref (issue
+/// #321). A value at the ref's default, a hidden value ETS stored
+/// (`hidden@…`, which a flash writes as is) and a channel label are left
+/// out. Empty without a product model with pages.
+///
+/// # Errors
+///
+/// [`ViewError::NoDevice`] when the model has no device `address`.
+pub fn ignored_overrides(
+    model: &Model,
+    products: &ProductModels,
+    address: IndividualAddress,
+) -> Result<Vec<IgnoredOverride>, ViewError> {
+    let device = &model
+        .devices
+        .get(&address)
+        .ok_or(ViewError::NoDevice(address))?
+        .device;
+    let product = device
+        .product
+        .as_ref()
+        .and_then(|p| p.application_ref.as_deref())
+        .and_then(|a| products.get(a))
+        .filter(|p| !p.blocks.is_empty());
+    let Some(product) = product else {
+        return Ok(Vec::new());
+    };
+    let params = parameter_entries(device);
+    let pg = Pages::new(device, product, &params);
+    Ok(ignored_in(device, &pg))
+}
+
+/// [`ignored_overrides`] on the pages `pg` of `device`.
+fn ignored_in(device: &Device, pg: &Pages<'_>) -> Vec<IgnoredOverride> {
+    let visibility = pg.visibility();
+    let mut out = Vec::new();
+    for (mem_key, value) in &device.parameters {
+        if crate::files::is_hidden_mem_key(mem_key) {
+            continue;
+        }
+        let Some((head, reference)) = mem_key.split_once('@') else {
+            continue;
+        };
+        if head == "label" {
+            continue;
+        }
+        let Some(needs) = visibility.get(reference).and_then(|v| v.needs.clone()) else {
+            continue;
+        };
+        let def = pg.product.parameters.get(ref_param_id(reference));
+        let locked = device.lock.parameters.get(reference);
+        let default = locked
+            .and_then(|p| p.default.as_deref())
+            .or_else(|| def.and_then(|d| d.default.as_deref()));
+        if default.is_some_and(|d| same_value(def, value, d)) {
+            continue;
+        }
+        out.push(IgnoredOverride {
+            key: locked.map_or_else(|| mem_key.clone(), |p| p.key.clone()),
+            reference: reference.to_string(),
+            value: display_value(def, value),
+            needs,
+        });
+    }
+    out
 }
 
 /// Pads `rows` into columns under `header`.
@@ -1863,11 +2060,12 @@ impl DeviceView {
                                 .clone()
                                 .or_else(|| p.default.clone())
                                 .unwrap_or_else(|| "-".to_string());
-                            let marker = match p.at_default {
-                                Some(true) => "default",
-                                Some(false) => "set",
-                                None if p.value.is_some() => "set",
-                                None => "",
+                            let marker = match (&p.ignored, p.at_default) {
+                                (Some(why), _) => format!("ignored: {why}"),
+                                (None, Some(true)) => "default".to_string(),
+                                (None, Some(false)) => "set".to_string(),
+                                (None, None) if p.value.is_some() => "set".to_string(),
+                                (None, None) => String::new(),
                             };
                             let allowed = if !p.choices.is_empty() {
                                 p.choices.join(" | ")
@@ -1877,7 +2075,7 @@ impl DeviceView {
                             vec![
                                 p.key.clone(),
                                 value,
-                                marker.to_string(),
+                                marker,
                                 allowed,
                                 p.text.clone().unwrap_or_default(),
                             ]
@@ -1983,6 +2181,11 @@ impl DeviceView {
             let hint = match (&p.text, hint.is_empty()) {
                 (Some(t), false) => format!("{t}: {hint}"),
                 (Some(t), true) => t.clone(),
+                (None, _) => hint,
+            };
+            let hint = match (&p.ignored, hint.is_empty()) {
+                (Some(why), true) => format!("ignored: {why}"),
+                (Some(why), false) => format!("ignored: {why}; {hint}"),
                 (None, _) => hint,
             };
             let comment = if hint.is_empty() {

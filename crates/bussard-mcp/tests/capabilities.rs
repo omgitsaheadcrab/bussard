@@ -797,13 +797,27 @@ async fn test_set_parameter_prefers_the_ref_the_function_shows() -> TestResult {
     unique.sort_unstable();
     unique.dedup();
     assert_eq!(keys.len(), unique.len(), "{reason}");
-    // The suggested keys resolve.
+    // The suggested keys resolve; neither ref is shown under Temperatur, so
+    // storing a value takes `force` (issue #321).
     let body = call(
         &client,
         "knx_set_parameter",
         set("helligkeitsschwelle-c4@P-1042_R-1045".to_string(), "405"),
     )
     .await?;
+    assert_eq!(body["refused"], true, "{body}");
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("Funktion des Kanals = Wind; Funktion des Kanals is Temperatur"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("Set Funktion des Kanals = Wind first"),
+        "{reason}"
+    );
+    let mut forced = set("helligkeitsschwelle-c4@P-1042_R-1045".to_string(), "405");
+    forced["force"] = json!(true);
+    let body = call(&client, "knx_set_parameter", forced).await?;
     assert_ne!(body["refused"], true, "{body}");
     assert_eq!(field_ref(&body), Some("P-1042_R-1045"), "{body}");
 
@@ -820,4 +834,152 @@ fn field_ref(body: &Value) -> Option<&str> {
         .find_map(|d| d["field"].as_str())
         .and_then(|f| f.rsplit_once('@'))
         .map(|(_, r)| r)
+}
+
+/// The ignored-override lines the plan of `ia` carries (issue #321).
+fn ignored_notes(dir: &Path, ia: &str) -> anyhow::Result<Vec<String>> {
+    let ia: bussard_model::IndividualAddress = ia.parse()?;
+    let model = bussard_model::Model::load(dir)?;
+    Ok(bussard_service::params::ignored_override_notes(
+        &model, ia, dir,
+    ))
+}
+
+/// The row of `reference` in `knx_show_device`'s view of `page`.
+async fn shown_row(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    ia: &str,
+    page: &str,
+    reference: &str,
+) -> anyhow::Result<Value> {
+    let shown = call(
+        client,
+        "knx_show_device",
+        json!({"address": ia, "channel": page}),
+    )
+    .await?;
+    shown["scope"]["parameters"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["reference"] == reference))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no row {reference} on {page}: {shown}"))
+}
+
+/// Issue #321: a value set on the "Wind" ref of the C4 threshold while the
+/// function is "Helligkeit" would be stored and never written. It is refused
+/// with the branch in words and the shown ref named; `force` stores it, the
+/// view marks it ignored and the plan lists it; switching the function to
+/// "Wind" makes it a live value.
+#[tokio::test]
+async fn test_set_parameter_refuses_a_ref_the_configuration_does_not_show() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    write_meteo(dir.path())?;
+    let (client, task) = serve(dir.path()).await?;
+    let ia = "1.1.202";
+    let page = "universalkanal-c4-funktion";
+    let file = dir.path().join("devices/1.1.202.toml");
+
+    let body = call(
+        &client,
+        "knx_set_parameter",
+        json!({"address": ia, "parameter": "P-1042_R-1045", "value": "500"}),
+    )
+    .await?;
+    assert_eq!(body["refused"], true, "{body}");
+    let reason = body["reason"].as_str().unwrap_or_default();
+    for part in [
+        "`helligkeitsschwelle-c4@P-1042_R-1045` belongs to the branch Funktion des Kanals = \
+         Wind; Funktion des Kanals is Helligkeit",
+        "never written",
+        "The shown parameter is `helligkeitsschwelle-c4` (P-1042_R-1042)",
+        "`force: true`",
+    ] {
+        assert!(reason.contains(part), "{part}: {reason}");
+    }
+    assert!(!std::fs::read_to_string(&file)?.contains("500"));
+
+    // A bare parameter id and the vendor text name the shown ref.
+    for (parameter, value) in [("P-1042", "410"), ("Helligkeitsschwelle C4", "411")] {
+        let body = call(
+            &client,
+            "knx_set_parameter",
+            json!({"address": ia, "parameter": parameter, "value": value}),
+        )
+        .await?;
+        assert_ne!(body["refused"], true, "{parameter}: {body}");
+        assert_eq!(
+            field_ref(&body),
+            Some("P-1042_R-1042"),
+            "{parameter}: {body}"
+        );
+    }
+
+    // `force` keeps the old behaviour: stored, marked ignored, listed.
+    let body = call(
+        &client,
+        "knx_set_parameter",
+        json!({"address": ia, "parameter": "P-1042_R-1045", "value": "500", "force": true}),
+    )
+    .await?;
+    assert_ne!(body["refused"], true, "{body}");
+    assert!(std::fs::read_to_string(&file)?.contains("500"));
+    let why = "not shown under the current values (needs Funktion des Kanals = Wind)";
+    let row = shown_row(&client, ia, page, "P-1042_R-1045").await?;
+    assert_eq!(row["value"], "500", "{row}");
+    assert_eq!(row["ignored"], why, "{row}");
+    let live = shown_row(&client, ia, page, "P-1042_R-1042").await?;
+    assert!(live.get("ignored").is_none(), "{live}");
+    assert_eq!(
+        ignored_notes(dir.path(), ia)?,
+        vec![format!(
+            "`helligkeitsschwelle-c4@P-1042_R-1045` = 500 ignored: {why}"
+        )]
+    );
+
+    // Switching the function to Wind shows the ref: the value is live, and
+    // the one stored for the Helligkeit ref is now the ignored one.
+    let body = call(
+        &client,
+        "knx_set_parameter",
+        json!({"address": ia, "parameter": "funktion-des-kanals", "channel": page, "value": "Wind"}),
+    )
+    .await?;
+    assert_ne!(body["refused"], true, "{body}");
+    let row = shown_row(&client, ia, page, "P-1042_R-1045").await?;
+    assert!(row.get("ignored").is_none(), "{row}");
+    assert_eq!(
+        ignored_notes(dir.path(), ia)?,
+        vec![
+            "`helligkeitsschwelle-c4` = 411 ignored: not shown under the current values (needs \
+             Funktion des Kanals = Helligkeit)"
+                .to_string()
+        ]
+    );
+    let body = call(
+        &client,
+        "knx_set_parameter",
+        json!({"address": ia, "parameter": "P-1042_R-1045", "value": "501"}),
+    )
+    .await?;
+    assert_ne!(body["refused"], true, "{body}");
+
+    // A ref on a page the configuration does not show names what enables
+    // the page.
+    let body = call(
+        &client,
+        "knx_set_parameter",
+        json!({"address": ia, "parameter": "P-1062_R-1062", "value": "600"}),
+    )
+    .await?;
+    assert_eq!(body["refused"], true, "{body}");
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("sits on a page"), "{reason}");
+    assert!(
+        reason.contains("Universalkanal C5 aktivieren = ja and Universalkanal C6 aktivieren = ja"),
+        "{reason}"
+    );
+
+    client.cancel().await?;
+    task.abort();
+    Ok(())
 }
