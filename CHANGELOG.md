@@ -861,6 +861,21 @@ directory or a script from before these changes needs:
   function. Only two or more shown refs are ambiguous, and the refusal then
   lists each one once, as `key@reference` with its branch condition in words
   where the page-qualified keys would repeat (#315).
+- A healthy System 7 device (mask 0701/0705, such as the Meteodata 140 S)
+  could not be flashed without `--force`. `knx_plan_device` refused the
+  flash plan with "carries another application (unidentified)", and
+  `bussard flash` refused with "an application bussard could not identify",
+  while `bussard describe` said the device matches bussard.lock. System 7
+  exposes no readable application id, so both gates now judge the device the
+  way the parameter read-back already did: every load-state machine the
+  application loads must be Loaded and the first octets of each code segment
+  must match the product. A device that passes is the same application and
+  flashes without `--force` on both surfaces; the CLI says "already runs
+  this application" and the MCP flash plan carries the `identity` line and a
+  `resident` verdict. Code that differs is refused with the segment and the
+  first differing offset, and only then does the message name `bussard
+  flash --force`. `--force` still replaces a different or unreadable
+  application. The written image is unchanged.
 - `knx_set_parameter` refused a parameter on a page that was inactive at
   import, even though `knx_show_device` listed it: after switching on
   "Universalkanal C4", its brightness threshold was "no parameter" in every

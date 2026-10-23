@@ -1,0 +1,195 @@
+//! Issue #314: `bussard flash` on a healthy System 7 device needs no
+//! `--force`. System 7 has no readable application id, so the pre-flight
+//! judges the device by its load-state machines and a sample of its code
+//! (the verdict `knx_plan_device` decides on too): the product's code
+//! proceeds, code that differs by one octet is refused with the segment
+//! named. Against an in-process mock KNXnet/IP gateway on loopback; the
+//! `bussard` binary always runs with an explicit loopback `--gateway`.
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
+
+use bussard_model::IndividualAddress;
+use bussard_testkit::MockGateway;
+use bussard_testkit::sys7::{
+    SYS7_APP_ID, SYS7_APP_XML, SYS7_CODE, SYS7_CODE_BASE, SYS7_PARAM_BASE, system7_device,
+};
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+const CHANNEL: u8 = 0x58;
+
+fn device_ia() -> Result<IndividualAddress, Box<dyn std::error::Error>> {
+    Ok("1.1.7".parse()?)
+}
+
+/// A gateway serving the fixture device with `code`, a model and the
+/// product archive in a fresh temporary directory. The runtime is returned
+/// so it outlives the gateway.
+struct Bench {
+    gateway: MockGateway,
+    dir: PathBuf,
+    product: PathBuf,
+    _rt: tokio::runtime::Runtime,
+}
+
+impl Bench {
+    fn start(code: &[u8]) -> Result<Bench, Box<dyn std::error::Error>> {
+        let rt = tokio::runtime::Runtime::new()?;
+        let gateway = rt.block_on(
+            MockGateway::builder()
+                .channel(CHANNEL)
+                .keep_serving()
+                .idle_timeout(Duration::from_secs(120))
+                .device(system7_device(device_ia()?, code))
+                .start(),
+        )?;
+        let dir = std::env::temp_dir().join(format!(
+            "bussard-sys7-flash-{}-{}",
+            std::process::id(),
+            gateway.port()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let product = dir.join("sys7-test.knxprod");
+        knxprod(&product)?;
+        write_model(&dir.join("knx"))?;
+        Ok(Bench {
+            gateway,
+            dir,
+            product,
+            _rt: rt,
+        })
+    }
+
+    /// Runs `bussard flash 1.1.7 --product <archive> --yes <extra> --dir
+    /// <model> --gateway 127.0.0.1:<port>`.
+    fn flash(&self, extra: &[&str]) -> Result<Output, Box<dyn std::error::Error>> {
+        let model = self.dir.join("knx");
+        let gateway = format!("127.0.0.1:{}", self.gateway.port());
+        let product = self.product.to_str().ok_or("non-UTF-8 temp path")?;
+        let mut args = vec!["flash", "1.1.7", "--product", product, "--yes"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&[
+            "--dir",
+            model.to_str().ok_or("non-UTF-8 temp path")?,
+            "--gateway",
+            &gateway,
+        ]);
+        Ok(Command::new(env!("CARGO_BIN_EXE_bussard"))
+            .args(&args)
+            .env_remove("BUSSARD_ALLOW_REAL_GATEWAY")
+            .env_remove("BUSSARD_FLASH_SYS7_LSM")
+            .env("BUSSARD_FLASH_L4_TIMEOUT_MS", "300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?)
+    }
+}
+
+impl Drop for Bench {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Packs the fixture application into a `.knxprod`.
+fn knxprod(path: &Path) -> TestResult {
+    let mut writer = zip::ZipWriter::new(std::fs::File::create(path)?);
+    writer.start_file(
+        format!("M-00FA/{SYS7_APP_ID}.xml"),
+        zip::write::SimpleFileOptions::default(),
+    )?;
+    writer.write_all(SYS7_APP_XML.as_bytes())?;
+    writer.finish()?;
+    Ok(())
+}
+
+/// The model: 1.1.7 runs the fixture application with object 2 on and one
+/// link.
+fn write_model(dir: &Path) -> TestResult {
+    std::fs::create_dir_all(dir.join("devices"))?;
+    std::fs::write(
+        dir.join("bussard.toml"),
+        "[connection]\ntransport = \"tunnel\"\n",
+    )?;
+    std::fs::write(
+        dir.join("bussard.lock"),
+        format!(
+            "version = 3\n\n[[device]]\naddress = \"1.1.7\"\napplication = \"{SYS7_APP_ID}\"\n\
+             mask = \"0705\"\n"
+        ),
+    )?;
+    std::fs::write(
+        dir.join("devices").join("1.1.7.toml"),
+        "address = \"1.1.7\"\nname = \"Weather station\"\n\n[parameters]\n\
+         \"thr@P-0_R-1\" = \"9\"\n\"obj2@P-1_R-2\" = \"1\"\n\n[links]\n1.listen = [\"1/2/0\"]\n",
+    )?;
+    std::fs::write(
+        dir.join("groups.toml"),
+        "groups = [\n  { address = \"1/2/0\", name = \"Switch\" },\n]\n",
+    )?;
+    Ok(())
+}
+
+fn text(out: &Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[test]
+fn test_flash_system7_same_application_proceeds_without_force() -> TestResult {
+    let bench = Bench::start(&SYS7_CODE)?;
+    let out = bench.flash(&[])?;
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stderr.contains("already runs this application"), "{stderr}");
+    assert!(stderr.contains("the code matches"), "{stderr}");
+    assert!(!stderr.contains("could not identify"), "{stderr}");
+    let (code, params) = bench.gateway.with_device(device_ia()?, |dev| {
+        (
+            dev.read_mem(SYS7_CODE_BASE, 4),
+            dev.read_mem(SYS7_PARAM_BASE, 2),
+        )
+    })?;
+    assert_eq!(code, SYS7_CODE);
+    assert_eq!(params, [9, 0x80], "threshold 9, object 2 on");
+    Ok(())
+}
+
+#[test]
+fn test_flash_system7_differing_code_is_refused_with_the_segment() -> TestResult {
+    let mut code = SYS7_CODE;
+    code[2] = 0xEE;
+    let bench = Bench::start(&code)?;
+    let out = bench.flash(&[])?;
+    let (stdout, stderr) = text(&out);
+    assert!(
+        !out.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stderr.contains("REFUSING to flash 1.1.7"), "{stderr}");
+    assert!(
+        stderr.contains("M-00FA_A-0007_AS-4") && stderr.contains("offset 2"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--force"), "{stderr}");
+    assert!(!stderr.contains("could not identify"), "{stderr}");
+    let writes = bench.gateway.with_device(device_ia()?, |dev| dev.writes)?;
+    assert_eq!(writes, 0, "a refused flash writes nothing");
+
+    // `--force` keeps its meaning: it replaces the other application.
+    let out = bench.flash(&["--force"])?;
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let written = bench
+        .gateway
+        .with_device(device_ia()?, |dev| dev.read_mem(SYS7_CODE_BASE, 4))?;
+    assert_eq!(written, SYS7_CODE);
+    Ok(())
+}

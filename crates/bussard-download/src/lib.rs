@@ -79,11 +79,12 @@ pub use flash::{
     sys7_profile_from_hawk, trace,
 };
 pub use model_params::{
-    OrderNumberError, build_module_obj3_descriptors, build_table_images,
-    describe_group_object_change, identity_gate, linked_object_flags, malformed_parameter_warning,
-    model_parameters, parameter_overrides, plan_for_readback, product_display, region_rows,
-    resolve_by_order_number, runtime_segments, sys7_code_mismatch, template_ops_for,
-    verify_readback, write_parameter_memory_backup,
+    OrderNumberError, Sys7Identity, build_module_obj3_descriptors, build_table_images,
+    describe_group_object_change, flash_gate, identity_gate, linked_object_flags,
+    malformed_parameter_warning, model_parameters, needs_sys7_identity, parameter_overrides,
+    plan_for_readback, product_display, region_rows, resolve_by_order_number, runtime_segments,
+    sys7_code_mismatch, sys7_identity, template_ops_for, verify_readback,
+    write_parameter_memory_backup,
 };
 pub use param_decode::{
     DecodedParameters, OctetOwner, OctetRange, OctetRole, attribute_octets, decode_parameters,

@@ -30,6 +30,8 @@
 //! - [`device`]: [`MockDevice`], a builder-configured KNX device that speaks
 //!   transport-layer connected mode, broadcast management, and the System B
 //!   load-state machine.
+//! - [`sys7`]: a System 7 (mask 0705) [`MockDevice`] running a synthetic
+//!   application, for the flash-gate tests (issue #314).
 //!
 //! # Feature union of the copies this crate replaces
 //!
@@ -129,6 +131,7 @@ pub mod device;
 pub mod gateway;
 pub mod ha;
 pub mod secure_gateway;
+pub mod sys7;
 pub mod wire;
 
 pub use device::{

@@ -19,7 +19,7 @@ use std::path::Path;
 
 use bussard_download::{
     DeviceFacts, FlashOptions, FlashPlan, Freshness, PlanReport, SecureSenderEntry,
-    assess_freshness,
+    assess_freshness, flash_gate,
 };
 use bussard_model::{IndividualAddress, Model};
 use bussard_secure::{Key16, SequenceHighWater};
@@ -109,24 +109,15 @@ pub(super) fn flash_image(
         .plan(mask)
         .map_err(|e| format!("cannot flash {target}: {e}"))?;
     // The factory-freshness gate of `bussard flash` (issue #79), without its
-    // `--force`: a device must carry no application or this one.
+    // `--force`: a device must carry no application or this one. A System 7
+    // device has no readable id, so the read's code sample decides there
+    // (issue #314), the verdict the CLI pre-flight decides on too. The image
+    // is shaped by the probe's freshness, as `bussard flash` shapes it.
     let freshness = assess_freshness(&detail.resident, &plan.identity);
-    match &freshness {
-        Freshness::Fresh | Freshness::SameApplication { .. } => {}
-        Freshness::Resident { resident, .. } => {
-            return Err(format!(
-                "{target} carries another application ({}) than the one this flash writes \
-                 ({}); replacing it is `bussard flash --force {target}` at the CLI",
-                resident.as_deref().unwrap_or("unidentified"),
-                plan.identity.id
-            ));
-        }
-        Freshness::Unknown { reason } => {
-            return Err(format!(
-                "{target}'s load state could not be read ({reason}), so a flash cannot tell \
-                 what it replaces; check the device and plan again"
-            ));
-        }
+    let sys7 = read.params.as_ref().and_then(|p| p.sys7_identity.as_ref());
+    let gate = flash_gate(&freshness, &plan, Some(&detail.resident), sys7);
+    if let Some(why) = gate_refusal(target, &plan, &gate) {
+        return Err(why);
     }
     // A self-contained application's download carries no table objects: the
     // flash would leave changed links unwritten.
@@ -176,6 +167,11 @@ pub(super) fn flash_image(
     let (min, max) = DEVICE_OFFLINE_SECONDS;
     let summary = json!({
         "why": why,
+        "identity": read
+            .check
+            .as_ref()
+            .map(|c| bussard_service::identity_line(target, c)),
+        "resident": resident_line(&gate),
         "objects": {
             "shown": objects(&after.difference(&before).copied().collect()),
             "hidden": objects(&before.difference(&after).copied().collect()),
@@ -362,5 +358,52 @@ impl BussardMcp {
             }
         }
         result
+    }
+}
+
+/// The refusal of the flash gate, `None` when the flash may go ahead: the
+/// device carries another application, or what it carries could not be
+/// confirmed. Only a device that differs names `bussard flash --force`.
+fn gate_refusal(target: IndividualAddress, plan: &FlashPlan, gate: &Freshness) -> Option<String> {
+    let expected = &plan.identity.id;
+    match gate {
+        Freshness::Fresh | Freshness::SameApplication { .. } => None,
+        Freshness::Resident {
+            reason: Some(reason),
+            ..
+        } => Some(format!(
+            "{target} does not run the application this flash writes ({expected}): {reason}; \
+             replacing it is `bussard flash --force {target}` at the CLI"
+        )),
+        Freshness::Resident {
+            resident: Some(id), ..
+        } => Some(format!(
+            "{target} runs application {id}, not the one this flash writes ({expected}); \
+             replacing it is `bussard flash --force {target}` at the CLI"
+        )),
+        Freshness::Resident { resident: None, .. } => Some(format!(
+            "{target} runs an application whose id (PID_PROGRAM_VERSION) cannot be read, so \
+             it cannot be confirmed to be {expected}; replacing it is `bussard flash --force \
+             {target}` at the CLI"
+        )),
+        Freshness::Unknown { reason } => Some(format!(
+            "{target}'s resident application could not be confirmed ({reason}), so a flash \
+             cannot tell what it replaces; check the device and plan again"
+        )),
+    }
+}
+
+/// The flash plan's `resident` field: what the gate found on the device.
+fn resident_line(gate: &Freshness) -> String {
+    match gate {
+        Freshness::Fresh => "no application is loaded (factory-fresh)".to_string(),
+        Freshness::SameApplication { resident } => {
+            format!("runs this application ({resident})")
+        }
+        Freshness::Resident { resident, .. } => format!(
+            "runs another application ({})",
+            resident.as_deref().unwrap_or("unidentified")
+        ),
+        Freshness::Unknown { reason } => format!("unknown ({reason})"),
     }
 }

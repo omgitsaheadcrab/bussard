@@ -5556,7 +5556,9 @@ async fn test_probe_resident_state_other_application_is_refused() -> TestResult 
     );
     assert!(resident.has_loaded_application());
     match bussard_download::assess_freshness(&resident, &plan.identity) {
-        bussard_download::Freshness::Resident { resident, objects } => {
+        bussard_download::Freshness::Resident {
+            resident, objects, ..
+        } => {
             assert_eq!(resident.as_deref(), Some("M-0083 A-0007 v35"));
             assert_eq!(objects, vec!["object 3 (application program)".to_string()]);
         }
@@ -5611,7 +5613,9 @@ async fn test_probe_resident_state_loaded_without_app_id_is_refused() -> TestRes
 
     assert!(resident.app_id.is_none());
     match bussard_download::assess_freshness(&resident, &plan.identity) {
-        bussard_download::Freshness::Resident { resident, objects } => {
+        bussard_download::Freshness::Resident {
+            resident, objects, ..
+        } => {
             assert!(resident.is_none(), "unidentifiable resident application");
             assert_eq!(objects, vec!["object 3 (application program)".to_string()]);
         }

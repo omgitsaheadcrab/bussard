@@ -1884,7 +1884,9 @@ async fn probe_loaded_sys7_device(mode: LsmMode) -> Result<(), Box<dyn std::erro
 
     assert!(resident.has_loaded_application(), "{resident:?}");
     match bussard_download::assess_freshness(&resident, &plan.identity) {
-        bussard_download::Freshness::Resident { resident, objects } => {
+        bussard_download::Freshness::Resident {
+            resident, objects, ..
+        } => {
             // System 7 has no application-id property: the resident application
             // exists but cannot be named, which is still a refusal.
             assert!(
@@ -2609,6 +2611,87 @@ async fn test_parameter_engine_sys7_memory_mapped_gates_writes_and_verifies()
 async fn test_parameter_engine_sys7_property_gates_writes_and_verifies()
 -> Result<(), Box<dyn std::error::Error>> {
     run_parameter_engine_sys7(LsmMode::Property).await
+}
+
+/// The System 7 identity verdict both flash gates share (issue #314): a
+/// fully Loaded device whose code differs from the product is another
+/// application, named by segment and offset; the product's code is this
+/// application, which the gate lets flash without `--force`; an LSM the
+/// procedure drives that is not Loaded is another application too.
+async fn run_sys7_identity(mode: LsmMode) -> Result<(), Box<dyn std::error::Error>> {
+    set_sys7_lsm_env(mode);
+    let (mut bus, state, handle) = setup(mode, Fault::None).await?;
+    let (_app, full) = parameters_only_fixture(&state, LS_LOADED)?;
+    let target: bussard_model::IndividualAddress = "1.1.99".parse()?;
+    let source: bussard_model::IndividualAddress = "0.0.255".parse()?;
+    let l4 = Layer4Connection::connect(&mut bus, target, source).await?;
+    let mut session = authed_session(l4).await?;
+    let access = full.sys7_lsm_access();
+    let resident =
+        bussard_download::probe_resident_state(session.l4(), MASK_0705, access.as_ref()).await;
+    let freshness = bussard_download::assess_freshness(&resident, &full.identity);
+    assert!(bussard_download::needs_sys7_identity(&full, &resident));
+
+    // Unprogrammed code memory: AS-1's octet 1 is 0x00 on the device, 0x01 in
+    // the product (octet 0 matches, octet 2 is device-owned under the mask).
+    let differs = bussard_download::sys7_identity(session.l4(), &full, &resident).await;
+    let bussard_download::Sys7Identity::Resident { reason } = &differs else {
+        return Err(format!("expected a different application, got {differs:?}").into());
+    };
+    assert!(
+        reason.contains("M-83_A-E_AS-1") && reason.contains("offset 1"),
+        "{reason}"
+    );
+    let gate = bussard_download::flash_gate(&freshness, &full, Some(&resident), Some(&differs));
+    assert!(!gate.allows_flash(), "{gate:?}");
+    assert!(
+        matches!(&gate, bussard_download::Freshness::Resident { reason: Some(r), .. } if r == reason),
+        "{gate:?}"
+    );
+
+    // The product's code: the same application.
+    {
+        let mut s = lock(&state);
+        for (i, b) in [0u8, 1, 2, 3].iter().enumerate() {
+            s.memory.insert(0x4000 + i as u16, *b);
+        }
+        for (i, b) in [1u8, 2, 3].iter().enumerate() {
+            s.memory.insert(0x4201 + i as u16, *b);
+        }
+    }
+    let same = bussard_download::sys7_identity(session.l4(), &full, &resident).await;
+    assert_eq!(
+        same,
+        bussard_download::Sys7Identity::SameApplication { segments: 2 }
+    );
+    let gate = bussard_download::flash_gate(&freshness, &full, Some(&resident), Some(&same));
+    assert!(gate.allows_flash(), "{gate:?}");
+    // The image is still shaped by the probe's own verdict.
+    assert!(!freshness.allows_flash());
+
+    // LSM 3 not Loaded: not this application, whatever the code says.
+    lock(&state).lsm_states.insert(3, LS_UNLOADED);
+    let partial =
+        bussard_download::probe_resident_state(session.l4(), MASK_0705, access.as_ref()).await;
+    let unloaded = bussard_download::sys7_identity(session.l4(), &full, &partial).await;
+    assert!(
+        matches!(&unloaded, bussard_download::Sys7Identity::Resident { reason } if reason.contains("LSM 3")),
+        "{unloaded:?}"
+    );
+    drop(handle);
+    let _ = session.into_disconnect().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sys7_identity_memory_mapped_compares_the_code()
+-> Result<(), Box<dyn std::error::Error>> {
+    run_sys7_identity(LsmMode::MemoryMapped).await
+}
+
+#[tokio::test]
+async fn test_sys7_identity_property_compares_the_code() -> Result<(), Box<dyn std::error::Error>> {
+    run_sys7_identity(LsmMode::Property).await
 }
 
 // --- ETS parity: state read-backs, one connection, prelude (issue #116) -----
