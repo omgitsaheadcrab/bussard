@@ -182,6 +182,14 @@ debug = "line-tables-only"
 # fast to iterate) while making the hot inner loops orders of magnitude faster
 # to run. These deps are third-party and rarely rebuilt, so the one-time
 # optimized compile is amortized across every subsequent test run.
+#
+# `bussard-secure` is first party but must be on the list too. PBKDF2 is
+# generic (`pbkdf2_hmac::<Sha256>`), and generic code is monomorphized and
+# optimized in the crate that instantiates it, so an override on `pbkdf2`,
+# `hmac` and `sha2` alone leaves the hot loop at opt-level 0. One 65_536-round
+# derivation drops from ~0.4 s to ~0.06 s; a keyring parse runs five.
+[profile.test.package.bussard-secure]
+opt-level = 3
 [profile.test.package.pbkdf2]
 opt-level = 3
 [profile.test.package.sha2]
@@ -223,6 +231,8 @@ opt-level = 3
 # `cargo test --doc` and any `cargo run` in tests use the `dev` profile, and the
 # CLI integration tests spawn the built `bussard` binary — which itself imports
 # the project. Mirror the crypto optimization there so those paths are fast too.
+[profile.dev.package.bussard-secure]
+opt-level = 3
 [profile.dev.package.pbkdf2]
 opt-level = 3
 [profile.dev.package.sha2]
