@@ -34,7 +34,7 @@ use rmcp::{tool, tool_router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::param_keys::{KeyContext, resolve_parameter_key};
+use crate::param_keys::{KeyContext, index_parameter, resolve_parameter_key};
 use crate::server::BussardMcp;
 use crate::session_edits::Subject;
 
@@ -622,7 +622,8 @@ impl BussardMcp {
         (`P-7305_R-7305`) work too, and `channel` takes a channel handle, `device` or a page \
         handle, as knx_show_device does, when the key repeats. An unknown key is refused with \
         the three closest keys on the device. Any \
-        parameter the lock knows for the device can be set, and the value (an enum label or \
+        parameter the lock knows for the device, or the product model's pages hold (one on a \
+        page that was inactive at import), can be set, and the value (an enum label or \
         code, a number) is checked against the vendor's product model first; without a product \
         model the edit is refused rather than guessed. This edits FILES ONLY: the device keeps \
         its current settings until the change is pushed with knx_plan_device and \
@@ -667,6 +668,9 @@ impl BussardMcp {
             };
             let key = resolve_parameter_key(&loaded.device, &keys, &wanted, channel.as_deref())?;
             let value = check_parameter(&dir, loaded, &key, &value)?;
+            // A parameter on a page that was inactive at import gets its lock
+            // entry now, saved with the device file below.
+            index_parameter(&mut loaded.device, &keys, &key);
             loaded.device.parameters.insert(key, value);
             Ok(refresh_device_facts(&dir, model, ia, tiers))
         })

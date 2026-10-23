@@ -316,6 +316,7 @@ impl BussardMcp {
             &self.state.dir,
             &args.query,
             limit,
+            crate::guidance::Tiers::of(&self.state),
         ))
     }
 
@@ -397,7 +398,13 @@ impl BussardMcp {
         let view =
             bussard_model::device_view::device_view(&model, &products, ia, args.channel.as_deref())
                 .map_err(|e| invalid(e.to_string()))?;
-        let value = tools::show_device_result(view, args.inactive, args.toml).map_err(|e| {
+        let value = tools::show_device_result(
+            view,
+            args.inactive,
+            args.toml,
+            crate::guidance::Tiers::of(&self.state),
+        )
+        .map_err(|e| {
             ErrorData::internal_error(format!("serializing the device view: {e}"), None)
         })?;
         ok(value)

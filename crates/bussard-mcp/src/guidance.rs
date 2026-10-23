@@ -211,6 +211,38 @@ impl Tiers {
         }
     }
 
+    /// The `needs` sentence of an inactive page or channel of device `ia`
+    /// (`<ia>` when `None`) with how this tier runs that push appended: the
+    /// model says what kind of push it is
+    /// ([`bussard_model::device_view::NEEDS_FLASH`] or
+    /// [`bussard_model::device_view::NEEDS_PUSH`]), this says how.
+    pub fn needs_how(&self, needs: &str, ia: Option<IndividualAddress>) -> String {
+        let at = ia.map_or_else(|| "<ia>".to_string(), |ia| ia.to_string());
+        let flash = needs == bussard_model::device_view::NEEDS_FLASH;
+        let how = match (flash, self.programming) {
+            (true, true) => {
+                "set `enable` with knx_set_parameter; knx_plan_device plans the push as \
+                             `method: flash` and knx_apply_device runs it"
+                    .to_string()
+            }
+            (true, false) => format!(
+                "set `enable` with knx_set_parameter, then `bussard flash {at}` at the CLI (with \
+                 --allow-programming, knx_plan_device and knx_apply_device push it as a flash)"
+            ),
+            (false, true) => {
+                "set `enable` with knx_set_parameter, then push it with knx_plan_device and \
+                 knx_apply_device"
+                    .to_string()
+            }
+            (false, false) => format!(
+                "set `enable` with knx_set_parameter, then `bussard plan {at}` and `bussard apply \
+                 {at}` at the CLI (with --allow-programming, knx_plan_device and \
+                 knx_apply_device)"
+            ),
+        };
+        format!("{needs}: {how}")
+    }
+
     /// The server instructions (`initialize` result) for this tier.
     pub fn instructions(&self) -> String {
         let mut out = vec![format!(
@@ -443,6 +475,26 @@ mod tests {
             from: None,
             to: None,
         }
+    }
+
+    #[test]
+    fn test_needs_how_says_how_at_each_tier() -> Result<(), Box<dyn std::error::Error>> {
+        use bussard_model::device_view::{NEEDS_FLASH, NEEDS_PUSH};
+        let ia: IndividualAddress = "1.1.202".parse()?;
+        let programming = tiers(false, false, true).needs_how(NEEDS_FLASH, Some(ia));
+        assert!(programming.starts_with(NEEDS_FLASH), "{programming}");
+        assert!(programming.contains("`method: flash`"), "{programming}");
+        assert!(!programming.contains("bussard flash"), "{programming}");
+        let read = tiers(false, false, false).needs_how(NEEDS_FLASH, Some(ia));
+        assert!(read.contains("`bussard flash 1.1.202`"), "{read}");
+        let push = tiers(false, false, true).needs_how(NEEDS_PUSH, Some(ia));
+        assert!(
+            push.contains("knx_plan_device and knx_apply_device") && !push.contains("flash"),
+            "{push}"
+        );
+        let push = tiers(false, false, false).needs_how(NEEDS_PUSH, None);
+        assert!(push.contains("`bussard apply <ia>`"), "{push}");
+        Ok(())
     }
 
     #[test]

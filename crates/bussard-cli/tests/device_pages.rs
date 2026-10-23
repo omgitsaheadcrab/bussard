@@ -99,7 +99,8 @@ fn test_device_lists_pages_and_marks_the_inactive_ones() -> TestResult {
     assert!(
         b.contains(
             "inactive: set universal-channel-b-enable = \"yes\" (default \"no\"); shows 1 \
-             object(s); enabling it shows com-objects, so it needs `bussard flash 1.1.30`"
+             object(s); shows com-objects, so the push is a flash (a parameter push does not \
+             change the object table): `bussard flash 1.1.30`"
         ),
         "{b}"
     );

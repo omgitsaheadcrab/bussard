@@ -193,7 +193,7 @@ $ bussard history --json | jq '.snapshots[-1]'
 }
 ```
 
-Nothing an assistant does over MCP reaches the bus: the model-edit tools write the model files, and `plan`/`apply`/`flash` are CLI-only. A change touching a `protected = true` group address ends with "This group address is protected." and is sorted first, and the MCP tools refuse such a change outright. If you dislike what you see, `bussard undo`. To run the server without the edit tools at all, start it with `bussard mcp --no-model-edits`.
+The model-edit tools write the model files only; nothing reaches a device until it is pushed. A server started with `--allow-programming` pushes with `knx_plan_device` and `knx_apply_device` (a change that shows or hides com-objects is planned as `method: flash`), each after the human's yes to the plan; without that flag the push is `bussard plan`, `bussard apply` and `bussard flash` at the CLI. A change touching a `protected = true` group address ends with "This group address is protected." and is sorted first, and the MCP tools refuse such a change outright. If you dislike what you see, `bussard undo`. To run the server without the edit tools at all, start it with `bussard mcp --no-model-edits`.
 
 ## ... send my configuration to an integrator?
 

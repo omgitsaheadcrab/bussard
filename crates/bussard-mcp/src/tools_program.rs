@@ -486,7 +486,8 @@ impl BussardMcp {
         // for it here could outlast the client's call budget.
         if let Some((job, device)) = tier.jobs.running() {
             return Err(format!(
-                "an apply is running on this server (job {job} for {device}); call                  knx_apply_status with job {job} until it is done, then plan again"
+                "an apply is running on this server (job {job} for {device}); call \
+                 knx_apply_status with job {job} until it is done, then plan again"
             ));
         }
         let dir = self.state().dir.clone();

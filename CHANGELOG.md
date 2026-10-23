@@ -850,6 +850,28 @@ directory or a script from before these changes needs:
 
 ### Fixed
 
+- `knx_set_parameter` refused a parameter on a page that was inactive at
+  import, even though `knx_show_device` listed it: after switching on
+  "Universalkanal C4", its brightness threshold was "no parameter" in every
+  key shape. The lock indexes only what the configuration showed at import,
+  and the key resolver looked nowhere else. It now also resolves against the
+  product model's pages, so every key `knx_show_device` prints works as the
+  bare key, page-qualified, `key@reference` or the bare reference. A bare
+  key that several pages share is refused with the page-qualified keys to
+  pick from, instead of silently taking the indexed one. Setting such a
+  parameter adds its lock entry, so the device file names it like its
+  neighbours. An unknown reference is refused as "no parameter with
+  reference ... in its application" instead of a list of unrelated near
+  matches, and a near match on a page the lock does not index says it is at
+  its default.
+- The inactive-page hint of `knx_show_device` and `knx_model_lookup` said
+  "needs `bussard flash <ia>`" even on a server that flashes through
+  `knx_plan_device` and `knx_apply_device`. The model now says what kind of
+  push it is, and the server and the CLI each say how at their end (#310).
+  Scoped page lines read "1 parameter, 1 object" instead of "1 parameters,
+  1 objects", the "an apply is running" refusal lost a run of spaces, and the
+  how-to no longer says plan, apply and flash are CLI-only.
+
 - A secured group write the actuator discarded was reported as confirmed
   (#297). `write`, `read`, `knx_write_group` and `knx_read_group` on a secured
   GA now check whether the devices on it admit bussard's tunnel address (the

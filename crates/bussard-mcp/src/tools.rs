@@ -245,15 +245,22 @@ pub fn model_lookup(model: &Model, query: &str, limit: usize) -> Value {
 /// plus `capabilities`, the parameter texts and enum choice texts of the
 /// installed devices' product models that match, each with its device, page
 /// or channel, whether that is active, and what enables it when it is not
-/// ([`bussard_model::capabilities::capability_lookup`]).
+/// ([`bussard_model::capabilities::capability_lookup`]), each `needs` with
+/// how `tiers` runs that push.
 pub fn model_lookup_with_capabilities(
     model: &Model,
     dir: &std::path::Path,
     query: &str,
     limit: usize,
+    tiers: crate::guidance::Tiers,
 ) -> Value {
     let mut out = model_lookup(model, query, limit);
-    let capabilities = bussard_model::capabilities::capability_lookup(model, dir, query, limit);
+    let mut capabilities = bussard_model::capabilities::capability_lookup(model, dir, query, limit);
+    for c in &mut capabilities {
+        if let Some(needs) = c.needs.take() {
+            c.needs = Some(tiers.needs_how(&needs, c.device_ia.parse().ok()));
+        }
+    }
     if let Some(map) = out.as_object_mut() {
         map.insert(
             "capabilities".to_string(),
@@ -383,9 +390,20 @@ fn compact_row(row: &bussard_model::device_view::BlockRow) -> String {
         .map(|t| format!(" {t:?}"))
         .unwrap_or_default();
     format!(
-        "{}{text}: {state}, {} parameters, {} objects",
-        row.handle, row.parameters, row.objects
+        "{}{text}: {state}, {}, {}",
+        row.handle,
+        counted(row.parameters, "parameter"),
+        counted(row.objects, "object")
     )
+}
+
+/// `n` and `noun`, plural unless `n` is 1: "1 parameter", "2 objects".
+fn counted(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }
 
 /// `knx_show_device`'s result for `view` (issue #304). Without a scope: the
@@ -393,14 +411,30 @@ fn compact_row(row: &bussard_model::device_view::BlockRow) -> String {
 /// `also_needs`, and `how_to_change`. With one: the scope in detail, the
 /// pages and inactive channels one line each, their `inactive` detail only
 /// with `inactive` (as `inactive_pages`), and no `how_to_change` (the tool
-/// description carries it). `toml` adds the paste-ready snippet.
+/// description carries it). `toml` adds the paste-ready snippet. Each
+/// `needs` gets how `tiers` runs that push.
 pub fn show_device_result(
     mut view: bussard_model::device_view::DeviceView,
     inactive: bool,
     toml: bool,
+    tiers: crate::guidance::Tiers,
 ) -> Result<Value, serde_json::Error> {
     let snippet = toml.then(|| view.render_toml());
     view.collapse_enable_chains();
+    let ia = view.address.parse().ok();
+    let how = |row: Option<&mut bussard_model::device_view::Inactive>| {
+        if let Some(i) = row {
+            i.needs = tiers.needs_how(&i.needs, ia);
+        }
+    };
+    for row in view
+        .blocks
+        .iter_mut()
+        .chain(view.inactive_channels.iter_mut())
+    {
+        how(row.inactive.as_mut());
+    }
+    how(view.scope.as_mut().and_then(|s| s.inactive.as_mut()));
     let scoped = view.scope.is_some();
     let mut value = if scoped {
         let blocks = std::mem::take(&mut view.blocks);
