@@ -12,10 +12,10 @@ use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 use bussard_model::IndividualAddress;
-use bussard_testkit::MockGateway;
 use bussard_testkit::sys7::{
     SYS7_APP_ID, SYS7_APP_XML, SYS7_CODE, SYS7_CODE_BASE, SYS7_PARAM_BASE, system7_device,
 };
+use bussard_testkit::{MockDevice, MockGateway};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -37,13 +37,19 @@ struct Bench {
 
 impl Bench {
     fn start(code: &[u8]) -> Result<Bench, Box<dyn std::error::Error>> {
+        Bench::start_with(system7_device(device_ia()?, code), SYS7_APP_XML)
+    }
+
+    /// [`Bench::start`] with `device` on the bus and the application `xml`
+    /// in the archive.
+    fn start_with(device: MockDevice, xml: &str) -> Result<Bench, Box<dyn std::error::Error>> {
         let rt = tokio::runtime::Runtime::new()?;
         let gateway = rt.block_on(
             MockGateway::builder()
                 .channel(CHANNEL)
                 .keep_serving()
                 .idle_timeout(Duration::from_secs(120))
-                .device(system7_device(device_ia()?, code))
+                .device(device)
                 .start(),
         )?;
         let dir = std::env::temp_dir().join(format!(
@@ -54,7 +60,7 @@ impl Bench {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)?;
         let product = dir.join("sys7-test.knxprod");
-        knxprod(&product)?;
+        knxprod(&product, xml)?;
         write_model(&dir.join("knx"))?;
         Ok(Bench {
             gateway,
@@ -96,14 +102,14 @@ impl Drop for Bench {
     }
 }
 
-/// Packs the fixture application into a `.knxprod`.
-fn knxprod(path: &Path) -> TestResult {
+/// Packs the application `xml` into a `.knxprod`.
+fn knxprod(path: &Path, xml: &str) -> TestResult {
     let mut writer = zip::ZipWriter::new(std::fs::File::create(path)?);
     writer.start_file(
         format!("M-00FA/{SYS7_APP_ID}.xml"),
         zip::write::SimpleFileOptions::default(),
     )?;
-    writer.write_all(SYS7_APP_XML.as_bytes())?;
+    writer.write_all(xml.as_bytes())?;
     writer.finish()?;
     Ok(())
 }
@@ -148,6 +154,7 @@ fn test_flash_system7_same_application_proceeds_without_force() -> TestResult {
     let out = bench.flash(&[])?;
     let (stdout, stderr) = text(&out);
     assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("parameters match the model"), "{stdout}");
     assert!(stderr.contains("already runs this application"), "{stderr}");
     assert!(stderr.contains("the code matches"), "{stderr}");
     assert!(!stderr.contains("could not identify"), "{stderr}");
@@ -191,5 +198,40 @@ fn test_flash_system7_differing_code_is_refused_with_the_segment() -> TestResult
         .gateway
         .with_device(device_ia()?, |dev| dev.read_mem(SYS7_CODE_BASE, 4))?;
     assert_eq!(written, SYS7_CODE);
+    Ok(())
+}
+
+/// Issue #319: a device that reports every LSM Loaded but lost a parameter
+/// octet (it reverts object 2's switch at the restart) fails the flash: the
+/// read-back against the model names the parameter and the exit is non-zero.
+/// The parameter segment carries a `<Mask>`, as the Meteodata's do, so no
+/// spot check samples it.
+#[test]
+fn test_flash_system7_parameter_lost_on_the_device_fails_with_the_parameter() -> TestResult {
+    let device = system7_device(device_ia()?, &SYS7_CODE).with_hook(|dev, apci, _| {
+        if apci == bussard_testkit::consts::A_RESTART {
+            dev.memory.insert(SYS7_PARAM_BASE + 1, 0x00);
+        }
+        None
+    });
+    let masked = SYS7_APP_XML.replace(
+        r#"Address="17408"><Data>AAA=</Data>"#,
+        r#"Address="17408"><Data>AAA=</Data><Mask>//8=</Mask>"#,
+    );
+    if masked == SYS7_APP_XML {
+        return Err("the fixture's parameter segment moved".into());
+    }
+    let bench = Bench::start_with(device, &masked)?;
+    let out = bench.flash(&[])?;
+    let (stdout, stderr) = text(&out);
+    assert!(
+        !out.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("still differ from the model") && stderr.contains("obj2"),
+        "the error names the parameter: {stderr}"
+    );
+    assert!(!stdout.contains("flash verified"), "{stdout}");
     Ok(())
 }

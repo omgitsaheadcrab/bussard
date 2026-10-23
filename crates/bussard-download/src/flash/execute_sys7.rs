@@ -678,9 +678,10 @@ pub(super) async fn read_sys7_memory<C: Connector>(
 }
 
 /// Streams a System 7 segment image to `addr`, honouring an optional per-byte
-/// `<Mask>` (`[system7-spec §4.2]`): a `0xFF` mask byte means the byte belongs to
-/// the image and is written; any other value marks a device-owned byte the write
-/// must leave untouched. Owned bytes are streamed in maximal contiguous runs
+/// write mask (`[system7-spec §4.2]`, the product's `<Mask>` with the placed
+/// parameter octets added, issue #320): a `0xFF` mask byte means the byte
+/// belongs to the image and is written; any other value marks a device-owned
+/// byte the write must leave untouched. Owned bytes are streamed in maximal contiguous runs
 /// (streamed in negotiated-max-APDU chunks by [`write_image`]). With no mask,
 /// the whole image is streamed.
 pub(super) async fn write_sys7_segment<C: Connector, F: FnMut(Progress)>(
@@ -691,9 +692,15 @@ pub(super) async fn write_sys7_segment<C: Connector, F: FnMut(Progress)>(
     progress: &mut F,
 ) -> Result<(), WriteError> {
     let Some(mask) = mask else {
-        return write_image(session, u32::from(addr), bytes, progress).await;
+        write_image(session, u32::from(addr), bytes, progress).await?;
+        progress(Progress::Written {
+            written: bytes.len(),
+            writable: bytes.len(),
+        });
+        return Ok(());
     };
     // Walk the mask, writing each maximal run of owned (0xFF) bytes at its address.
+    let mut written = 0usize;
     let mut i = 0usize;
     while i < bytes.len() {
         let owned = mask.get(i).copied() == Some(0xFF);
@@ -707,7 +714,12 @@ pub(super) async fn write_sys7_segment<C: Connector, F: FnMut(Progress)>(
         }
         let run_addr = addr.saturating_add(run_start as u16);
         write_image(session, u32::from(run_addr), &bytes[run_start..i], progress).await?;
+        written += i - run_start;
     }
+    progress(Progress::Written {
+        written,
+        writable: written,
+    });
     Ok(())
 }
 
@@ -718,8 +730,9 @@ pub(super) async fn write_sys7_segment<C: Connector, F: FnMut(Progress)>(
 /// The image is walked in chunks of the negotiated memory chunk (the write
 /// chunk, 12 octets on the Meteodata). Each chunk is read from the device and
 /// compared with the image over its owned octets (all of them without a
-/// `<Mask>`; only the `0xFF`-masked ones with one, and a chunk with no owned
-/// octet is neither read nor written). A matching chunk is left alone. A
+/// mask; only the `0xFF`-masked ones with one, a placed parameter octet under
+/// a `0x00` product `<Mask>` byte included (issue #320), and a chunk with no
+/// owned octet is neither read nor written). A matching chunk is left alone. A
 /// differing chunk has its owned runs written, then is read back and must
 /// match, or the write fails with
 /// [`MgmtError::MemoryVerifyFailed`](bussard_mgmt::MgmtError::MemoryVerifyFailed).
@@ -734,7 +747,9 @@ pub(super) async fn read_compare_sys7_segment<C: Connector, F: FnMut(Progress)>(
     let owned = |i: usize| mask.is_none_or(|m| m.get(i).copied() == Some(0xFF));
     let chunk = usize::from(session.l4().max_memory_chunk()).max(1);
     let total = bytes.len();
+    let writable = (0..total).filter(|&i| owned(i)).count();
     let mut written_chunks = 0usize;
+    let mut written_octets = 0usize;
     let mut start = 0usize;
     while start < total {
         let end = (start + chunk).min(total);
@@ -770,6 +785,7 @@ pub(super) async fn read_compare_sys7_segment<C: Connector, F: FnMut(Progress)>(
                         &mut |_: Progress| {},
                     )
                     .await?;
+                    written_octets += i - run_start;
                 }
                 let got =
                     read_memory(session.l4(), u32::from(span_addr), expected.len() as u8).await?;
@@ -787,10 +803,16 @@ pub(super) async fn read_compare_sys7_segment<C: Connector, F: FnMut(Progress)>(
             }
         }
         start = end;
+        // The walk position, for a progress bar; `Written` below reports what
+        // was written (issue #320).
         progress(Progress::Bytes {
             written: start,
             total,
         });
     }
+    progress(Progress::Written {
+        written: written_octets,
+        writable,
+    });
     Ok(written_chunks)
 }

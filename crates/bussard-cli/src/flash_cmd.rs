@@ -794,7 +794,9 @@ pub fn run(
     // (issue #213); otherwise the write phase opens its own.
     let handed_over = handover.take();
     let download_started = std::time::Instant::now();
-    let outcome = runtime.block_on(execute(
+    // Issue #319: on the flash's last connection, read the parameter memory
+    // back and compare it with the model the way `bussard plan` does.
+    let (outcome, flashed) = runtime.block_on(execute_then(
         service,
         target,
         source,
@@ -806,6 +808,17 @@ pub fn run(
         output.json,
         &restart_started,
         handed_over,
+        async |l4| {
+            bussard_service::params::read_flashed_parameters(
+                l4,
+                &product_data,
+                app,
+                model.as_ref(),
+                target,
+                device_mask,
+            )
+            .await
+        },
     ));
     if output.verbose > 0 {
         let readiness = outcome
@@ -826,10 +839,31 @@ pub fn run(
 
     match outcome {
         Ok(verify) if verify.ok() => {
-            println!(
-                "\nflash verified: application program {} is {} on {target}",
-                plan.identity.id, verify.load_state,
-            );
+            // The application is loaded; the parameters must match the model
+            // too, or the flash did not do what the plan said (issue #319).
+            let params_failure = flashed.as_ref().and_then(|f| f.failure());
+            let not_compared = flashed.as_ref().and_then(|f| f.note.as_ref());
+            if let Some(failure) = &params_failure {
+                eprintln!("\nERROR: {failure}");
+                eprintln!(
+                    "the application program {} is {} on {target}, but the device does not \
+                     hold the model's parameters; run `bussard plan {target}` to see what is \
+                     left",
+                    plan.identity.id, verify.load_state,
+                );
+            } else if let Some(note) = not_compared {
+                println!(
+                    "\nflash verified: application program {} is {} on {target}",
+                    plan.identity.id, verify.load_state,
+                );
+                eprintln!("warning: parameters not compared with the model: {note}");
+            } else {
+                println!(
+                    "\nflash verified: application program {} is {} on {target}, and its \
+                     parameters match the model",
+                    plan.identity.id, verify.load_state,
+                );
+            }
             // Advisory findings (issue #145) do not fail the flash.
             for warning in &verify.warnings {
                 eprintln!("{warning}");
@@ -846,6 +880,9 @@ pub fn run(
                     Ok(false) => {}
                     Err(err) => eprintln!("warning: {err}"),
                 }
+            }
+            if params_failure.is_some() {
+                return Ok(ExitCode::FAILURE);
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -1074,40 +1111,7 @@ fn preflight_interrupted(
     }
 }
 
-/// Runs the on-bus flash sequence with a progress line.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute(
-    service: &BusService,
-    target: IndividualAddress,
-    source: IndividualAddress,
-    plan: &FlashPlan,
-    options: bussard_download::FlashOptions,
-    facts: bussard_download::DeviceFacts,
-    secure_tool_key: Option<bussard_secure::Key16>,
-    secure_seq: bussard_secure::SequenceHighWater,
-    json: bool,
-    restart_started: &std::cell::Cell<Option<std::time::Instant>>,
-    handover: Option<Management>,
-) -> Result<bussard_download::FlashOutcome, WriteError> {
-    let (result, _) = execute_then(
-        service,
-        target,
-        source,
-        plan,
-        options,
-        facts,
-        secure_tool_key,
-        secure_seq,
-        json,
-        restart_started,
-        handover,
-        async |_| {},
-    )
-    .await;
-    result
-}
-
-/// [`execute`], then `after` on the session's last connection (the one the
+/// Runs the flash, then `after` on the session's last connection (the one the
 /// post-restart verification ran on) when the flash verified, before the
 /// disconnect: `flash --parameters-only` reads its parameters back there
 /// instead of opening another session (issue #215). `after` gets `None`

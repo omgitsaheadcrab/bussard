@@ -201,6 +201,9 @@ struct DeviceState {
     l4_connects: usize,
     /// KNXnet/IP CONNECT_REQUESTs answered (tunnel (re)establishments).
     tunnel_connects: usize,
+    /// Addresses whose memory writes the device acknowledges but does not
+    /// store (issue #320): the octet keeps its old value.
+    frozen: Vec<u16>,
 }
 
 impl DeviceState {
@@ -258,6 +261,7 @@ fn fresh_device(mode: LsmMode, fault: Fault) -> Shared {
         l4_dead_after_outage: false,
         l4_connects: 0,
         tunnel_connects: 0,
+        frozen: Vec::new(),
     }))
 }
 
@@ -505,6 +509,9 @@ fn handle_request(state: &Shared, req_apci: u16, payload: &[u8]) -> Reaction {
         s.segment_writes.push((addr, data.len()));
         for (i, &b) in data.iter().enumerate() {
             let a = addr.wrapping_add(i as u16);
+            if s.frozen.contains(&a) {
+                continue;
+            }
             let stored = if s.fault == Fault::CorruptStoredImage && i == 0 {
                 b ^ 0xFF
             } else {
@@ -1785,6 +1792,197 @@ async fn test_flash_sys7_verify_mode_mask_writes_blind() -> Result<(), Box<dyn s
         "a blind write streams every segment: {}",
         s.memory_writes_seen
     );
+    Ok(())
+}
+
+// --- Placed parameter octets under a 0x00 `<Mask>` byte (issue #320) --------
+//
+// The Theben Meteodata masks its parameter segment `AS-4800` with `0x00` runs,
+// and its C4 page lives in one. ETS writes the octets its placed parameters
+// occupy whatever the mask says, and leaves a masked run no parameter occupies
+// alone (`AS-4C00`, which the device holds as `0xFF`).
+
+/// A 0701 app with one 40-octet parameter segment at `0x4400` whose `<Mask>`
+/// owns octets `0..16` and masks `16..40` out. `P-0` sits at offset 2 (owned),
+/// `P-1` at offset 20 (inside the masked run); nothing else is placed.
+fn masked_param_app() -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
+    let xml = r#"<KNX xmlns="http://knx.org/xml/project/23">
+     <ApplicationProgram Id="M-48_A-4949" ApplicationNumber="18761" ApplicationVersion="16"
+        MaskVersion="MV-0701" Name="masked parameters" LoadProcedureStyle="ProductProcedure">
+      <Static>
+       <Code>
+        <AbsoluteSegment Id="M-48_A-4949_AS-2" Size="40" Address="17408"><Data>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==</Data><Mask>/////////////////////wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==</Mask></AbsoluteSegment>
+       </Code>
+       <ParameterTypes>
+        <ParameterType Id="M-48_A-4949_PT-0" Name="n"><TypeNumber SizeInBit="8" Type="unsignedInt" maxInclusive="255" /></ParameterType>
+       </ParameterTypes>
+       <Parameters>
+        <Parameter Id="M-48_A-4949_P-0" Name="owned" Text="Owned" ParameterType="M-48_A-4949_PT-0" Value="7"><Memory CodeSegment="M-48_A-4949_AS-2" Offset="2" BitOffset="0" /></Parameter>
+        <Parameter Id="M-48_A-4949_P-1" Name="masked" Text="Masked" ParameterType="M-48_A-4949_PT-0" Value="0"><Memory CodeSegment="M-48_A-4949_AS-2" Offset="20" BitOffset="0" /></Parameter>
+       </Parameters>
+       <ParameterRefs>
+        <ParameterRef Id="M-48_A-4949_P-0_R-1" RefId="M-48_A-4949_P-0" />
+        <ParameterRef Id="M-48_A-4949_P-1_R-2" RefId="M-48_A-4949_P-1" />
+       </ParameterRefs>
+       <LoadProcedures>
+        <LoadProcedure>
+         <LdCtrlConnect />
+         <LdCtrlUnload LsmIdx="3" />
+         <LdCtrlLoad LsmIdx="3" />
+         <LdCtrlAbsSegment LsmIdx="3" Address="17408" Size="40" />
+         <LdCtrlTaskSegment LsmIdx="3" Address="17408" />
+         <LdCtrlLoadCompleted LsmIdx="3" />
+         <LdCtrlRestart />
+         <LdCtrlDisconnect />
+        </LoadProcedure>
+       </LoadProcedures>
+      </Static>
+     </ApplicationProgram></KNX>"#;
+    parse_application_program("M-48_A-4949", xml.as_bytes())
+        .map_err(|e| format!("parse masked-parameter app: {e}").into())
+}
+
+/// The masked parameter at offset 20 set to 0x5A.
+fn masked_override() -> BTreeMap<String, String> {
+    BTreeMap::from([("P-1_R-2".to_string(), "90".to_string())])
+}
+
+/// Plans [`masked_param_app`] with `overrides`, prepares the mock with
+/// `prepare`, and runs the read-compare flash. Returns the device state, the
+/// plan and the flash result.
+async fn run_masked_param_flash(
+    overrides: &BTreeMap<String, String>,
+    prepare: impl FnOnce(&Shared),
+) -> Result<
+    (
+        Shared,
+        bussard_download::FlashPlan,
+        Result<bussard_download::FlashOutcome, bussard_mgmt::load::WriteError>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    set_sys7_lsm_env(LsmMode::MemoryMapped);
+    let (mut bus, state, handle) = setup(LsmMode::MemoryMapped, Fault::None).await?;
+    let target: bussard_model::IndividualAddress = "1.1.99".parse()?;
+    let source: bussard_model::IndividualAddress = "0.0.255".parse()?;
+    let plan = plan_flash(
+        &masked_param_app()?,
+        "1.1.99",
+        0x0701,
+        overrides,
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    prepare(&state);
+    let l4 = Layer4Connection::connect(&mut bus, target, source).await?;
+    let mut session = authed_session(l4).await?;
+    let outcome = flash(
+        &mut session,
+        &plan,
+        bussard_download::FlashOptions::default(),
+        |_p| {},
+    )
+    .await;
+    drop(handle);
+    let _ = session.into_disconnect().await;
+    Ok((state, plan, outcome))
+}
+
+/// Whether any segment write of `s` covered `addr`.
+fn written_at(s: &DeviceState, addr: u16) -> bool {
+    s.segment_writes
+        .iter()
+        .any(|&(start, len)| addr >= start && usize::from(addr - start) < len)
+}
+
+#[tokio::test]
+async fn test_flash_sys7_placed_octet_under_masked_run_is_written()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (state, plan, outcome) = run_masked_param_flash(&masked_override(), |state| {
+        // The rest of the masked run holds what the device keeps there.
+        let mut s = lock(state);
+        for i in 16..40u16 {
+            s.memory.insert(0x4400 + i, 0xFF);
+        }
+    })
+    .await?;
+    assert!(outcome?.ok(), "the flash verifies");
+    let mask = plan
+        .segment_mask("M-48_A-4949_AS-2")
+        .ok_or("the segment keeps a write mask")?;
+    assert_eq!(
+        mask.get(20).copied(),
+        Some(0xFF),
+        "the placed octet is writable"
+    );
+    assert_eq!(mask.get(21).copied(), Some(0x00), "an unplaced one is not");
+    let s = lock(&state);
+    assert_eq!(s.memory.get(&0x4414).copied(), Some(90), "the placed octet");
+    assert_eq!(
+        s.memory.get(&0x4402).copied(),
+        Some(7),
+        "the owned parameter"
+    );
+    for i in (16..40u16).filter(|&i| i != 20) {
+        assert!(
+            !written_at(&s, 0x4400 + i),
+            "octet {i} of the masked run was written"
+        );
+        assert_eq!(
+            s.memory.get(&(0x4400 + i)).copied(),
+            Some(0xFF),
+            "octet {i}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_flash_sys7_masked_run_without_placed_parameter_is_not_written()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The 0x4C00 shape: a masked run no parameter occupies. The device holds
+    // 0xFF there and the image 0x00; the flash leaves it alone.
+    let (state, _plan, outcome) = run_masked_param_flash(&BTreeMap::new(), |state| {
+        let mut s = lock(state);
+        for i in 21..40u16 {
+            s.memory.insert(0x4400 + i, 0xFF);
+        }
+    })
+    .await?;
+    assert!(outcome?.ok(), "the flash verifies");
+    let s = lock(&state);
+    for i in 21..40u16 {
+        assert!(!written_at(&s, 0x4400 + i), "octet {i} was written");
+        assert_eq!(
+            s.memory.get(&(0x4400 + i)).copied(),
+            Some(0xFF),
+            "octet {i}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_flash_sys7_stale_placed_octet_under_masked_run_fails_verification()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The device takes every write but the one to the placed octet: the
+    // read-compare's read-back of that chunk must fail the flash. Before issue
+    // #320 the octet was neither written nor compared, and the flash passed.
+    let (state, _plan, outcome) = run_masked_param_flash(&masked_override(), |state| {
+        lock(state).frozen.push(0x4414);
+    })
+    .await?;
+    match outcome {
+        Err(bussard_mgmt::load::WriteError::Mgmt(
+            bussard_mgmt::MgmtError::MemoryVerifyFailed { addr, .. },
+        )) => assert!(
+            (0x4400..=0x4414).contains(&addr),
+            "the failing read-back covers the placed octet: {addr:#06X}"
+        ),
+        other => return Err(format!("expected a verify failure, got {other:?}").into()),
+    }
+    assert_eq!(lock(&state).memory.get(&0x4414).copied(), None);
     Ok(())
 }
 

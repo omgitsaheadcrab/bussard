@@ -37,14 +37,14 @@ fn device(code: &[u8]) -> anyhow::Result<MockDevice> {
     Ok(system7_device(device_ia()?, code))
 }
 
-/// Packs the synthetic application into a `.knxprod`.
-fn knxprod(path: &Path) -> anyhow::Result<()> {
+/// Packs the synthetic application `xml` into a `.knxprod`.
+fn knxprod(path: &Path, xml: &str) -> anyhow::Result<()> {
     let mut writer = zip::ZipWriter::new(std::fs::File::create(path)?);
     writer.start_file(
         "M-00FA/M-00FA_A-0007.xml",
         zip::write::SimpleFileOptions::default(),
     )?;
-    writer.write_all(SYS7_APP_XML.as_bytes())?;
+    writer.write_all(xml.as_bytes())?;
     writer.finish()?;
     Ok(())
 }
@@ -52,10 +52,15 @@ fn knxprod(path: &Path) -> anyhow::Result<()> {
 /// The model: 1.1.7 runs the app with object 2 on (the change), the archive
 /// pinned in `bussard.lock`.
 fn write_model(dir: &Path) -> anyhow::Result<()> {
+    write_model_with(dir, SYS7_APP_XML)
+}
+
+/// [`write_model`] with the application `xml` in the archive.
+fn write_model_with(dir: &Path, xml: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir.join("devices"))?;
     std::fs::create_dir_all(dir.join("products"))?;
     let archive = dir.join("products").join("sys7-test.knxprod");
-    knxprod(&archive)?;
+    knxprod(&archive, xml)?;
     let sha: String = sha2::Sha256::digest(std::fs::read(&archive)?)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -200,6 +205,9 @@ async fn test_knx_plan_device_flashes_a_healthy_system7_device_without_force() -
     assert_eq!(done["state"], "done", "{done}");
     assert_eq!(done["result"]["ok"], true, "{done}");
     assert_eq!(done["result"]["method"], "flash", "{done}");
+    // Issue #319: the read-back after the flash matches the model.
+    assert_eq!(done["result"]["verified"], true, "{done}");
+    assert_eq!(done["result"]["parameters"]["verified"], true, "{done}");
 
     let (code, params) = gateway.with_device(device_ia()?, |dev| {
         (
@@ -235,6 +243,90 @@ async fn test_knx_plan_device_refuses_a_system7_device_whose_code_differs() -> a
     assert!(!text.contains("unidentified"), "{text}");
     let writes = gateway.with_device(device_ia()?, |dev| dev.writes)?;
     assert_eq!(writes, 0, "planning must not write");
+
+    client.cancel().await?;
+    task.abort();
+    Ok(())
+}
+
+/// Plans and applies the flash on `gateway`'s device, returning the finished
+/// job's status.
+async fn plan_and_flash(client: &Client) -> anyhow::Result<Value> {
+    let plan = call(client, "knx_plan_device", json!({"address": "1.1.7"})).await?;
+    assert_eq!(plan["method"], "flash", "plan: {plan}");
+    let digest = plan["plan_digest"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no plan_digest in {plan}"))?
+        .to_string();
+    let started = call(
+        client,
+        "knx_apply_device",
+        json!({"address": "1.1.7", "plan_digest": digest}),
+    )
+    .await?;
+    let job = started["job"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no job in {started}"))?
+        .to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let status = call(client, "knx_apply_status", json!({"job": job})).await?;
+        if status["done"] == true {
+            return Ok(status);
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("job {job} did not finish: {status}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn test_knx_apply_device_flash_whose_device_drops_a_write_is_not_verified()
+-> anyhow::Result<()> {
+    // Issue #319: the device takes the download and reports every LSM
+    // Loaded, but loses the parameter octet that switches object 2 on (here:
+    // it reverts the octet at the restart). The parameter segment carries a
+    // `<Mask>`, as the Meteodata's do, so no spot check samples it: the
+    // flash's own checks pass, the read-back against the model must not.
+    let dropping = device(&SYS7_CODE)?.with_hook(|dev, apci, _| {
+        if apci == bussard_testkit::consts::A_RESTART {
+            dev.memory.insert(SYS7_PARAM_BASE + 1, 0x00);
+        }
+        None
+    });
+    let gateway = gateway(dropping).await?;
+    let dir = tempfile::tempdir()?;
+    let masked = SYS7_APP_XML.replace(
+        r#"Address="17408"><Data>AAA=</Data>"#,
+        r#"Address="17408"><Data>AAA=</Data><Mask>//8=</Mask>"#,
+    );
+    anyhow::ensure!(
+        masked != SYS7_APP_XML,
+        "the fixture's parameter segment moved"
+    );
+    write_model_with(dir.path(), &masked)?;
+    let (client, task) = serve(dir.path(), &gateway).await?;
+
+    let done = plan_and_flash(&client).await?;
+    assert_eq!(done["state"], "done", "{done}");
+    let result = &done["result"];
+    assert_eq!(result["method"], "flash", "{done}");
+    assert_eq!(result["verified"], false, "{done}");
+    assert_eq!(result["ok"], false, "{done}");
+    assert_eq!(result["parameters"]["verified"], false, "{done}");
+    let reason = result["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("obj2") && reason.contains("still differ"),
+        "the reason names the parameter that differs: {done}"
+    );
+    let differences = result["parameters"]["differences"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("no differences in {done}"))?;
+    assert_eq!(differences.len(), 1, "{done}");
+    let key = differences[0]["key"].as_str().unwrap_or_default();
+    assert!(key.starts_with("obj2"), "the device-file key: {done}");
+    assert_eq!(differences[0]["model"], "On", "{done}");
 
     client.cancel().await?;
     task.abort();

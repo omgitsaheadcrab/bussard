@@ -45,7 +45,7 @@ The gated tests:
 | Crate | Test file | What it checks |
 |---|---|---|
 | bussard-download | `flash_corpus.rs` | the conformance sweep against `conformance-manifest.json`, no duplicate consecutive allocations, extended-memory applications lower to executable plans |
-| bussard-download | `flash_dryrun_system7.rs` | System 7 plans for MDT `A-000E`, Theben FIX2 `M-0048_A-4947` (ends at the terminal restart), Zennio LUMENTO, Jung `A-A011`, and the Meteodata Hawk verify-mode profile |
+| bussard-download | `flash_dryrun_system7.rs` | System 7 plans for MDT `A-000E`, Theben FIX2 `M-0048_A-4947` (ends at the terminal restart), Zennio LUMENTO, Jung `A-A011`, the Meteodata Hawk verify-mode profile, and the Meteodata C4 page octets the write mask owns (#320) |
 | bussard-download | `sys7_jung_m2_plan.rs` | the Jung 3361-1M (0705) full plan against the M2 capture, and its parameter-only plan against `bad-eg-pm-1-1-18.pcapng` (1.1.32) |
 | bussard-download | `ets_golden.rs` | group-object tables, parameter image and allocation of the F50 (`A-D142-21`), Jung `A-3030`, ABB `A-A0ED`, Helios `A-0003`, Jung `A-20DE` byte for byte against ETS |
 | bussard-download | `param_readback_roundtrip.rs` | parameter read-back decodes what the image builder wrote, for a set of real products |

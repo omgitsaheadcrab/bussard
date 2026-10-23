@@ -638,6 +638,109 @@ pub async fn read_state<Ch: L4Channel>(
     }
 }
 
+/// What the parameter read-back after a full flash found (issue #319): the
+/// same decode-and-compare `bussard plan` and `knx_plan_device` run, on the
+/// memory the flash just wrote.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct FlashedParameters {
+    /// The parameters the device still holds differently from the model,
+    /// keyed as the device file keys them. Runtime-owned (device-managed)
+    /// parameters are never listed, as in a plan.
+    pub differences: Vec<DifferenceJson>,
+    /// Why the memory was not compared; `None` when it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl FlashedParameters {
+    /// Whether the device's parameters now match the model: the memory was
+    /// read and decoded, and nothing differs.
+    pub fn verified(&self) -> bool {
+        self.note.is_none() && self.differences.is_empty()
+    }
+
+    /// One line naming the parameters that still differ, `None` when none
+    /// does. A read-back that could not be made (`note`) is no difference:
+    /// the plan treats unreadable memory as "not compared" too.
+    pub fn failure(&self) -> Option<String> {
+        if self.differences.is_empty() {
+            return None;
+        }
+        let listed: Vec<String> = self
+            .differences
+            .iter()
+            .map(|d| {
+                let unit = d.unit.as_deref().filter(|u| !u.is_empty());
+                let with_unit = |v: &str| match unit {
+                    Some(u) => format!("{v} {u}"),
+                    None => v.to_string(),
+                };
+                format!(
+                    "{} ({}) is {}, the model says {}",
+                    d.key,
+                    d.name,
+                    d.device
+                        .as_deref()
+                        .map_or_else(|| "unreadable".to_string(), with_unit),
+                    with_unit(&d.model)
+                )
+            })
+            .collect();
+        Some(format!(
+            "{} parameter(s) still differ from the model after the flash: {}",
+            listed.len(),
+            listed.join("; ")
+        ))
+    }
+}
+
+/// Reads the parameter memory back after a full flash of `app` and compares
+/// it with the model (issue #319), on the flash's own connection.
+///
+/// The plan's read (`plan_for_readback`, the parameter segments, then
+/// `decode_parameters` on the placements the model's configuration reaches),
+/// without the identity gate: the flash that just ran decided that. A
+/// verified flash therefore means a new plan finds no parameter to change.
+pub async fn read_flashed_parameters<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    product: &ProductData,
+    app: &ApplicationProgram,
+    model: Option<&Model>,
+    target: IndividualAddress,
+    device_mask: u16,
+) -> FlashedParameters {
+    let noted = |note: String| FlashedParameters {
+        differences: Vec::new(),
+        note: Some(note),
+    };
+    let plan = match bussard_download::plan_for_readback(product, app, model, target, device_mask) {
+        Ok(plan) => plan,
+        Err(err) => return noted(format!("the parameter memory cannot be located: {err}")),
+    };
+    let regions = read_parameter_regions(l4, &plan).await;
+    let expects_parameters = plan.param_images.values().any(|b| !b.is_empty());
+    if regions.is_empty() && expects_parameters {
+        return noted("the parameter memory could not be read back".into());
+    }
+    let current = regions_memory(&regions);
+    let (overrides, bases) = bussard_download::model_parameters(model, target);
+    let decoded = decode_parameters(app, &overrides, &bases, &current);
+    let device = model
+        .and_then(|m| m.devices.get(&target))
+        .map(|d| &d.device);
+    let (_, differences) = report(decoded);
+    FlashedParameters {
+        differences: differences
+            .into_iter()
+            .map(|d| DifferenceJson {
+                key: file_key(device, &d.key),
+                ..d
+            })
+            .collect(),
+        note: None,
+    }
+}
+
 /// The model's image of each segment `changed` names (the octets a full
 /// download writes there), for attributing octets of `partial`.
 pub(crate) fn model_images(
@@ -1170,6 +1273,21 @@ pub fn build_device_plan(
                 }
             }
             Some(detail) => {
+                // Issue #319: a model value on a ref the configuration does
+                // not show is never written, so it is in no change either.
+                // Say so instead of dropping it (issue #321 refuses the edit).
+                if !detail.decoded.unshown.is_empty() {
+                    let keys: Vec<String> = detail
+                        .decoded
+                        .unshown
+                        .iter()
+                        .map(|k| file_key(device, k))
+                        .collect();
+                    notes.push(format!(
+                        "ignored: not shown under the current values, so not written: {}",
+                        keys.join(", ")
+                    ));
+                }
                 let differences = &detail.decoded.differences;
                 unchanged_parameters = Some(
                     detail

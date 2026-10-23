@@ -370,7 +370,10 @@ pub(super) fn plan_flash_sys7(
                         bytes.map(|data| {
                             images.insert(seg.id.clone(), data.clone());
                             if let Some(mask) = &seg.mask {
-                                segment_masks.insert(seg.id.clone(), mask.clone());
+                                segment_masks.insert(
+                                    seg.id.clone(),
+                                    effective_mask(mask, placed.get(&seg.id)),
+                                );
                             }
                             ImageRef {
                                 segment_id: seg.id.clone(),
@@ -544,6 +547,23 @@ pub(super) fn plan_flash_sys7(
         placed,
         unwritten: BTreeMap::new(),
     })
+}
+
+/// The write mask of a parameter segment (issue #320): an octet is written
+/// when the product's `<Mask>` marks it `0xFF` or when the plan placed a
+/// parameter in it. ETS writes and read-compares the octets its placed
+/// parameters occupy whatever the `<Mask>` says (the Meteodata's C4 page sits
+/// in a `0x00` run of `AS-4800`), and leaves a masked run that no parameter
+/// occupies alone (the 992 octets of its `AS-4C00` the device holds as
+/// `0xFF`). A table segment has no placed octets and keeps its mask as is.
+fn effective_mask(mask: &[u8], placed: Option<&std::collections::BTreeSet<usize>>) -> Vec<u8> {
+    let mut out = mask.to_vec();
+    for &i in placed.into_iter().flatten() {
+        if let Some(byte) = out.get_mut(i) {
+            *byte = 0xFF;
+        }
+    }
+    out
 }
 
 /// What the System 7 post-pass writes for one object that the project does not

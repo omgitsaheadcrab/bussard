@@ -137,7 +137,7 @@ separate write op (section 4.2). Address families `[corpus §3]`:
 
 | Address | Role | Data |
 |---|---|---|
-| 0x4000 (16384) | LSM 1 table region (address / com-object descriptors). The **only** segment carrying a per-byte `<Mask>`. ~511–513 B | present + mask |
+| 0x4000 (16384) | LSM 1 table region (address / com-object descriptors). Carries a per-byte `<Mask>`; some products mask their parameter segments too (section 4.2, issue #320). ~511–513 B | present + mask |
 | 0x4201 (16897) | LSM 2 table region (association / group-object). ~511 B | present |
 | 0x4400 (17408) | LSM 3 parameter image start | present |
 | 0x0700 (1792), 0x0730 | LSM 3 low-RAM working region | **allocate only, NO `<Data>`** |
@@ -418,6 +418,24 @@ The 0x4000 segment carries a per-byte `<Mask>`: `0xFF` = this byte belongs to th
 image, other = device-owned, leave untouched. Under the mask, bussard streams
 only owned bytes (still in 12-octet chunks by address run). The sim, on receiving
 a write into a masked region, must accept the owned bytes and preserve the rest.
+
+**Parameter segments with a `<Mask>` (issue #320).** Some products mask their
+parameter segments as well. The Theben Meteodata 140 S (`M-0048_A-140C-14-EB70`)
+masks `AS-4800` with `0x00` runs at offsets 17..31, 64..351 and 528..623, and
+`AS-4C00` from 32 to the end. Its C4 page (`P-2238` at offset 128 and the
+parameters under it) lives in such a run. ETS does not treat those octets as
+device-owned: in `meteodata-1-1-202-new.pcapng` it read-compares the 12-octet
+chunks at `0x4844`, `0x4860`, `0x4880` and others inside the masked runs, and the
+device holds C2/C3 active at `0x4840`/`0x4860`, which only ETS wrote. In
+`AS-4C00` ETS reads only the 32 octets that carry parameters and leaves the other
+992 alone (the device holds `0xFF` there). The rule: an octet of a segment is
+written when the product's `<Mask>` marks it `0xFF` **or** the plan placed a
+parameter in it (`FlashPlan::placed`, the octets the image builder laid a
+reached parameter's bits into). A masked run with no placed parameter stays
+untouched, so the 0x4000 table region and the tail of `AS-4C00` behave as
+before. The planner folds this into the write mask once, so the blind writer,
+the read-compare writer, the parameter-only diff and its read-back verify all
+use the same set.
 
 **Amendment (issue #133): read-compare-write on masks without `VerifyMode`.**
 `CONFIRMED` against `meteodata-1-1-202-new.pcapng` (Theben Meteodata 140 S,
