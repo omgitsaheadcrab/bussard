@@ -165,6 +165,8 @@ impl Bench {
         let bin = std::env::var("BUSSARD_BIN")
             .unwrap_or_else(|_| env!("CARGO_BIN_EXE_bussard").to_string());
         Ok(Command::new(bin)
+            .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+            .env("BUSSARD_ADDRESS_PROBE_MS", "200")
             .args(&full)
             .env_remove("BUSSARD_ALLOW_REAL_GATEWAY")
             .stdin(Stdio::null())
@@ -367,6 +369,8 @@ fn test_describe_without_model_writes_no_facts() -> TestResult {
     let empty = bench.tmp.join("absent");
     let gateway = format!("127.0.0.1:{}", bench.gw.port());
     let out = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "describe",
             "1.1.12",
@@ -779,6 +783,8 @@ fn build_knxprod(dir: &Path) -> TestResult<Option<PathBuf>> {
     std::fs::write(src.join("M-00FA").join("M-00FA_A-0002.xml"), APP_XML)?;
     let archive = dir.join("facts-test.knxprod");
     let Ok(status) = Command::new("zip")
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .current_dir(&src)
         .args(["-r", "-X", "-q"])
         .arg(&archive)

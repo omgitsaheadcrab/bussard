@@ -188,6 +188,8 @@ fn run_bussard(port: u16, args: &[&str]) -> anyhow::Result<std::process::Output>
     all.push("--gateway");
     all.push(&gw);
     Ok(Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args(&all)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -60,6 +60,8 @@ fn write_model(dir: &Path) -> std::io::Result<()> {
 fn bussard(args: &[&str], env: &[(&str, &str)]) -> std::io::Result<Output> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_bussard"));
     cmd.args(args)
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .env_remove("BUSSARD_ALLOW_REAL_GATEWAY")
         .env_remove("BUSSARD_KEYRING_PASSWORD")
         .env_remove("BUSSARD_KEYRING")

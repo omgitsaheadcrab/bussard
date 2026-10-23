@@ -242,7 +242,7 @@ fn execute(
             }
         });
 
-        if !handle.wait_connected(Duration::from_secs(10)).await {
+        if !handle.wait_connected(crate::conn_cmd::connect_wait()).await {
             eprintln!("warning: bus not connected yet; the first test may time out");
         }
 

@@ -28,6 +28,8 @@ async fn test_init_reports_tunnels_and_full_interface() -> Result<(), Box<dyn st
 
     let output = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_bussard"))
+            .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+            .env("BUSSARD_ADDRESS_PROBE_MS", "200")
             .args(["init", "--gateway", &format!("127.0.0.1:{port}"), "--dir"])
             .arg(&dir)
             .output()

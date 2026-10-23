@@ -313,6 +313,8 @@ impl Server {
     /// [`Server::start`] with another keyring (or key store) file.
     fn start_with(dir: &Path, port: u16, extra: &[&str], keyring: &Path) -> TestResult<Server> {
         let mut child = Command::new(env!("CARGO_BIN_EXE_bussard"))
+            .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+            .env("BUSSARD_ADDRESS_PROBE_MS", "200")
             .arg("mcp")
             .arg("--dir")
             .arg(dir)

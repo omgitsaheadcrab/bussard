@@ -289,6 +289,8 @@ fn adopt_happy_path_writes_rich_device_file() -> TestResult {
     build_knxprod(&knxprod)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "adopt",
             "1.1.7",
@@ -405,6 +407,8 @@ fn adopt_warns_on_order_number_mismatch() -> TestResult {
     build_knxprod(&knxprod)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "adopt",
             "1.1.7",
@@ -457,6 +461,8 @@ fn adopt_times_out_with_no_device() -> TestResult {
     build_knxprod(&knxprod)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "adopt",
             "1.1.7",
@@ -504,6 +510,8 @@ fn adopt_refuses_product_less_non_tty() -> TestResult {
     write_model(&model_dir)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "adopt",
             "--dir",
@@ -583,6 +591,8 @@ fn adopt_fetches_the_product_data_for_the_reported_order_number() -> TestResult 
     stub_index(&index, "MDT-BE-04001.02", &knxprod)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "adopt",
             "1.1.7",
@@ -737,6 +747,8 @@ fn secure_adopt(tag: &str, device: MockDevice, address: &str) -> TestResult<Secu
     let knxprod = tmp.join("fixture.knxprod");
     build_knxprod(&knxprod)?;
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "adopt",
             address,
@@ -757,6 +769,8 @@ fn secure_adopt(tag: &str, device: MockDevice, address: &str) -> TestResult<Secu
     // `plan` against the same device right after: the model now holds what the
     // device holds.
     let plan = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "plan",
             address,
@@ -786,6 +800,8 @@ fn secure_adopt(tag: &str, device: MockDevice, address: &str) -> TestResult<Secu
     let lock = std::fs::read_to_string(model_dir.join("bussard.lock")).unwrap_or_default();
     // The written model must validate (links against the recorded objects).
     let validate = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "validate",
             "--dir",

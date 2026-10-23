@@ -133,6 +133,8 @@ fn learn_names_and_types_group_addresses_without_transmitting() -> TestResult {
     write_model(&model_dir)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "learn",
             "--ga",
@@ -196,6 +198,8 @@ fn learn_names_and_types_group_addresses_without_transmitting() -> TestResult {
 
     // The acceptance criterion: no W011 (no DPT) for any learned GA.
     let validate = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "validate",
             "--dir",

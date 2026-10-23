@@ -452,6 +452,7 @@ impl Bench {
         Ok(Command::new(env!("CARGO_BIN_EXE_bussard"))
             .args(&full)
             .env("BUSSARD_ASSIGN_WAIT_MS", "300")
+            .env("BUSSARD_SCAN_DISCOVERY_MS", "200")
             .env_remove("BUSSARD_ALLOW_REAL_GATEWAY")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

@@ -128,6 +128,8 @@ fn learn(dir: &Path, port: u16, gas: &[&str], extra: &[String]) -> TestResult<Ou
     ]);
     args.extend(extra.iter().cloned());
     Ok(Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args(&args)
         .env("BUSSARD_KEYRING_PASSWORD", PASSWORD)
         .env_remove("BUSSARD_ALLOW_REAL_GATEWAY")

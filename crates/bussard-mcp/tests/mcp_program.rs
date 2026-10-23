@@ -164,6 +164,18 @@ impl Harness {
     }
 }
 
+/// Shrinks the management timeouts and the source-address probe for the mock
+/// device on loopback, as the CLI mock-device tests do.
+fn fast_mock_timeouts() {
+    // SAFETY: nextest runs each test in its own process, and every test in
+    // this binary sets the same values before the server starts; they are
+    // read when a management connection or probe is set up.
+    unsafe {
+        std::env::set_var(bussard_mgmt::MGMT_TIMEOUT_MS_ENV, "300");
+        std::env::set_var(bussard_mgmt::probe::ADDRESS_PROBE_MS_ENV, "200");
+    }
+}
+
 /// Builds the state from a model directory and serves it over a duplex
 /// transport, spawning the bus actor only when `with_bus` is set.
 async fn serve(
@@ -176,6 +188,7 @@ async fn serve(
     rmcp::service::RunningService<rmcp::RoleClient, ()>,
     tokio::task::JoinHandle<()>,
 )> {
+    fast_mock_timeouts();
     let config = McpConfig {
         dir: dir.to_path_buf(),
         connection: connection.clone(),

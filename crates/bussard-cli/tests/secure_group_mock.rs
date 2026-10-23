@@ -61,7 +61,11 @@ fn model_dir(tag: &str, port: u16) -> TestResult<PathBuf> {
 async fn bussard(args: Vec<String>) -> TestResult<Output> {
     let out = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_bussard"))
+            .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+            .env("BUSSARD_ADDRESS_PROBE_MS", "200")
             .args(&args)
+            // The silent-responder reads are about the refusal, not the wait.
+            .env("BUSSARD_READ_TIMEOUT_MS", "800")
             .env("BUSSARD_KEYRING_PASSWORD", PASSWORD)
             .env_remove("BUSSARD_ALLOW_REAL_GATEWAY")
             .stdin(Stdio::null())
@@ -355,6 +359,8 @@ async fn test_monitor_keyring_decrypts_and_flags_secured_telegrams() -> TestResu
     let dir = model_dir("monitor", gw.port())?;
     let gateway = format!("127.0.0.1:{}", gw.port());
     let mut child = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "monitor",
             "--json",

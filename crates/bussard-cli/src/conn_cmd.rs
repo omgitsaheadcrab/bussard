@@ -588,6 +588,33 @@ fn apply_secure_keepalive(secure: SecureTunnelConfig, value: Option<&str>) -> Se
     }
 }
 
+/// How long a command waits for the first tunnel connect before it goes on
+/// (or, on a refusal retrying cannot fix, stops with that cause).
+pub(crate) const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Environment variable that overrides [`CONNECT_WAIT`] in milliseconds. Set by
+/// the integration tests that point at a closed port or a refusing mock, where
+/// the test is about the refusal and not about the wait; unset in normal use.
+pub(crate) const CONNECT_WAIT_MS_ENV: &str = "BUSSARD_CONNECT_WAIT_MS";
+
+/// The first-connect budget, honouring [`CONNECT_WAIT_MS_ENV`] when set.
+pub(crate) fn connect_wait() -> std::time::Duration {
+    parse_connect_wait(
+        bussard_model::dotenv::var(CONNECT_WAIT_MS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Maps a [`CONNECT_WAIT_MS_ENV`] value to a budget; an absent or unparsable
+/// value keeps [`CONNECT_WAIT`].
+fn parse_connect_wait(value: Option<&str>) -> std::time::Duration {
+    match value.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(ms) => std::time::Duration::from_millis(ms),
+        None => CONNECT_WAIT,
+    }
+}
+
 /// The tunnel re-establish policy, honouring [`TUNNEL_RECONNECT_SECS_ENV`] and
 /// [`TCP_READ_DEADLINE_MS_ENV`].
 fn tunnel_reconnect() -> TunnelReconnect {
@@ -662,9 +689,7 @@ pub async fn open_service(
     crate::timing::record("to tunnel open", crate::timing::since_start(), "");
     let tunnel_started = std::time::Instant::now();
     let service = BusService::open(config, policy)?;
-    let connected = service
-        .wait_connected(std::time::Duration::from_secs(10))
-        .await;
+    let connected = service.wait_connected(connect_wait()).await;
     crate::timing::record("tunnel", tunnel_started.elapsed(), "");
     if !connected {
         // A refusal retrying cannot fix (issue #182): stop here with that
@@ -703,6 +728,16 @@ fn parse_socket(s: &str) -> anyhow::Result<SocketAddrV4> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_connect_wait_maps_env_values() {
+        assert_eq!(parse_connect_wait(None), CONNECT_WAIT);
+        assert_eq!(parse_connect_wait(Some("junk")), CONNECT_WAIT);
+        assert_eq!(
+            parse_connect_wait(Some(" 200 ")),
+            std::time::Duration::from_millis(200)
+        );
+    }
 
     #[test]
     fn test_parse_reconnect_secs_maps_env_values() {

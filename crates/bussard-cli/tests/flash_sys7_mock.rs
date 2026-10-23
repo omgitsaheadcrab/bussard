@@ -85,6 +85,8 @@ impl Bench {
             &gateway,
         ]);
         Ok(Command::new(env!("CARGO_BIN_EXE_bussard"))
+            .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+            .env("BUSSARD_ADDRESS_PROBE_MS", "200")
             .args(&args)
             .env_remove("BUSSARD_ALLOW_REAL_GATEWAY")
             .env_remove("BUSSARD_FLASH_SYS7_LSM")

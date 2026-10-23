@@ -454,6 +454,8 @@ impl Bench {
         let bin = std::env::var("BUSSARD_BIN")
             .unwrap_or_else(|_| env!("CARGO_BIN_EXE_bussard").to_string());
         Ok(Command::new(bin)
+            .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+            .env("BUSSARD_ADDRESS_PROBE_MS", "200")
             .args(&full)
             .env_remove("BUSSARD_ALLOW_REAL_GATEWAY")
             .env("BUSSARD_FLASH_L4_TIMEOUT_MS", "300")
@@ -486,6 +488,8 @@ fn build_knxprod(dir: &Path, app_xml: &str) -> Result<Option<PathBuf>, Box<dyn E
     std::fs::write(src.join("M-00FA").join("M-00FA_A-0002.xml"), app_xml)?;
     let archive = dir.join("param-test.knxprod");
     let Ok(status) = Command::new("zip")
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .current_dir(&src)
         .args(["-r", "-X", "-q"])
         .arg(&archive)

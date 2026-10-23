@@ -127,7 +127,7 @@ pub fn run(
             }
         });
 
-        if !handle.wait_connected(Duration::from_secs(10)).await {
+        if !handle.wait_connected(crate::conn_cmd::connect_wait()).await {
             eprintln!("warning: not connected to the bus yet; still waiting for telegrams");
         }
 

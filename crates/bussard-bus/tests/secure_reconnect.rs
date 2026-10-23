@@ -28,6 +28,23 @@ const TUNNEL_23: u16 = 0x1117;
 /// Windows (it retries the SYN), and an attempt makes up to two of them.
 const SLACK: Duration = Duration::from_secs(10);
 
+/// The initial reconnect backoff under test (production: 1 s), set through
+/// `BUSSARD_BUS_BACKOFF_MS` so a refused attempt is retried in milliseconds.
+const BACKOFF_START: Duration = Duration::from_millis(100);
+
+/// Shrinks the actor's initial reconnect backoff to [`BACKOFF_START`].
+fn fast_backoff() {
+    // SAFETY: nextest runs each test in its own process, and every test in
+    // this binary sets the same value before it starts a bus; the variable is
+    // read once when an actor starts.
+    unsafe {
+        std::env::set_var(
+            bussard_bus::BACKOFF_START_MS_ENV,
+            BACKOFF_START.as_millis().to_string(),
+        );
+    }
+}
+
 fn key(password: &str, salt: &[u8]) -> Key16 {
     Password::new(password).derive(salt)
 }
@@ -82,6 +99,7 @@ async fn until(handle: &BusHandle, limit: Duration, done: impl Fn(&BusHandle) ->
 
 #[tokio::test]
 async fn test_bus_reconnects_within_one_backoff_after_the_listener_returns() -> TestResult {
+    fast_backoff();
     let gw = gateway(false).await?;
     let (handle, _task) = Bus::connect(config(&gw, None));
     assert!(handle.wait_connected(Duration::from_secs(5)).await);
@@ -130,6 +148,7 @@ async fn test_bus_reconnects_within_one_backoff_after_the_listener_returns() -> 
 
 #[tokio::test]
 async fn test_reconnect_connects_now_with_the_backoff_reset() -> TestResult {
+    fast_backoff();
     let gw = gateway(false).await?;
     let (handle, _task) = Bus::connect(config(&gw, None));
     assert!(handle.wait_connected(Duration::from_secs(5)).await);
@@ -143,13 +162,14 @@ async fn test_reconnect_connects_now_with_the_backoff_reset() -> TestResult {
 
     // While down with a grown backoff: the next attempt is now, not later.
     gw.close_tcp()?;
+    // Grown past 1 s, so a reconnect that waited it out would show.
     assert!(
-        until(&handle, Duration::from_secs(45), |h| h
-            .diagnostics()
-            .attempts
-            >= 2)
+        until(&handle, Duration::from_secs(45), |h| {
+            let d = h.diagnostics();
+            d.attempts >= 2 && d.retry_in.is_some_and(|r| r > Duration::from_secs(1))
+        })
         .await,
-        "two failed attempts"
+        "failed attempts grew the backoff past 1 s"
     );
     let waiting = handle
         .diagnostics()
@@ -176,6 +196,7 @@ async fn test_reconnect_connects_now_with_the_backoff_reset() -> TestResult {
 async fn test_two_buses_with_the_same_first_user_both_come_up() -> TestResult {
     // The interface holds one session per user. Without lock files the second
     // bus collides on user 2 and rotates to user 3.
+    fast_backoff();
     let gw = gateway(true).await?;
     let (a, _ta) = Bus::connect(config(&gw, None));
     assert!(a.wait_connected(Duration::from_secs(5)).await);

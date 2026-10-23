@@ -385,7 +385,9 @@ async fn test_secure_tunnel_without_read_deadline_does_not_probe() -> TestResult
     ))
     .await?;
     let _ = expect_con(&mut conn).await?;
-    let noticed = tokio::time::timeout(Duration::from_millis(1500), until_reconnecting(&mut link))
+    // Over three times the 300 ms deadline plus its probe wait that the
+    // detecting sibling test needs.
+    let noticed = tokio::time::timeout(Duration::from_millis(1000), until_reconnecting(&mut link))
         .await
         .is_ok();
     assert!(!noticed, "without a read deadline nothing probes the link");
@@ -543,14 +545,15 @@ async fn test_secure_tunnel_keepalive_interval_is_configurable() -> TestResult {
     let fast = explicit(&gw, SecureTransport::Tcp);
     let fast = fast.clone().with_secure(
         fast.secure
-            .map(|s| s.with_keepalive(Duration::from_millis(150))),
+            .map(|s| s.with_keepalive(Duration::from_millis(50))),
     );
     let conn = Transport::connect(&fast).await?;
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // Eight intervals; at least four keepalives even on a loaded runner.
+    tokio::time::sleep(Duration::from_millis(400)).await;
     conn.close().await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
     let keepalives = gw.stats()?.keepalives;
-    assert!(keepalives >= 4, "150 ms keepalive sent only {keepalives}");
+    assert!(keepalives >= 4, "50 ms keepalive sent only {keepalives}");
 
     // Zero turns it off.
     let gw = gateway().await?;
@@ -559,7 +562,8 @@ async fn test_secure_tunnel_keepalive_interval_is_configurable() -> TestResult {
         .clone()
         .with_secure(off.secure.map(|s| s.with_keepalive(Duration::ZERO)));
     let conn = Transport::connect(&off).await?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Four of the intervals above: an interval of zero must send none.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     conn.close().await?;
     assert_eq!(gw.stats()?.keepalives, 0);
     Ok(())
@@ -592,26 +596,35 @@ async fn test_probe_secure_idle_detects_the_session_timeout() -> TestResult {
         .device_auth(device_key())
         .user(3, user_key(USER3_KEY), TUNNEL_23)
         .udp_sessions()
-        .session_timeout(Duration::from_millis(300))
+        .session_timeout(Duration::from_millis(150))
         .start()
         .await?;
     // TCP: the interface announces the timeout and closes.
-    let report =
-        probe_secure_idle(&explicit(&gw, SecureTransport::Tcp), Duration::from_secs(1)).await?;
+    let report = probe_secure_idle(
+        &explicit(&gw, SecureTransport::Tcp),
+        Duration::from_millis(500),
+    )
+    .await?;
     match report.outcome {
         SecureIdleOutcome::Dropped { after, reason } => {
             assert!(
-                after >= Duration::from_millis(300),
+                after >= Duration::from_millis(150),
                 "dropped after {after:?}"
             );
-            assert!(after < Duration::from_secs(1), "dropped after {after:?}");
+            assert!(
+                after < Duration::from_millis(500),
+                "dropped after {after:?}"
+            );
             assert!(reason.contains("SESSION_STATUS"), "{reason}");
         }
         other => return Err(format!("expected a drop over TCP, got {other:?}").into()),
     }
     // UDP: the interface forgets the session; the probe goes unanswered.
-    let report =
-        probe_secure_idle(&explicit(&gw, SecureTransport::Udp), Duration::from_secs(1)).await?;
+    let report = probe_secure_idle(
+        &explicit(&gw, SecureTransport::Udp),
+        Duration::from_millis(500),
+    )
+    .await?;
     assert_eq!(report.outcome, SecureIdleOutcome::Silent);
     assert_eq!(gw.stats()?.timeouts, 2);
     Ok(())

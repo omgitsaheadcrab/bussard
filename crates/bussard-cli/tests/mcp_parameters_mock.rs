@@ -95,6 +95,8 @@ impl Server {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bussard"));
         command
             .arg("mcp")
+            .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+            .env("BUSSARD_ADDRESS_PROBE_MS", "200")
             .arg("--dir")
             .arg(dir)
             .arg("--gateway")

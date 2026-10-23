@@ -117,6 +117,8 @@ fn bussard(dir: &Path, args: &[&str]) -> std::io::Result<Output> {
         .env_remove("BUSSARD_KEYRING")
         .env_remove("BUSSARD_ALLOW_REAL_GATEWAY")
         .env("BUSSARD_PRODUCT_INDEX", "/nonexistent/index.json")
+        // The models point at a closed port: no test here is about the wait.
+        .env("BUSSARD_CONNECT_WAIT_MS", "200")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

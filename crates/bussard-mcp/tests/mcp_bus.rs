@@ -579,6 +579,11 @@ async fn test_bus_status_explains_the_outage_and_reconnect_recovers() -> TestRes
     // the attempts, the next retry), a refused bus tool quotes it, and
     // knx_bus_reconnect connects afresh once the interface is back.
     use bussard_secure::{Password, salt};
+    // SAFETY: nextest runs each test in its own process; the variable only
+    // shortens the actor's first reconnect backoff and is read when it starts.
+    unsafe {
+        std::env::set_var(bussard_bus::BACKOFF_START_MS_ENV, "100");
+    }
     let gw = bussard_testkit::MockSecureGateway::builder()
         .device_auth(Password::new("device-auth-code").derive(salt::DEVICE_AUTHENTICATION_CODE))
         .user(

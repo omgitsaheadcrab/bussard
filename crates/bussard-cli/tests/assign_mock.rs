@@ -169,6 +169,8 @@ fn assign_writes_address_and_stub_file() -> TestResult {
     write_model(&model_dir)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "assign",
             "1.1.7",
@@ -245,6 +247,8 @@ fn assign_clears_programming_mode_like_ets() -> TestResult {
     write_model(&model_dir)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "assign",
             "1.1.7",
@@ -311,6 +315,8 @@ fn assign_refuses_implicit_address_without_tty() -> TestResult {
     // No explicit address → implicit allocation. Piped stdin (non-TTY) must be
     // refused for safety.
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "assign",
             "--dir",
@@ -355,6 +361,8 @@ fn assign_warns_when_device_stays_in_programming_mode() -> TestResult {
     write_model(&model_dir)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "assign",
             "1.1.7",
@@ -466,6 +474,8 @@ fn secure_assign(
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args(&args)
         .env("BUSSARD_ASSIGN_WAIT_MS", "200")
         .env("BUSSARD_KEYRING_PASSWORD", KEYRING_PASSWORD)

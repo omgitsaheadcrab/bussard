@@ -190,7 +190,7 @@ async fn live_report(
     let service = BusService::open(config, WritePolicy::ReadOnly)?;
 
     let handle = service.handle().clone();
-    if !handle.wait_connected(Duration::from_secs(10)).await {
+    if !handle.wait_connected(crate::conn_cmd::connect_wait()).await {
         let _ = handle.close().await;
         bail!("the bus did not connect within 10 s; the live audit needs a working gateway");
     }
