@@ -456,8 +456,10 @@ const READ_INSTRUCTIONS: &str = "bussard: KNX as code over MCP. The installation
     tool says the bus is not connected, knx_bus_status says why (the last transport error, \
     the attempts, the next retry) and knx_bus_reconnect connects afresh now; neither writes \
     to the bus. Change the \
-    model with the edit tools, never by writing files: knx_set_group, knx_add_link, \
-    knx_remove_link, knx_set_device, knx_set_parameter and knx_undo. Parameters are edited \
+    model with the edit tools, never by writing files: knx_set_group, knx_remove_group, \
+    knx_add_link, knx_remove_link, knx_set_device, knx_set_parameter, knx_discard_edits and \
+    knx_undo. To abandon a change on one device, knx_discard_edits; knx_undo rolls the whole \
+    model back to a snapshot. Parameters are edited \
     with knx_set_parameter using the keys knx_show_device lists (the device needs its \
     product model). Every edit snapshots the files first and returns the change as \
     sentences: quote them to the human, and follow the result's next_step. Group writes are \
@@ -485,8 +487,9 @@ const PROGRAMMING_INSTRUCTIONS: &str = "bussard: KNX as code over MCP. The insta
     objects over the bus. When a bus tool says the bus is not connected, knx_bus_status says \
     why (the last transport error, the attempts, the next retry) and knx_bus_reconnect \
     connects afresh now; neither writes to the bus. Change the model with the edit tools, never by writing files: \
-    knx_set_group, knx_add_link, knx_remove_link, knx_set_device, knx_set_parameter and \
-    knx_undo. Parameters are edited with knx_set_parameter using the keys knx_show_device \
+    knx_set_group, knx_remove_group, knx_add_link, knx_remove_link, knx_set_device, \
+    knx_set_parameter, knx_discard_edits and knx_undo. To abandon a change on one device, \
+    knx_discard_edits; knx_undo rolls the whole model back to a snapshot. Parameters are edited with knx_set_parameter using the keys knx_show_device \
     lists (the device needs its product model). Every edit snapshots the files first and \
     returns the change as sentences: quote them to the human, and follow the result's \
     next_step. Group writes are off: restart with --allow-writes for knx_write_group. Push a \

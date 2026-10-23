@@ -63,6 +63,15 @@ directory or a script from before these changes needs:
 
 ### Added
 
+- `knx_remove_group` and `knx_discard_edits` (#305). `knx_remove_group`
+  removes a group address from `groups.toml`; it is refused while a link uses
+  the address (the reason lists the links and names `knx_remove_link`) and for
+  a protected address, and `knx_undo` restores it. `knx_discard_edits` takes a
+  device `address` or a `group` and drops only that subject's unapplied edits
+  from this session, so reverting one device no longer means undoing the
+  edits made on other devices since. It returns the dropped sentences and
+  snapshots first, so `knx_undo` brings them back. A removed group address now
+  reads "Group address 1/0/22 (Kitchen door light) removed."
 - `[connection] admit_tunnel_senders = true` (#297): `plan`, `apply`,
   `flash`, `apply --line`, `knx_plan_device` and `knx_apply_device` on a KNX
   Data Secure device add every tunnelling address of the key store to its

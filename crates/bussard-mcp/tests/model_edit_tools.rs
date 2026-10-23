@@ -793,3 +793,121 @@ async fn test_edit_tools_report_only_their_change_and_new_warnings() -> TestResu
     }
     Ok(())
 }
+
+/// `knx_remove_group` refuses while a link uses the address (naming the link
+/// and knx_remove_link), refuses a protected one, succeeds after the link is
+/// gone, and `knx_undo` puts it back (issue #305).
+#[tokio::test]
+async fn test_remove_group_refuses_while_linked_and_succeeds_after_remove_link() -> TestResult {
+    let dir = model_dir("remove-group")?;
+    let (client, task) = connect(server_over(&dir)?).await?;
+    let link = json!({"address": "1.1.4", "com_object": 12, "ga": "3/0/1", "role": "listen"});
+    let ga: bussard_model::GroupAddress = "3/0/1".parse()?;
+
+    let res = call(&client, "knx_add_link", link.clone()).await;
+    assert_eq!(res["ok"], true, "{res}");
+
+    let res = call(&client, "knx_remove_group", json!({"ga": "3/0/1"})).await;
+    assert_eq!(res["refused"], true, "{res}");
+    let reason = res["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("1.1.4 object 12 listens"), "{reason}");
+    assert!(reason.contains("knx_remove_link"), "{reason}");
+    assert!(Model::load(&dir)?.groups.groups.contains_key(&ga));
+
+    let res = call(&client, "knx_remove_group", json!({"ga": "3/2/0"})).await;
+    assert_eq!(res["refused"], true, "{res}");
+    assert!(
+        res["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("protected")),
+        "{res}"
+    );
+
+    let res = call(&client, "knx_remove_link", link).await;
+    assert_eq!(res["ok"], true, "{res}");
+    let res = call(&client, "knx_remove_group", json!({"ga": "3/0/1"})).await;
+    assert_eq!(res["ok"], true, "{res}");
+    assert_eq!(
+        res["changes"],
+        json!(["Group address 3/0/1 (Central down) removed."]),
+        "{res}"
+    );
+    assert_eq!(res["detail"][0]["kind"], "group_removed", "{res}");
+    assert!(res["snapshot"].is_string(), "{res}");
+    assert!(!Model::load(&dir)?.groups.groups.contains_key(&ga));
+
+    let res = call(&client, "knx_undo", json!({})).await;
+    assert_eq!(res["ok"], true, "{res}");
+    assert!(Model::load(&dir)?.groups.groups.contains_key(&ga));
+
+    client.cancel().await?;
+    task.abort();
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// `knx_discard_edits` with `group` drops a group address created in the
+/// session, but refuses while a link uses it; a device discard leaves such a
+/// group in place and says so (issue #305).
+#[tokio::test]
+async fn test_discard_edits_group_created_in_session() -> TestResult {
+    let dir = model_dir("discard-group")?;
+    let (client, task) = connect(server_over(&dir)?).await?;
+    let ga: bussard_model::GroupAddress = "1/0/22".parse()?;
+
+    let res = call(
+        &client,
+        "knx_set_group",
+        json!({"ga": "1/0/22", "name": "Kitchen door light", "dpt": "1.001"}),
+    )
+    .await;
+    assert_eq!(res["ok"], true, "{res}");
+    let res = call(
+        &client,
+        "knx_add_link",
+        json!({"address": "1.1.4", "com_object": 12, "ga": "1/0/22", "role": "listen"}),
+    )
+    .await;
+    assert_eq!(res["ok"], true, "{res}");
+
+    // Linked: the group cannot be discarded.
+    let res = call(&client, "knx_discard_edits", json!({"group": "1/0/22"})).await;
+    assert_eq!(res["refused"], true, "{res}");
+    assert!(
+        res["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("1.1.4 object 12 listens")),
+        "{res}"
+    );
+
+    // Discarding the device drops the link and keeps the group, saying so.
+    let res = call(&client, "knx_discard_edits", json!({"address": "1.1.4"})).await;
+    assert_eq!(res["ok"], true, "{res}");
+    assert!(
+        res["note"].as_str().is_some_and(|n| n.contains("1/0/22")),
+        "{res}"
+    );
+    let model = Model::load(&dir)?;
+    assert!(model.groups.groups.contains_key(&ga));
+    let ia: bussard_model::IndividualAddress = "1.1.4".parse()?;
+    assert!(
+        model
+            .links
+            .links
+            .get(&ia)
+            .is_none_or(|links| links.iter().all(|l| !l.listen.contains(&ga))),
+        "the link is gone"
+    );
+
+    // Now the group goes too; neither call needs an argument it cannot use.
+    let res = call(&client, "knx_discard_edits", json!({"group": "1/0/22"})).await;
+    assert_eq!(res["ok"], true, "{res}");
+    assert!(!Model::load(&dir)?.groups.groups.contains_key(&ga));
+    let res = call(&client, "knx_discard_edits", json!({})).await;
+    assert_eq!(res["refused"], true, "{res}");
+
+    client.cancel().await?;
+    task.abort();
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}

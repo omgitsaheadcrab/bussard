@@ -37,10 +37,12 @@
 //! | `knx_describe_change` | Pending or between-snapshot model changes, as plain sentences. |
 //! | `knx_history` | The model's history snapshots with a one-line summary each. |
 //! | `knx_set_group` | Create or update a group address (refuses to rename or retype a protected one). |
+//! | `knx_remove_group` | Remove a group address (refuses while linked, and protected ones). |
 //! | `knx_add_link` / `knx_remove_link` | Bind or unbind a com object and a GA (refuses protected GAs). |
 //! | `knx_set_device` | Rename a device or change its floor/room. |
 //! | `knx_set_parameter` | Set one device parameter, checked against the product model. |
 //! | `knx_undo` | Restore the model files to a history snapshot. |
+//! | `knx_discard_edits` | Drop one device's or group address's unapplied edits, leaving the rest. |
 //! | `knx_export_bundle` | Write the model and history as one `.bussard` handover file. |
 //! | `knx_diff_project` | What a received `.knxproj` or bundle would change, as sentences. |
 //! | `knx_plan_device` | Read one device's live tables and return the plan `bussard plan` prints, plus a `plan_digest` (registered only with `--allow-programming`). |
@@ -55,9 +57,9 @@
 //! | `knx_last_apply` | The latest apply job for a device, from the session or its record under `.bussard/history/` (registered only with `--allow-programming`). |
 //! | `knx_restore_parameters` | Plan, then with the digest write, the replay of a parameter backup from `captures/backups/parameters/` onto one device: refused on a device, application or mask mismatch, only placed octets, device-managed ones kept, verified by read-back, run as a job (issue #290; registered only with `--allow-programming`). |
 //!
-//! The eight from `knx_describe_change` to `knx_undo` are model tools: they
+//! The ten from `knx_describe_change` to `knx_discard_edits` are model tools: they
 //! read and write the model files (TOML) under the model directory and never touch the bus,
-//! so they are available in every tier including `--passive`. The six that
+//! so they are available in every tier including `--passive`. The eight that
 //! edit, and `knx_scaffold_groups` and `knx_reserve_groups`, which write
 //! `groups.toml`, are withheld by
 //! `--no-model-edits`. Every edit snapshots first, validates after, and returns
