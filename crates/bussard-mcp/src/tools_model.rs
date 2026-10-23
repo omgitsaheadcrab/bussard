@@ -34,6 +34,7 @@ use rmcp::{tool, tool_router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::param_keys::{KeyContext, resolve_parameter_key};
 use crate::server::BussardMcp;
 use crate::session_edits::Subject;
 
@@ -113,12 +114,15 @@ pub struct SetDeviceArgs {
 pub struct SetParameterArgs {
     /// The device's individual address, e.g. `"1.1.4"`.
     pub address: String,
-    /// The parameter key as the device file uses it (`knx_show_device` lists
-    /// them), e.g. `"betriebsart"`, `"sollwerte.komfort"`, or the escape-hatch
-    /// form `"nachtabsenkung@P-1312_R-2140"`.
+    /// The parameter key as `knx_show_device` lists it (`"betriebsart"`,
+    /// page-qualified `"sollwerte.komfort"`, escape hatch
+    /// `"nachtabsenkung@P-1312_R-2140"`), the same key prefixed with its page
+    /// or channel handle (`"universalkanal-c4-funktion.helligkeitsschwelle"`),
+    /// `key@reference`, or the bare reference (`"P-1312_R-2140"`).
     pub parameter: String,
-    /// The channel handle the parameter sits in (`"a-1"`), when the key alone
-    /// is not unique on the device.
+    /// The channel handle (`"a-1"`), `"device"`, or the ETS page handle
+    /// (`"universalkanal-c4-funktion"`) the parameter sits on, when the key
+    /// alone is not unique on the device.
     #[serde(default)]
     pub channel: Option<String>,
     /// The new value: an enum label (`"Jalousie"`) or code, a number, or text.
@@ -611,8 +615,13 @@ impl BussardMcp {
     /// `knx_set_parameter`.
     #[tool(
         description = "Change one device parameter value in its device file, devices/<address>.toml \
-        (e.g. a night setback temperature). `parameter` is the key the file uses, as \
-        knx_show_device lists it (add `channel` when the key repeats across channels); any \
+        (e.g. a night setback temperature). `parameter` is the key knx_show_device lists \
+        (`helligkeitsschwelle`, page-qualified `sollwerte.komfort`, or `key@reference`); the \
+        same key prefixed with its page or channel handle \
+        (`universalkanal-c4-funktion.helligkeitsschwelle`) and the bare reference \
+        (`P-7305_R-7305`) work too, and `channel` takes a channel handle, `device` or a page \
+        handle, as knx_show_device does, when the key repeats. An unknown key is refused with \
+        the three closest keys on the device. Any \
         parameter the lock knows for the device can be set, and the value (an enum label or \
         code, a number) is checked against the vendor's product model first; without a product \
         model the edit is refused rather than guessed. This edits FILES ONLY: the device keeps \
@@ -643,10 +652,17 @@ impl BussardMcp {
         let label = vec![ia.to_string(), wanted.clone(), value.clone()];
 
         self.edit_with_note("knx_set_parameter", label, move |model| {
+            let app = model
+                .devices
+                .get(&ia)
+                .and_then(|d| d.device.product.as_ref())
+                .and_then(|p| p.application_ref.clone());
+            let products = ProductModels::load_apps(&dir, app.iter().map(String::as_str));
+            let keys = KeyContext::new(model, &products, ia);
             let Some(loaded) = model.devices.get_mut(&ia) else {
                 return Err(format!("{ia} is not a device in this model"));
             };
-            let key = resolve_parameter_key(&loaded.device, &wanted, channel.as_deref())?;
+            let key = resolve_parameter_key(&loaded.device, &keys, &wanted, channel.as_deref())?;
             let value = check_parameter(&dir, loaded, &key, &value)?;
             loaded.device.parameters.insert(key, value);
             Ok(refresh_device_facts(&dir, model, ia))
@@ -1210,68 +1226,6 @@ fn refuse_protected_ga(protected: bool, ga: GroupAddress) -> Result<(), String> 
         ))
     } else {
         Ok(())
-    }
-}
-
-/// Validates a parameter value against the vendor product model, refusing when
-/// there is no model to check it against.
-/// The in-memory key (`<slug>@<ref>`) of the parameter a device file names
-/// `wanted` (in `channel`, when given): an in-memory key as is, else the one
-/// lock entry with that file key.
-fn resolve_parameter_key(
-    device: &bussard_model::schema::Device,
-    wanted: &str,
-    channel: Option<&str>,
-) -> Result<String, String> {
-    if device.parameters.contains_key(wanted) {
-        return Ok(wanted.to_string());
-    }
-    let hits: Vec<(&String, &bussard_model::schema::LockedParameter)> = device
-        .lock
-        .parameters
-        .iter()
-        .filter(|(_, p)| p.key == wanted)
-        .filter(|(_, p)| match channel {
-            Some(h) => {
-                p.channel
-                    .as_deref()
-                    .map(|id| device.channel_handle(id))
-                    .as_deref()
-                    == Some(h)
-            }
-            None => true,
-        })
-        .collect();
-    match hits.as_slice() {
-        [(reference, _)] => Ok(device
-            .parameters
-            .keys()
-            .find(|k| {
-                k.split_once('@')
-                    .is_some_and(|(_, r)| r == reference.as_str())
-            })
-            .cloned()
-            .unwrap_or_else(|| format!("{}@{reference}", bussard_model::slug(wanted)))),
-        [] => Err(format!(
-            "{} has no parameter {wanted:?}{}. knx_show_device lists the keys the device file \
-             accepts.",
-            device.address,
-            channel
-                .map(|c| format!(" in channel {c}"))
-                .unwrap_or_default()
-        )),
-        many => Err(format!(
-            "{wanted:?} names a parameter in several channels of {} ({}); pass `channel`",
-            device.address,
-            many.iter()
-                .map(|(_, p)| p
-                    .channel
-                    .as_deref()
-                    .map(|id| device.channel_handle(id))
-                    .unwrap_or_else(|| "device".to_string()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
     }
 }
 

@@ -251,3 +251,252 @@ async fn test_model_lookup_finds_a_function_on_an_inactive_page() -> TestResult 
     task.abort();
     Ok(())
 }
+
+/// A Meteodata-like application (issue #304): twelve universal channels,
+/// each a function page and an objects page behind an enable switch on the
+/// "Allgemein" page, C5 .. C12 behind the switches of every channel from C5
+/// up to their own (C10 needs C5 .. C10). C1 .. C4 are enabled.
+const METEO_APP: &str = "M-0004_A-0304-10-0000";
+const METEO_CHANNELS: u32 = 12;
+const METEO_ON: u32 = 4;
+
+fn meteo_product() -> String {
+    let id = |s: String| format!("{METEO_APP}_{s}");
+    let enum_yes_no = "  type: !enum\n    values:\n    - value: 0\n      text: nein\n    - value: 1\n      text: ja\n  default: '0'\n";
+    let mut objects = String::from("com_objects:\n");
+    let mut params = String::from("parameters:\n");
+    let mut blocks = String::from(
+        "blocks:\n- id: CH-0\n  kind: channel\n  text: Generic\n  number: 0\n- id: PB-1\n  text: Allgemein\n  parent: CH-0\n  channel: CH-0\n  parameters:\n",
+    );
+    for k in 1..=METEO_CHANNELS {
+        blocks.push_str(&format!("  - P-{k}_R-{k}\n"));
+        params.push_str(&format!(
+            "- id: {}\n  name: Enable{k}\n  text: Universalkanal C{k} aktivieren\n{enum_yes_no}",
+            id(format!("P-{k}"))
+        ));
+    }
+    for k in 1..=METEO_CHANNELS {
+        let first = if k >= 5 { 5 } else { k };
+        let when: String = (first..=k)
+            .map(|j| format!("  - ref: P-{j}_R-{j}\n    test: '1'\n"))
+            .collect();
+        let (f, s, h) = (1000 + 10 * k, 1001 + 10 * k, 1002 + 10 * k);
+        params.push_str(&format!(
+            "- id: {}\n  name: Function{k}\n  text: Funktion des Kanals\n  type: !enum\n    values:\n    - value: 1\n      text: Helligkeit\n    - value: 2\n      text: Temperatur\n    - value: 3\n      text: Wind\n  default: '1'\n",
+            id(format!("P-{f}"))
+        ));
+        params.push_str(&format!(
+            "- id: {}\n  name: Threshold{k}\n  text: Schwellwert in lx\n  type: !int\n    min: 1\n    max: 1000\n    size: 16\n  default: '100'\n",
+            id(format!("P-{s}"))
+        ));
+        params.push_str(&format!(
+            "- id: {}\n  name: Brightness{k}\n  text: Helligkeitsschwelle C{k}\n  type: !int\n    min: 1\n    max: 1000\n    size: 16\n  default: '200'\n",
+            id(format!("P-{h}"))
+        ));
+        for (n, text) in [(2 * k, "Schaltausgang"), (2 * k + 1, "Messwert")] {
+            objects.push_str(&format!(
+                "  {n}:\n    text: C{k} {text}\n    function_text: Ausgang\n    dpt: '1.001'\n    flags: CRT\n    ref_id: {}\n",
+                id(format!("O-{n}_R-{n}"))
+            ));
+        }
+        blocks.push_str(&format!(
+            "- id: PB-{k}0\n  text: 'Universalkanal C{k}: Funktion'\n  parent: CH-0\n  channel: CH-0\n  when:\n{when}  parameters:\n  - P-{f}_R-{f}\n  - P-{s}_R-{s}\n  - P-{h}_R-{h}\n  objects:\n  - O-{n}_R-{n}\n",
+            n = 2 * k
+        ));
+        blocks.push_str(&format!(
+            "- id: PB-{k}1\n  text: Objekte zu C{k}\n  parent: CH-0\n  channel: CH-0\n  when:\n{when}  objects:\n  - O-{n}_R-{n}\n",
+            n = 2 * k + 1
+        ));
+    }
+    format!(
+        "model_format: 2\nidentity:\n  id: {METEO_APP}\n  name: meteo test app\n  application_number: 304\n  application_version: 16\n  mask_version: '0701'\n  load_procedure_style: ProductProcedure\n  schema_version: '23'\n{objects}{params}load_procedure:\n- connect\n- restart\n- disconnect\n{blocks}"
+    )
+}
+
+fn write_meteo(dir: &Path) -> anyhow::Result<()> {
+    let mut objects = String::new();
+    let mut params = String::new();
+    let mut file = String::from(
+        "address = \"1.1.202\"\nname = \"Meteodata\"\nproduct = \"MD-304\"\n\n[channel.generic-0]\n",
+    );
+    for k in 1..=METEO_CHANNELS {
+        params.push_str(&format!(
+            "  {{ key = \"universalkanal-c{k}-aktivieren\", channel = \"generic-0\", ref = \"P-{k}_R-{k}\", param = \"P-{k}\" }},\n"
+        ));
+    }
+    for k in 1..=METEO_ON {
+        file.push_str(&format!("universalkanal-c{k}-aktivieren = \"ja\"\n"));
+        let (f, s, h) = (1000 + 10 * k, 1001 + 10 * k, 1002 + 10 * k);
+        let page = format!("universalkanal-c{k}-funktion");
+        params.push_str(&format!(
+            "  {{ key = \"{page}.funktion-des-kanals\", channel = \"generic-0\", ref = \"P-{f}_R-{f}\", param = \"P-{f}\" }},\n  {{ key = \"{page}.schwellwert-in-lx\", channel = \"generic-0\", ref = \"P-{s}_R-{s}\", param = \"P-{s}\" }},\n  {{ key = \"helligkeitsschwelle-c{k}\", channel = \"generic-0\", ref = \"P-{h}_R-{h}\", param = \"P-{h}\" }},\n"
+        ));
+        for n in [2 * k, 2 * k + 1] {
+            objects.push_str(&format!(
+                "  {{ number = {n}, key = \"o{n}\", channel = \"generic-0\", text = \"C{k}\", function = \"Ausgang\", dpt = \"1.001\", flags = \"CRT\", ref = \"O-{n}_R-{n}\" }},\n"
+            ));
+        }
+    }
+    let lock = format!(
+        "version = 3\n\n[[device]]\naddress = \"1.1.202\"\nproduct = \"MD-304\"\napplication = \"{METEO_APP}\"\nmask = \"0701\"\nchannels = [\n  {{ key = \"generic-0\", id = \"CH-0\", number = 0 }},\n]\nobjects = [\n{objects}]\nparameters = [\n{params}]\n"
+    );
+    std::fs::create_dir_all(dir.join("devices"))?;
+    std::fs::create_dir_all(dir.join(".bussard/models"))?;
+    std::fs::write(dir.join("groups.toml"), "groups = []\n")?;
+    std::fs::write(dir.join("devices/1.1.202.toml"), file)?;
+    std::fs::write(dir.join("bussard.lock"), lock)?;
+    std::fs::write(
+        dir.join(format!(".bussard/models/{METEO_APP}.yaml")),
+        meteo_product(),
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_show_device_scoped_on_a_meteodata_like_model_stays_small() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    write_meteo(dir.path())?;
+    let (client, task) = serve(dir.path()).await?;
+
+    let full = call(&client, "knx_show_device", json!({"address": "1.1.202"})).await?;
+    let blocks = full["blocks"].as_array().cloned().unwrap_or_default();
+    let c10 = blocks
+        .iter()
+        .find(|b| b["handle"] == "universalkanal-c10-funktion")
+        .ok_or_else(|| anyhow::anyhow!("no C10 page: {full}"))?;
+    // C10's chain names only its own switch; C5 .. C9 are `also_needs`.
+    let enable = c10["inactive"]["enable"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(enable.len(), 1, "{c10}");
+    assert_eq!(enable[0]["reference"], "P-10_R-10", "{c10}");
+    let also: Vec<&str> = c10["inactive"]["also_needs"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        also,
+        (5..=9)
+            .map(|k| format!("universalkanal-c{k}-funktion"))
+            .collect::<Vec<_>>(),
+        "{c10}"
+    );
+    assert!(full["how_to_change"].is_string(), "{full}");
+
+    let scoped = call(
+        &client,
+        "knx_show_device",
+        json!({"address": "1.1.202", "channel": "universalkanal-c4-funktion"}),
+    )
+    .await?;
+    let size = serde_json::to_string(&scoped)?.len();
+    assert!(size < 8 * 1024, "scoped view is {size} bytes: {scoped}");
+    assert_eq!(scoped["scope"]["block"], "universalkanal-c4-funktion");
+    assert!(scoped.get("how_to_change").is_none(), "{scoped}");
+    assert!(scoped.get("inactive_pages").is_none(), "{scoped}");
+    let lines = scoped["blocks"].as_array().cloned().unwrap_or_default();
+    assert!(
+        lines.iter().all(Value::is_string) && lines.len() == blocks.len(),
+        "{scoped}"
+    );
+    assert!(
+        lines.iter().any(|l| l.as_str().is_some_and(|l| l
+            .starts_with("universalkanal-c12-funktion")
+            && l.contains("inactive"))),
+        "{scoped}"
+    );
+
+    // `inactive: true` adds the enable detail of the inactive pages.
+    let detail = call(
+        &client,
+        "knx_show_device",
+        json!({"address": "1.1.202", "channel": "objekte-zu-c4", "inactive": true}),
+    )
+    .await?;
+    let pages = detail["inactive_pages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(pages.len(), 8, "{detail}");
+    assert!(
+        pages.iter().all(|p| p["inactive"]["enable"].is_array()),
+        "{detail}"
+    );
+
+    client.cancel().await?;
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_set_parameter_takes_every_key_shape_and_page_scope() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    write_meteo(dir.path())?;
+    let (client, task) = serve(dir.path()).await?;
+    let page = "universalkanal-c4-funktion";
+    let file = dir.path().join("devices/1.1.202.toml");
+
+    for (args, value) in [
+        (
+            json!({"parameter": "helligkeitsschwelle-c4", "channel": page}),
+            "301",
+        ),
+        (
+            json!({"parameter": format!("{page}.helligkeitsschwelle-c4")}),
+            "302",
+        ),
+        (
+            json!({"parameter": "helligkeitsschwelle-c4@P-1042_R-1042"}),
+            "303",
+        ),
+        (json!({"parameter": "P-1042_R-1042"}), "304"),
+        (
+            json!({"parameter": "funktion-des-kanals", "channel": page}),
+            "Wind",
+        ),
+    ] {
+        let mut args = args;
+        args["address"] = json!("1.1.202");
+        args["value"] = json!(value);
+        let mut params = CallToolRequestParams::new("knx_set_parameter");
+        if let Some(map) = args.as_object() {
+            params = params.with_arguments(map.clone());
+        }
+        let result = client.call_tool(params).await?;
+        let body = result.structured_content.clone().unwrap_or_default();
+        assert_ne!(body["refused"], true, "{args}: {body}");
+        let text = std::fs::read_to_string(&file)?;
+        let expect = if value == "Wind" {
+            "\"Wind\"".to_string()
+        } else {
+            value.to_string()
+        };
+        assert!(text.contains(&expect), "{args}: {text}");
+    }
+
+    // A misspelling names the closest keys with their page.
+    let mut params = CallToolRequestParams::new("knx_set_parameter");
+    if let Some(map) =
+        json!({"address": "1.1.202", "parameter": "helligkeitschwelle-c4", "value": "1"})
+            .as_object()
+    {
+        params = params.with_arguments(map.clone());
+    }
+    let body = client
+        .call_tool(params)
+        .await?
+        .structured_content
+        .unwrap_or_default();
+    assert_eq!(body["refused"], true, "{body}");
+    assert!(
+        body["reason"].as_str().is_some_and(
+            |r| r.contains("Closest: `helligkeitsschwelle-c4` on universalkanal-c4-funktion")
+        ),
+        "{body}"
+    );
+
+    client.cancel().await?;
+    task.abort();
+    Ok(())
+}

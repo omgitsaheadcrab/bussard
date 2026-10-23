@@ -332,17 +332,22 @@ async fn test_show_device_says_how_to_change_it() -> TestResult {
     write_model(dir.path())?;
     let tier = TIERS[3];
     let (client, task) = serve(dir.path(), tier).await?;
-    let view = call(
+    // A scoped call leaves it out: the tool description carries it (#304).
+    let scoped = call(
         &client,
         "knx_show_device",
         json!({"address": "1.1.47", "channel": "a-1"}),
     )
     .await?;
+    assert!(scoped["scope"].is_object(), "{scoped}");
+    assert!(scoped.get("how_to_change").is_none(), "{scoped}");
+    let view = call(&client, "knx_show_device", json!({"address": "1.1.47"})).await?;
     assert_eq!(view["product_model"], true, "{view}");
     let how = view["how_to_change"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("no how_to_change: {view}"))?;
     assert!(how.contains("knx_set_parameter"), "{how}");
+    assert!(how.contains("bare reference"), "{how}");
     assert!(
         how.contains("knx_plan_device then knx_apply_device"),
         "{how}"

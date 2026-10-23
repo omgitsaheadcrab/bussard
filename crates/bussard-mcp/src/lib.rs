@@ -23,7 +23,7 @@
 //! | `knx_show_device` | A device's channels, and one channel's parameters (choices, defaults) and objects, in its device file's words; optionally as paste-ready TOML. |
 //! | `knx_recent_telegrams` | Recent telegrams from the ring (and capture DB). |
 //! | `knx_wait_for_telegram` | Block for the next matching telegram ("press the button now"). |
-//! | `knx_validate` | Model validation diagnostics as JSON. |
+//! | `knx_validate` | Model validation diagnostics as JSON: errors and warnings by default, infos on request, filtered by device or group. |
 //! | `knx_audit` | Installation audit: model gaps, one-sided links, mask capabilities, Secure devices; with `live`, tunnel slots and a traffic sample (live refused in `--passive`). |
 //! | `knx_scaffold_groups` | Draft or extend `groups.toml` from a room and function list (JSON). |
 //! | `knx_reserve_groups` | Reserve the conventional addresses for one room in `groups.toml`. |
@@ -133,6 +133,7 @@ pub mod args;
 pub mod guidance;
 pub mod instances;
 pub mod model_handle;
+pub mod param_keys;
 pub mod run;
 mod secure_group;
 pub mod server;

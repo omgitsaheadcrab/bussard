@@ -547,6 +547,20 @@ directory or a script from before these changes needs:
 
 ### Changed
 
+- Smaller and more forgiving MCP answers about parameters (#304).
+  `knx_set_parameter` takes a parameter key in every shape
+  `knx_show_device` shows: the bare key, the key behind its page or channel
+  handle (`universalkanal-c4-funktion.helligkeitsschwelle`), `key@reference`
+  and the bare reference. Its `channel` takes a page handle as
+  `knx_show_device` does, and an unknown key is refused with the three
+  closest keys on the device and the page each sits on. A scoped
+  `knx_show_device` lists the other pages one line each, leaves out
+  `how_to_change`, and returns the enable detail of the inactive pages only
+  with `inactive: true` (about 30 KB down to under 8 KB on a Meteodata).
+  Unscoped, a page whose enable chain repeats an earlier page's lists only
+  its own switch plus `also_needs`. `knx_validate` returns errors and
+  warnings by default, infos with `severity: "info"`, takes `address` and
+  `group` filters, and always counts every severity.
 - The partial parameter write does what ETS's download does (#290, owner
   decision, option b): `apply`, `flash --parameters-only` and
   `knx_apply_device` compare and write only the octets a parameter is placed
