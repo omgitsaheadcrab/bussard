@@ -45,7 +45,7 @@ use bussard_download::backup::{
 };
 use bussard_mgmt::apci::PID_ORDER_INFO;
 use bussard_mgmt::{
-    L4Channel, Layer4Connection, MaskProfile, Timeouts, read_mcb_table, read_memory_range,
+    L4Channel, Layer4Connection, MaskProfile, read_mcb_table, read_memory_range,
     read_table_reference, system_type,
 };
 use bussard_model::{IndividualAddress, Model};
@@ -391,7 +391,7 @@ async fn probe_mask(
 ) -> Probe {
     let options = L4Options {
         source: SourcePolicy::Known(source),
-        timeouts: Timeouts::discovery(),
+        timeouts: crate::scan_cmd::discovery_timeouts(),
         authorize: Authorize::Skip,
         ..L4Options::default()
     };

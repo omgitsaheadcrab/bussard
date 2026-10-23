@@ -143,6 +143,8 @@ fn test_runner_reports_pass_fail_refusal_and_skip() -> TestResult {
     let gateway_arg = format!("127.0.0.1:{port}");
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "test",
             "--yes",
@@ -206,6 +208,8 @@ fn test_runner_reports_pass_fail_refusal_and_skip() -> TestResult {
     // The report is deterministic apart from timestamps: the text report has
     // none, so a second run over the same installation renders identically.
     let second = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "test",
             "--yes",
@@ -240,6 +244,8 @@ fn test_runner_only_filter_and_json_report() -> TestResult {
     write_fixture(&model_dir)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "test",
             "--yes",

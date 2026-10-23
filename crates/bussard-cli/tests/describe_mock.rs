@@ -169,6 +169,8 @@ fn describe_against(device: MockDevice, model_dir: &Path, extra: &[&str]) -> Tes
     let mut args = vec!["describe", "1.1.12", "--dir", dir, "--gateway", &gateway];
     args.extend_from_slice(extra);
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -243,7 +243,7 @@ pub fn run(
             let service =
                 BusService::open(config, WritePolicy::transmit(options.allow_remote_gateway))?;
             let _ = service
-                .wait_connected(std::time::Duration::from_secs(10))
+                .wait_connected(crate::conn_cmd::connect_wait())
                 .await;
             let source = checked_source_or_close(&service, &conn).await?;
             let mut present = Vec::new();
@@ -383,7 +383,7 @@ fn commission_one(
             let service =
                 BusService::open(config, WritePolicy::transmit(options.allow_remote_gateway))?;
             let _ = service
-                .wait_connected(std::time::Duration::from_secs(10))
+                .wait_connected(crate::conn_cmd::connect_wait())
                 .await;
             let source = checked_source_or_close(&service, overrides).await?;
             let result = assign_on_bus(&service, source, target).await;

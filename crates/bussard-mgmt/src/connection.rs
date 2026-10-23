@@ -214,12 +214,31 @@ pub struct Timeouts {
     pub absent_on_negative_confirmation: bool,
 }
 
+/// Environment variable that overrides [`ACK_TIMEOUT`] and [`RESPONSE_TIMEOUT`]
+/// of the standard budget ([`Timeouts::default`]) and caps the S-A_Sync retry
+/// backoff ([`SyncRetry`]) with a millisecond value. Set by the mock-device
+/// integration tests so an unanswered request on loopback costs tens of
+/// milliseconds instead of seconds; unset in normal use, where the KNX-standard
+/// values apply. The repetition and attempt counts are unchanged.
+pub const MGMT_TIMEOUT_MS_ENV: &str = "BUSSARD_MGMT_TIMEOUT_MS";
+
+/// The [`MGMT_TIMEOUT_MS_ENV`] override, when set to a whole number.
+fn mgmt_timeout_override() -> Option<Duration> {
+    bussard_model::dotenv::var(MGMT_TIMEOUT_MS_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
 impl Default for Timeouts {
+    /// The KNX-standard budget, or the [`MGMT_TIMEOUT_MS_ENV`] timeouts when
+    /// that test knob is set.
     fn default() -> Self {
+        let wait = mgmt_timeout_override();
         Timeouts {
-            ack_timeout: ACK_TIMEOUT,
+            ack_timeout: wait.unwrap_or(ACK_TIMEOUT),
             max_repetitions: MAX_REPETITIONS,
-            response_timeout: RESPONSE_TIMEOUT,
+            response_timeout: wait.unwrap_or(RESPONSE_TIMEOUT),
             absent_on_negative_confirmation: false,
         }
     }
@@ -287,12 +306,14 @@ pub struct SyncRetry {
 impl Default for SyncRetry {
     /// Three attempts, backing off 1 s then 2 s: the policy of every secured
     /// connection.
+    /// [`MGMT_TIMEOUT_MS_ENV`] caps both backoff bounds when set.
     fn default() -> Self {
         SyncRetry {
             attempts: 3,
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(4),
         }
+        .with_env_cap()
     }
 }
 
@@ -301,11 +322,23 @@ impl SyncRetry {
     /// itself triggered: five attempts, backing off 1, 2, 4 and 8 s. With the
     /// standard 3 s response timeout the whole sync gives the device about 30 s
     /// to bring its security layer up.
+    ///
+    /// [`MGMT_TIMEOUT_MS_ENV`] caps both backoff bounds when set; the attempt
+    /// count stays five.
     pub fn after_restart() -> Self {
         SyncRetry {
             attempts: 5,
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(8),
+        }
+        .with_env_cap()
+    }
+
+    /// Caps the backoff with [`MGMT_TIMEOUT_MS_ENV`] when that test knob is set.
+    fn with_env_cap(self) -> Self {
+        match mgmt_timeout_override() {
+            Some(cap) => self.with_backoff_cap(cap),
+            None => self,
         }
     }
 

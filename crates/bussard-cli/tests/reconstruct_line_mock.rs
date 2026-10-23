@@ -220,6 +220,8 @@ fn run_reconstruct_line(
     ];
     args.extend_from_slice(extra);
     Ok(Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args(&args)
         // No --dir: run away from any checkout so model discovery (issue
         // #228) finds nothing and the line sweep supplies its own defaults.

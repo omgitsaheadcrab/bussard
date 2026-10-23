@@ -29,6 +29,30 @@ use crate::conn_cmd::{ConnOverrides, load_model_optional, open_service, resolve_
 /// How long to wait for a GroupValueResponse before giving up.
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Environment variable that overrides [`READ_TIMEOUT`] in milliseconds. Set by
+/// the integration tests whose responder stays silent on purpose; unset in
+/// normal use.
+const READ_TIMEOUT_MS_ENV: &str = "BUSSARD_READ_TIMEOUT_MS";
+
+/// The response wait, honouring [`READ_TIMEOUT_MS_ENV`] when set.
+fn read_timeout() -> Duration {
+    bussard_model::dotenv::var(READ_TIMEOUT_MS_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(READ_TIMEOUT)
+}
+
+/// `timeout` as the error messages print it: whole seconds (`3s`), or
+/// milliseconds when the test knob set a fraction.
+fn timeout_label(timeout: Duration) -> String {
+    if timeout.subsec_millis() == 0 {
+        format!("{}s", timeout.as_secs())
+    } else {
+        format!("{}ms", timeout.as_millis())
+    }
+}
+
 /// Runs `bussard read <ga>`.
 pub fn run(
     ga_str: &str,
@@ -80,7 +104,7 @@ pub fn run(
         } else {
             Some(
                 service
-                    .read_group(ga, dpt, key.as_ref(), READ_TIMEOUT)
+                    .read_group(ga, dpt, key.as_ref(), read_timeout())
                     .await,
             )
         };
@@ -144,17 +168,17 @@ pub fn run(
         Ok(None) => {
             if secured {
                 eprintln!(
-                    "error: {} ({}s)",
+                    "error: {} ({})",
                     admission::secured_read_timeout(ga, source),
-                    READ_TIMEOUT.as_secs()
+                    timeout_label(read_timeout())
                 );
                 if let Some(note) = &note {
                     eprintln!("note: {note}");
                 }
             } else {
                 eprintln!(
-                    "error: no response for {ga} within {}s",
-                    READ_TIMEOUT.as_secs()
+                    "error: no response for {ga} within {}",
+                    timeout_label(read_timeout())
                 );
             }
             Ok(ExitCode::FAILURE)
@@ -199,7 +223,7 @@ fn print_json(
                 "name": name,
                 "answered": false,
                 "secured": secured,
-                "timeout_seconds": READ_TIMEOUT.as_secs(),
+                "timeout_seconds": read_timeout().as_secs(),
                 "reason": secured.then(|| admission::secured_read_timeout(ga, source)),
             }),
             ExitCode::FAILURE,
@@ -217,4 +241,16 @@ fn print_json(
     };
     crate::output::print(crate::output::schema::READ, &body)?;
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_timeout_label_keeps_whole_seconds() {
+        assert_eq!(super::timeout_label(super::READ_TIMEOUT), "3s");
+        assert_eq!(
+            super::timeout_label(std::time::Duration::from_millis(200)),
+            "200ms"
+        );
+    }
 }

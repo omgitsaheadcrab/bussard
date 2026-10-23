@@ -901,8 +901,12 @@ Serve the network-visualization website: an HTTP server that renders the model a
 | `BUSSARD_SECURE_ALGORITHM` | Test knob: `auth` wraps KNX Data Secure management APDUs authentication-only (in the clear under a MAC) instead of the default authentication + encryption. For the conformance loop against the simulator; a real flash never sets it. |
 | `BUSSARD_FLASH_SYS7_LSM` | Test knob: `memory` or `property` overrides the product-driven System 7 load-state-machine realisation (memory-mapped record or PID 5). For conformance tests against knx-sim; unset in normal use. |
 | `BUSSARD_ASSIGN_WAIT_MS` | Test knob: shrinks the programming-mode wait budget of `assign` and `adopt`. Unset in normal use. |
-| `BUSSARD_SCAN_DISCOVERY_MS` | Test knob: shrinks the per-address probe timeout of `scan` and `reconstruct --line`. Unset in normal use. |
+| `BUSSARD_SCAN_DISCOVERY_MS` | Test knob: shrinks the per-address probe timeout of `scan`, `reconstruct --line`, `commission`, `backup` and `replace`. Unset in normal use. |
 | `BUSSARD_ADDRESS_PROBE_MS` | Test knob: shrinks the per-attempt timeout of the source-address check (default 600 ms). Unset in normal use. |
+| `BUSSARD_CONNECT_WAIT_MS` | Test knob: shrinks how long a command waits for the first tunnel connect (default 10 s). Unset in normal use. |
+| `BUSSARD_MGMT_TIMEOUT_MS` | Test knob: shrinks the management ACK and response timeouts (default 3 s each) and caps the KNX Data Secure sync retry backoff (default 1 s doubling to 4 s, or 8 s after a restart). Repetitions and attempts are unchanged. Unset in normal use. |
+| `BUSSARD_BUS_BACKOFF_MS` | Test knob: shrinks the first reconnect backoff of the bus connection (default 1 s, doubling to 30 s). Unset in normal use. |
+| `BUSSARD_READ_TIMEOUT_MS` | Test knob: shrinks how long `read` waits for a group response (default 3 s). Unset in normal use. |
 | `BUSSARD_PRODUCT_CACHE` | Set to `off` (or `0`, `false`) to bypass the parsed-product cache under `.bussard/products/`, so every command parses the product archive again. |
 | `BUSSARD_WIRE_TRACE` | Set to `1` to log every cEMI frame as hex on stderr, one `[wire] <UTC time, ms> TX >>`/`RX <<` line each, so per-frame timing can be read off the log. The diagnostic of last resort when a gateway behaves unexpectedly; very noisy. |
 | `BUSSARD_SECURE_KEEPALIVE_SECS` | The KNXnet/IP Secure session keepalive interval in seconds (default `30`; `0` sends none). A wrapped SESSION_STATUS `STATUS_KEEPALIVE` goes out this often. The default is half the 60 s session timeout measured on the Jung interface (the KNX specification's value); `bussard test --secure-idle` measures another interface's. A value of 60 or more prints a warning at connect. |

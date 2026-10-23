@@ -69,6 +69,21 @@ pub const STALE_CUTOFF: Duration = Duration::from_secs(2);
 const BACKOFF_START: Duration = Duration::from_secs(1);
 /// The maximum reconnect backoff.
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Environment variable that overrides [`BACKOFF_START`] with a millisecond
+/// value. Set by the reconnect tests so a refused attempt is retried in tens of
+/// milliseconds; unset in normal use. The doubling and [`BACKOFF_MAX`] are
+/// unchanged.
+pub const BACKOFF_START_MS_ENV: &str = "BUSSARD_BUS_BACKOFF_MS";
+
+/// The initial reconnect backoff, honouring [`BACKOFF_START_MS_ENV`].
+fn backoff_start() -> Duration {
+    bussard_model::dotenv::var(BACKOFF_START_MS_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(BACKOFF_START)
+}
 /// Depth of the inbound broadcast channel. Subscribers that fall behind this far
 /// lag (older frames dropped) rather than blocking the actor.
 const BROADCAST_DEPTH: usize = 1024;
@@ -669,7 +684,8 @@ impl Actor {
     /// consume until the connection drops, reconnect. It exits only on a
     /// [`Command::Close`] or when every handle has been dropped.
     async fn run(mut self) {
-        let mut backoff = BACKOFF_START;
+        let start = backoff_start();
+        let mut backoff = start;
         // Whether the bus has been connected once. A connect error that is
         // fatal at startup (a refused password, a TCP endpoint that refuses)
         // is retried after that: the same credentials worked, so the cause is
@@ -683,7 +699,7 @@ impl Actor {
             let connected = attempt.is_ok();
             match attempt {
                 Ok(conn) => {
-                    backoff = BACKOFF_START;
+                    backoff = start;
                     ever_connected = true;
                     // Publish the assigned IA and connected state.
                     let ia = conn.assigned_individual_address().unwrap_or(0);
@@ -792,7 +808,7 @@ impl Actor {
                 BackoffOutcome::Reconnect(reply) => {
                     tracing::info!("bus reconnect requested; connecting now");
                     waiting.push(reply);
-                    backoff = BACKOFF_START;
+                    backoff = start;
                 }
                 BackoffOutcome::Close => {
                     self.shared.set_state(BusState::Closed);

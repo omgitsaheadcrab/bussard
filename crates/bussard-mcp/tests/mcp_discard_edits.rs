@@ -81,9 +81,22 @@ async fn call(
         .ok_or_else(|| anyhow::anyhow!("{tool} returned no structured content"))
 }
 
+/// Shrinks the management timeouts and the source-address probe for the mock
+/// device on loopback, as the CLI mock-device tests do.
+fn fast_mock_timeouts() {
+    // SAFETY: nextest runs each test in its own process, and every test in
+    // this binary sets the same values before the server starts; they are
+    // read when a management connection or probe is set up.
+    unsafe {
+        std::env::set_var(bussard_mgmt::MGMT_TIMEOUT_MS_ENV, "300");
+        std::env::set_var(bussard_mgmt::probe::ADDRESS_PROBE_MS_ENV, "200");
+    }
+}
+
 #[tokio::test]
 async fn test_knx_discard_edits_one_device_keeps_the_other_and_undo_restores() -> anyhow::Result<()>
 {
+    fast_mock_timeouts();
     let gateway = MockGateway::builder()
         .channel(CHANNEL)
         .keep_serving()

@@ -117,6 +117,8 @@ fn scan_reports_devices_and_model_delta() -> TestResult {
     write_model(&model_dir)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "scan",
             "1.1",
@@ -222,6 +224,8 @@ fn scan_refuses_when_a_device_answers_at_our_source_address() -> TestResult {
     write_model(&model_dir)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "scan",
             "1.1",
@@ -277,6 +281,8 @@ fn scan_with_skip_address_check_runs_despite_a_shared_source_address() -> TestRe
     write_model(&model_dir)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "scan",
             "1.1",
@@ -368,6 +374,8 @@ fn run_scan(
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
     Ok(Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args(&args)
         .env("BUSSARD_SCAN_DISCOVERY_MS", "60")
         .env("BUSSARD_KEYRING_PASSWORD", KEYRING_PASSWORD)

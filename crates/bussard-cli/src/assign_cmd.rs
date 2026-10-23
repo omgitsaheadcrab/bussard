@@ -83,7 +83,7 @@ pub fn run(
         // Wait for the actor to connect so the tunnel-assigned source address is
         // available (falling back to 0.0.255 on routing) — issue #30.
         service
-            .wait_connected(std::time::Duration::from_secs(10))
+            .wait_connected(crate::conn_cmd::connect_wait())
             .await;
         let source = checked_source_or_close(&service, &overrides).await?;
         // Guard the assign flow with Ctrl-C: on interrupt, fall through to a

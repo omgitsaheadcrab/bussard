@@ -37,7 +37,7 @@ use std::process::ExitCode;
 use anyhow::{Context, anyhow, bail};
 use bussard_download::backup::rfc3339_utc;
 use bussard_mgmt::apci::PID_ORDER_INFO;
-use bussard_mgmt::{Timeouts, system_type, write_individual_address};
+use bussard_mgmt::{system_type, write_individual_address};
 use bussard_model::{IndividualAddress, Model};
 use bussard_service::{Authorize, BusService, L4Options, ServiceError, SourcePolicy, WritePolicy};
 
@@ -368,7 +368,7 @@ async fn probe_present(
 ) -> Option<u16> {
     let options = L4Options {
         source: SourcePolicy::Known(source),
-        timeouts: Timeouts::discovery(),
+        timeouts: crate::scan_cmd::discovery_timeouts(),
         authorize: Authorize::Skip,
         ..L4Options::default()
     };

@@ -46,11 +46,22 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 fn bussard(args: &[&str]) -> std::io::Result<Output> {
+    bussard_with(args, &[])
+}
+
+/// [`bussard`] with extra environment variables.
+fn bussard_with(args: &[&str], env: &[(&str, &str)]) -> std::io::Result<Output> {
     Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args(args)
         .env("BUSSARD_SCAN_DISCOVERY_MS", "40")
+        .envs(env.iter().copied())
         .output()
 }
+
+/// A mock that refuses every connect: the refusal is the point, not the wait.
+const REFUSED_CONNECT_WAIT: (&str, &str) = ("BUSSARD_CONNECT_WAIT_MS", "200");
 
 #[test]
 fn test_audit_static_text_has_every_section() -> TestResult {
@@ -235,14 +246,17 @@ fn test_audit_live_full_interface_exits_with_distinct_code() -> TestResult {
 
     let dir = fixture("full")?;
     let gateway = format!("127.0.0.1:{port}");
-    let out = bussard(&[
-        "audit",
-        "--live",
-        "--gateway",
-        &gateway,
-        "--dir",
-        dir.to_str().ok_or("path")?,
-    ])?;
+    let out = bussard_with(
+        &[
+            "audit",
+            "--live",
+            "--gateway",
+            &gateway,
+            "--dir",
+            dir.to_str().ok_or("path")?,
+        ],
+        &[REFUSED_CONNECT_WAIT],
+    )?;
     drop(mock);
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -264,14 +278,17 @@ fn test_read_full_interface_exits_with_distinct_code() -> TestResult {
 
     let dir = fixture("read-full")?;
     let gateway = format!("127.0.0.1:{port}");
-    let out = bussard(&[
-        "read",
-        "1/0/2",
-        "--gateway",
-        &gateway,
-        "--dir",
-        dir.to_str().ok_or("path")?,
-    ])?;
+    let out = bussard_with(
+        &[
+            "read",
+            "1/0/2",
+            "--gateway",
+            &gateway,
+            "--dir",
+            dir.to_str().ok_or("path")?,
+        ],
+        &[REFUSED_CONNECT_WAIT],
+    )?;
     drop(mock);
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -352,6 +369,8 @@ fn test_audit_live_probes_secure_devices_with_the_keyring_tool_key() -> TestResu
     let dir = secure_model("secure-live")?;
     let keyring = keyring_path();
     let out = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
         .args([
             "audit",
             "--live",
