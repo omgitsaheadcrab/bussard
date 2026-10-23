@@ -25,7 +25,7 @@ use bussard_download::backup::backups_root;
 use bussard_download::{
     ChangeMark, ChangeSubject, DecodedParameters, DevicePlan, FlashPlan, LiveTables, OctetRange,
     OctetRole, ParamRegions, ParamValue, PlanChange, PlanReport, PlanWrites, ResidentState,
-    decode_parameters, group_object_change, object_changes, probe_resident_state,
+    Sys7Identity, decode_parameters, group_object_change, object_changes, probe_resident_state,
     read_parameter_regions, regions_memory, select_application, sort_changes, state_hash,
 };
 use bussard_mgmt::{L4Channel, Layer4Connection};
@@ -507,6 +507,11 @@ pub struct ParamState {
     /// The memory and its decoding; `None` when the read was refused (see
     /// the report's note).
     pub detail: Option<ParamDetail>,
+    /// The System 7 identity verdict (issue #314), when the device is a
+    /// System 7 device holding a loaded application: the stand-in for the
+    /// application id the flash gate decides on. `None` on System B, on a
+    /// factory-fresh device and when the read stopped before the check.
+    pub sys7_identity: Option<Sys7Identity>,
 }
 
 impl ParamState {
@@ -514,6 +519,7 @@ impl ParamState {
         ParamState {
             readback: Readback::noted(application, note),
             detail: None,
+            sys7_identity: None,
         }
     }
 }
@@ -551,10 +557,21 @@ pub async fn read_state<Ch: L4Channel>(
     if let Err(why) = bussard_download::identity_gate(&plan, Some(&resident)) {
         return ParamState::noted(&app.id, format!("parameters not decoded: {why}"));
     }
-    if plan.is_sys7()
-        && let Some(why) = bussard_download::sys7_code_mismatch(l4, &plan).await
-    {
-        return ParamState::noted(&app.id, format!("parameters not decoded: {why}"));
+    // System 7 has no readable id: the code sample stands in for it (issue
+    // #314). Code that differs is another application; code that could not
+    // be read leaves the parameter read to fail on its own, as before.
+    let sys7_identity = if bussard_download::needs_sys7_identity(&plan, &resident) {
+        Some(bussard_download::sys7_identity(l4, &plan, &resident).await)
+    } else {
+        None
+    };
+    if let Some(Sys7Identity::Resident { reason }) = &sys7_identity {
+        let mut state = ParamState::noted(
+            &app.id,
+            format!("parameters not decoded: {reason}. Run `bussard flash --force` to replace it."),
+        );
+        state.sys7_identity = sys7_identity;
+        return state;
     }
     let regions = read_parameter_regions(l4, &plan).await;
     if regions.is_empty() {
@@ -617,6 +634,7 @@ pub async fn read_state<Ch: L4Channel>(
             octets,
             unwritten,
         }),
+        sys7_identity,
     }
 }
 

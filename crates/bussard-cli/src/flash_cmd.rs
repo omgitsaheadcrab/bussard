@@ -498,7 +498,24 @@ pub fn run(
                             }
                             _ => None,
                         };
-                        Ok::<_, ServiceError>((r, resident, current, preread))
+                        // System 7 has no readable application id: the code
+                        // sample stands in for it (issue #314), on this same
+                        // connection. `--force` replaces whatever is there, so
+                        // it does not ask.
+                        let sys7 = match (planned, &resident) {
+                            (Some(plan), Some(state))
+                                if !force
+                                    && !parameters_only
+                                    && bussard_download::needs_sys7_identity(plan, state) =>
+                            {
+                                Some(
+                                    bussard_download::sys7_identity(dev.l4_mut(), plan, state)
+                                        .await,
+                                )
+                            }
+                            _ => None,
+                        };
+                        Ok::<_, ServiceError>((r, resident, current, (preread, sys7)))
                     };
                     let outcome = body(&mut dev).await;
                     // Keep a complete pre-flight's connection for the write
@@ -521,14 +538,16 @@ pub fn run(
             // Whether the T_Connect established before the first read: a
             // connect-then-disconnect on the descriptor read is the diagnostic
             // pattern (see `descriptor_read_error`).
-            let (connected, result, resident, current, preread, kept) = match session {
-                Ok(((r, resident, current, preread), kept)) => {
-                    (true, r, resident, current, preread, kept)
+            let (connected, result, resident, current, preread, sys7, kept) = match session {
+                Ok(((r, resident, current, (preread, sys7)), kept)) => {
+                    (true, r, resident, current, preread, sys7, kept)
                 }
-                Err(ServiceError::Mgmt(err)) => (false, Err(err), None, None, None, None),
+                Err(ServiceError::Mgmt(err)) => (false, Err(err), None, None, None, None, None),
                 Err(err) => return Err(anyhow::Error::new(err)),
             };
-            anyhow::Ok((connected, result, resident, facts, current, preread, kept))
+            anyhow::Ok((
+                connected, result, resident, facts, current, preread, sys7, kept,
+            ))
         })?;
         // A loss still being re-established counts too: over TCP the probe can
         // run into the silence before the tunnel has noticed it (issue #192).
@@ -547,7 +566,7 @@ pub fn run(
         runtime.block_on(handle.wait_connected(handle.reconnect_budget()));
     };
 
-    let (connected, device_mask, resident, facts, current, preread, kept) = probe;
+    let (connected, device_mask, resident, facts, current, preread, sys7, kept) = probe;
     if let Some(l4) = kept {
         handover.keep(l4);
     }
@@ -698,7 +717,11 @@ pub fn run(
     // `--force`, and an unreadable state is refused too (unknown is not fresh).
     // A re-flash of the same application — the documented recovery path — goes
     // through with a notice.
-    let decision = decide_freshness(target, &gateway, dir, force, &freshness);
+    // System 7 exposes no application id: the code sample read on the
+    // pre-flight connection decides there (issue #314), the verdict the MCP
+    // flash plan decides on too. The image above stays shaped by `freshness`.
+    let gate = bussard_download::flash_gate(&freshness, &plan, resident.as_ref(), sys7.as_ref());
+    let decision = decide_freshness(target, &gateway, dir, force, &gate);
     eprintln!("{}", decision.message);
     if !decision.proceed {
         return Ok(ExitCode::FAILURE);
@@ -1425,7 +1448,9 @@ struct FreshnessDecision {
 ///   the same application is the documented recovery path for an interrupted
 ///   flash (see `docs/SAFETY.md`). The notice still says what a re-flash resets.
 /// - [`Freshness::Resident`] — a *different* (or unidentifiable) application is
-///   loaded. Refused unless `force`, because the flash would destroy it with no
+///   loaded (on System 7: a driven load-state machine is not `Loaded`, or the
+///   code differs from the product's; a healthy System 7 device arrives as
+///   `SameApplication` through [`bussard_download::flash_gate`]). Refused unless `force`, because the flash would destroy it with no
 ///   backup; the message names the resident application and the two ways
 ///   forward.
 /// - [`Freshness::Unknown`] — the state could not be read. Refused unless
@@ -1469,11 +1494,17 @@ fn decide_freshness(
                  resets its parameters and tables."
             )),
         },
-        Freshness::Resident { resident, objects } => {
-            let what = match resident {
-                Some(id) => format!("application {id}"),
-                None => "an application bussard could not identify (no readable \
-                         PID_PROGRAM_VERSION)"
+        Freshness::Resident {
+            resident,
+            objects,
+            reason,
+        } => {
+            let what = match (resident, reason) {
+                (Some(id), _) => format!("application {id}"),
+                // System 7 (issue #314): the code sample says what differs.
+                (None, Some(reason)) => format!("another application ({reason})"),
+                (None, None) => "an application bussard could not identify (no readable \
+                                 PID_PROGRAM_VERSION)"
                     .to_string(),
             };
             let where_ = objects.join(", ");
@@ -1911,6 +1942,7 @@ mod tests {
         Freshness::Resident {
             resident: Some("M-0083 A-0007 v35".to_string()),
             objects: vec!["object 3 (application program)".to_string()],
+            reason: None,
         }
     }
 
@@ -2031,6 +2063,7 @@ mod tests {
             &Freshness::Resident {
                 resident: None,
                 objects: vec!["LSM 3".to_string()],
+                reason: None,
             },
         );
         assert!(!decision.proceed);
@@ -2040,6 +2073,34 @@ mod tests {
             decision.message
         );
         assert!(decision.message.contains("LSM 3"), "{}", decision.message);
+    }
+
+    #[test]
+    fn test_decide_freshness_system7_code_difference_is_refused_with_the_segment() {
+        let decision = gate(
+            false,
+            &Freshness::Resident {
+                resident: None,
+                objects: vec!["LSM 1".to_string()],
+                reason: Some(
+                    "the code segment M-00FA_A-0007_AS-1 at 0x4800 differs from \
+                     M-00FA_A-0007's at offset 3"
+                        .to_string(),
+                ),
+            },
+        );
+        assert!(!decision.proceed);
+        assert!(
+            decision.message.contains("AS-1") && decision.message.contains("offset 3"),
+            "{}",
+            decision.message
+        );
+        assert!(
+            !decision.message.contains("could not identify"),
+            "{}",
+            decision.message
+        );
+        assert!(decision.message.contains("--force"), "{}", decision.message);
     }
 
     #[test]

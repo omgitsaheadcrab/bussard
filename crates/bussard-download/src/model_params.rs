@@ -487,25 +487,8 @@ pub fn identity_gate(plan: &FlashPlan, resident: Option<&ResidentState>) -> Resu
         )),
         Freshness::Resident { resident: None, .. } if plan.is_sys7() => {
             // System 7 exposes no application id. Every load-state machine must
-            // be Loaded; the code-segment comparison in `read_device` stands in
-            // for the id.
-            let driven: std::collections::BTreeSet<u32> = plan
-                .steps
-                .iter()
-                .filter_map(|step| match step {
-                    FlashStep::Sys7StartLoading { lsm } => Some(*lsm),
-                    _ => None,
-                })
-                .collect();
-            let unloaded: Vec<String> = state
-                .objects
-                .iter()
-                // An LSM the application's procedure never loads (the probe
-                // reads every one the mask defines) says nothing about it.
-                .filter(|o| driven.is_empty() || driven.contains(&u32::from(o.index)))
-                .filter(|o| o.state != bussard_mgmt::load::LoadState::Loaded)
-                .map(|o| format!("{} is {}", o.label(), o.state))
-                .collect();
+            // be Loaded; the code sample of `sys7_identity` stands in for the id.
+            let unloaded = sys7_unloaded(plan, state);
             if unloaded.is_empty() {
                 Ok(())
             } else {
@@ -522,18 +505,50 @@ pub fn identity_gate(plan: &FlashPlan, resident: Option<&ResidentState>) -> Resu
     }
 }
 
+/// The load-state machines a System 7 plan drives that are not `Loaded`,
+/// labelled (`LSM 3 is Unloaded`). An LSM the application's procedure never
+/// loads (the probe reads every one the mask defines) says nothing about the
+/// application and is left out.
+fn sys7_unloaded(plan: &FlashPlan, state: &ResidentState) -> Vec<String> {
+    let driven: std::collections::BTreeSet<u32> = plan
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            FlashStep::Sys7StartLoading { lsm } => Some(*lsm),
+            _ => None,
+        })
+        .collect();
+    state
+        .objects
+        .iter()
+        .filter(|o| driven.is_empty() || driven.contains(&u32::from(o.index)))
+        .filter(|o| o.state != bussard_mgmt::load::LoadState::Loaded)
+        .map(|o| format!("{} is {}", o.label(), o.state))
+        .collect()
+}
+
 /// How many leading octets of each System 7 code segment are compared.
 const CODE_SAMPLE: usize = 32;
 
-/// Compares the leading octets of every System 7 code segment (a data-bearing
-/// segment no parameter targets) against the product's bytes. System 7 has no
-/// readable application id, so resident code that differs is the evidence of a
-/// different application. `None` when every sampled segment matches, or when
-/// there is none to sample.
-pub async fn sys7_code_mismatch<Ch: bussard_mgmt::L4Channel>(
+/// What the System 7 code sample found.
+enum CodeSample {
+    /// Every segment that could be read matches; `segments` were compared.
+    Matches { segments: usize },
+    /// A segment differs: the reason names it and the first differing offset.
+    Differs(String),
+    /// No segment could be compared; the reason says why.
+    Unread(String),
+}
+
+/// Reads the leading octets of every System 7 code segment (a data-bearing
+/// segment no parameter targets) and compares them with the product's bytes,
+/// octet by octet where the segment mask marks the octet as written.
+async fn sample_code<Ch: bussard_mgmt::L4Channel>(
     l4: &mut bussard_mgmt::Layer4Connection<Ch>,
     plan: &FlashPlan,
-) -> Option<String> {
+) -> CodeSample {
+    let mut compared = 0;
+    let mut unread = Vec::new();
     for step in &plan.steps {
         let FlashStep::Sys7AbsSegment {
             address,
@@ -557,21 +572,187 @@ pub async fn sys7_code_mismatch<Ch: bussard_mgmt::L4Channel>(
             continue;
         };
         let len = expected.len().min(CODE_SAMPLE);
-        let Ok(got) = read_memory_range(l4, *address, len).await else {
-            continue;
-        };
         let mask = plan.segment_mask(&image.segment_id);
-        let differs = (0..len)
-            .any(|i| mask.is_none_or(|m| m.get(i) == Some(&0xFF)) && got.get(i) != expected.get(i));
-        if differs {
-            return Some(format!(
-                "the code at {address:#06X} ({}) does not match {}; the device runs another \
-                 application or version. Run a full `bussard flash` to replace it.",
+        let owned = |i: usize| mask.is_none_or(|m| m.get(i) == Some(&0xFF));
+        if !(0..len).any(owned) {
+            continue;
+        }
+        let got = match read_memory_range(l4, *address, len).await {
+            Ok(got) => got,
+            Err(err) => {
+                unread.push(format!("{address:#06X} ({}): {err}", image.segment_id));
+                continue;
+            }
+        };
+        let first = (0..len).find(|&i| owned(i) && got.get(i) != expected.get(i));
+        if let Some(i) = first {
+            let device = got
+                .get(i)
+                .map_or_else(|| "nothing".to_string(), |b| format!("{b:#04X}"));
+            let product = expected.get(i).copied().unwrap_or_default();
+            return CodeSample::Differs(format!(
+                "the code segment {} at {address:#06X} differs from {}'s at offset {i} (the \
+                 device holds {device}, the product {product:#04X}): the device runs another \
+                 application or version",
                 image.segment_id, plan.identity.id
             ));
         }
+        compared += 1;
     }
-    None
+    if compared > 0 {
+        CodeSample::Matches { segments: compared }
+    } else if unread.is_empty() {
+        CodeSample::Unread(format!(
+            "{} has no code segment to compare against the device",
+            plan.identity.id
+        ))
+    } else {
+        CodeSample::Unread(format!(
+            "no code segment could be read ({})",
+            unread.join("; ")
+        ))
+    }
+}
+
+/// Compares the leading octets of every System 7 code segment against the
+/// product's bytes (see [`sys7_identity`]). System 7 has no readable
+/// application id, so resident code that differs is the evidence of a
+/// different application. `None` when every sampled segment matches, or when
+/// none could be sampled; the parameter read-back that follows fails on its
+/// own when the memory does not answer.
+pub async fn sys7_code_mismatch<Ch: bussard_mgmt::L4Channel>(
+    l4: &mut bussard_mgmt::Layer4Connection<Ch>,
+    plan: &FlashPlan,
+) -> Option<String> {
+    match sample_code(l4, plan).await {
+        CodeSample::Differs(reason) => Some(format!(
+            "{reason}. Run `bussard flash --force` to replace it."
+        )),
+        CodeSample::Matches { .. } | CodeSample::Unread(_) => None,
+    }
+}
+
+/// The System 7 identity verdict: the stand-in for the application id that
+/// System 7 does not expose (issue #314).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sys7Identity {
+    /// Every load-state machine the procedure drives is `Loaded` and the
+    /// sampled code matches the product: the device runs this application.
+    SameApplication {
+        /// How many code segments were compared.
+        segments: usize,
+    },
+    /// The device runs something else: a driven load-state machine is not
+    /// `Loaded`, or the code differs.
+    Resident {
+        /// What differed (the segment and first differing offset, or the
+        /// load-state machines that are not `Loaded`).
+        reason: String,
+    },
+    /// The code could not be compared.
+    Unknown {
+        /// Why not.
+        reason: String,
+    },
+}
+
+impl Sys7Identity {
+    /// One sentence for a plan or a pre-flight: what the check concluded.
+    pub fn describe(&self, plan: &FlashPlan) -> String {
+        match self {
+            Sys7Identity::SameApplication { segments } => format!(
+                "System 7: every load-state machine is Loaded and the code matches {} ({segments} \
+                 segment(s) compared)",
+                plan.identity.id
+            ),
+            Sys7Identity::Resident { reason } | Sys7Identity::Unknown { reason } => {
+                format!("System 7: {reason}")
+            }
+        }
+    }
+
+    /// The flash gate's verdict for this identity: `SameApplication`,
+    /// `Resident` with the reason, or `Unknown`. The loaded objects come from
+    /// the probe.
+    pub fn freshness(&self, plan: &FlashPlan, state: &ResidentState) -> Freshness {
+        match self {
+            Sys7Identity::SameApplication { .. } => Freshness::SameApplication {
+                resident: format!("{}, {}", plan.identity.id, self.describe(plan)),
+            },
+            Sys7Identity::Resident { reason } => Freshness::Resident {
+                resident: None,
+                objects: state
+                    .loaded_applications()
+                    .iter()
+                    .map(|o| o.label())
+                    .collect(),
+                reason: Some(reason.clone()),
+            },
+            Sys7Identity::Unknown { reason } => Freshness::Unknown {
+                reason: format!("System 7 has no readable application id and {reason}"),
+            },
+        }
+    }
+}
+
+/// Whether the flash gate needs [`sys7_identity`] for this probe: a System 7
+/// plan whose device holds a loaded application, which `assess_freshness`
+/// can only call unidentified (System 7 has no `PID_PROGRAM_VERSION`).
+pub fn needs_sys7_identity(plan: &FlashPlan, state: &ResidentState) -> bool {
+    plan.is_sys7()
+        && matches!(
+            assess_freshness(state, &plan.identity),
+            Freshness::Resident { resident: None, .. }
+        )
+}
+
+/// The System 7 identity check (issue #314): every load-state machine the
+/// application's procedure drives must be `Loaded` (the rule of
+/// [`identity_gate`]), and the leading octets of every code segment must
+/// match the product. The parameter read-back and both flash gates (the
+/// `bussard flash` pre-flight and the MCP flash plan) share it.
+pub async fn sys7_identity<Ch: bussard_mgmt::L4Channel>(
+    l4: &mut bussard_mgmt::Layer4Connection<Ch>,
+    plan: &FlashPlan,
+    state: &ResidentState,
+) -> Sys7Identity {
+    if let Some(reason) = &state.unreadable {
+        return Sys7Identity::Unknown {
+            reason: format!("the load state could not be read ({reason})"),
+        };
+    }
+    let unloaded = sys7_unloaded(plan, state);
+    if !unloaded.is_empty() {
+        return Sys7Identity::Resident {
+            reason: format!("the device is not fully Loaded ({})", unloaded.join(", ")),
+        };
+    }
+    match sample_code(l4, plan).await {
+        CodeSample::Matches { segments } => Sys7Identity::SameApplication { segments },
+        CodeSample::Differs(reason) => Sys7Identity::Resident { reason },
+        CodeSample::Unread(reason) => Sys7Identity::Unknown { reason },
+    }
+}
+
+/// The verdict a flash gate decides on: the probe's `freshness`, with a
+/// System 7 device that `assess_freshness` could only call unidentified
+/// judged by `identity` instead. The image is still shaped by `freshness`
+/// itself (its factory reset and differential download), so the written
+/// image does not depend on this verdict, only whether it is written.
+pub fn flash_gate(
+    freshness: &Freshness,
+    plan: &FlashPlan,
+    state: Option<&ResidentState>,
+    identity: Option<&Sys7Identity>,
+) -> Freshness {
+    match (freshness, state, identity) {
+        (Freshness::Resident { resident: None, .. }, Some(state), Some(identity))
+            if plan.is_sys7() =>
+        {
+            identity.freshness(plan, state)
+        }
+        _ => freshness.clone(),
+    }
 }
 
 /// Names what a group-object change shows and hides.

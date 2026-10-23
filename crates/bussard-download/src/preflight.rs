@@ -178,6 +178,11 @@ pub enum Freshness {
         resident: Option<String>,
         /// The loaded objects, labelled — e.g. `object 3 (application program)`.
         objects: Vec<String>,
+        /// What a check beyond the id found different, when one ran: on
+        /// System 7 the code segment and first differing offset of
+        /// [`sys7_identity`](crate::sys7_identity). `None` from
+        /// [`assess_freshness`], which judges by the id alone.
+        reason: Option<String>,
     },
     /// The device's load state could not be read at all, so freshness is
     /// undetermined. Refused without `--force`: unreadable is not evidence of an
@@ -473,6 +478,7 @@ pub fn assess_freshness(state: &ResidentState, identity: &AppIdentity) -> Freshn
     Freshness::Resident {
         resident,
         objects: loaded.iter().map(|o| o.label()).collect(),
+        reason: None,
     }
 }
 
@@ -573,7 +579,9 @@ mod tests {
         let verdict = assess_freshness(&state, &da_tp());
         assert!(!verdict.allows_flash());
         match verdict {
-            Freshness::Resident { resident, objects } => {
+            Freshness::Resident {
+                resident, objects, ..
+            } => {
                 assert_eq!(resident.as_deref(), Some("M-00FA A-2500 v10"));
                 assert_eq!(objects, vec!["object 3 (application program)".to_string()]);
             }
@@ -594,7 +602,9 @@ mod tests {
         let verdict = assess_freshness(&state, &da_tp());
         assert!(!verdict.allows_flash());
         match verdict {
-            Freshness::Resident { resident, objects } => {
+            Freshness::Resident {
+                resident, objects, ..
+            } => {
                 assert!(resident.is_none());
                 assert_eq!(objects, vec!["object 4 (interface program)".to_string()]);
             }
@@ -615,7 +625,9 @@ mod tests {
             ..ResidentState::default()
         };
         match assess_freshness(&state, &da_tp()) {
-            Freshness::Resident { resident, objects } => {
+            Freshness::Resident {
+                resident, objects, ..
+            } => {
                 assert!(resident.is_none());
                 assert_eq!(objects, vec!["LSM 3".to_string()]);
             }

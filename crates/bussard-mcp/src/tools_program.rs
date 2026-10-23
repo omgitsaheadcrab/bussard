@@ -1795,16 +1795,26 @@ fn admit_in_plan(
 }
 
 /// Refuses a device whose identity drifted from the lock, naming the
-/// `bussard flash` it needs (the CLI's `apply` rule).
+/// `bussard flash` it needs (the CLI's `apply` rule). A System 7 device has
+/// no readable application id: code that differs from the pinned product's
+/// is its drift (issue #314).
 fn refuse_drift(target: IndividualAddress, read: &DeviceRead) -> Result<(), String> {
-    match read
+    if let Some(refusal) = read
         .check
         .as_ref()
         .and_then(|check| bussard_service::drift_refusal(target, check, "write"))
     {
-        Some(refusal) => Err(refusal),
-        None => Ok(()),
+        return Err(refusal);
     }
+    if let Some(bussard_download::Sys7Identity::Resident { reason }) =
+        read.params.as_ref().and_then(|p| p.sys7_identity.as_ref())
+    {
+        return Err(format!(
+            "{target} does not run the application bussard.lock pins: {reason}; replacing it \
+             is `bussard flash --force {target}` at the CLI"
+        ));
+    }
+    Ok(())
 }
 
 /// The device plan with its parameter half, built by the CLI's builder

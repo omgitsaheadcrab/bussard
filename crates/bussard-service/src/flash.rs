@@ -546,6 +546,7 @@ mod tests {
         let resident = Freshness::Resident {
             resident: Some("0001000101".to_string()),
             objects: Vec::new(),
+            reason: None,
         };
         let mut plan = inputs.plan(0x07B0)?;
         apply_freshness(&mut plan, Some(&resident), false);
