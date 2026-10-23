@@ -42,6 +42,16 @@ use crate::schema::Device;
 /// and `[links]` of the device file).
 pub const DEVICE_SCOPE: &str = "device";
 
+/// [`Inactive::needs`] for a page or channel whose parameters reach the
+/// device with a parameter push: what changes, not how (the CLI and the MCP
+/// server each say how at their end).
+pub const NEEDS_PUSH: &str = "a parameter push (the com-objects stay as they are)";
+
+/// [`Inactive::needs`] for a page or channel that shows com-objects once
+/// enabled: the push is a full download.
+pub const NEEDS_FLASH: &str = "shows com-objects, so the push is a flash (a parameter push \
+     does not change the object table)";
+
 /// One channel in the list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChannelRow {
@@ -166,7 +176,8 @@ pub struct Inactive {
     /// The com-objects it shows with the vendor defaults once enabled.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub would_show: Vec<ShownObject>,
-    /// How the change reaches the device.
+    /// What kind of push the change takes: [`NEEDS_PUSH`] or
+    /// [`NEEDS_FLASH`]. How to run it is the caller's to say.
     pub needs: String,
     /// The handles of earlier inactive pages or channels whose `enable`
     /// steps this one needs too, when [`DeviceView::collapse_enable_chains`]
@@ -222,7 +233,8 @@ pub struct ScopeView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block: Option<String>,
     /// For an inactive page: what enables it. Its parameters are then the
-    /// ones it would show (no key in the lock yet, no value), and its objects
+    /// ones it would show (under the lock's key and with the stored value when it
+    /// has them, else the slug of the vendor text), and its objects
     /// the ones it would show with the vendor defaults.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inactive: Option<Inactive>,
@@ -614,9 +626,8 @@ impl<'a> Pages<'a> {
         value_number(def, &raw)
     }
 
-    /// What enables inactive block `i` (shown together with `members`), for
-    /// device `address`.
-    fn inactive(&self, i: usize, members: &[usize], address: IndividualAddress) -> Inactive {
+    /// What enables inactive block `i` (shown together with `members`).
+    fn inactive(&self, i: usize, members: &[usize]) -> Inactive {
         let enable = self.states[i]
             .failing
             .iter()
@@ -648,16 +659,11 @@ impl<'a> Pages<'a> {
             .collect();
         let would_show = self.would_show(members);
         let needs = if would_show.is_empty() {
-            format!(
-                "set the parameter in the device file, then push it with knx_apply_device or \
-                 `bussard apply {address}`"
-            )
+            NEEDS_PUSH
         } else {
-            format!(
-                "enabling it shows com-objects, so it needs `bussard flash {address}` (a \
-                 parameter push does not change the object table)"
-            )
-        };
+            NEEDS_FLASH
+        }
+        .to_string();
         Inactive {
             enable,
             would_show,
@@ -692,7 +698,7 @@ impl<'a> Pages<'a> {
 
     /// The row of block `i` (with the blocks folded into it, `members`)
     /// under `handle`.
-    fn row(&self, listed: &Listed, address: IndividualAddress) -> BlockRow {
+    fn row(&self, listed: &Listed) -> BlockRow {
         let i = listed.index;
         let members = listed.members.as_slice();
         let b = &self.blocks[i];
@@ -704,7 +710,7 @@ impl<'a> Pages<'a> {
                 None,
             )
         } else {
-            let inactive = self.inactive(i, members, address);
+            let inactive = self.inactive(i, members);
             (
                 self.held_params(members).len(),
                 inactive.would_show.len(),
@@ -924,7 +930,6 @@ fn block_scope(
     device: &Device,
     links: Option<&Vec<crate::schema::Link>>,
     listed: &Listed,
-    address: IndividualAddress,
 ) -> ScopeView {
     let i = listed.index;
     let handle = listed.handle.clone();
@@ -967,14 +972,14 @@ fn block_scope(
         .held_params(&listed.members)
         .into_iter()
         .map(|(reference, def)| {
+            // A ref the lock indexes (or the file stores) keeps its key and
+            // value, so the key printed here is the one the edit tools take.
+            if let Some(e) = pg.entries.get(reference) {
+                return param_row(e, Some(pg.product));
+            }
             let entry = ParamEntry {
                 reference: reference.to_string(),
-                key: crate::slug(
-                    def.text
-                        .as_deref()
-                        .or(def.name.as_deref())
-                        .unwrap_or(reference),
-                ),
+                key: unindexed_key(def, reference),
                 channel: None,
                 param: Some(ref_param_id(reference).to_string()),
                 stored: None,
@@ -983,7 +988,7 @@ fn block_scope(
             param_row(&entry, Some(pg.product))
         })
         .collect();
-    let inactive = pg.inactive(i, &listed.members, address);
+    let inactive = pg.inactive(i, &listed.members);
     let objects: Vec<ObjectRow> = inactive
         .would_show
         .iter()
@@ -1080,7 +1085,7 @@ pub fn device_view(
         _ => Vec::new(),
     };
     let blocks: Vec<BlockRow> = match &pages {
-        Some(pg) => listed.iter().map(|l| pg.row(l, address)).collect(),
+        Some(pg) => listed.iter().map(|l| pg.row(l)).collect(),
         None => Vec::new(),
     };
     let inactive_channels: Vec<BlockRow> = match &pages {
@@ -1102,14 +1107,11 @@ pub fn device_view(
                     .map(crate::slug)
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| b.id.to_lowercase());
-                pg.row(
-                    &Listed {
-                        index: i,
-                        handle,
-                        members: vec![i],
-                    },
-                    address,
-                )
+                pg.row(&Listed {
+                    index: i,
+                    handle,
+                    members: vec![i],
+                })
             })
             .collect(),
         _ => Vec::new(),
@@ -1138,7 +1140,7 @@ pub fn device_view(
     let scope = match channel {
         None => None,
         Some(_) if block_hit.is_some() => {
-            block_hit.map(|(pg, hit)| block_scope(pg, device, links, hit, address))
+            block_hit.map(|(pg, hit)| block_scope(pg, device, links, hit))
         }
         Some(wanted) => {
             let id: Option<String> = if wanted == DEVICE_SCOPE {
@@ -1333,6 +1335,137 @@ pub fn parameter_pages(
     Ok(out)
 }
 
+/// A parameter of a device's application that its pages hold but the lock
+/// does not index: one on a page that was inactive at import and that ETS
+/// stores nothing for (it is at its default). See [`unindexed_parameters`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnindexedParameter {
+    /// The key [`device_view`] prints for it on an inactive page: the slug of
+    /// its vendor text.
+    pub key: String,
+    /// The handle of the page [`device_view`] lists it under, when the device
+    /// lists pages and one of them holds it. A page enabled since import with
+    /// nothing on it indexed yet is not listed; it keeps the handle of its
+    /// title here, the one the view gave it while it was inactive.
+    pub page: Option<String>,
+    /// The application parameter id (`P-7305`).
+    pub param: String,
+    /// The vendor text.
+    pub text: Option<String>,
+}
+
+/// The key the view gives a parameter the lock does not index: the slug of
+/// its vendor text, else of its name, else the ref itself.
+fn unindexed_key(def: &ParamDef, reference: &str) -> String {
+    crate::slug(
+        def.text
+            .as_deref()
+            .or(def.name.as_deref())
+            .unwrap_or(reference),
+    )
+}
+
+/// Every parameter ref the product model's pages hold for device `address`
+/// that neither the lock indexes nor the device file stores, keyed by the
+/// app-relative `ParameterRef` id: what [`device_view`] prints on an
+/// inactive page, and what an active page holds beyond the lock. Headings
+/// (`type: none`) are left out. Empty without a product model with pages.
+pub fn unindexed_parameters(
+    model: &Model,
+    products: &ProductModels,
+    address: IndividualAddress,
+) -> Result<BTreeMap<String, UnindexedParameter>, ViewError> {
+    let device = &model
+        .devices
+        .get(&address)
+        .ok_or(ViewError::NoDevice(address))?
+        .device;
+    let mut out = BTreeMap::new();
+    let product = device
+        .product
+        .as_ref()
+        .and_then(|p| p.application_ref.as_deref())
+        .and_then(|a| products.get(a))
+        .filter(|p| !p.blocks.is_empty());
+    let Some(product) = product else {
+        return Ok(out);
+    };
+    let params = parameter_entries(device);
+    let known: HashSet<&str> = params.iter().map(|p| p.reference.as_str()).collect();
+    let pg = Pages::new(device, product, &params);
+    let mut handle_of: HashMap<usize, &str> = HashMap::new();
+    let listed = if device.channels.len() > 1 {
+        Vec::new()
+    } else {
+        let taken: Vec<String> = device
+            .channels
+            .keys()
+            .map(|id| device.channel_handle(id))
+            .collect();
+        pg.listed(&taken)
+    };
+    for l in &listed {
+        for m in &l.members {
+            handle_of.entry(*m).or_insert(l.handle.as_str());
+        }
+    }
+    let mut used: HashSet<String> = listed.iter().map(|l| l.handle.clone()).collect();
+    used.extend(device.channels.keys().map(|id| device.channel_handle(id)));
+    used.insert(DEVICE_SCOPE.to_string());
+    // Active blocks claim a ref first, as `Pages::new` does.
+    let order = (0..pg.blocks.len())
+        .filter(|i| pg.states[*i].active)
+        .chain((0..pg.blocks.len()).filter(|i| !pg.states[*i].active));
+    for i in order {
+        for reference in &pg.blocks[i].parameters {
+            if known.contains(reference.as_str()) || out.contains_key(reference) {
+                continue;
+            }
+            let id = ref_param_id(reference);
+            let Some(def) = product.parameters.get(id) else {
+                continue;
+            };
+            if matches!(def.kind, ParamKind::None) {
+                continue;
+            }
+            let mut page = None;
+            let mut at = Some(i);
+            while let Some(b) = at {
+                if let Some(handle) = handle_of.get(&b) {
+                    page = Some((*handle).to_string());
+                    break;
+                }
+                at = pg.parents[b];
+            }
+            // An active page the view does not list (just enabled, nothing
+            // on it indexed yet) keeps the handle it had while inactive, when
+            // that handle is free.
+            if page.is_none() && !listed.is_empty() && pg.blocks[i].kind == BlockKind::Block {
+                let b = &pg.blocks[i];
+                let base = [b.text.as_deref(), b.name.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .map(crate::slug)
+                    .find(|s| !s.is_empty())
+                    .unwrap_or_else(|| b.id.to_lowercase());
+                if !used.contains(&base) {
+                    page = Some(base);
+                }
+            }
+            out.insert(
+                reference.clone(),
+                UnindexedParameter {
+                    key: unindexed_key(def, reference),
+                    page,
+                    param: id.to_string(),
+                    text: def.text.clone().or_else(|| def.name.clone()),
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// Pads `rows` into columns under `header`.
 fn table(header: &[&str], rows: &[Vec<String>]) -> String {
     let rows: Vec<Vec<String>> = rows
@@ -1409,8 +1542,19 @@ fn toml_string(s: &str) -> String {
     out
 }
 
-/// What enables an inactive page or channel, in one line.
-fn inactive_line(inactive: &Inactive) -> String {
+/// How the terminal user runs the push [`Inactive::needs`] names, for
+/// device `address`.
+fn cli_push(needs: &str, address: &str) -> String {
+    if needs == NEEDS_FLASH {
+        format!("{needs}: `bussard flash {address}`")
+    } else {
+        format!("{needs}: `bussard plan {address}` and `bussard apply {address}`")
+    }
+}
+
+/// What enables an inactive page or channel of device `address`, in one
+/// line.
+fn inactive_line(inactive: &Inactive, address: &str) -> String {
     let steps: Vec<String> = inactive
         .enable
         .iter()
@@ -1437,12 +1581,12 @@ fn inactive_line(inactive: &Inactive) -> String {
     if !inactive.would_show.is_empty() {
         line.push_str(&format!("; shows {} object(s)", inactive.would_show.len()));
     }
-    line.push_str(&format!("; {}", inactive.needs));
+    line.push_str(&format!("; {}", cli_push(&inactive.needs, address)));
     line
 }
 
 /// The page or channel rows as a table.
-fn block_table(rows: &[BlockRow]) -> String {
+fn block_table(rows: &[BlockRow], address: &str) -> String {
     let rows: Vec<Vec<String>> = rows
         .iter()
         .map(|r| {
@@ -1452,7 +1596,7 @@ fn block_table(rows: &[BlockRow]) -> String {
                 r.parameters.to_string(),
                 r.objects.to_string(),
                 match &r.inactive {
-                    Some(i) => format!("inactive: {}", inactive_line(i)),
+                    Some(i) => format!("inactive: {}", inactive_line(i, address)),
                     None => "active".to_string(),
                 },
             ]
@@ -1506,11 +1650,11 @@ impl DeviceView {
                 ));
                 if !self.blocks.is_empty() {
                     out.push_str("pages (ETS parameter blocks, in ETS order):\n");
-                    out.push_str(&block_table(&self.blocks));
+                    out.push_str(&block_table(&self.blocks, &self.address));
                 }
                 if !self.inactive_channels.is_empty() {
                     out.push_str("inactive channels:\n");
-                    out.push_str(&block_table(&self.inactive_channels));
+                    out.push_str(&block_table(&self.inactive_channels, &self.address));
                 }
                 if let Some(summary) = &self.summary {
                     out.push_str(&format!("summary: {summary}\n"));
@@ -1551,7 +1695,10 @@ impl DeviceView {
                     },
                 }
                 if let Some(inactive) = &scope.inactive {
-                    out.push_str(&format!("inactive: {}\n", inactive_line(inactive)));
+                    out.push_str(&format!(
+                        "inactive: {}\n",
+                        inactive_line(inactive, &self.address)
+                    ));
                     out.push_str(
                         "it would show these parameters (at their defaults) and objects:\n",
                     );

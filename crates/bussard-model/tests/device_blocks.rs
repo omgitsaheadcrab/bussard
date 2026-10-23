@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use bussard_model::capabilities::{cache_path, capability_lookup};
-use bussard_model::device_view::{device_view, parameter_pages};
+use bussard_model::device_view::{device_view, parameter_pages, unindexed_parameters};
 use bussard_model::{IndividualAddress, Model, ProductModel, ProductModels};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -154,11 +154,8 @@ fn test_device_view_groups_a_channel_less_app_by_page() -> TestResult {
         .map(|o| (o.number, o.function.as_deref()))
         .collect();
     assert_eq!(shown, [(2, Some("Switch"))]);
-    assert!(
-        inactive.needs.contains("bussard flash 1.1.30"),
-        "{}",
-        inactive.needs
-    );
+    // The model says what kind of push it is; the surfaces say how.
+    assert_eq!(inactive.needs, bussard_model::device_view::NEEDS_FLASH);
 
     // C needs B first, then its own switch (a parameter the configuration
     // does not show yet, so no key).
@@ -195,6 +192,8 @@ fn test_device_view_groups_a_channel_less_app_by_page() -> TestResult {
         "{text}"
     );
     assert!(text.contains(&format!("summary: {summary}")), "{text}");
+    // The terminal says how to run the push.
+    assert!(text.contains("`bussard flash 1.1.30`"), "{text}");
     Ok(())
 }
 
@@ -298,10 +297,9 @@ fn test_capability_lookup_finds_a_choice_on_an_inactive_page() -> TestResult {
         b.enable.first().and_then(|e| e.key.as_deref()),
         Some("universal-channel-b-enable")
     );
-    assert!(
-        b.needs
-            .as_deref()
-            .is_some_and(|n| n.contains("bussard flash"))
+    assert_eq!(
+        b.needs.as_deref(),
+        Some(bussard_model::device_view::NEEDS_FLASH)
     );
 
     // A parameter text matches too, and an active one the device shows
@@ -400,5 +398,42 @@ fn test_parameter_pages_maps_refs_to_page_handles() -> TestResult {
         parameter_pages(&model()?, &ProductModels::default(), ia()?)?.len(),
         0
     );
+    Ok(())
+}
+
+#[test]
+fn test_unindexed_parameters_lists_what_the_pages_hold_beyond_the_lock() -> TestResult {
+    let more = unindexed_parameters(&model()?, &products()?, ia()?)?;
+    let rows: Vec<(&str, &str, Option<&str>)> = more
+        .iter()
+        .map(|(r, u)| (r.as_str(), u.key.as_str(), u.page.as_deref()))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                "P-12_R-12",
+                "dusk-threshold-in-lx",
+                Some("universal-channel-a-function")
+            ),
+            (
+                "P-21_R-21",
+                "channel-function",
+                Some("universal-channel-b-function")
+            ),
+            (
+                "P-22_R-22",
+                "dusk-threshold-in-lx",
+                Some("universal-channel-b-function")
+            ),
+            (
+                "P-31_R-31",
+                "channel-function",
+                Some("universal-channel-c-function")
+            ),
+            ("P-3_R-3", "universal-channel-c-enable", Some("general")),
+        ]
+    );
+    assert!(unindexed_parameters(&model()?, &ProductModels::default(), ia()?)?.is_empty());
     Ok(())
 }

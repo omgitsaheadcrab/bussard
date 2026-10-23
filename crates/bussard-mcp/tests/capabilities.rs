@@ -407,6 +407,20 @@ async fn test_show_device_scoped_on_a_meteodata_like_model_stays_small() -> Test
         "{scoped}"
     );
 
+    // Counts are pluralised: "Objekte zu C4" shows one object.
+    assert!(
+        lines.iter().any(|l| l
+            .as_str()
+            .is_some_and(|l| l.starts_with("objekte-zu-c4") && l.ends_with(", 1 object"))),
+        "{scoped}"
+    );
+    assert!(
+        !lines.iter().any(|l| l
+            .as_str()
+            .is_some_and(|l| l.contains(" 1 objects") || l.contains(" 1 parameters"))),
+        "{scoped}"
+    );
+
     // `inactive: true` adds the enable detail of the inactive pages.
     let detail = call(
         &client,
@@ -492,6 +506,221 @@ async fn test_set_parameter_takes_every_key_shape_and_page_scope() -> TestResult
     assert!(
         body["reason"].as_str().is_some_and(
             |r| r.contains("Closest: `helligkeitsschwelle-c4` on universalkanal-c4-funktion")
+        ),
+        "{body}"
+    );
+
+    client.cancel().await?;
+    task.abort();
+    Ok(())
+}
+
+/// One parameter row `knx_show_device` prints: page handle, key, reference.
+type Printed = (String, String, String);
+
+/// Every parameter row the scoped views of `ia`'s pages print.
+fn printed_keys(dir: &Path, ia: &str) -> anyhow::Result<Vec<Printed>> {
+    let ia: bussard_model::IndividualAddress = ia.parse()?;
+    let model = bussard_model::Model::load(dir)?;
+    let products = bussard_model::ProductModels::load(dir);
+    let view = bussard_model::device_view::device_view(&model, &products, ia, None)?;
+    let mut out = Vec::new();
+    for row in &view.blocks {
+        let scoped =
+            bussard_model::device_view::device_view(&model, &products, ia, Some(&row.handle))?;
+        for p in scoped.scope.map(|s| s.parameters).unwrap_or_default() {
+            out.push((row.handle.clone(), p.key, p.reference));
+        }
+    }
+    Ok(out)
+}
+
+/// Asserts that each of `rows` resolves to its reference on `ia` in every
+/// key shape: `page.key`, `key` in `channel: page`, `key@reference`, the
+/// bare reference, and the bare key (or a refusal naming the page-qualified
+/// keys when it repeats). With `pages: false` the page-qualified shapes are
+/// skipped (for rows of a page the view no longer lists).
+fn assert_resolves(dir: &Path, ia: &str, rows: &[Printed], pages: bool) -> anyhow::Result<()> {
+    use bussard_mcp::param_keys::{KeyContext, resolve_parameter_key};
+    let ia: bussard_model::IndividualAddress = ia.parse()?;
+    let model = bussard_model::Model::load(dir)?;
+    let products = bussard_model::ProductModels::load(dir);
+    let ctx = KeyContext::new(&model, &products, ia);
+    let device = &model
+        .devices
+        .get(&ia)
+        .ok_or_else(|| anyhow::anyhow!("no device {ia}"))?
+        .device;
+    for (page, key, reference) in rows {
+        let with_ref = if key.contains('@') {
+            key.clone()
+        } else {
+            format!("{key}@{reference}")
+        };
+        let mut shapes = vec![(with_ref, None), (reference.clone(), None)];
+        if pages {
+            shapes.push((format!("{page}.{key}"), None));
+            shapes.push((key.clone(), Some(page.as_str())));
+        }
+        for (wanted, channel) in shapes {
+            let got = resolve_parameter_key(device, &ctx, &wanted, channel)
+                .map_err(|e| anyhow::anyhow!("{wanted} in {channel:?}: {e}"))?;
+            anyhow::ensure!(
+                got.split_once('@').map(|(_, r)| r) == Some(reference.as_str()),
+                "{wanted} in {channel:?} resolved to {got}, not {reference}"
+            );
+        }
+        match resolve_parameter_key(device, &ctx, key, None) {
+            Ok(got) => anyhow::ensure!(
+                got.split_once('@').map(|(_, r)| r) == Some(reference.as_str()),
+                "bare {key} resolved to {got}, not {reference}"
+            ),
+            Err(e) => anyhow::ensure!(
+                e.contains("several places") && (!pages || e.contains(&format!("`{page}."))),
+                "bare {key} on {page}: {e}"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Sets every enable step of every inactive page of `ia` over MCP, the way
+/// an assistant would, until no page has one left.
+async fn enable_every_page(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    ia: &str,
+) -> anyhow::Result<()> {
+    for _ in 0..32 {
+        let full = call(client, "knx_show_device", json!({"address": ia})).await?;
+        let blocks = full["blocks"].as_array().cloned().unwrap_or_default();
+        let Some(step) = blocks
+            .iter()
+            .filter_map(|b| b["inactive"]["enable"].as_array())
+            .flatten()
+            .next()
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let parameter = step["key"]
+            .as_str()
+            .or_else(|| step["reference"].as_str())
+            .ok_or_else(|| anyhow::anyhow!("an enable step without key: {step}"))?;
+        let body = call(
+            client,
+            "knx_set_parameter",
+            json!({"address": ia, "parameter": parameter, "value": step["set_to"]}),
+        )
+        .await?;
+        anyhow::ensure!(body["refused"] != true, "{parameter}: {body}");
+    }
+    anyhow::bail!("pages of {ia} stay inactive")
+}
+
+/// Every key the device view prints resolves in every shape, on active and
+/// inactive pages, and still after the inactive pages are enabled (the
+/// keys of a page the lock did not index at import, issue #310 session).
+async fn check_every_printed_key(dir: &Path, ia: &str) -> TestResult {
+    let before = printed_keys(dir, ia)?;
+    anyhow::ensure!(!before.is_empty(), "no parameters printed");
+    assert_resolves(dir, ia, &before, true)?;
+
+    let (client, task) = serve(dir).await?;
+    enable_every_page(&client, ia).await?;
+    client.cancel().await?;
+    task.abort();
+
+    let after = printed_keys(dir, ia)?;
+    assert_resolves(dir, ia, &after, true)?;
+    // The rows printed while their page was inactive still resolve, under
+    // the page handle they were printed with.
+    assert_resolves(dir, ia, &before, true)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_every_printed_key_resolves_on_the_blocks_fixture() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    write_model(dir.path())?;
+    check_every_printed_key(dir.path(), "1.1.30").await
+}
+
+#[tokio::test]
+async fn test_every_printed_key_resolves_on_a_meteodata_like_model() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    write_meteo(dir.path())?;
+    check_every_printed_key(dir.path(), "1.1.202").await
+}
+
+/// The 2026-10-23 session: enable a channel, then set the threshold on its
+/// page, which the lock did not index, by page-qualified key and by bare
+/// reference. The set indexes it, so the file names it like its neighbours
+/// and the view lists its value.
+#[tokio::test]
+async fn test_set_parameter_on_a_page_enabled_since_import() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    write_meteo(dir.path())?;
+    let (client, task) = serve(dir.path()).await?;
+    let ia = "1.1.202";
+    let body = call(
+        &client,
+        "knx_set_parameter",
+        json!({"address": ia, "parameter": "universalkanal-c5-aktivieren", "value": "ja"}),
+    )
+    .await?;
+    assert_ne!(body["refused"], true, "{body}");
+
+    let page = "universalkanal-c5-funktion";
+    for (parameter, value) in [
+        (format!("{page}.helligkeitsschwelle-c5"), "333"),
+        ("P-1052_R-1052".to_string(), "334"),
+        ("helligkeitsschwelle-c5".to_string(), "335"),
+    ] {
+        let body = call(
+            &client,
+            "knx_set_parameter",
+            json!({"address": ia, "parameter": parameter, "value": value}),
+        )
+        .await?;
+        assert_ne!(body["refused"], true, "{parameter}: {body}");
+        let text = std::fs::read_to_string(dir.path().join("devices/1.1.202.toml"))?;
+        assert!(
+            text.contains(&format!("helligkeitsschwelle-c5 = \"{value}\"")),
+            "{parameter}: {text}"
+        );
+    }
+    let lock = std::fs::read_to_string(dir.path().join("bussard.lock"))?;
+    assert!(
+        lock.contains(r#"key = "helligkeitsschwelle-c5", channel = "generic-0", ref = "P-1052_R-1052", param = "P-1052""#),
+        "{lock}"
+    );
+    let shown = call(
+        &client,
+        "knx_show_device",
+        json!({"address": ia, "channel": page}),
+    )
+    .await?;
+    let rows = shown["scope"]["parameters"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        rows.iter()
+            .any(|r| r["key"] == "helligkeitsschwelle-c5" && r["value"] == "335"),
+        "{shown}"
+    );
+
+    // A reference the application does not have is named as such.
+    let body = call(
+        &client,
+        "knx_set_parameter",
+        json!({"address": ia, "parameter": "P-7305_R-7305", "value": "1"}),
+    )
+    .await?;
+    assert_eq!(body["refused"], true, "{body}");
+    assert!(
+        body["reason"].as_str().is_some_and(
+            |r| r.contains("no parameter with reference P-7305_R-7305 in its application")
         ),
         "{body}"
     );
