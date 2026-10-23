@@ -23,6 +23,7 @@
 
 use std::collections::BTreeSet;
 
+use bussard_model::IndividualAddress;
 use bussard_model::change::{ChangeKind, ChangeSet};
 use serde_json::{Value, json};
 
@@ -30,8 +31,7 @@ use crate::state::SharedState;
 
 /// The CLI commands no MCP tool replaces, named once in the instructions.
 const CLI_ONLY: &str = "Still needs the CLI: `bussard flash` to load a new application \
-    program, `bussard adopt`, `bussard replace` and `bussard commission`. A parameter that \
-    shows or hides com-objects needs `bussard flash <ia>`.";
+    program, `bussard adopt`, `bussard replace` and `bussard commission`.";
 
 /// What still needs ETS, named once in the instructions.
 const ETS_ONLY: &str = "Still needs ETS: the Secure activation of a fresh device, and any \
@@ -188,6 +188,29 @@ impl Tiers {
         }
     }
 
+    /// How a parameter that shows or hides com-objects reaches device `ia`
+    /// (`<ia>` when `None`) at this tier (issue #303): the same plan and
+    /// apply pair as a full download with `--allow-programming`, else
+    /// `bussard flash` at the CLI.
+    pub fn flash_push(&self, ia: Option<IndividualAddress>) -> String {
+        let ia = ia.map_or_else(|| "<ia>".to_string(), |ia| ia.to_string());
+        if self.programming {
+            let (min, max) = bussard_service::flash::DEVICE_OFFLINE_SECONDS;
+            format!(
+                "A parameter that shows or hides com-objects is pushed by the same \
+                 knx_plan_device / knx_apply_device pair; the plan says `method: flash`, the \
+                 device restarts and is offline for the stated time ({min} to {max} s), and the \
+                 human's yes must be a yes to flashing {ia}."
+            )
+        } else {
+            format!(
+                "A parameter that shows or hides com-objects needs `bussard flash {ia}` at the \
+                 CLI; with --allow-programming, knx_plan_device and knx_apply_device push it as \
+                 a flash."
+            )
+        }
+    }
+
     /// The server instructions (`initialize` result) for this tier.
     pub fn instructions(&self) -> String {
         let mut out = vec![format!(
@@ -268,6 +291,7 @@ impl Tiers {
             out.push(HA_INSTRUCTIONS.to_string());
         }
         out.push(CLI_ONLY.to_string());
+        out.push(self.flash_push(None));
         out.push(ETS_ONLY.to_string());
         out.join(" ")
     }

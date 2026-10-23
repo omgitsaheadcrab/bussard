@@ -427,6 +427,45 @@ async fn test_descriptions_say_configured_state_versus_what_a_device_can_do() ->
     Ok(())
 }
 
+/// Issue #303: at the programming tier a parameter that shows or hides a
+/// com-object is pushed by knx_plan_device / knx_apply_device as a flash;
+/// nothing sends the assistant to `bussard flash <ia>` for it there.
+#[tokio::test]
+async fn test_flash_guidance_names_the_mcp_flash_at_the_programming_tier() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    write_model(dir.path())?;
+    let (client, task) = serve(dir.path(), TIERS[3]).await?;
+    let got = instructions(&client)?;
+    assert!(got.contains("the plan says `method: flash`"), "{got}");
+    assert!(got.contains("a yes to flashing"), "{got}");
+    assert!(!got.contains("needs `bussard flash <ia>`"), "{got}");
+    for tool in client.list_all_tools().await? {
+        let description = tool.description.as_deref().unwrap_or_default();
+        match tool.name.as_ref() {
+            "knx_plan_device" => {
+                assert!(description.contains("`method`"), "{description}");
+                assert!(
+                    description.contains("device_offline_seconds"),
+                    "{description}"
+                );
+                assert!(description.contains("product_sha256"), "{description}");
+            }
+            "knx_apply_device" => {
+                assert!(description.contains("yes to flashing"), "{description}");
+            }
+            _ => {}
+        }
+        assert!(
+            !description.contains("(also `bussard flash`)"),
+            "{}: {description}",
+            tool.name
+        );
+    }
+    client.cancel().await?;
+    task.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_instructions_read_and_programming_tiers_snapshot() -> TestResult {
     for (tier, expected) in [
@@ -475,7 +514,8 @@ const READ_INSTRUCTIONS: &str = "bussard: KNX as code over MCP. The installation
     CLI: `bussard \
     flash` to load a new application program, `bussard adopt`, `bussard replace` and \
     `bussard commission`. A parameter that shows or hides com-objects needs `bussard flash \
-    <ia>`. Still needs ETS: the Secure activation of a fresh device, and any \
+    <ia>` at the CLI; with --allow-programming, knx_plan_device and knx_apply_device push it \
+    as a flash. Still needs ETS: the Secure activation of a fresh device, and any \
     setting the device's product model does not expose.";
 
 /// The instructions with `--allow-programming`.
@@ -509,6 +549,8 @@ const PROGRAMMING_INSTRUCTIONS: &str = "bussard: KNX as code over MCP. The insta
     knx_restore_parameters replays a parameter backup an apply kept, with the same plan, \
     explicit yes and job flow. Still needs the CLI: `bussard flash` to load a new \
     application program, `bussard adopt`, `bussard replace` and `bussard commission`. A \
-    parameter that shows or hides com-objects needs `bussard flash <ia>`. Still \
+    parameter that shows or hides com-objects is pushed by the same knx_plan_device / \
+    knx_apply_device pair; the plan says `method: flash`, the device restarts and is offline \
+    for the stated time (30 to 50 s), and the human's yes must be a yes to flashing <ia>. Still \
     needs ETS: the Secure activation of a fresh device, and any setting the device's product \
     model does not expose.";

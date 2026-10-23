@@ -629,7 +629,9 @@ impl BussardMcp {
         knx_apply_device (the plan lists the parameter by name); the result's next_step says how \
         it reaches the device at this server's tier. Parameters at their vendor default are set \
         the same way. A parameter that shows or hides com-objects (an enable flag, a data \
-        length) needs `bussard flash <ia>`: the result's `note` names the objects, and \
+        length) changes the group-object table, which only a full download writes: the \
+        result's `note` names the objects and how that download is pushed at this server's \
+        tier (with --allow-programming, knx_plan_device plans it as `method: flash`), and \
         knx_show_device lists the parameters and objects it reveals right away. Returns the \
         change as sentences: quote them to the human."
     )]
@@ -651,6 +653,7 @@ impl BussardMcp {
         let channel = args.channel.clone();
         let label = vec![ia.to_string(), wanted.clone(), value.clone()];
 
+        let tiers = crate::guidance::Tiers::of(self.state());
         self.edit_with_note("knx_set_parameter", label, move |model| {
             let app = model
                 .devices
@@ -665,7 +668,7 @@ impl BussardMcp {
             let key = resolve_parameter_key(&loaded.device, &keys, &wanted, channel.as_deref())?;
             let value = check_parameter(&dir, loaded, &key, &value)?;
             loaded.device.parameters.insert(key, value);
-            Ok(refresh_device_facts(&dir, model, ia))
+            Ok(refresh_device_facts(&dir, model, ia, tiers))
         })
     }
 
@@ -1073,9 +1076,15 @@ impl BussardMcp {
 /// intact product archive for it (issue #276). A parameter that enables a
 /// block or picks a data length then shows its dependent parameters and
 /// objects in `knx_show_device` right away. Returns a note naming the
-/// objects the change shows or hides, which only a full flash writes; `None`
+/// objects the change shows or hides, which only a full flash writes, and
+/// how that flash is pushed at `tiers` (issue #303); `None`
 /// when nothing changed shape or there is no archive to derive from.
-fn refresh_device_facts(dir: &Path, model: &mut Model, ia: IndividualAddress) -> Option<String> {
+fn refresh_device_facts(
+    dir: &Path,
+    model: &mut Model,
+    ia: IndividualAddress,
+    tiers: crate::guidance::Tiers,
+) -> Option<String> {
     let lookup = bussard_service::params::resolve_product(
         dir,
         bussard_service::params::Selection::default(),
@@ -1139,10 +1148,9 @@ fn refresh_device_facts(dir: &Path, model: &mut Model, ia: IndividualAddress) ->
     }
     (!parts.is_empty()).then(|| {
         format!(
-            "This value {} on {ia}; knx_show_device lists the device under it. A parameter \
-             that shows or hides com-objects needs `bussard flash {ia}`: knx_apply_device and \
-             `bussard apply` refuse it.",
-            parts.join(", ")
+            "This value {} on {ia}; knx_show_device lists the device under it. {}",
+            parts.join(", "),
+            tiers.flash_push(Some(ia))
         )
     })
 }
