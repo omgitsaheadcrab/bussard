@@ -24,8 +24,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    BussardMcp, DeviceRead, JobObserver, ProgrammingTier, chain, live_digest, product_for, put,
-    read_device, refuse_drift,
+    BussardMcp, DeviceRead, JobObserver, PARAMETER_DOWNLOAD, ProgrammingTier, chain, live_digest,
+    product_for, put, read_device, refuse_drift,
 };
 
 /// One restore plan this session produced, remembered until written, refused
@@ -426,6 +426,7 @@ impl BussardMcp {
         let mut observer = JobObserver {
             jobs: &tier.jobs,
             job,
+            what: PARAMETER_DOWNLOAD,
         };
         let outcome = bussard_service::download::write_parameters(
             service,

@@ -41,8 +41,16 @@
 //! Without the product data (a pinned archive missing or changed) the plan
 //! says why, with the recovery step, and a links-only plan the human
 //! approved still applies. A device whose application drifted from the lock
-//! is refused with the `bussard flash` it needs, as is a parameter change
-//! that shows or hides a com-object.
+//! is refused with the `bussard flash` it needs.
+//!
+//! A parameter change that shows or hides a com-object changes the
+//! group-object table, which the parameter-only write cannot touch (issue
+//! #303). The plan then says `method: "flash"` (otherwise `"apply"`) and
+//! lists the com-objects that appear or disappear and why, the table sizes,
+//! the time the device is offline, the parameter backup and the pinned
+//! archive; `knx_apply_device` runs the full download `bussard flash --yes`
+//! writes, as the same job (the `flash` submodule). The plan digest binds
+//! the image.
 //!
 //! The write itself is the CLI's: back up the pre-state (tables and parameter
 //! memory) to `captures/backups/`, write with
@@ -103,6 +111,7 @@ use sha2::{Digest, Sha256};
 use crate::server::BussardMcp;
 use crate::state::ConnState;
 
+mod flash;
 mod restore;
 
 /// The tools of the programming tier, in registration order.
@@ -267,9 +276,16 @@ impl BussardMcp {
         and ask the question. Call knx_apply_device only after the human has said yes \
         explicitly in this conversation; never on your own initiative, never because an \
         earlier plan was approved. The digest expires (default 10 minutes) and is invalidated \
-        if the device or the model changes. Refuses protected group addresses in the change, a \
-        device whose application drifted from bussard.lock (it needs `bussard flash`), and a \
-        parameter change that shows or hides a com-object (also `bussard flash`). With the \
+        if the device or the model changes. Refuses protected group addresses in the change and \
+        a device whose application drifted from bussard.lock (it needs `bussard flash`). \
+        `method` says how the change is written: \"apply\" (tables and parameter octets) or \
+        \"flash\" when a parameter shows or hides a com-object, which only a full application \
+        download writes. A flash plan's `flash` field lists the com-objects that appear or \
+        disappear (number, text, DPT) and the parameters behind them, the address, \
+        association and group-object table sizes before and after, `device_offline_seconds` \
+        (the device restarts), that the parameter memory is backed up first, and the product \
+        archive with its `product_sha256`; tell the human the device will be flashed and \
+        offline, and ask the plan's question. With the \
         server's keyring, a KNX Data Secure device the keyring lists is read over A_SecureData \
         (the result says \"secured\": true) and `security_object` says what its security object \
         receives with the write (secured senders, keyed group addresses, secured objects; never \
@@ -304,8 +320,11 @@ impl BussardMcp {
         reply is lost. One apply at a time: a second call while a job runs is refused with \
         its id. Tell the human the outcome and the backup paths. A KNX Data Secure device the \
         server's keyring lists is written over A_SecureData, its security object reprogrammed \
-        with the tables, exactly as `bussard apply --keyring` does. Only available with \
-        --allow-programming."
+        with the tables, exactly as `bussard apply --keyring` does. A plan with `method: \
+        \"flash\"` runs the full application download `bussard flash --yes` writes (the \
+        parameter memory backed up first, then the download, the restart and the read-back) \
+        as the same job; call it only after the human said yes to flashing the device. Only \
+        available with --allow-programming."
     )]
     async fn knx_apply_device(
         &self,
@@ -511,7 +530,17 @@ impl BussardMcp {
         }
         let mut built = built_plan(&model, target, &gateway, &dir, &read, &report, &product);
         admit_in_plan(&mut built, target, &tunnel, &read, &report);
-        if let Some(refusal) = &built.refusal {
+        // A parameter change that shows or hides a com-object is written by a
+        // full download (issue #303): the plan says `method: flash`.
+        let flash = match built.needs_flash {
+            Some(_) => Some(flash::flash_image(
+                &dir, &model, target, &read, &report, &built, &product, &material, &tunnel,
+            )?),
+            None => None,
+        };
+        if flash.is_none()
+            && let Some(refusal) = &built.refusal
+        {
             return Err(refusal.clone());
         }
 
@@ -528,7 +557,7 @@ impl BussardMcp {
         // A security-object change of its own rewrites the tables too (issue
         // #297): the security object is written inside the table download.
         let tables_noop = report.is_noop() && !built.plan.writes.security_object;
-        let noop = tables_noop && built.partial.is_none();
+        let noop = tables_noop && built.partial.is_none() && flash.is_none();
         if noop {
             // The device already holds the model: nothing this session
             // edited is pending on it any more.
@@ -561,6 +590,9 @@ impl BussardMcp {
         {
             device_plan.notes.push(line);
         }
+        if flash.is_some() {
+            device_plan.notes.push(flash_note(target));
+        }
         let digest = if noop {
             None
         } else {
@@ -568,7 +600,10 @@ impl BussardMcp {
                 target,
                 created: Instant::now(),
                 live: live_digest(&read),
-                model: model_digest(&model, target, &desired, security.as_ref(), &built),
+                model: flash::with_flash(
+                    model_digest(&model, target, &desired, security.as_ref(), &built),
+                    flash.as_ref(),
+                ),
             };
             let digest = plan_digest(&pending_plan);
             let mut plans = tier.plans();
@@ -583,8 +618,15 @@ impl BussardMcp {
                 .collect()
         };
         let parameters_json = parameters_json(&built);
+        let question = match &flash {
+            _ if noop => None,
+            Some(_) => Some(flash_question(target, &gateway, device_plan.change_count())),
+            None => Some(device_plan.question()),
+        };
         Ok(json!({
             "ok": true,
+            "method": if flash.is_some() { "flash" } else { "apply" },
+            "flash": flash.as_ref().map(|f| f.summary.clone()),
             "address": target.to_string(),
             "gateway": gateway,
             "mask": format!("{:04X}", tables.mask),
@@ -601,7 +643,7 @@ impl BussardMcp {
             "parameters": parameters_json,
             "writes": device_plan.writes,
             "notes": device_plan.notes,
-            "question": (!noop).then(|| device_plan.question()),
+            "question": question,
             "state_hash": device_plan.state_hash,
             "pending_model_changes": pending,
             "additions": pairs(&report.additions),
@@ -634,6 +676,17 @@ impl BussardMcp {
                         .to_string(),
                     None => "nothing to write: the device already matches the model".to_string(),
                 }
+            } else if flash.is_some() {
+                format!(
+                    "Show the plan above to the human (every sentence, the com-objects in \
+                     flash.objects and the table sizes in flash.tables) and say that this change \
+                     needs a full download: {target} restarts and is offline for {} to {} s, and \
+                     its parameter memory is backed up first. Ask whether to flash {target}. \
+                     Call knx_apply_device with this plan_digest only after an explicit yes to \
+                     flashing it.",
+                    bussard_service::flash::DEVICE_OFFLINE_SECONDS.0,
+                    bussard_service::flash::DEVICE_OFFLINE_SECONDS.1
+                )
             } else {
                 let skipped = built
                     .parameters_skipped
@@ -876,6 +929,20 @@ impl BussardMcp {
         let report = plan(tables, &desired);
         let mut built = built_plan(&model, target, &gateway, &dir, &read, &report, &product);
         admit_in_plan(&mut built, target, &tunnel, &read, &report);
+        // The flash a com-object change needs (issue #303), rebuilt from the
+        // fresh read: its image is part of the digest.
+        let flash = match built.needs_flash {
+            Some(_) => match flash::flash_image(
+                &dir, &model, target, &read, &report, &built, &product, &material, &tunnel,
+            ) {
+                Ok(image) => Some(image),
+                Err(reason) => {
+                    tier.plans().remove(digest);
+                    return Err(reason);
+                }
+            },
+            None => None,
+        };
 
         // Re-derive the digest from what is true now; anything that moved since
         // the plan retires it.
@@ -883,7 +950,10 @@ impl BussardMcp {
             target,
             created: planned.created,
             live: live_digest(&read),
-            model: model_digest(&model, target, &desired, security.as_ref(), &built),
+            model: flash::with_flash(
+                model_digest(&model, target, &desired, security.as_ref(), &built),
+                flash.as_ref(),
+            ),
         };
         let moved = match (now.live != planned.live, now.model != planned.model) {
             (true, true) => Some("the device's live state and the model both changed"),
@@ -911,7 +981,9 @@ impl BussardMcp {
             return Err(refusal);
         }
         refuse_protected(&model, &report)?;
-        if let Some(refusal) = &built.refusal {
+        if flash.is_none()
+            && let Some(refusal) = &built.refusal
+        {
             tier.plans().remove(digest);
             return Err(refusal.clone());
         }
@@ -952,6 +1024,7 @@ impl BussardMcp {
                 .with_args([target.to_string(), digest.to_string()])
                 .with_gateway(Some(gateway.clone()))
                 .with_result(match (tables_change, param_write.is_some()) {
+                    _ if flash.is_some() => "before flashing the application program",
                     (true, true) => "before writing the device tables and parameters",
                     (false, true) => "before writing the device parameters",
                     _ => "before writing the device tables",
@@ -972,8 +1045,14 @@ impl BussardMcp {
         // Both backups before the first write, as `bussard apply` takes them.
         let backup = write_pre_write_backup(&dir, target, tables, live.sys7())
             .map_err(|e| format!("refusing to write {target} without a backup: {e}"))?;
-        let param_backup = match param_write {
-            Some((_, detail)) => Some(
+        // A flash rewrites the whole parameter memory: it is backed up first,
+        // where knx_restore_parameters reads it (issue #303).
+        let backed_up = match (&flash, param_write) {
+            (Some(_), _) => read.params.as_ref().and_then(|p| p.detail.as_ref()),
+            (None, write) => write.map(|(_, detail)| detail),
+        };
+        let param_backup = match backed_up {
+            Some(detail) => Some(
                 bussard_download::write_parameter_memory_backup(
                     &dir,
                     target,
@@ -990,6 +1069,7 @@ impl BussardMcp {
         let param_backup_path = param_backup.as_ref().map(|p| p.display().to_string());
 
         let result = json!({
+            "method": if flash.is_some() { "flash" } else { "apply" },
             "address": target.to_string(),
             "gateway": gateway,
             "secured": tool_key.is_some(),
@@ -1014,6 +1094,7 @@ impl BussardMcp {
             snapshot,
             backup_path,
             param_backup_path,
+            flash,
             result,
         })
     }
@@ -1038,9 +1119,29 @@ impl BussardMcp {
             images,
             backup_path,
             param_backup_path,
+            flash,
             mut result,
             ..
         } = p;
+        if let Some(image) = flash {
+            let ctx = flash::FlashJob {
+                target,
+                gateway: &gateway,
+                dir: &dir,
+                source,
+                tool_key,
+                high_water,
+                changed: json!(built.parameters),
+                param_backup: param_backup_path.as_deref(),
+            };
+            let result = self.flash_write(tier, job, image, ctx, result).await;
+            if result["ok"] == json!(true) {
+                // The lock may have changed (the PID 54 record): serve it.
+                self.state().model.reload();
+                self.session_edits().applied(target, true);
+            }
+            return result;
+        }
         let live = &read.live;
         let tables = live.tables();
         let tables_change = !report.is_noop() || built.plan.writes.security_object;
@@ -1182,6 +1283,7 @@ impl BussardMcp {
             let mut observer = JobObserver {
                 jobs: &tier.jobs,
                 job,
+                what: PARAMETER_DOWNLOAD,
             };
             let outcome = bussard_service::download::write_parameters(
                 service,
@@ -1330,16 +1432,24 @@ struct Prepared {
     backup_path: String,
     /// The parameter backup, when parameters are written.
     param_backup_path: Option<String>,
+    /// The full download, when the plan says `method: flash` (issue #303).
+    flash: Option<flash::FlashImage>,
     /// The result so far (address, gateway, backups, snapshot).
     result: Value,
 }
 
-/// Reports a parameter download's progress into its job.
+/// [`JobObserver::what`] of a parameter-only write.
+const PARAMETER_DOWNLOAD: &str = "parameter download";
+
+/// Reports a download's progress into its job.
 struct JobObserver<'a> {
     /// The job table.
     jobs: &'a crate::apply_jobs::ApplyJobs,
     /// The job.
     job: &'a str,
+    /// What downloads: `"parameter download"` for a parameter-only write,
+    /// `"download"` for a flash (issue #303).
+    what: &'static str,
 }
 
 impl bussard_service::download::FlashObserver for JobObserver<'_> {
@@ -1352,7 +1462,7 @@ impl bussard_service::download::FlashObserver for JobObserver<'_> {
             } => {
                 self.jobs.step(
                     self.job,
-                    format!("parameter download step {index} of {total}: {label}"),
+                    format!("{} step {index} of {total}: {label}", self.what),
                 );
                 self.jobs
                     .progress(self.job, "download_step", json!(format!("{index}/{total}")));
@@ -1373,7 +1483,7 @@ impl bussard_service::download::FlashObserver for JobObserver<'_> {
             "download",
             json!(if verified { "verified" } else { "failed" }),
         );
-        if verified {
+        if verified && self.what == PARAMETER_DOWNLOAD {
             self.jobs
                 .step(self.job, "reading the parameter memory back to verify");
         }
@@ -1722,6 +1832,31 @@ fn built_plan(
         built.parameters_skipped = Some(why.clone());
     }
     built
+}
+
+/// The plan note of a flash (issue #303).
+fn flash_note(target: IndividualAddress) -> String {
+    let (min, max) = bussard_service::flash::DEVICE_OFFLINE_SECONDS;
+    format!(
+        "method: flash. The parameter values change the group-object table, which only a full \
+         download writes: {target} gets the application, its parameters and its tables as \
+         `bussard flash {target} --yes` writes them, restarts, and is offline for {min} to \
+         {max} s. Its parameter memory is backed up first."
+    )
+}
+
+/// The question of a flash plan: the human's yes must be a yes to flashing.
+fn flash_question(target: IndividualAddress, gateway: &str, changes: usize) -> String {
+    let (min, max) = bussard_service::flash::DEVICE_OFFLINE_SECONDS;
+    format!(
+        "flash {target} through {gateway} to write {}? The device restarts and is offline for \
+         {min} to {max} s.",
+        if changes == 1 {
+            "this change".to_string()
+        } else {
+            format!("these {changes} changes")
+        }
+    )
 }
 
 /// The `parameters` field of a plan: what differs, by key, vendor text,

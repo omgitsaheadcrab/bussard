@@ -54,6 +54,9 @@ bussard-bus = { workspace = true }
 rmcp = { version = "3.3.0", features = ["server", "client", "macros", "transport-io", "schemars"] }
 # The shared mock KNXnet/IP gateway and mock devices (issue #87).
 bussard-testkit = { workspace = true }
+# Packs the synthetic `.knxprod` of the flash test (issue #303). Already in
+# the tree (bussard-prod, bussard-model). MIT.
+zip = { workspace = true }
 
 [lints]
 workspace = true

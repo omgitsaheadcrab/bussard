@@ -244,6 +244,36 @@ pub fn visible_objects(
         .collect()
 }
 
+/// The text and DPT of com-object `number` in `app`: the reference's words
+/// when it has them, else the object's.
+pub fn com_object_words(app: &ApplicationProgram, number: u16) -> (Option<String>, Option<String>) {
+    let mut found: Vec<_> = app
+        .com_objects
+        .values()
+        .filter(|o| o.number == number)
+        .collect();
+    found.sort_by(|a, b| a.id.cmp(&b.id));
+    let Some(object) = found.first() else {
+        return (None, None);
+    };
+    let mut refs: Vec<_> = app
+        .com_object_refs
+        .values()
+        .filter(|r| r.ref_id == object.id)
+        .collect();
+    refs.sort_by(|a, b| a.id.cmp(&b.id));
+    let reference = refs.first();
+    let text = reference
+        .and_then(|r| r.text.clone())
+        .or_else(|| object.text.clone())
+        .or_else(|| object.name.clone());
+    let dpt = reference
+        .and_then(|r| r.dpt.as_ref())
+        .or(object.dpt.as_ref())
+        .map(ToString::to_string);
+    (text, dpt)
+}
+
 /// The factory reset of a full download (issues #79, #117): a device that
 /// carries another application, or whose state could not be read, is reset
 /// before the download, on top of the reset the planner adds for a sparse,
