@@ -850,6 +850,17 @@ directory or a script from before these changes needs:
 
 ### Fixed
 
+- `knx_set_parameter` refused `universalkanal-c4-funktion.helligkeitsschwelle`
+  on a Theben weather station with the same key listed twice as the choice.
+  The page holds the threshold twice, once per branch of "Funktion des
+  Kanals", and only one of them shows under the current function. Product
+  models now record the conditions inside a page for each parameter
+  (`parameter_when`, model format 3; older models regenerate from their
+  archive), and the key resolver picks the ref the current values show, so
+  the page-qualified and the bare key work again and follow a change of the
+  function. Only two or more shown refs are ambiguous, and the refusal then
+  lists each one once, as `key@reference` with its branch condition in words
+  where the page-qualified keys would repeat (#315).
 - `knx_set_parameter` refused a parameter on a page that was inactive at
   import, even though `knx_show_device` listed it: after switching on
   "Universalkanal C4", its brightness threshold was "no parameter" in every

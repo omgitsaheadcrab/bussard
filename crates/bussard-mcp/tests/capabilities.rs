@@ -255,7 +255,10 @@ async fn test_model_lookup_finds_a_function_on_an_inactive_page() -> TestResult 
 /// A Meteodata-like application (issue #304): twelve universal channels,
 /// each a function page and an objects page behind an enable switch on the
 /// "Allgemein" page, C5 .. C12 behind the switches of every channel from C5
-/// up to their own (C10 needs C5 .. C10). C1 .. C4 are enabled.
+/// up to their own (C10 needs C5 .. C10). C1 .. C4 are enabled. Like the
+/// real Theben application (`P-7305_R-7305` and `P-7305_R-7330`), each
+/// function page holds its brightness threshold twice, in the "Helligkeit"
+/// and the "Wind" branch of "Funktion des Kanals" (issue #315).
 const METEO_APP: &str = "M-0004_A-0304-10-0000";
 const METEO_CHANNELS: u32 = 12;
 const METEO_ON: u32 = 4;
@@ -299,8 +302,9 @@ fn meteo_product() -> String {
                 id(format!("O-{n}_R-{n}"))
             ));
         }
+        let wind = 1005 + 10 * k;
         blocks.push_str(&format!(
-            "- id: PB-{k}0\n  text: 'Universalkanal C{k}: Funktion'\n  parent: CH-0\n  channel: CH-0\n  when:\n{when}  parameters:\n  - P-{f}_R-{f}\n  - P-{s}_R-{s}\n  - P-{h}_R-{h}\n  objects:\n  - O-{n}_R-{n}\n",
+            "- id: PB-{k}0\n  text: 'Universalkanal C{k}: Funktion'\n  parent: CH-0\n  channel: CH-0\n  when:\n{when}  parameters:\n  - P-{f}_R-{f}\n  - P-{s}_R-{s}\n  - P-{h}_R-{h}\n  - P-{h}_R-{wind}\n  parameter_when:\n    P-{h}_R-{h}:\n    - ref: P-{f}_R-{f}\n      test: '1'\n    P-{h}_R-{wind}:\n    - ref: P-{f}_R-{f}\n      test: '3'\n  objects:\n  - O-{n}_R-{n}\n",
             n = 2 * k
         ));
         blocks.push_str(&format!(
@@ -309,7 +313,7 @@ fn meteo_product() -> String {
         ));
     }
     format!(
-        "model_format: 2\nidentity:\n  id: {METEO_APP}\n  name: meteo test app\n  application_number: 304\n  application_version: 16\n  mask_version: '0701'\n  load_procedure_style: ProductProcedure\n  schema_version: '23'\n{objects}{params}load_procedure:\n- connect\n- restart\n- disconnect\n{blocks}"
+        "model_format: 3\nidentity:\n  id: {METEO_APP}\n  name: meteo test app\n  application_number: 304\n  application_version: 16\n  mask_version: '0701'\n  load_procedure_style: ProductProcedure\n  schema_version: '23'\n{objects}{params}load_procedure:\n- connect\n- restart\n- disconnect\n{blocks}"
     )
 }
 
@@ -728,4 +732,92 @@ async fn test_set_parameter_on_a_page_enabled_since_import() -> TestResult {
     client.cancel().await?;
     task.abort();
     Ok(())
+}
+
+/// Issue #315: the C4 page holds its threshold in the "Helligkeit" and the
+/// "Wind" branch of "Funktion des Kanals". The page-qualified and the bare
+/// key name the ref the current function shows; with neither shown, the
+/// refusal lists each ref once, by `key@reference` with its condition.
+#[tokio::test]
+async fn test_set_parameter_prefers_the_ref_the_function_shows() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    write_meteo(dir.path())?;
+    let (client, task) = serve(dir.path()).await?;
+    let ia = "1.1.202";
+    let page = "universalkanal-c4-funktion";
+    let qualified = format!("{page}.helligkeitsschwelle-c4");
+    let set = |parameter: String, value: &str| json!({"address": ia, "parameter": parameter, "value": value});
+
+    // Helligkeit (the default) shows P-1042_R-1042.
+    for (parameter, value) in [
+        (qualified.clone(), "401"),
+        ("helligkeitsschwelle-c4".to_string(), "402"),
+    ] {
+        let body = call(&client, "knx_set_parameter", set(parameter.clone(), value)).await?;
+        assert_ne!(body["refused"], true, "{parameter}: {body}");
+        assert_eq!(
+            field_ref(&body),
+            Some("P-1042_R-1042"),
+            "{parameter}: {body}"
+        );
+    }
+
+    // Wind shows the other ref.
+    let body = call(
+        &client,
+        "knx_set_parameter",
+        json!({"address": ia, "parameter": "funktion-des-kanals", "channel": page, "value": "Wind"}),
+    )
+    .await?;
+    assert_ne!(body["refused"], true, "{body}");
+    let body = call(&client, "knx_set_parameter", set(qualified.clone(), "403")).await?;
+    assert_ne!(body["refused"], true, "{body}");
+    assert_eq!(field_ref(&body), Some("P-1042_R-1045"), "{body}");
+
+    // Temperatur shows neither: ambiguous, each ref named once.
+    let body = call(
+        &client,
+        "knx_set_parameter",
+        json!({"address": ia, "parameter": "funktion-des-kanals", "channel": page, "value": "Temperatur"}),
+    )
+    .await?;
+    assert_ne!(body["refused"], true, "{body}");
+    let body = call(&client, "knx_set_parameter", set(qualified.clone(), "404")).await?;
+    assert_eq!(body["refused"], true, "{body}");
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("several places"), "{reason}");
+    for named in [
+        "`helligkeitsschwelle-c4@P-1042_R-1042` (Funktion des Kanals = Helligkeit)",
+        "`helligkeitsschwelle-c4@P-1042_R-1045` (Funktion des Kanals = Wind)",
+    ] {
+        assert!(reason.contains(named), "{reason}");
+    }
+    let keys: Vec<&str> = reason.split('`').skip(1).step_by(2).collect();
+    let mut unique = keys.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(keys.len(), unique.len(), "{reason}");
+    // The suggested keys resolve.
+    let body = call(
+        &client,
+        "knx_set_parameter",
+        set("helligkeitsschwelle-c4@P-1042_R-1045".to_string(), "405"),
+    )
+    .await?;
+    assert_ne!(body["refused"], true, "{body}");
+    assert_eq!(field_ref(&body), Some("P-1042_R-1045"), "{body}");
+
+    client.cancel().await?;
+    task.abort();
+    Ok(())
+}
+
+/// The reference in the `field` of a `knx_set_parameter` result's change.
+fn field_ref(body: &Value) -> Option<&str> {
+    body["detail"]
+        .as_array()?
+        .iter()
+        .find_map(|d| d["field"].as_str())
+        .and_then(|f| f.rsplit_once('@'))
+        .map(|(_, r)| r)
 }

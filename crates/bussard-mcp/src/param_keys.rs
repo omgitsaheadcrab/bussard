@@ -13,7 +13,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use bussard_model::blocks::ref_param_id;
-use bussard_model::device_view::{DEVICE_SCOPE, parameter_pages, unindexed_parameters};
+use bussard_model::device_view::{
+    DEVICE_SCOPE, RefVisibility, parameter_pages, parameter_visibility, unindexed_parameters,
+};
 use bussard_model::param_model::ProductModels;
 use bussard_model::schema::{Device, LockedParameter};
 use bussard_model::{IndividualAddress, Model, param_mem_key, slug};
@@ -40,6 +42,9 @@ pub struct KeyContext {
     unindexed: BTreeMap<String, Unindexed>,
     /// The application program, when its product model is at hand.
     application: Option<String>,
+    /// Whether the configuration shows each ref the product model's pages
+    /// hold, and the condition inside its page, by ref (issue #315).
+    visibility: BTreeMap<String, RefVisibility>,
 }
 
 /// A parameter the product model's pages hold and the lock does not index.
@@ -108,7 +113,27 @@ impl KeyContext {
             texts,
             unindexed,
             application,
+            visibility: parameter_visibility(model, products, address).unwrap_or_default(),
         }
+    }
+
+    /// Whether the configuration shows `reference`; a ref the product
+    /// model's pages do not hold counts as shown.
+    fn shown(&self, reference: &str) -> bool {
+        self.visibility.get(reference).is_none_or(|v| v.shown)
+    }
+
+    /// Whether the conditions inside its page hold for `reference`: its page
+    /// shows it once enabled. A ref the pages do not hold counts as on it.
+    fn on_branch(&self, reference: &str) -> bool {
+        self.visibility.get(reference).is_none_or(|v| v.on_branch)
+    }
+
+    /// The condition inside its page that shows `reference`, in words.
+    fn condition(&self, reference: &str) -> Option<&str> {
+        self.visibility
+            .get(reference)
+            .and_then(|v| v.condition.as_deref())
     }
 }
 
@@ -341,6 +366,7 @@ pub fn resolve_parameter_key(
     let mut hits = find(device, ctx, wanted, &scopes);
     hits.sort_unstable();
     hits.dedup();
+    let hits = prefer_shown(device, ctx, with_siblings(device, ctx, wanted, hits));
     match hits.as_slice() {
         [reference] => Ok(mem_key(device, ctx, reference)),
         [] => Err(no_match(device, ctx, wanted, channel)),
@@ -348,12 +374,108 @@ pub fn resolve_parameter_key(
             "{wanted:?} names a parameter in several places on {}: {}. Use one of these keys, or \
              pass `channel`",
             device.address,
-            many.iter()
-                .map(|r| format!("`{}`", qualified(device, ctx, r)))
-                .collect::<Vec<_>>()
-                .join(", ")
+            distinct_keys(device, ctx, many).join(", ")
         )),
     }
+}
+
+/// `hits` with the other refs of the same parameter on the same page, unless
+/// `wanted` names one ref (`key@reference` or the bare reference). Once one
+/// of two such refs is indexed under the escape hatch (`key@reference`), a
+/// key still names both, and [`prefer_shown`] picks between them.
+fn with_siblings<'a>(
+    device: &'a Device,
+    ctx: &'a KeyContext,
+    wanted: &str,
+    mut hits: Vec<&'a str>,
+) -> Vec<&'a str> {
+    let by_ref = wanted.rsplit_once('@').map_or(wanted, |(_, r)| r);
+    if hits.is_empty() || candidate(device, ctx, by_ref).is_some() {
+        return hits;
+    }
+    let found: Vec<(&str, String)> = hits
+        .iter()
+        .map(|r| (ref_param_id(r), place_of(device, ctx, r)))
+        .collect();
+    for c in candidates(device, ctx) {
+        if hits.contains(&c.reference) {
+            continue;
+        }
+        let place = place_of(device, ctx, c.reference);
+        if found
+            .iter()
+            .any(|(param, p)| *param == ref_param_id(c.reference) && *p == place)
+        {
+            hits.push(c.reference);
+        }
+    }
+    hits.sort_unstable();
+    hits
+}
+
+/// `hits` without the refs the configuration hides where another hit on the
+/// same page is shown (issue #315): a page that holds one parameter in two
+/// branches of a choice (Theben's "Funktion des Kanals") shows one of them,
+/// and its key names that one. On a page the configuration does not show,
+/// the ref whose branch the current values take counts, as the view lists
+/// it there. Refs on different pages, or several shown on one page, stay as
+/// they are.
+fn prefer_shown<'a>(device: &Device, ctx: &KeyContext, hits: Vec<&'a str>) -> Vec<&'a str> {
+    if hits.len() < 2 {
+        return hits;
+    }
+    let pages: Vec<String> = hits.iter().map(|r| place_of(device, ctx, r)).collect();
+    let all: Vec<(&'a str, &str)> = hits
+        .iter()
+        .copied()
+        .zip(pages.iter().map(String::as_str))
+        .collect();
+    let shown = keep_where(all, |r| ctx.shown(r));
+    keep_where(shown, |r| ctx.on_branch(r))
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect()
+}
+
+/// `refs` (each with its page) without those failing `test` where another
+/// on the same page passes it.
+fn keep_where<'a, 'p>(
+    refs: Vec<(&'a str, &'p str)>,
+    test: impl Fn(&str) -> bool,
+) -> Vec<(&'a str, &'p str)> {
+    refs.iter()
+        .filter(|(r, page)| test(r) || !refs.iter().any(|(other, p)| p == page && test(other)))
+        .copied()
+        .collect()
+}
+
+/// A key for each of `references` that names it alone, for an ambiguity
+/// refusal: `<place>.<key>`, else (where another of them sits on the same
+/// page under the same key) `key@reference` with the condition inside the
+/// page that shows it. No string repeats.
+fn distinct_keys(device: &Device, ctx: &KeyContext, references: &[&str]) -> Vec<String> {
+    let spot = |r: &str| {
+        let key = candidate(device, ctx, r).map_or(r, |c| last_part(c.key));
+        (place_of(device, ctx, r), key.to_string())
+    };
+    let spots: Vec<(String, String)> = references.iter().map(|r| spot(r)).collect();
+    let mut out: Vec<String> = Vec::new();
+    for (r, at) in references.iter().zip(&spots) {
+        let repeated = spots.iter().filter(|other| *other == at).count() > 1;
+        let named = if repeated {
+            let key = &at.1;
+            match ctx.condition(r) {
+                Some(when) => format!("`{key}@{r}` ({when})"),
+                None => format!("`{key}@{r}`"),
+            }
+        } else {
+            format!("`{}`", qualified(device, ctx, r))
+        };
+        if !out.contains(&named) {
+            out.push(named);
+        }
+    }
+    out
 }
 
 /// Indexes the parameter `mem_key` (as [`resolve_parameter_key`] returned
@@ -529,6 +651,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
     use bussard_model::ProductModel;
+    use bussard_model::blocks::Gate;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -570,6 +693,13 @@ brightness.send = "4/1/5"
 "#;
 
     fn setup() -> Result<(Model, KeyContext, IndividualAddress), Box<dyn std::error::Error>> {
+        setup_with(|_| {})
+    }
+
+    /// [`setup`] with the product model changed by `change` first.
+    fn setup_with(
+        change: impl Fn(&mut ProductModel),
+    ) -> Result<(Model, KeyContext, IndividualAddress), Box<dyn std::error::Error>> {
         let files: BTreeMap<String, String> = [
             ("bussard.lock", LOCK),
             ("devices/1.1.30.toml", DEVICE),
@@ -584,9 +714,9 @@ brightness.send = "4/1/5"
         .collect();
         let model = Model::from_texts(&files)?;
         let mut products = ProductModels::default();
-        products
-            .by_app_ref
-            .insert(APP.to_string(), ProductModel::from_yaml(PRODUCT, APP)?);
+        let mut product = ProductModel::from_yaml(PRODUCT, APP)?;
+        change(&mut product);
+        products.by_app_ref.insert(APP.to_string(), product);
         let ia: IndividualAddress = "1.1.30".parse()?;
         let ctx = KeyContext::new(&model, &products, ia);
         Ok((model, ctx, ia))
@@ -622,6 +752,121 @@ brightness.send = "4/1/5"
             let key = resolve_parameter_key(d, &ctx, &wanted, None)?;
             assert_eq!(ref_of(&key), Some("P-12_R-12"), "{wanted}");
         }
+        Ok(())
+    }
+
+    /// Channel A's page with the dusk threshold in more branches of the
+    /// channel function (issue #315): `P-12_R-12` under the brightness
+    /// sensor (as in the fixture), `P-12_R-13` under the temperature sensor
+    /// the device runs, and with `ungated` `P-12_R-14` under none.
+    fn branches(ungated: bool) -> impl Fn(&mut ProductModel) {
+        move |product: &mut ProductModel| {
+            let Some(page) = product.blocks.iter_mut().find(|b| b.id == "PB-10") else {
+                return;
+            };
+            page.parameters.push("P-12_R-13".to_string());
+            page.parameter_when.insert(
+                "P-12_R-13".to_string(),
+                vec![Gate {
+                    reference: "P-11_R-11".to_string(),
+                    test: "2".to_string(),
+                    others: Vec::new(),
+                }],
+            );
+            if ungated {
+                page.parameters.push("P-12_R-14".to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_parameter_key_prefers_the_ref_the_configuration_shows() -> TestResult {
+        let (model, ctx, ia) = setup_with(branches(false))?;
+        let d = device(&model, ia)?;
+        let page = "universal-channel-a-function";
+        for (wanted, channel) in [
+            (format!("{page}.dusk-threshold-in-lx"), None),
+            ("dusk-threshold-in-lx".to_string(), Some(page)),
+            // The lock's key names the hidden ref; its page shows the other.
+            ("a.dusk-threshold-in-lx".to_string(), None),
+        ] {
+            let key = resolve_parameter_key(d, &ctx, &wanted, channel)?;
+            assert_eq!(key, "dusk-threshold-in-lx@P-12_R-13", "{wanted}");
+        }
+        // Bare, the key names channel B's threshold too: A's page is
+        // offered once, by its page-qualified key.
+        let err = resolve_parameter_key(d, &ctx, "dusk-threshold-in-lx", None)
+            .err()
+            .ok_or("a bare key on two pages resolved")?;
+        assert_eq!(
+            err.matches("`universal-channel-a-function.dusk-threshold-in-lx`")
+                .count(),
+            1,
+            "{err}"
+        );
+        // A named ref is taken as named, shown or not.
+        for wanted in ["P-12_R-12", "a.dusk-threshold-in-lx@P-12_R-12"] {
+            let key = resolve_parameter_key(d, &ctx, wanted, None)?;
+            assert_eq!(ref_of(&key), Some("P-12_R-12"), "{wanted}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_parameter_key_two_shown_refs_are_ambiguous_without_repeats() -> TestResult {
+        let (model, ctx, ia) = setup_with(branches(true))?;
+        let d = device(&model, ia)?;
+        let err = resolve_parameter_key(
+            d,
+            &ctx,
+            "universal-channel-a-function.dusk-threshold-in-lx",
+            None,
+        )
+        .err()
+        .ok_or("two shown refs resolved")?;
+        assert!(err.contains("several places"), "{err}");
+        assert!(
+            err.contains(
+                "`dusk-threshold-in-lx@P-12_R-13` (Channel function = Temperature sensor)"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("`dusk-threshold-in-lx@P-12_R-14`"), "{err}");
+        // The hidden ref of the same page is not offered.
+        assert!(!err.contains("P-12_R-12"), "{err}");
+        let keys: Vec<&str> = err.split('`').skip(1).step_by(2).collect();
+        let mut unique = keys.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(keys.len(), unique.len(), "{err}");
+        // Each suggestion resolves to its ref.
+        for (wanted, reference) in [
+            ("dusk-threshold-in-lx@P-12_R-13", "P-12_R-13"),
+            ("dusk-threshold-in-lx@P-12_R-14", "P-12_R-14"),
+        ] {
+            let key = resolve_parameter_key(d, &ctx, wanted, None)?;
+            assert_eq!(ref_of(&key), Some(reference), "{wanted}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_distinct_keys_never_repeats_a_string() -> TestResult {
+        let (model, ctx, ia) = setup_with(branches(true))?;
+        let d = device(&model, ia)?;
+        let keys = distinct_keys(
+            d,
+            &ctx,
+            &["P-12_R-13", "P-12_R-14", "P-12_R-13", "P-11_R-11"],
+        );
+        assert_eq!(
+            keys,
+            [
+                "`dusk-threshold-in-lx@P-12_R-13` (Channel function = Temperature sensor)",
+                "`dusk-threshold-in-lx@P-12_R-14`",
+                "`universal-channel-a-function.channel-function`",
+            ]
+        );
         Ok(())
     }
 

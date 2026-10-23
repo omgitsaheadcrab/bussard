@@ -54,6 +54,20 @@ fn test_blocks_for_records_pages_gates_and_objects() -> TestResult {
         ("P-1_R-1", "1")
     );
     assert_eq!(a.parameters, ["P-11_R-11", "P-12_R-12"]);
+    // The dusk threshold sits under the channel function's choice inside
+    // the page (issue #315); the function itself under none.
+    let dusk: Vec<(&str, &str)> = a
+        .parameter_when
+        .get("P-12_R-12")
+        .map(|gates| {
+            gates
+                .iter()
+                .map(|g| (g.reference.as_str(), g.test.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(dusk, [("P-11_R-11", "1")]);
+    assert!(!a.parameter_when.contains_key("P-11_R-11"));
     assert_eq!(a.objects, ["O-1_R-1"]);
 
     // The objects page: the default function shows O-2_R-2; the default

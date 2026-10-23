@@ -59,8 +59,9 @@ pub struct ObjectDef {
 
 /// The product-model format this build writes: `model_format:` at the top of
 /// the file. A model of an older format regenerates from its archive
-/// (format 2 adds `blocks:`, issue #298).
-pub const MODEL_FORMAT: u32 = 2;
+/// (format 2 adds `blocks:`, issue #298; format 3 the conditions inside a
+/// block, `parameter_when:`, issue #315).
+pub const MODEL_FORMAT: u32 = 3;
 
 /// Whether the model file at `path` is of the current [`MODEL_FORMAT`]. Reads
 /// only the head of the file, where the emitter puts the key.

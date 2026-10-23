@@ -30,8 +30,8 @@ use serde::Serialize;
 
 use crate::address::IndividualAddress;
 use crate::blocks::{
-    BlockDef, BlockKind, BlockState, block_states, object_number, parent_indexes, ref_param_id,
-    subtree,
+    BlockDef, BlockKind, BlockState, Gate, block_states, object_number, parent_indexes,
+    ref_param_id, subtree,
 };
 use crate::flags::Flags;
 use crate::loader::Model;
@@ -549,9 +549,13 @@ impl<'a> Pages<'a> {
     }
 
     /// The parameter definitions blocks `members` and their nested blocks
-    /// hold, one per parameter, without headings (`type: none`).
+    /// hold, one per parameter, without headings (`type: none`). Of several
+    /// refs of one parameter, the first whose conditions inside its block
+    /// hold, else the first.
     fn held_params(&self, members: &[usize]) -> Vec<(&'a str, &'a ParamDef)> {
-        let mut seen: HashSet<&str> = HashSet::new();
+        // Per parameter id: its index in `out` and whether that ref's
+        // branch holds.
+        let mut seen: HashMap<&str, (usize, bool)> = HashMap::new();
         let mut out = Vec::new();
         let all = members
             .iter()
@@ -562,10 +566,22 @@ impl<'a> Pages<'a> {
                 let Some(def) = self.product.parameters.get(id) else {
                     continue;
                 };
-                if matches!(def.kind, ParamKind::None) || !seen.insert(id) {
+                if matches!(def.kind, ParamKind::None) {
                     continue;
                 }
-                out.push((r.as_str(), def));
+                let holds = self.on_branch(j, r);
+                match seen.get_mut(id) {
+                    Some((at, taken)) => {
+                        if holds && !*taken {
+                            out[*at] = (r.as_str(), def);
+                            *taken = true;
+                        }
+                    }
+                    None => {
+                        seen.insert(id, (out.len(), holds));
+                        out.push((r.as_str(), def));
+                    }
+                }
             }
         }
         out
@@ -624,6 +640,62 @@ impl<'a> Pages<'a> {
             None => def.and_then(|d| d.default.clone()),
         }?;
         value_number(def, &raw)
+    }
+
+    /// Whether the configuration shows parameter ref `reference` of block
+    /// `i`: the block is active and every condition inside it between the
+    /// block and the ref holds for the device's values.
+    fn shows_ref(&self, i: usize, reference: &str) -> bool {
+        self.states[i].active && self.on_branch(i, reference)
+    }
+
+    /// Whether every condition inside block `i` between the block and
+    /// parameter ref `reference` holds for the device's values: the block
+    /// shows the ref once it shows itself.
+    fn on_branch(&self, i: usize, reference: &str) -> bool {
+        self.blocks[i]
+            .parameter_when
+            .get(reference)
+            .is_none_or(|gates| {
+                gates
+                    .iter()
+                    .all(|g| g.holds(self.value_number(&g.reference)))
+            })
+    }
+
+    /// A condition in words: the controlling parameter's text and the values
+    /// that satisfy the test, as the device file writes them ("Funktion des
+    /// Kanals = Helligkeit").
+    fn gate_words(&self, gate: &Gate) -> String {
+        let def = self.product.parameters.get(ref_param_id(&gate.reference));
+        let name = def
+            .and_then(|d| d.text.clone().or_else(|| d.name.clone()))
+            .unwrap_or_else(|| gate.reference.clone());
+        // `1 2` becomes "A or B", `!=0` becomes "!= A".
+        let plain = |test: &str, join: &str| -> String {
+            let t = test.trim();
+            for op in ["!=", "<=", ">=", "<", ">"] {
+                if let Some(rest) = t.strip_prefix(op) {
+                    return format!("{op} {}", display_value(def, rest.trim()));
+                }
+            }
+            t.split_whitespace()
+                .map(|v| display_value(def, v))
+                .collect::<Vec<_>>()
+                .join(join)
+        };
+        let test = gate.test.trim();
+        if test == "default" {
+            if gate.others.is_empty() {
+                return format!("{name} at any value");
+            }
+            let others: Vec<String> = gate.others.iter().map(|o| plain(o, ", ")).collect();
+            return format!("{name} is none of {}", others.join(", "));
+        }
+        if test.starts_with(['!', '<', '>', '?']) {
+            return format!("{name} {}", plain(test, " or "));
+        }
+        format!("{name} = {}", plain(test, " or "))
     }
 
     /// What enables inactive block `i` (shown together with `members`).
@@ -1461,6 +1533,81 @@ pub fn unindexed_parameters(
                     text: def.text.clone().or_else(|| def.name.clone()),
                 },
             );
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a device's configuration shows a parameter ref its pages hold,
+/// and the conditions inside its page that decide it (issue #315). See
+/// [`parameter_visibility`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefVisibility {
+    /// The configuration shows it: its page is active and every condition
+    /// inside the page between the page and the ref holds for the device's
+    /// values (stored, else the default).
+    pub shown: bool,
+    /// Every condition inside its page between the page and the ref holds:
+    /// the page shows this ref once it shows itself.
+    pub on_branch: bool,
+    /// Those conditions in words ("Funktion des Kanals = Helligkeit"),
+    /// joined with "and"; `None` for a ref outside any `<choose>` of its
+    /// page.
+    pub condition: Option<String>,
+}
+
+/// Every parameter ref the product model's pages hold for device `address`,
+/// keyed by the app-relative `ParameterRef` id, with whether the device's
+/// configuration shows it under its current values: the page states
+/// [`device_view`] lists, and the conditions inside each page. A ref on
+/// several pages counts as shown when one of them shows it. Empty without a
+/// product model with pages.
+pub fn parameter_visibility(
+    model: &Model,
+    products: &ProductModels,
+    address: IndividualAddress,
+) -> Result<BTreeMap<String, RefVisibility>, ViewError> {
+    let device = &model
+        .devices
+        .get(&address)
+        .ok_or(ViewError::NoDevice(address))?
+        .device;
+    let mut out: BTreeMap<String, RefVisibility> = BTreeMap::new();
+    let product = device
+        .product
+        .as_ref()
+        .and_then(|p| p.application_ref.as_deref())
+        .and_then(|a| products.get(a))
+        .filter(|p| !p.blocks.is_empty());
+    let Some(product) = product else {
+        return Ok(out);
+    };
+    let params = parameter_entries(device);
+    let pg = Pages::new(device, product, &params);
+    for (i, b) in pg.blocks.iter().enumerate() {
+        for reference in &b.parameters {
+            let seen = RefVisibility {
+                shown: pg.shows_ref(i, reference),
+                on_branch: pg.on_branch(i, reference),
+                condition: b
+                    .parameter_when
+                    .get(reference)
+                    .filter(|gates| !gates.is_empty())
+                    .map(|gates| {
+                        gates
+                            .iter()
+                            .map(|g| pg.gate_words(g))
+                            .collect::<Vec<_>>()
+                            .join(" and ")
+                    }),
+            };
+            match out.get_mut(reference) {
+                Some(v) if (seen.shown, seen.on_branch) > (v.shown, v.on_branch) => *v = seen,
+                Some(_) => {}
+                None => {
+                    out.insert(reference.clone(), seen);
+                }
+            }
         }
     }
     Ok(out)
