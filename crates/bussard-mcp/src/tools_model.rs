@@ -35,6 +35,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::server::BussardMcp;
+use crate::session_edits::Subject;
 
 /// Arguments for `knx_describe_change`.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -124,6 +125,28 @@ pub struct SetParameterArgs {
     pub value: String,
 }
 
+/// Arguments for `knx_remove_group`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RemoveGroupArgs {
+    /// The group address to remove from groups.toml, e.g. `"1/0/22"`.
+    pub ga: String,
+}
+
+/// Arguments for `knx_discard_edits`. Pass exactly one of `address` and
+/// `group`.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct DiscardEditsArgs {
+    // `address`, not `device`: the remote-devices bridge strips `device`.
+    /// A device's individual address, e.g. `"1.1.5"`: drop its unapplied link
+    /// and parameter edits.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// A group address, e.g. `"1/0/22"`: drop this session's edits of its
+    /// groups.toml entry.
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
 /// Arguments for `knx_undo`.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct UndoArgs {
@@ -139,15 +162,17 @@ pub struct UndoArgs {
 ///
 /// `knx_scaffold_groups` and `knx_reserve_groups` live on the group-planning
 /// router but write `groups.toml`, so they are withheld with the others.
-pub const MODEL_EDIT_TOOLS: [&str; 8] = [
+pub const MODEL_EDIT_TOOLS: [&str; 10] = [
     "knx_scaffold_groups",
     "knx_reserve_groups",
     "knx_set_group",
+    "knx_remove_group",
     "knx_add_link",
     "knx_remove_link",
     "knx_set_device",
     "knx_set_parameter",
     "knx_undo",
+    "knx_discard_edits",
 ];
 
 /// The read-only model/history tools, available in every tier.
@@ -341,6 +366,55 @@ impl BussardMcp {
                     );
                 }
             }
+            Ok(())
+        })
+    }
+
+    /// `knx_remove_group`.
+    #[tool(
+        description = "Remove a group address from groups.toml. Refused while any com object \
+        still sends or listens to it: the refusal lists those links, and knx_remove_link unbinds \
+        each one first. A protected group address (safety-critical, e.g. a wind alarm) is \
+        refused outright. This edits FILES ONLY: no telegram is sent and no device stores a \
+        group address's name; knx_undo puts it back. Returns the change as sentences: quote \
+        them to the human."
+    )]
+    async fn knx_remove_group(
+        &self,
+        Parameters(args): Parameters<RemoveGroupArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ga: GroupAddress = match args.ga.parse() {
+            Ok(ga) => ga,
+            Err(_) => {
+                return refusal(format!(
+                    "{:?} is not a group address like \"0/0/4\"",
+                    args.ga
+                ));
+            }
+        };
+        self.edit("knx_remove_group", vec![ga.to_string()], move |model| {
+            let Some(group) = model.groups.groups.get(&ga) else {
+                return Err(format!(
+                    "{ga} is not in groups.toml, so there is nothing to remove"
+                ));
+            };
+            if group.protected {
+                return Err(format!(
+                    "{ga} ({:?}) is protected (safety-critical): removing it is refused over MCP. \
+                     A human can edit groups.toml directly.",
+                    group.name
+                ));
+            }
+            let users = links_using(model, ga);
+            if !users.is_empty() {
+                return Err(format!(
+                    "{ga} ({:?}) is still linked: {}. Unbind each with knx_remove_link first, \
+                     then remove the group address.",
+                    group.name,
+                    users.join("; ")
+                ));
+            }
+            model.groups.groups.remove(&ga);
             Ok(())
         })
     }
@@ -656,9 +730,223 @@ impl BussardMcp {
         put_changes(&mut result, &changes);
         ok(result)
     }
+
+    /// `knx_discard_edits`.
+    #[tool(
+        description = "Abandon this session's unapplied edits of ONE subject and leave every \
+        other edit alone: `address` (a device: its link and parameter edits since it last \
+        matched the model) or `group` (a group address: its groups.toml edits). The subject's \
+        part of the files goes back to the snapshot before its first such edit. Use it to \
+        revert one device while edits on other devices stay; knx_undo instead rolls the whole \
+        model back to a snapshot. A group created this session that a link still uses cannot \
+        be discarded (the refusal lists the links; knx_remove_link first). This edits FILES \
+        ONLY and snapshots first, so knx_undo brings the edits back. Returns the dropped edits \
+        as sentences: quote them to the human."
+    )]
+    async fn knx_discard_edits(
+        &self,
+        Parameters(args): Parameters<DiscardEditsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if self.state().no_model_edits {
+            return refusal("this server was started with --no-model-edits");
+        }
+        let subject = match (args.address.as_deref(), args.group.as_deref()) {
+            (Some(raw), None) => match raw.parse::<IndividualAddress>() {
+                Ok(ia) => Subject::Device(ia),
+                Err(_) => {
+                    return refusal(format!(
+                        "{raw:?} is not an individual address like \"1.1.4\""
+                    ));
+                }
+            },
+            (None, Some(raw)) => match raw.parse::<GroupAddress>() {
+                Ok(ga) => Subject::Group(ga),
+                Err(_) => {
+                    return refusal(format!("{raw:?} is not a group address like \"0/0/4\""));
+                }
+            },
+            _ => {
+                return refusal(
+                    "pass exactly one of `address` (a device) or `group` (a group address)",
+                );
+            }
+        };
+        let pending = self.session_edits().pending(subject);
+        let Some(baseline) = pending.iter().map(|e| e.snapshot.clone()).min() else {
+            return refusal(format!(
+                "this session has no unapplied edits of {subject}, so there is nothing to \
+                 discard. knx_undo rolls the whole model back to a snapshot."
+            ));
+        };
+
+        let dir = self.state().dir.clone();
+        let history = History::open(&dir);
+        let before = match Model::load(&dir) {
+            Ok(model) => model,
+            Err(err) => {
+                return refusal(format!(
+                    "the model at {} does not load: {err}",
+                    dir.display()
+                ));
+            }
+        };
+        let base = match history
+            .resolve(&baseline)
+            .and_then(|snapshot| history.load(&snapshot.id))
+        {
+            Ok(model) => model,
+            Err(err) => return refusal(format!("snapshot {baseline} does not load: {err}")),
+        };
+        let mut edited = before.clone();
+        let mut notes: Vec<String> = Vec::new();
+        match subject {
+            Subject::Device(ia) => {
+                let Some(device) = base.devices.get(&ia) else {
+                    return refusal(format!(
+                        "{ia} is not in snapshot {baseline}, so its edits cannot be discarded \
+                         here; knx_undo rolls the whole model back"
+                    ));
+                };
+                edited.devices.insert(ia, device.clone());
+                match base.links.links.get(&ia) {
+                    Some(links) => {
+                        edited.links.links.insert(ia, links.clone());
+                    }
+                    None => {
+                        edited.links.links.remove(&ia);
+                    }
+                }
+                // A group address a dropped link used and this session
+                // created stays in groups.toml: say so.
+                let gas_of = |model: &Model| -> std::collections::BTreeSet<GroupAddress> {
+                    model
+                        .links
+                        .links
+                        .get(&ia)
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|l| l.send.into_iter().chain(l.listen.iter().copied()))
+                        .collect()
+                };
+                let kept = gas_of(&base);
+                let session_groups: Vec<GroupAddress> = gas_of(&before)
+                    .into_iter()
+                    .filter(|ga| !kept.contains(ga) && before.groups.groups.contains_key(ga))
+                    .filter(|ga| self.created_in_session(&history, *ga))
+                    .collect();
+                for ga in session_groups {
+                    notes.push(format!(
+                        "Group address {ga} was created in this session and stays in \
+                         groups.toml; knx_discard_edits with group {ga} or knx_remove_group \
+                         drops it once nothing links it."
+                    ));
+                }
+            }
+            Subject::Group(ga) => match base.groups.groups.get(&ga) {
+                Some(group) => {
+                    edited.groups.groups.insert(ga, group.clone());
+                }
+                None => {
+                    let users = links_using(&before, ga);
+                    if !users.is_empty() {
+                        return refusal(format!(
+                            "{ga} was created in this session and is still linked: {}. \
+                             Discarding it would leave those links without a group address; \
+                             unbind them with knx_remove_link (or knx_discard_edits on each \
+                             device) first.",
+                            users.join("; ")
+                        ));
+                    }
+                    edited.groups.groups.remove(&ga);
+                }
+            },
+        }
+
+        let mut changes = describe(&before, &edited);
+        settle_changes(&dir, &mut changes, [&edited, &before]);
+        let dropped_sentences: Vec<String> = pending
+            .iter()
+            .flat_map(|e| e.sentences.iter().cloned())
+            .collect();
+        if changes.is_empty() {
+            // The files already say what the baseline said (a human reverted
+            // them): only the record goes.
+            self.session_edits().discard(subject, None);
+            return ok(json!({
+                "ok": true,
+                "discarded": subject.to_string(),
+                "dropped": dropped_sentences,
+                "changes": [],
+                "note": "the files already matched the state before these edits; nothing was written",
+            }));
+        }
+
+        let reason = SnapshotReason::new("mcp knx_discard_edits")
+            .with_args(vec![subject.to_string()])
+            .with_result("before discarding a subject's edits");
+        let snapshot = match history.snapshot(reason) {
+            Ok(id) => id,
+            Err(err) => {
+                return refusal(format!(
+                    "refusing to discard: the history snapshot could not be written ({err})"
+                ));
+            }
+        };
+        if let Err(err) = edited.save(&dir) {
+            return refusal(format!("the model could not be saved: {err}"));
+        }
+        self.state().model.reload();
+        self.session_edits()
+            .discard(subject, Some(snapshot.as_str()));
+
+        let earlier = bussard_model::validate_in_dir(&before, &dir);
+        let diagnostics = bussard_model::validate_in_dir(&edited, &dir);
+        let next_step = match subject {
+            Subject::Device(ia) if self.state().programming.is_some() && !self.state().passive => {
+                format!(
+                    "{ia}'s file is back to what it was before these edits. If the device \
+                     received none of them, it already matches; knx_plan_device for {ia} \
+                     confirms it."
+                )
+            }
+            _ => self.next_step(&changes),
+        };
+        let mut result = json!({
+            "ok": true,
+            "discarded": subject.to_string(),
+            "dropped": dropped_sentences,
+            "snapshot": snapshot,
+            "touches_protected": changes.touches_protected(),
+            "validation": validation_json(&earlier, &diagnostics),
+            "next_step": next_step,
+        });
+        put_changes(&mut result, &changes);
+        if let (false, Some(map)) = (notes.is_empty(), result.as_object_mut()) {
+            map.insert("note".to_string(), Value::String(notes.join(" ")));
+        }
+        ok(result)
+    }
 }
 
 impl BussardMcp {
+    /// Whether this session created `ga`: it has session edits, and the
+    /// snapshot before the first of them does not define it.
+    fn created_in_session(&self, history: &History, ga: GroupAddress) -> bool {
+        let Some(first) = self
+            .session_edits()
+            .pending(Subject::Group(ga))
+            .into_iter()
+            .map(|e| e.snapshot)
+            .min()
+        else {
+            return false;
+        };
+        history
+            .resolve(&first)
+            .and_then(|snapshot| history.load(&snapshot.id))
+            .is_ok_and(|model| !model.groups.groups.contains_key(&ga))
+    }
+
     /// The `next_step` for an edit that produced `changes`, at this server's
     /// tier (see [`crate::guidance::Tiers::next_step`]).
     fn next_step(&self, changes: &ChangeSet) -> String {
@@ -884,6 +1172,23 @@ fn parse_link_args(args: &LinkArgs) -> Result<(IndividualAddress, GroupAddress, 
         }
     };
     Ok((ia, ga, role))
+}
+
+/// Every com object in `model` that sends or listens to `ga`, as
+/// `1.1.5 object 3 listens` lines, by device and object.
+fn links_using(model: &Model, ga: GroupAddress) -> Vec<String> {
+    let mut out = Vec::new();
+    for (ia, links) in &model.links.links {
+        for link in links {
+            if link.send == Some(ga) {
+                out.push(format!("{ia} object {} sends", link.object));
+            }
+            if link.listen.contains(&ga) {
+                out.push(format!("{ia} object {} listens", link.object));
+            }
+        }
+    }
+    out
 }
 
 /// Whether a GA is protected in `groups`.

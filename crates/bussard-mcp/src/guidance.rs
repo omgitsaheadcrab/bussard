@@ -147,7 +147,7 @@ impl Tiers {
                 .to_string()
         });
         parts.push(if self.model_edits {
-            "It edits the model files: group addresses (knx_set_group), links \
+            "It edits the model files: group addresses (knx_set_group, knx_remove_group), links \
              (knx_add_link, knx_remove_link), names and rooms (knx_set_device) and parameter \
              values (knx_set_parameter, with the keys knx_show_device lists)."
                 .to_string()
@@ -219,7 +219,9 @@ impl Tiers {
         });
         out.push(if self.model_edits {
             "Change the model with the edit tools, never by writing files: knx_set_group, \
-             knx_add_link, knx_remove_link, knx_set_device, knx_set_parameter and knx_undo. \
+             knx_remove_group, knx_add_link, knx_remove_link, knx_set_device, \
+             knx_set_parameter, knx_discard_edits and knx_undo. To abandon a change on one \
+             device, knx_discard_edits; knx_undo rolls the whole model back to a snapshot. \
              Parameters are edited with knx_set_parameter using the keys knx_show_device lists \
              (the device needs its product model). Every edit snapshots the files first and \
              returns the change as sentences: quote them to the human, and follow the result's \

@@ -643,12 +643,9 @@ fn describe_groups(old: &Model, new: &Model, out: &mut Vec<Change>) {
                     .protected_if(protected),
             ),
             (Some(group), None) => out.push(
-                Change::new(
-                    ChangeKind::GroupRemoved,
-                    format!("Group address {} is gone.", label_for_group(ga, group)),
-                )
-                .with_group(ga)
-                .protected_if(protected),
+                Change::new(ChangeKind::GroupRemoved, removed_group_sentence(ga, group))
+                    .with_group(ga)
+                    .protected_if(protected),
             ),
             (Some(a), Some(b)) => group_field_changes(ga, a, b, protected, out),
             (None, None) => {}
@@ -663,6 +660,17 @@ fn label_for_group(ga: GroupAddress, group: &Group) -> String {
         ga.to_string()
     } else {
         format!("{name} ({ga})")
+    }
+}
+
+/// The sentence for a removed group address: `Group address 0/0/4 (Porch
+/// light) removed.`, the address first because the name goes with it.
+fn removed_group_sentence(ga: GroupAddress, group: &Group) -> String {
+    let name = group.name.trim();
+    if name.is_empty() {
+        format!("Group address {ga} removed.")
+    } else {
+        format!("Group address {ga} ({name}) removed.")
     }
 }
 

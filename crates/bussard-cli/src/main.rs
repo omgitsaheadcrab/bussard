@@ -1377,8 +1377,9 @@ enum Command {
             requires = "allow_programming"
         )]
         plan_ttl_minutes: u64,
-        /// Refuse model edits: omits the `knx_set_group`, `knx_add_link`,
-        /// `knx_remove_link`, `knx_set_device`, `knx_set_parameter`, `knx_undo`,
+        /// Refuse model edits: omits the `knx_set_group`, `knx_remove_group`,
+        /// `knx_add_link`, `knx_remove_link`, `knx_set_device`,
+        /// `knx_set_parameter`, `knx_undo`, `knx_discard_edits`,
         /// `knx_scaffold_groups` and `knx_reserve_groups` tools. The read tools
         /// stay available. Model edits only
         /// touch the model files (never the bus), so they are on by default.
