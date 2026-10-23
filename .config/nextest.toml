@@ -41,6 +41,11 @@ retries = 2
 # budget and report it as a failure.
 slow-timeout = { period = "30s", terminate-after = 2 }
 
+# GitHub runners have 3-4 cores, and the default is one thread per core. The
+# slow tests wait on loopback sockets and timeouts, not CPU: at 4 threads the
+# summed per-test time (613 s) is ~4x the wall time (154 s). Oversubscribe ~3x.
+test-threads = 12
+
 # Emit JUnit XML so CI can surface per-test results and timings.
 [profile.ci.junit]
 path = "junit.xml"
