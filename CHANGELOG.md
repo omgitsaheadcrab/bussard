@@ -72,6 +72,26 @@ directory or a script from before these changes needs:
   edits made on other devices since. It returns the dropped sentences and
   snapshots first, so `knx_undo` brings them back. A removed group address now
   reads "Group address 1/0/22 (Kitchen door light) removed."
+- `knx_plan_device` and `knx_apply_device` push a parameter that shows or
+  hides com-objects (#303). Such a change rewrites the group-object table,
+  which only a full application download writes, so the plan used to refuse
+  it with "needs `bussard flash`". The plan now says `method: "flash"`
+  (`"apply"` otherwise) and lists, under `flash`, the com-objects that appear
+  or disappear with their text, DPT and the parameter behind them, the
+  address, association and group-object table sizes before and after, that
+  the device restarts and is offline for 30 to 50 s, that its parameter
+  memory is backed up first, and the archive it writes with its
+  `product_sha256` from the lock. Its question asks to flash the device.
+  `knx_apply_device` with that plan's digest runs the flash as the usual job
+  (`knx_apply_status`, `knx_last_apply`, one at a time, the plan hash check):
+  the parameter backup under `captures/backups/parameters/`, then the same
+  image `bussard flash <ia> --yes` writes (both now build it with the same
+  code from the same inputs), the restart and the verify, then the lock
+  update `flash` makes. It refuses what `flash` refuses: no archive pinned in
+  the lock, an identity that drifted, another or an unreadable resident
+  application, a stale plan. `bussard flash` is unchanged. The server
+  instructions and the `knx_set_parameter` note say so at the programming
+  tier.
 - `[connection] admit_tunnel_senders = true` (#297): `plan`, `apply`,
   `flash`, `apply --line`, `knx_plan_device` and `knx_apply_device` on a KNX
   Data Secure device add every tunnelling address of the key store to its
@@ -912,8 +932,9 @@ directory or a script from before these changes needs:
   objects and parameter index are re-derived under the new value when the
   lock pins the archive, so dependent parameters and objects appear in
   `knx_show_device` at once, and the result's `note` names objects the value
-  shows or hides. Such a change still needs `bussard flash <ia>`, which the
-  `apply` refusal and the MCP instructions now say. The lock format is now
+  shows or hides. Such a change needs a full download: `bussard flash <ia>`,
+  which the `apply` refusal names, or the flash `knx_plan_device` plans
+  (#303). The lock format is now
   version 3 (see Breaking changes).
 - An MCP tool call without arguments no longer fails with serde's "missing
   field `device`", which read as a server bug. The error says the call
