@@ -104,10 +104,21 @@ impl Walk<'_> {
                     self.nodes(children, Some(index), channel, &mut Vec::new(), true);
                 }
                 DynamicNode::ParameterRefRef(reference) => {
-                    if let Some(c) = current
-                        && self.seen_params[c].insert(reference.clone())
-                    {
+                    let Some(c) = current else { continue };
+                    if self.seen_params[c].insert(reference.clone()) {
                         self.out[c].parameters.push(reference.clone());
+                        if !gates.is_empty() {
+                            self.out[c]
+                                .parameter_when
+                                .insert(reference.clone(), gates.clone());
+                        }
+                    } else if self.out[c]
+                        .parameter_when
+                        .get(reference)
+                        .is_some_and(|g| g != gates)
+                    {
+                        // On another branch too: no one condition shows it.
+                        self.out[c].parameter_when.remove(reference);
                     }
                 }
                 DynamicNode::ComObjectRefRef(reference) => {

@@ -16,7 +16,7 @@
 //! device's values. An inactive block names the conditions that do not hold:
 //! the parameters to set to show it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -139,6 +139,12 @@ pub struct BlockDef {
     /// branch, app-relative, in document order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<String>,
+    /// For each of [`Self::parameters`] that sits under a `<choose>` inside
+    /// this block on one branch only: the conditions between the block and
+    /// the ref, outermost first (issue #315). A ref outside any `<choose>`,
+    /// or on several branches, has no entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameter_when: BTreeMap<String, Vec<Gate>>,
     /// The com-object refs directly inside that the vendor defaults show
     /// (`O-22_R-7`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -13,7 +13,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use bussard_model::capabilities::{cache_path, capability_lookup};
-use bussard_model::device_view::{device_view, parameter_pages, unindexed_parameters};
+use bussard_model::device_view::{
+    device_view, parameter_pages, parameter_visibility, unindexed_parameters,
+};
 use bussard_model::{IndividualAddress, Model, ProductModel, ProductModels};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -383,6 +385,44 @@ fn test_collapse_enable_chains_keeps_the_own_switch() -> TestResult {
     scoped.collapse_enable_chains();
     let scope = scoped.scope.as_ref().ok_or("no scope")?;
     assert_eq!(scope.inactive.as_ref().map(|i| i.enable.len()), Some(2));
+    Ok(())
+}
+
+#[test]
+fn test_parameter_visibility_evaluates_the_conditions_inside_a_page() -> TestResult {
+    let mut model = model()?;
+    let products = products()?;
+    let seen = parameter_visibility(&model, &products, ia()?)?;
+    let shown = |r: &str| seen.get(r).map(|v| v.shown);
+    // Channel A shows its function; the dusk threshold only under the
+    // brightness function, and the device runs the temperature function.
+    assert_eq!(shown("P-11_R-11"), Some(true));
+    assert_eq!(shown("P-12_R-12"), Some(false));
+    assert_eq!(
+        seen.get("P-12_R-12").and_then(|v| v.condition.as_deref()),
+        Some("Channel function = Brightness sensor 1 .. 100 000 lx")
+    );
+    assert_eq!(
+        seen.get("P-11_R-11").and_then(|v| v.condition.as_deref()),
+        None
+    );
+    // Channel B's page is inactive: nothing on it shows.
+    assert_eq!(shown("P-21_R-21"), Some(false));
+
+    // Back to the brightness function: the threshold shows.
+    let device = &mut model.devices.get_mut(&ia()?).ok_or("no device")?.device;
+    let key = device
+        .parameters
+        .keys()
+        .find(|k| k.ends_with("@P-11_R-11"))
+        .cloned()
+        .ok_or("no channel function stored")?;
+    device
+        .parameters
+        .insert(key, "Brightness sensor 1 .. 100 000 lx".to_string());
+    let seen = parameter_visibility(&model, &products, ia()?)?;
+    assert_eq!(seen.get("P-12_R-12").map(|v| v.shown), Some(true));
+    assert!(parameter_visibility(&model, &ProductModels::default(), ia()?)?.is_empty());
     Ok(())
 }
 
