@@ -511,6 +511,10 @@ impl BussardMcp {
     async fn plan_device(&self, address: &str) -> Result<Value, String> {
         let began = Instant::now();
         let target = parse_address(address)?;
+        // A link the model itself shows cannot work refuses before the bus is
+        // touched or a job is claimed (issue #330); `plan_body` checks again
+        // on the model it plans with.
+        refuse_insecure_links(&self.state().model.reload(), target)?;
         let (tier, _, _) = self.programming_preflight()?;
         let (job, fresh) = match tier.jobs.claim_plan(target)? {
             crate::apply_jobs::PlanClaim::New(job) => (job, true),
@@ -1005,6 +1009,8 @@ impl BussardMcp {
         }
 
         let model = self.state().model.reload();
+        // The model may have changed since the plan (issue #330).
+        refuse_insecure_links(&model, target)?;
         let desired = desired_tables_for(&model, target).map_err(|e| e.to_string())?;
         let mut product = product_for(&dir, &model, target);
         // KNX Data Secure: the same material the plan resolved, one

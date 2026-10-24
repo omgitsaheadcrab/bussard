@@ -1075,7 +1075,7 @@ async fn test_knx_plan_device_refuses_plain_sender_on_secured_ga() -> anyhow::Re
         connection,
         Duration::from_secs(600),
         false,
-        None,
+        (None, None),
     )
     .await?;
 
