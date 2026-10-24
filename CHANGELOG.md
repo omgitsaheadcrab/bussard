@@ -63,6 +63,18 @@ directory or a script from before these changes needs:
 
 ### Added
 
+- `knx_plan_device` runs as a job when the device read is slow (#332). A
+  Data Secure System B device reads its whole parameter memory over a secured
+  session, which outlasted the client bridge's 60 s call cap. The plan still
+  comes inline when the read ends within about 20 s; otherwise the call
+  answers `started: true` with a `job` id, and `knx_apply_status` (now for
+  plan jobs too, `kind: plan`) returns the plan as its `result`, digest
+  included, exactly as the inline answer would. A second plan of the same
+  device joins the running job. Plan and apply jobs share the one slot, so a
+  plan never reads a device while a write runs, and the other way round.
+  `knx_apply_device` also answers `started` when its pre-flight read outlasts
+  the same wait; a pre-flight that refuses after that ends the job with
+  `result.refused: true` and nothing written.
 - `knx_remove_group` and `knx_discard_edits` (#305). `knx_remove_group`
   removes a group address from `groups.toml`; it is refused while a link uses
   the address (the reason lists the links and names `knx_remove_link`) and for

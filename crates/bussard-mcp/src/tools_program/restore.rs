@@ -140,11 +140,8 @@ impl BussardMcp {
         let dir = self.state().dir.clone();
         let file = backup_file(&dir, backup)?;
         let Some(digest) = digest else {
-            if let Some((job, device)) = tier.jobs.running() {
-                return Err(format!(
-                    "an apply is running on this server (job {job} for {device}); call \
-                     knx_apply_status with job {job} until it is done, then plan again"
-                ));
+            if let Some(refusal) = tier.jobs.busy(crate::apply_jobs::JobKind::Plan) {
+                return Err(refusal);
             }
             let _guard = tier.bus_lock.lock().await;
             let mut warm = self.warm().lock().await;
@@ -294,7 +291,7 @@ impl BussardMcp {
         let (planned, mut result, record) = match prepared {
             Ok(prepared) => prepared,
             Err(reason) => {
-                tier.jobs.abandon(job);
+                tier.jobs.refuse(job, &reason);
                 let _ = started.send(Err(reason));
                 return;
             }

@@ -110,6 +110,15 @@ impl Harness {
         plan_ttl: Duration,
         reply_wait: Option<Duration>,
     ) -> anyhow::Result<Harness> {
+        Harness::start_waits(plan_ttl, reply_wait, None).await
+    }
+
+    /// [`Harness::start_with`] with the read wait set too (issue #332).
+    async fn start_waits(
+        plan_ttl: Duration,
+        reply_wait: Option<Duration>,
+        read_wait: Option<Duration>,
+    ) -> anyhow::Result<Harness> {
         // Keep serving after a DISCONNECT so a second connection finds the
         // same device with the same state.
         let gateway = MockGateway::builder()
@@ -123,8 +132,14 @@ impl Harness {
         let dir = tempfile::tempdir()?;
         write_model(dir.path())?;
         let connection = ConnectionConfig::tunnel(gateway.addr());
-        let (client, server_task) =
-            serve(dir.path(), connection.clone(), plan_ttl, true, reply_wait).await?;
+        let (client, server_task) = serve(
+            dir.path(),
+            connection.clone(),
+            plan_ttl,
+            true,
+            (reply_wait, read_wait),
+        )
+        .await?;
         Ok(Harness {
             client,
             server_task,
@@ -183,7 +198,7 @@ async fn serve(
     connection: ConnectionConfig,
     plan_ttl: Duration,
     with_bus: bool,
-    reply_wait: Option<Duration>,
+    (reply_wait, read_wait): (Option<Duration>, Option<Duration>),
 ) -> anyhow::Result<(
     rmcp::service::RunningService<rmcp::RoleClient, ()>,
     tokio::task::JoinHandle<()>,
@@ -205,6 +220,9 @@ async fn serve(
     let state = bussard_mcp::build_state(&config)?;
     if let (Some(wait), Some(tier)) = (reply_wait, state.programming.as_ref()) {
         tier.set_reply_wait(wait);
+    }
+    if let (Some(wait), Some(tier)) = (read_wait, state.programming.as_ref()) {
+        tier.set_read_wait(wait);
     }
     if with_bus {
         let service = bussard_service::BusService::open(connection, config.write_policy())?;
@@ -416,7 +434,7 @@ async fn test_knx_plan_device_refuses_non_loopback_gateway_without_gate() -> any
         connection,
         Duration::from_secs(600),
         false,
-        None,
+        (None, None),
     )
     .await?;
 
@@ -451,7 +469,7 @@ async fn test_programming_tools_registered_only_with_the_tier() -> anyhow::Resul
         connection,
         Duration::from_secs(600),
         false,
-        None,
+        (None, None),
     )
     .await?;
     let names: Vec<String> = client
@@ -716,6 +734,194 @@ async fn test_knx_apply_device_slow_write_returns_started_and_completes_under_st
     h.stop().await
 }
 
+/// The plan with the fields that name the moment it was made removed.
+fn timeless(plan: &Value) -> Value {
+    let mut plan = plan.clone();
+    if let Some(map) = plan.as_object_mut() {
+        map.remove("planned_at");
+        map.remove("expires_at");
+    }
+    plan
+}
+
+/// The `job` id of a `started` answer.
+fn job_of(started: &Value) -> anyhow::Result<String> {
+    started["job"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("no job in {started}"))
+}
+
+/// Issue #332: a plan whose device read outlasts the read wait answers
+/// `started` with a plan job; a second plan of the device joins it, an apply
+/// is refused naming it, and `knx_apply_status` returns the plan exactly as
+/// the synchronous call returned it on the fast device, digest included.
+#[tokio::test]
+async fn test_knx_plan_device_slow_read_runs_as_a_job_equal_to_the_inline_plan()
+-> anyhow::Result<()> {
+    let h = Harness::start_waits(
+        Duration::from_secs(600),
+        None,
+        Some(Duration::from_millis(300)),
+    )
+    .await?;
+    // The fast device answers within the read wait: the plan comes inline.
+    let inline = h
+        .call("knx_plan_device", json!({"address": "1.1.4"}))
+        .await?;
+    assert_eq!(inline["ok"], true, "inline: {inline}");
+    assert!(inline.get("started").is_none(), "inline: {inline}");
+    let digest = digest_of(&inline)?;
+
+    // Every answer 80 ms late: the read takes seconds, past the read wait.
+    h.gateway.with_device(device_ia()?, |dev| {
+        dev.response_delay = Some(Duration::from_millis(80));
+    })?;
+    let started = h
+        .call("knx_plan_device", json!({"address": "1.1.4"}))
+        .await?;
+    assert_eq!(started["started"], true, "plan: {started}");
+    assert_eq!(started["done"], false, "plan: {started}");
+    assert_eq!(started["kind"], "plan", "plan: {started}");
+    assert!(
+        started.get("plan_digest").is_none(),
+        "no plan yet: {started}"
+    );
+    let job = job_of(&started)?;
+    assert!(job.starts_with("plan-"), "{job}");
+    let next = started["next_step"].as_str().unwrap_or_default();
+    assert!(
+        next.contains("knx_apply_status") && next.contains(&job),
+        "{next}"
+    );
+
+    // A second plan of the device joins the running job; an apply waits.
+    let joined = h
+        .call("knx_plan_device", json!({"address": "1.1.4"}))
+        .await?;
+    assert_eq!(job_of(&joined)?, job, "joined: {joined}");
+    let apply = h
+        .call(
+            "knx_apply_device",
+            json!({"address": "1.1.4", "plan_digest": digest}),
+        )
+        .await?;
+    assert_eq!(apply["refused"], true, "{apply}");
+    assert!(
+        apply["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains(&job) && r.contains("already running")),
+        "{apply}"
+    );
+    assert_eq!(h.writes()?, 0, "a plan job never writes");
+
+    let done = poll_until_done(&h, &job).await?;
+    assert_eq!(done["kind"], "plan", "{done}");
+    assert_eq!(done["state"], "done", "{done}");
+    assert!(
+        done["next_step"]
+            .as_str()
+            .is_some_and(|n| n.contains("result.plan_digest")),
+        "{done}"
+    );
+    let plan = &done["result"];
+    assert_eq!(
+        digest_of(plan)?,
+        digest,
+        "same device, same model, same digest"
+    );
+    assert_eq!(timeless(plan), timeless(&inline));
+    // A plan is not an apply.
+    let last = h
+        .call("knx_last_apply", json!({"address": "1.1.4"}))
+        .await?;
+    assert_eq!(last["found"], false, "{last}");
+
+    // The digest the job produced is good for the apply.
+    h.gateway.with_device(device_ia()?, |dev| {
+        dev.response_delay = None;
+    })?;
+    let applied = h
+        .call(
+            "knx_apply_device",
+            json!({"address": "1.1.4", "plan_digest": digest}),
+        )
+        .await?;
+    assert_eq!(applied["ok"], true, "{applied}");
+    assert_eq!(applied["verified"], true, "{applied}");
+    h.stop().await
+}
+
+/// Issue #332: an apply whose pre-flight read outlasts the read wait answers
+/// `started` before the backups exist, and completes under
+/// `knx_apply_status`; a pre-flight that refuses after that ends the job
+/// with `result.refused` and nothing written.
+#[tokio::test]
+async fn test_knx_apply_device_slow_preflight_answers_started_and_reports_a_late_refusal()
+-> anyhow::Result<()> {
+    let h = Harness::start_waits(
+        Duration::from_secs(600),
+        None,
+        Some(Duration::from_millis(300)),
+    )
+    .await?;
+    let plan = h
+        .call("knx_plan_device", json!({"address": "1.1.4"}))
+        .await?;
+    let digest = digest_of(&plan)?;
+    h.gateway.with_device(device_ia()?, |dev| {
+        dev.response_delay = Some(Duration::from_millis(80));
+    })?;
+
+    // The device moved since the plan: the slow pre-flight refuses late.
+    let moved = address_table(&["1/2/0", "1/2/1", "5/0/0"])?;
+    h.gateway
+        .with_device(device_ia()?, |dev| dev.preload_table(1, &moved))?;
+    let started = h
+        .call(
+            "knx_apply_device",
+            json!({"address": "1.1.4", "plan_digest": digest}),
+        )
+        .await?;
+    assert_eq!(started["started"], true, "apply: {started}");
+    let job = job_of(&started)?;
+    let refused = poll_until_done(&h, &job).await?;
+    assert_eq!(refused["result"]["refused"], true, "{refused}");
+    assert!(
+        refused["result"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("live tables changed")),
+        "{refused}"
+    );
+    assert!(
+        refused["next_step"]
+            .as_str()
+            .is_some_and(|n| n.contains("nothing was written")),
+        "{refused}"
+    );
+    assert_eq!(h.writes()?, 0, "a refused pre-flight must not write");
+
+    // A fresh plan (as a job) and its apply (started in the pre-flight)
+    // complete under knx_apply_status.
+    let started = h
+        .call("knx_plan_device", json!({"address": "1.1.4"}))
+        .await?;
+    let plan = poll_until_done(&h, &job_of(&started)?).await?;
+    let digest = digest_of(&plan["result"])?;
+    let started = h
+        .call(
+            "knx_apply_device",
+            json!({"address": "1.1.4", "plan_digest": digest}),
+        )
+        .await?;
+    assert_eq!(started["started"], true, "apply: {started}");
+    let done = poll_until_done(&h, &job_of(&started)?).await?;
+    assert_eq!(done["kind"], "apply", "{done}");
+    assert_eq!(done["result"]["ok"], true, "{done}");
+    assert_eq!(done["result"]["verified"], true, "{done}");
+    h.stop().await
+}
+
 /// Issue #289: a reply the client lost is recoverable: `knx_last_apply`
 /// returns the job's result in the session, and a restarted server reads it
 /// from the record under `.bussard/history`, by address and by job.
@@ -756,7 +962,14 @@ async fn test_knx_last_apply_recovers_a_lost_reply_across_a_restart() -> anyhow:
     // A server restart: a fresh session on the same model reads the record.
     let dir = h.dir.path().to_path_buf();
     let connection = ConnectionConfig::tunnel(h.gateway.addr());
-    let (client, task) = serve(&dir, connection, Duration::from_secs(600), false, None).await?;
+    let (client, task) = serve(
+        &dir,
+        connection,
+        Duration::from_secs(600),
+        false,
+        (None, None),
+    )
+    .await?;
     let restored = call(&client, "knx_last_apply", json!({"address": "1.1.4"})).await?;
     assert_eq!(restored["found"], true, "{restored}");
     assert_eq!(restored["from_record"], true, "{restored}");

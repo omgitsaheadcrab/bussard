@@ -23,6 +23,21 @@
 //! - **One apply at a time.** A second `knx_apply_device` while a job runs
 //!   is refused with the running job's id (management calls are sequential,
 //!   issue #215).
+//! - **A slow pre-flight answers too (issue #332).** When the pre-flight's
+//!   device read outlasts the read wait (default [`DEFAULT_REPLY_WAIT`]), the
+//!   call answers `started: true` with the job id; a pre-flight that refuses
+//!   later ends the job with `result.refused: true`, nothing written.
+//!
+//! **Plan jobs (issue #332).** Reading a KNX Data Secure System B device's
+//! whole parameter memory can outlast the bridge's 60 s too, so
+//! `knx_plan_device` runs its read as a job of the same table
+//! ([`JobKind::Plan`]): it answers with the plan when the read ends within
+//! the read wait, and otherwise with the job id, which `knx_apply_status`
+//! polls; the finished job's `result` is the plan exactly as the call would
+//! have returned it. Plan and apply jobs share the one slot, so a plan never
+//! reads a device while a write runs and the other way round. A second plan
+//! of the same device while its plan job runs gets that job back. Plan jobs
+//! are not recorded on disk and are not an apply for `knx_last_apply`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,6 +59,35 @@ pub const DEFAULT_REPLY_WAIT: Duration = Duration::from_secs(20);
 /// The file a job's record is written to, in the audit snapshot's directory.
 pub const RECORD_FILE: &str = "apply-result.json";
 
+/// What a job does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobKind {
+    /// A write: `knx_apply_device` or `knx_restore_parameters` with a digest.
+    Apply,
+    /// The device read and diff of `knx_plan_device` (issue #332).
+    Plan,
+}
+
+impl JobKind {
+    /// The kind as `knx_apply_status` reports it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobKind::Apply => "apply",
+            JobKind::Plan => "plan",
+        }
+    }
+}
+
+/// The outcome of claiming the slot for a plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanClaim {
+    /// A new plan job with this id; the caller starts its work.
+    New(String),
+    /// A plan job of the same device is already running under this id; the
+    /// caller waits for it instead of reading the device again.
+    Running(String),
+}
+
 /// A job's lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobState {
@@ -53,9 +97,11 @@ enum JobState {
     Done,
 }
 
-/// One apply job of this session.
+/// One job of this session.
 struct Job {
-    /// The device written.
+    /// Apply or plan.
+    kind: JobKind,
+    /// The device written or read.
     address: IndividualAddress,
     /// When the call that started the job came in.
     started_at: SystemTime,
@@ -96,6 +142,10 @@ pub struct ApplyJobs {
     inner: std::sync::Mutex<Inner>,
     /// The reply wait in milliseconds (see [`DEFAULT_REPLY_WAIT`]).
     reply_wait_ms: AtomicU64,
+    /// The read wait in milliseconds: how long a call waits for a device
+    /// read (a plan, an apply's pre-flight) before it answers with the job
+    /// (issue #332; default [`DEFAULT_REPLY_WAIT`]).
+    read_wait_ms: AtomicU64,
 }
 
 impl Default for ApplyJobs {
@@ -103,6 +153,7 @@ impl Default for ApplyJobs {
         ApplyJobs {
             inner: std::sync::Mutex::new(Inner::default()),
             reply_wait_ms: AtomicU64::new(millis(DEFAULT_REPLY_WAIT)),
+            read_wait_ms: AtomicU64::new(millis(DEFAULT_REPLY_WAIT)),
         }
     }
 }
@@ -135,6 +186,23 @@ impl ApplyJobs {
         self.reply_wait_ms.store(millis(wait), Ordering::Relaxed);
     }
 
+    /// How long a call waits for a device read (a plan, an apply's
+    /// pre-flight) before it answers with the job id.
+    pub fn read_wait(&self) -> Duration {
+        Duration::from_millis(self.read_wait_ms.load(Ordering::Relaxed))
+    }
+
+    /// Sets the read wait (tests shrink it to turn a slow plan into a job).
+    pub fn set_read_wait(&self, wait: Duration) {
+        self.read_wait_ms.store(millis(wait), Ordering::Relaxed);
+    }
+
+    /// Why a `wanting` job cannot start now: the running job, named with its
+    /// id and what to poll. `None` when the slot is free.
+    pub fn busy(&self, wanting: JobKind) -> Option<String> {
+        busy_message(&self.inner(), wanting)
+    }
+
     /// The job writing now and its device, if any.
     pub fn running(&self) -> Option<(String, IndividualAddress)> {
         let inner = self.inner();
@@ -147,49 +215,125 @@ impl ApplyJobs {
     /// or the refusal naming the job that runs.
     pub fn claim(&self, address: IndividualAddress) -> Result<String, String> {
         let mut inner = self.inner();
-        if let Some(id) = &inner.running
-            && let Some(job) = inner.jobs.get(id)
-        {
-            return Err(format!(
-                "an apply is already running on this server: job {id} for {}; one apply at a \
-                 time. Call knx_apply_status with job {id} until it is done, then plan again",
-                job.address
-            ));
+        if let Some(refusal) = busy_message(&inner, JobKind::Apply) {
+            return Err(refusal);
         }
-        let now = SystemTime::now();
-        let stamp = now
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let mut id = format!("apply-{stamp}-{address}");
-        let mut seq = 1;
-        while inner.jobs.contains_key(&id) {
-            seq += 1;
-            id = format!("apply-{stamp}-{address}-{seq}");
-        }
-        let (done, _) = tokio::sync::watch::channel(false);
-        inner.jobs.insert(
-            id.clone(),
-            Job {
-                address,
-                started_at: now,
-                finished_at: None,
-                began: Instant::now(),
-                state: JobState::Running,
-                step: "pre-flight: reading the device and checking the plan".to_string(),
-                progress: Map::new(),
-                context: Value::Null,
-                result: None,
-                record: None,
-                done,
-            },
-        );
-        inner.running = Some(id.clone());
-        Ok(id)
+        Ok(insert(&mut inner, JobKind::Apply, address))
     }
 
-    /// Drops a job whose pre-flight refused: nothing was written, and the
-    /// refusal is the call's reply.
+    /// Claims the slot for a plan of `address` (issue #332): a new job, the
+    /// running plan job of the same device, or the refusal naming the job
+    /// that runs. A new plan drops the finished plan jobs of the device (it
+    /// supersedes them).
+    pub fn claim_plan(&self, address: IndividualAddress) -> Result<PlanClaim, String> {
+        let mut inner = self.inner();
+        if let Some(id) = &inner.running
+            && let Some(job) = inner.jobs.get(id)
+            && job.kind == JobKind::Plan
+            && job.address == address
+        {
+            return Ok(PlanClaim::Running(id.clone()));
+        }
+        if let Some(refusal) = busy_message(&inner, JobKind::Plan) {
+            return Err(refusal);
+        }
+        // Inserted before the prune, so the new id never reuses a dropped one.
+        let id = insert(&mut inner, JobKind::Plan, address);
+        inner.jobs.retain(|_, job| {
+            !(job.kind == JobKind::Plan && job.address == address && job.state == JobState::Done)
+        });
+        Ok(PlanClaim::New(id))
+    }
+
+    /// Ends a job whose pre-flight refused: nothing was written. The job
+    /// stays done with the refusal as its result, for a caller that already
+    /// answered `started` (issue #332); one that gets the refusal in time
+    /// drops the job with [`ApplyJobs::abandon`].
+    pub fn refuse(&self, id: &str, reason: &str) {
+        let mut inner = self.inner();
+        if inner.running.as_deref() == Some(id) {
+            inner.running = None;
+        }
+        let Some(job) = inner.jobs.get_mut(id) else {
+            return;
+        };
+        job.state = JobState::Done;
+        job.finished_at = Some(SystemTime::now());
+        job.step = "refused".to_string();
+        job.result = Some(json!({
+            "ok": false,
+            "refused": true,
+            "address": job.address.to_string(),
+            "reason": reason,
+        }));
+        job.done.send_replace(true);
+    }
+}
+
+/// The refusal for a `wanting` job while another runs, or `None`.
+fn busy_message(inner: &Inner, wanting: JobKind) -> Option<String> {
+    let id = inner.running.as_ref()?;
+    let job = inner.jobs.get(id)?;
+    let device = job.address;
+    Some(match (job.kind, wanting) {
+        (JobKind::Apply, JobKind::Apply) => format!(
+            "an apply is already running on this server: job {id} for {device}; one apply at a \
+             time. Call knx_apply_status with job {id} until it is done, then plan again"
+        ),
+        (JobKind::Apply, JobKind::Plan) => format!(
+            "an apply is running on this server (job {id} for {device}); call \
+             knx_apply_status with job {id} until it is done, then plan again"
+        ),
+        (JobKind::Plan, _) => format!(
+            "a plan is already running on this server: job {id} reads {device}; one bus job at \
+             a time. Call knx_apply_status with job {id} until it is done, then call again"
+        ),
+    })
+}
+
+/// Inserts a new running job and marks it as the one in the slot.
+fn insert(inner: &mut Inner, kind: JobKind, address: IndividualAddress) -> String {
+    let now = SystemTime::now();
+    let stamp = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let prefix = kind.as_str();
+    let mut id = format!("{prefix}-{stamp}-{address}");
+    let mut seq = 1;
+    while inner.jobs.contains_key(&id) {
+        seq += 1;
+        id = format!("{prefix}-{stamp}-{address}-{seq}");
+    }
+    let (done, _) = tokio::sync::watch::channel(false);
+    let step = match kind {
+        JobKind::Apply => "pre-flight: reading the device and checking the plan",
+        JobKind::Plan => "reading the device",
+    };
+    inner.jobs.insert(
+        id.clone(),
+        Job {
+            kind,
+            address,
+            started_at: now,
+            finished_at: None,
+            began: Instant::now(),
+            state: JobState::Running,
+            step: step.to_string(),
+            progress: Map::new(),
+            context: Value::Null,
+            result: None,
+            record: None,
+            done,
+        },
+    );
+    inner.running = Some(id.clone());
+    id
+}
+
+impl ApplyJobs {
+    /// Drops a job: one whose pre-flight refusal is the call's reply
+    /// (nothing was written), or a plan the call answered with inline.
     pub fn abandon(&self, id: &str) {
         let mut inner = self.inner();
         inner.jobs.remove(id);
@@ -248,9 +392,11 @@ impl ApplyJobs {
             job.step = "done".to_string();
             job.result = Some(result);
             job.done.send_replace(true);
-            let address = job.address;
+            let (address, kind) = (job.address, job.kind);
             let status = job.status(id);
-            inner.last.insert(address, id.to_string());
+            if kind == JobKind::Apply {
+                inner.last.insert(address, id.to_string());
+            }
             status
         };
         persist(&status);
@@ -329,6 +475,7 @@ impl Job {
         };
         let mut status = json!({
             "job": id,
+            "kind": self.kind.as_str(),
             "address": self.address.to_string(),
             "state": state,
             "done": self.state == JobState::Done,
@@ -410,11 +557,33 @@ fn restored(mut record: Value) -> Value {
 fn next_step(status: &Value) -> String {
     let job = status["job"].as_str().unwrap_or_default();
     let address = status["address"].as_str().unwrap_or_default();
+    if status["kind"] == "plan" {
+        return match status["state"].as_str() {
+            Some("running") => format!(
+                "Still reading {address} for the plan. Call knx_apply_status with job {job} \
+                 again in a few seconds; the read continues in the server whether or not you \
+                 poll. Nothing is written."
+            ),
+            _ if status["result"]["refused"] == true => {
+                format!("The plan for {address} was refused: tell the human result.reason.")
+            }
+            _ => format!(
+                "The plan for {address} is ready: `result` is exactly what knx_plan_device \
+                 returns. Follow result.next_step: show the human result.sentences in full and \
+                 ask result.question; knx_apply_device takes result.plan_digest only after an \
+                 explicit yes."
+            ),
+        };
+    }
     match status["state"].as_str() {
         Some("running") => format!(
-            "Still writing {address} ({}). Call knx_apply_status with job {job} again in a few \
-             seconds; the job continues in the server whether or not you poll.",
+            "Still working on {address} ({}). Call knx_apply_status with job {job} again in a \
+             few seconds; the job continues in the server whether or not you poll.",
             status["step"].as_str().unwrap_or("writing")
+        ),
+        _ if status["result"]["refused"] == true => format!(
+            "Job {job} was refused in its pre-flight; nothing was written to {address}. Tell \
+             the human result.reason, then call knx_plan_device for {address} and ask again."
         ),
         Some("interrupted") => format!(
             "The server stopped while job {job} was writing {address}; the device may be partly \
@@ -478,6 +647,41 @@ mod tests {
         assert_eq!(done["state"], "done", "{done}");
         assert_eq!(done["result"]["verified"], true, "{done}");
         assert_eq!(done["from_record"], true, "{done}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_claim_plan_joins_the_same_device_and_shares_the_slot_with_apply() -> Result<(), String>
+    {
+        let jobs = ApplyJobs::new();
+        let other: IndividualAddress = "1.1.5".parse().map_err(|_| "address".to_string())?;
+        let PlanClaim::New(plan) = jobs.claim_plan(ia()?)? else {
+            return Err("the first plan must be new".into());
+        };
+        assert!(plan.starts_with("plan-"), "{plan}");
+        assert_eq!(jobs.claim_plan(ia()?)?, PlanClaim::Running(plan.clone()));
+        let refused = jobs
+            .claim_plan(other)
+            .err()
+            .ok_or("another device must wait")?;
+        assert!(refused.contains(&plan), "{refused}");
+        let refused = jobs.claim(ia()?).err().ok_or("an apply must wait")?;
+        assert!(refused.contains(&plan), "{refused}");
+        jobs.finish(&plan, json!({"ok": true}));
+        assert!(jobs.last(Path::new("/nonexistent"), ia()?).is_none());
+
+        let apply = jobs.claim(ia()?)?;
+        let refused = jobs.claim_plan(ia()?).err().ok_or("a plan must wait")?;
+        assert!(refused.contains(&apply), "{refused}");
+        jobs.refuse(&apply, "the device moved");
+        let status = jobs
+            .status(Path::new("/nonexistent"), &apply)
+            .ok_or("the refused job stays")?;
+        assert_eq!(status["result"]["refused"], true, "{status}");
+        assert!(jobs.running().is_none());
+        // A new plan of the device supersedes its finished plan job.
+        assert!(matches!(jobs.claim_plan(ia()?)?, PlanClaim::New(_)));
+        assert!(jobs.status(Path::new("/nonexistent"), &plan).is_none());
         Ok(())
     }
 
