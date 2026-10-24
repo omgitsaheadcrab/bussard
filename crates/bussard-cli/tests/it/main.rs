@@ -38,6 +38,7 @@ mod mcp_ha_stdio;
 mod mcp_parameters_mock;
 mod mcp_secure_mock;
 mod mcp_stdio;
+mod offline_oracle;
 mod plan_mock;
 mod product_store_cli;
 mod reconstruct_line_mock;

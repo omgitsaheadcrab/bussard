@@ -35,7 +35,7 @@ directory itself. Every gated test resolves all three to the vendor directory.
 $ export BUSSARD_PRODUCT_CORPUS="$PWD/tests-support/product-corpus"
 $ cargo nextest run --profile corpus \
     -p bussard-download -p bussard-prod -p bussard-cli \
-    -E 'binary(it) & test(/^(flash_corpus|flash_dryrun_system7|ets_golden|sys7_jung_m2_plan|param_readback_roundtrip|parameter_image|sys7_visible_parameters|selected|flash_dry_run)::/)'
+    -E 'binary(it) & test(/^(flash_corpus|flash_dryrun_system7|ets_golden|sys7_jung_m2_plan|param_readback_roundtrip|parameter_image|sys7_visible_parameters|selected|flash_dry_run|offline_oracle)::/)'
 ```
 
 The `corpus` nextest profile (`.config/nextest.toml`) allows a test 20 minutes:
@@ -57,9 +57,38 @@ The gated tests:
 | bussard-prod | `sys7_visible_parameters.rs` | Jung System 7 parameter images (3361, 2116, 3181) against ETS |
 | bussard-prod | `selected.rs` | a selective archive read equals the full read, on the first archives of the corpus (`BUSSARD_SELECTED_CORPUS_LIMIT`, default 6) |
 | bussard-cli | `flash_dry_run.rs` | `flash --dry-run --dump-images` of the Jung 3361-1M |
+| bussard-cli | `offline_oracle.rs` | the offline-oracle rows pass `--check` (needs `BUSSARD_ORACLE_ROWS`, see below) |
 
 `BUSSARD_UPDATE_SWEEP_MANIFEST=1` regenerates the sweep baseline instead of
 comparing against it; review and commit the diff.
+
+## The offline oracle rows (`BUSSARD_ORACLE_ROWS`)
+
+`offline_oracle.rs` (bussard-cli) runs `scripts/campaign/95-offline-oracle.sh
+--check` over the campaign rows files with the build's `bussard` (issue #347).
+Every row whose capture and product exist must give its expected verdict
+(identical unless the row says `expect=...`) and at least the coverage recorded
+in its `coverage` column; rows without a capture are skipped. Coverage is the
+share of the octets bussard places that the capture holds, per segment and per
+256-octet page; a matching row below 50 %, or with a page that has placed
+octets and none compared, is "not comparable (thin)". The row format, the
+`#@` per-file options and the coverage rule are documented in the script
+header.
+
+| Variable | Meaning |
+|---|---|
+| `BUSSARD_ORACLE_ROWS` | rows files, `:`-separated; relative to `BUSSARD_ORACLE_ROOT` |
+| `BUSSARD_ORACLE_ROOT` | where the rows' relative capture and product paths resolve (default: the workspace root) |
+| `BUSSARD_ORACLE_DIR` | the model directory for every file (`--dir`; else the file's `#@ --dir`, else `knx`). Use a copy. |
+
+```console
+$ BUSSARD_ORACLE_ROWS=captures/campaign/rows/rows-house-16.txt BUSSARD_ORACLE_ROOT=$PWD \
+    BUSSARD_ORACLE_DIR=/tmp/knx-copy \
+    cargo nextest run --profile corpus -p bussard-cli -E 'test(/^offline_oracle::/)'
+```
+
+The ungated `test_offline_oracle_check_skips_a_row_without_its_capture` runs
+the script's `--check` path on every CI run (POSIX hosts with `python3`).
 
 ## ETS project exports
 

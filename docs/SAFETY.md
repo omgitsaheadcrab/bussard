@@ -601,10 +601,12 @@ association tables identical, the group key table (PID 53) and the object
 security flags (PID 61) hash-equal, and the same differences every Secure row
 shows (ETS's commissioning writes of PID 51, 56 and 59, and the PID 54
 sequence numbers, which an offline run cannot know). The row is in the
-campaign rows file. Two conditions for that comparison: the keyring given to
-the oracle must be a key store export without the removed keys (the script
-hands the keyring to the bussard dry run too, where it overrides the key
-store), and the model copy must have `admit_tunnel_senders = false`.
+campaign rows file. The capture rewrote the tables and the security object
+only (1 of 943 placed parameter octets), so the row is judged with
+`scope=addr,assoc`: 184 of 184 table octets compared. Since issue #347 the
+script plans the bussard side with the model's key store and uses the keyring
+only to decode the capture, and it honours the model's
+`admit_tunnel_senders` (`--no-admit` plans without it).
 
 `bussard groups secure <GA> off` (or `knx_set_group` with `secure: false`)
 lets a Secure device run one group address plain, for example so a

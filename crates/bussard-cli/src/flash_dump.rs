@@ -10,8 +10,10 @@
 //!   it (System 7 AbsSegments, `WriteMem`), else the target object and offset
 //!   (System B `WriteRelMem`: the device chooses the segment base), plus the
 //!   segment id, length and SHA-256 (and, for a System 7 segment, its
-//!   `write_mode`: `read-compare` or `blind`, issue #133); the allocation records; and the table
-//!   images with their addresses;
+//!   `write_mode`: `read-compare` or `blind`, issue #133), and the octets a
+//!   parameter placement wrote in it (`placed`: count and offset ranges, the
+//!   denominator of the oracle's coverage, issue #347); the allocation
+//!   records; and the table images with their addresses;
 //! - one `.bin` per streamed image with the exact bytes the executor sends
 //!   (`0x<addr>.bin` for an absolute write, `obj<N>_<segment>.bin` for a
 //!   relative one), and a `.mask.bin` beside it when a System 7 segment masks
@@ -87,6 +89,12 @@ fn image_record(
         Some(mask) => Some(write_file(dir, used, stem, step, ".mask.bin", mask)?),
         None => None,
     };
+    // The octets a parameter placement wrote (issue #347): the denominator of
+    // the oracle's coverage figure. `null` for a segment no parameter lands in.
+    let placed = plan.placed_octets(&image.segment_id).map(|set| {
+        let ranges = placed_ranges(set);
+        json!({ "octets": set.len(), "ranges": ranges })
+    });
     Ok(json!({
         "segment_id": image.segment_id,
         "image_kind": image.kind.to_string(),
@@ -97,7 +105,20 @@ fn image_record(
         "sha256": sha256_hex(bytes),
         "file": file,
         "mask_file": mask_file,
+        "placed": placed,
     }))
+}
+
+/// The half-open `[start, end)` offset runs of a set of placed octets.
+fn placed_ranges(set: &BTreeSet<usize>) -> Vec<[usize; 2]> {
+    let mut ranges: Vec<[usize; 2]> = Vec::new();
+    for &i in set {
+        match ranges.last_mut() {
+            Some(last) if last[1] == i => last[1] = i + 1,
+            _ => ranges.push([i, i + 1]),
+        }
+    }
+    ranges
 }
 
 /// The `PID_MAX_APDU_LENGTH` the dump assumes when it splits the security
@@ -382,6 +403,13 @@ mod tests {
     #[test]
     fn test_file_safe_replaces_separators() {
         assert_eq!(file_safe("M-0004_A-1/RS 04"), "M-0004_A-1_RS_04");
+    }
+
+    #[test]
+    fn test_placed_ranges_merges_adjacent_offsets() {
+        let set: BTreeSet<usize> = [0, 1, 2, 5, 7, 8].into_iter().collect();
+        assert_eq!(placed_ranges(&set), vec![[0, 3], [5, 6], [7, 9]]);
+        assert!(placed_ranges(&BTreeSet::new()).is_empty());
     }
 
     #[test]

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Offline conformance oracle for the physical campaign (issue #89).
 #
-#   scripts/campaign/95-offline-oracle.sh --rows rows.txt [--dir knx] [--out DIR]
+#   scripts/campaign/95-offline-oracle.sh --rows rows.txt [--dir knx] [--out DIR] [--check]
 #   scripts/campaign/95-offline-oracle.sh --row '1.1.5|ets.pcapng|vendor.knxprod|M-0001_A-...'
 #   scripts/campaign/95-offline-oracle.sh \
 #       --keyring project.knxkeys --row '1.1.12|secure.pcapng|project.knxproj|M-0004_A-...'
+#
+# Options: --dir MODEL (default knx), --out DIR, --keyring FILE, --no-admit,
+# --min-coverage PERCENT (default 50), --check, --date YYYY-MM-DD.
 #
 # Before a real device is flashed, compare the memory images bussard WOULD
 # write to it against what ETS actually wrote to the same device in an existing
@@ -12,8 +15,9 @@
 # `flash --dry-run --dump-images` (no gateway is resolved, no connection is
 # opened) and knxtrace composes the ETS image from the capture offline.
 #
-# A row is `device|capture|product|application|note`, one per line in the rows
-# file (`#` starts a comment, blank lines are skipped):
+# A row is `device|capture|product|application|note|coverage|options`, one per
+# line in the rows file (a line starting with `#` is a comment, blank lines are
+# skipped; the last two fields are optional):
 #
 #   device       the individual address, e.g. 1.1.5
 #   capture      the ETS download capture (.pcap/.pcapng) that programs it
@@ -26,14 +30,51 @@
 #                only the `|` separators and the ends of a field are trimmed.
 #   application  optional --application ref (empty: the sole application)
 #   note         optional free text, shown when the row is not comparable
+#   coverage     optional: the coverage percent recorded for the row (see
+#                below); a later run below it is a coverage drop
+#   options      optional, space-separated:
+#                expect=VERDICT  the verdict the row is known to give
+#                                (identical, differs or not-comparable; default
+#                                identical), e.g. for a capture that predates a
+#                                model change
+#                scope=R1,R2     the regions the verdict and coverage judge
+#                                (addr, assoc, gobj, par, seg0x4800, ...), for a
+#                                capture that by design downloads only part of
+#                                the device: a security change rewrites the
+#                                tables, not the parameters
+#
+# A line `#@ <options>` in a rows file sets options for that file: --keyring,
+# --dir, --no-admit, --min-coverage. An option on the command line wins.
+#
+# Coverage (issue #347): of the octets bussard places (the octets a parameter
+# placement wrote, or every written octet of a table or code image), the share
+# the capture holds a value for, per segment and per 256-octet page. ETS
+# read-compares or skips what a device already holds, so a capture can match
+# while covering almost nothing. A row whose images match but whose coverage is
+# below --min-coverage, or that has a page with placed octets and none
+# compared, is "not comparable" (thin), never "identical". The summary shows
+# the figure per row.
+#
+# --check turns the run into a gate (the corpus-gated CI test uses it): every
+# row whose capture and product exist must give its expected verdict and at
+# least its recorded coverage, else the script exits 1. Rows without a capture
+# or product data are skipped.
 #
 # --keyring FILE names the ETS .knxkeys export for KNX Data Secure captures. It
-# is passed to `knxtrace image`, which then verifies and decrypts the secured
-# frames (without it a Secure download composes to nothing), and to the
-# bussard dry run, which then plans the secured download. The password comes
-# from $BUSSARD_KEYRING_PASSWORD (exported, or from the model's .env, see
-# load_dotenv in common.sh), never the command line. `knxtrace imgdiff`
-# reads the already decrypted image directory and needs no keyring.
+# is passed to `knxtrace image` only, which then verifies and decrypts the
+# secured frames (without it a Secure download composes to nothing). The
+# bussard dry run plans with the model's own key material, as a flash would:
+# the key store `bussard.keys` in --dir (else the model's connection.keyring);
+# $BUSSARD_KEYRING is cleared for it, so an ETS keyring never re-adds a key the
+# model removed (issue #336). The password comes from
+# $BUSSARD_KEYRING_PASSWORD (exported, or from the model's .env, see
+# load_dotenv in common.sh), never the command line. `knxtrace imgdiff` reads
+# the already decrypted image directory and needs no keyring.
+#
+# The dry run honours `[connection] admit_tunnel_senders` of the model, as a
+# flash does; the script prints the setting. --no-admit plans as if it were
+# false (a shadow of --dir under $OUT/.model with only bussard.toml changed),
+# for a capture ETS made without the tunnelling senders in PID 54.
 #
 # Per device the result is identical / differs (octets, first differing
 # offset, both hex excerpts, per region) / not comparable (why), plus the
@@ -48,6 +89,10 @@ ROWS_FILE=""
 SINGLE_ROW=""
 OUT=""
 KEYRING=""
+NO_ADMIT=0
+MIN_COVERAGE=""
+CHECK=0
+CLI_DIR=0
 PYTHON="${PYTHON:-python3}"
 
 while [ $# -gt 0 ]; do
@@ -56,24 +101,51 @@ while [ $# -gt 0 ]; do
     --rows=*)  ROWS_FILE="${1#*=}" ;;
     --row)     SINGLE_ROW="${2:?--row needs device|capture|product[|application]}"; shift ;;
     --row=*)   SINGLE_ROW="${1#*=}" ;;
-    --dir)     MODEL_DIR="${2:?--dir needs a directory}"; shift ;;
-    --dir=*)   MODEL_DIR="${1#*=}" ;;
+    --dir)     MODEL_DIR="${2:?--dir needs a directory}"; CLI_DIR=1; shift ;;
+    --dir=*)   MODEL_DIR="${1#*=}"; CLI_DIR=1 ;;
     --out)     OUT="${2:?--out needs a directory}"; shift ;;
     --out=*)   OUT="${1#*=}" ;;
     --date)    CAMPAIGN_DATE="${2:?--date needs YYYY-MM-DD}"; shift ;;
     --date=*)  CAMPAIGN_DATE="${1#*=}" ;;
     --keyring) KEYRING="${2:?--keyring needs a .knxkeys file}"; shift ;;
     --keyring=*) KEYRING="${1#*=}" ;;
-    -h|--help) sed -n '2,42p' "$0"; exit 0 ;;
+    --no-admit) NO_ADMIT=1 ;;
+    --min-coverage) MIN_COVERAGE="${2:?--min-coverage needs a percent}"; shift ;;
+    --min-coverage=*) MIN_COVERAGE="${1#*=}" ;;
+    --check)   CHECK=1 ;;
+    -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)         die "unknown argument: $1" ;;
   esac
   shift
 done
 
-load_dotenv
 [ -n "$ROWS_FILE" ] || [ -n "$SINGLE_ROW" ] || die "pass --rows FILE or --row 'device|capture|product[|application]'"
+
+# `#@ <options>` lines of the rows file: defaults for options the command line
+# did not give.
+if [ -n "$ROWS_FILE" ] && [ -f "$ROWS_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '#@'*) ;; *) continue ;; esac
+    read -r -a directive <<<"${line#\#@}"
+    set -- ${directive+"${directive[@]}"}
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --keyring)      [ -n "$KEYRING" ] || KEYRING="${2:?#@ --keyring needs a file}"; shift ;;
+        --dir)          [ "$CLI_DIR" = 1 ] || MODEL_DIR="${2:?#@ --dir needs a directory}"; shift ;;
+        --min-coverage) [ -n "$MIN_COVERAGE" ] || MIN_COVERAGE="${2:?#@ --min-coverage needs a percent}"; shift ;;
+        --no-admit)     NO_ADMIT=1 ;;
+        *)              die "$ROWS_FILE: unknown #@ option: $1" ;;
+      esac
+      shift
+    done
+  done <"$ROWS_FILE"
+fi
+MIN_COVERAGE="${MIN_COVERAGE:-50}"
+
+load_dotenv
 [ -n "$OUT" ] || OUT="$(campaign_root)/offline-oracle"
 [ -x "$BUSSARD_BIN" ] || die "no bussard binary at $BUSSARD_BIN (cargo build, or export BUSSARD_BIN)"
+[ -d "$MODEL_DIR" ] || die "no model directory at $MODEL_DIR"
 ensure_dir "$OUT"
 
 KEYRING_ARGS=()
@@ -81,6 +153,59 @@ if [ -n "$KEYRING" ]; then
   [ -f "$KEYRING" ] || die "no keyring at $KEYRING"
   [ -n "${BUSSARD_KEYRING_PASSWORD:-}" ] || die "--keyring needs the keyring password in \$BUSSARD_KEYRING_PASSWORD (export it or put it in the model's .env)"
   KEYRING_ARGS=(--keyring "$KEYRING")
+fi
+
+# The bussard side's key material and admission (issue #347): the model's key
+# store, never the capture's keyring.
+if [ -f "$MODEL_DIR/bussard.keys" ]; then
+  note "bussard side: key store $MODEL_DIR/bussard.keys${KEYRING:+ (the keyring only decodes the capture)}"
+else
+  note "bussard side: no key store in $MODEL_DIR (connection.keyring of the model, if any)"
+fi
+
+# `[connection] admit_tunnel_senders` of a bussard.toml: true or false.
+admit_setting() {
+  "$PYTHON" - "$1" <<'PY'
+import re, sys
+section, value = None, "false"
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+except OSError:
+    lines = []
+for line in lines:
+    line = line.split("#", 1)[0].strip()
+    m = re.match(r"^\[\s*([^\]]+?)\s*\]$", line)
+    if m:
+        section = m.group(1)
+        continue
+    m = re.match(r"^admit_tunnel_senders\s*=\s*(true|false)$", line)
+    if section == "connection" and m:
+        value = m.group(1)
+print(value)
+PY
+}
+
+PLAN_DIR="$MODEL_DIR"
+ADMIT="$(admit_setting "$MODEL_DIR/bussard.toml")"
+if [ "$ADMIT" = "true" ] && [ "$NO_ADMIT" = 1 ]; then
+  # A shadow of the model: every entry linked, bussard.toml copied with the
+  # setting off. The model itself is never written.
+  PLAN_DIR="$OUT/.model"
+  rm -rf "$PLAN_DIR"; ensure_dir "$PLAN_DIR"
+  abs_model="$(cd "$MODEL_DIR" && pwd)"
+  for entry in "$abs_model"/* "$abs_model"/.[!.]*; do
+    [ -e "$entry" ] || continue
+    [ "$(basename "$entry")" = "bussard.toml" ] && continue
+    ln -s "$entry" "$PLAN_DIR/$(basename "$entry")"
+  done
+  sed -E 's/^([[:space:]]*admit_tunnel_senders[[:space:]]*=[[:space:]]*)true/\1false/' \
+    "$abs_model/bussard.toml" >"$PLAN_DIR/bussard.toml"
+  note "admit_tunnel_senders = true in the model; --no-admit plans without it ($PLAN_DIR)"
+elif [ "$NO_ADMIT" = 1 ]; then
+  note "admit_tunnel_senders = false in the model (--no-admit changes nothing)"
+else
+  note "admit_tunnel_senders = $ADMIT (from the model; --no-admit plans without it)"
 fi
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
@@ -97,6 +222,19 @@ with open(path, "w", encoding="utf-8") as fh:
                "ets_only_octets": 0, "ets_only_ranges": []}, fh, indent=2)
 EOF
   note "$device: not comparable ($reason)"
+}
+
+# Marks a row --check skips (no capture or product data to run it with).
+mark_skipped() {
+  "$PYTHON" - "$1/row.json" "$2" <<'PY'
+import json, sys
+path, why = sys.argv[1:3]
+with open(path, encoding="utf-8") as fh:
+    row = json.load(fh)
+row["skipped"] = why
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(row, fh)
+PY
 }
 
 # Resolves `wrapper.zip!inner` to an extracted file under $OUT/.products.
@@ -122,23 +260,47 @@ EOF
   esac
 }
 
+# Runs one row into $OUT/<key> (the device address, with ~2, ~3 for a device
+# that has more than one row).
 run_row() {
-  local line="$1" device capture product application note_text
-  IFS='|' read -r device capture product application note_text <<<"$line"
+  local line="$1" key="$2" device capture product application note_text recorded options
+  IFS='|' read -r device capture product application note_text recorded options <<<"$line"
   device="$(trim "$device")"; capture="$(trim "${capture:-}")"
   product="$(trim "${product:-}")"; application="$(trim "${application:-}")"
-  note_text="$(trim "${note_text:-}")"
+  note_text="$(trim "${note_text:-}")"; recorded="$(trim "${recorded:-}")"
+  options="$(trim "${options:-}")"
+  local expect="" scope="" word
+  for word in $options; do
+    case "$word" in
+      expect=*) expect="${word#expect=}" ;;
+      scope=*)  scope="${word#scope=}" ;;
+      *)        die "$device: unknown row option: $word (expect=..., scope=...)" ;;
+    esac
+  done
+  local scope_args=()
+  [ -n "$scope" ] && scope_args=(--scope "$scope")
   [ -n "$device" ] || return 0
-  local dir="$OUT/$device"
+  local dir="$OUT/$key"
   rm -rf "$dir"; ensure_dir "$dir"
-  say "$device"
+  say "$key${note_text:+  ($note_text)}"
 
+  # The row's recorded coverage and expected verdict, for the summary and
+  # --check (written next to the result, whatever the result is).
+  "$PYTHON" - "$dir/row.json" "$recorded" "$expect" <<'PY'
+import json, sys
+path, recorded, expect = sys.argv[1:4]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump({"recorded_coverage": float(recorded.rstrip("% ")) if recorded else None,
+               "expect": expect or "identical", "skipped": None}, fh)
+PY
   if [ -z "$product" ] || [ "$product" = "-" ]; then
     not_comparable "$dir" "$device" "no product data${note_text:+: $note_text}"
+    mark_skipped "$dir" "no product data"
     return 0
   fi
   if [ ! -f "$capture" ]; then
     not_comparable "$dir" "$device" "capture not found"
+    mark_skipped "$dir" "capture not found"
     return 0
   fi
 
@@ -158,17 +320,20 @@ run_row() {
   fi
   local app_args=()
   [ -n "$application" ] && app_args=(--application "$application")
-  if ! "$BUSSARD_BIN" flash "$device" --product "$prod" ${app_args+"${app_args[@]}"} \
-       ${KEYRING_ARGS+"${KEYRING_ARGS[@]}"} \
-       --dir "$MODEL_DIR" --dry-run --dump-images "$dir/bussard" --json \
+  # No --keyring and no $BUSSARD_KEYRING: the model's key store decides.
+  if ! env -u BUSSARD_KEYRING "$BUSSARD_BIN" flash "$device" --product "$prod" \
+       ${app_args+"${app_args[@]}"} \
+       --dir "$PLAN_DIR" --dry-run --dump-images "$dir/bussard" --json \
        >"$dir/plan.log" 2>"$dir/plan.err"; then
     not_comparable "$dir" "$device" "bussard refused to plan: $(grep -v '^\s*$' "$dir/plan.err" | tail -1 | cut -c1-160)"
     return 0
   fi
 
   # 3. The per-region diff.
-  "$PYTHON" "$KNXTRACE" imgdiff "$dir/bussard" "$dir/ets" --json >"$dir/diff.json"
-  "$PYTHON" "$KNXTRACE" imgdiff "$dir/bussard" "$dir/ets" >"$dir/diff.txt"
+  "$PYTHON" "$KNXTRACE" imgdiff "$dir/bussard" "$dir/ets" --min-coverage "$MIN_COVERAGE" \
+    ${scope_args+"${scope_args[@]}"} --json >"$dir/diff.json"
+  "$PYTHON" "$KNXTRACE" imgdiff "$dir/bussard" "$dir/ets" --min-coverage "$MIN_COVERAGE" \
+    ${scope_args+"${scope_args[@]}"} >"$dir/diff.txt"
   sed 's/^/  /' "$dir/diff.txt"
   if [ -n "$note_text" ]; then
     "$PYTHON" - "$dir/diff.json" "$note_text" <<'EOF'
@@ -184,37 +349,65 @@ EOF
 }
 
 DEVICES_RUN=()
+# A result key per row: the device, made unique within this run.
+row_key() {
+  local device="$1" key="$1" n=1 seen
+  while :; do
+    seen=0
+    for k in ${DEVICES_RUN+"${DEVICES_RUN[@]}"}; do [ "$k" = "$key" ] && seen=1; done
+    [ "$seen" = 0 ] && break
+    n=$((n + 1)); key="$device~$n"
+  done
+  printf '%s' "$key"
+}
 if [ -n "$SINGLE_ROW" ]; then
-  run_row "$SINGLE_ROW"
-  DEVICES_RUN[${#DEVICES_RUN[@]}]="$(trim "${SINGLE_ROW%%|*}")"
+  key="$(row_key "$(trim "${SINGLE_ROW%%|*}")")"
+  run_row "$SINGLE_ROW" "$key"
+  DEVICES_RUN[${#DEVICES_RUN[@]}]="$key"
 else
   [ -f "$ROWS_FILE" ] || die "no rows file at $ROWS_FILE"
   while IFS= read -r line || [ -n "$line" ]; do
-    line="${line%%#*}"
-    [ -n "$(trim "$line")" ] || continue
-    run_row "$line"
-    DEVICES_RUN[${#DEVICES_RUN[@]}]="$(trim "${line%%|*}")"
+    # A comment is a whole line (a note may hold `#331`).
+    case "$(trim "$line")" in ''|'#'*) continue ;; esac
+    key="$(row_key "$(trim "${line%%|*}")")"
+    run_row "$line" "$key"
+    DEVICES_RUN[${#DEVICES_RUN[@]}]="$key"
   done <"$ROWS_FILE"
 fi
 
 rule
 say "Summary ($OUT)"
-"$PYTHON" - "$OUT" ${DEVICES_RUN+"${DEVICES_RUN[@]}"} <<'EOF'
+"$PYTHON" - "$OUT" "$CHECK" ${DEVICES_RUN+"${DEVICES_RUN[@]}"} <<'EOF'
 import json, os, sys
-out, devices = sys.argv[1], sys.argv[2:]
+out, check, devices = sys.argv[1], sys.argv[2] == "1", sys.argv[3:]
+failures = []
 short = {"address table": "addr", "association table": "assoc",
          "group-object table": "gobj", "parameters": "par"}
-print("%-9s %-6s %-15s %s" % ("device", "system", "verdict", "regions (differing/compared octets)"))
+print("%-9s %-6s %-15s %-16s %s" % (
+    "device", "system", "verdict", "coverage", "regions (differing/compared octets)"))
 for dev in devices:
     try:
         with open(os.path.join(out, dev, "diff.json"), encoding="utf-8") as fh:
             r = json.load(fh)
     except (OSError, ValueError):
-        print("%-9s %-6s %-15s %s" % (dev, "?", "error", "no result"))
+        print("%-9s %-6s %-15s %-16s %s" % (dev, "?", "error", "-", "no result"))
+        failures.append("%s: no result" % dev)
         continue
+    try:
+        with open(os.path.join(out, dev, "row.json"), encoding="utf-8") as fh:
+            row = json.load(fh)
+    except (OSError, ValueError):
+        row = {"recorded_coverage": None, "expect": "identical", "skipped": None}
+    cov = r.get("coverage") or {}
+    cov_text = "%.1f%%%s" % (cov["percent"], " thin" if cov.get("thin") else "") if cov else "-"
+    recorded = row.get("recorded_coverage")
+    if recorded is not None:
+        cov_text += " (%g)" % recorded
     parts = []
     for reg in r.get("regions", []):
         name = short.get(reg["region"], reg["region"].replace("app segment ", "seg").replace("application ", "app"))
+        if not reg.get("in_scope", True):
+            name = "(%s)" % name
         if reg["verdict"] == "identical":
             parts.append("%s=ok(%d)" % (name, reg["compared"]))
         elif reg["verdict"] == "differs":
@@ -231,5 +424,21 @@ for dev in devices:
         detail += "  props=differs(bussard-only %d, ets-only %d, value %d)" % (
             len(props.get("bussard_only", [])), len(props.get("ets_only", [])),
             props.get("value_counts", {}).get("differs", 0))
-    print("%-9s %-6s %-15s %s" % (dev, r.get("system") or "-", r["verdict"], detail))
+    if r.get("verdict") == "not-comparable" and parts and not r.get("reason", "").startswith("thin"):
+        detail += "  (%s)" % (r.get("reason") or "nothing compared")
+    print("%-9s %-6s %-15s %-16s %s" % (dev, r.get("system") or "-", r["verdict"], cov_text, detail))
+    if row.get("skipped"):
+        continue
+    if r["verdict"] != row.get("expect", "identical"):
+        failures.append("%s: %s, expected %s" % (dev, r["verdict"], row.get("expect")))
+    if recorded is not None and cov.get("percent", 0.0) + 0.05 < recorded:
+        failures.append("%s: coverage %.1f %% dropped below the recorded %g %%" % (
+            dev, cov.get("percent", 0.0), recorded))
+if check:
+    if failures:
+        print("check failed:")
+        for f in failures:
+            print("  " + f)
+        sys.exit(1)
+    print("check passed")
 EOF

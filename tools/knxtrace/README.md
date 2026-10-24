@@ -17,7 +17,7 @@ uv run tools/knxtrace/knxtrace.py trace   <capture> [--device 1.1.5] [--service 
 uv run tools/knxtrace/knxtrace.py ops     <capture> [--device 1.1.5] [--json]
 uv run tools/knxtrace/knxtrace.py diff    <a> <b> --device 1.1.5 [--json] [--only-real]
 uv run tools/knxtrace/knxtrace.py image   <capture> --device 1.1.5 --out <dir>
-uv run tools/knxtrace/knxtrace.py imgdiff <bussard-dump-dir> <image-dir> [--json]
+uv run tools/knxtrace/knxtrace.py imgdiff <bussard-dump-dir> <image-dir> [--json] [--min-coverage 50] [--scope addr,assoc]
 ```
 
 `devices`, `trace`, `ops`, `diff` and `image` also take `--keyring
