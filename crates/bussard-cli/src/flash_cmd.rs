@@ -522,7 +522,20 @@ pub fn run(
                             }
                             _ => None,
                         };
-                        Ok::<_, ServiceError>((r, resident, current, (preread, sys7)))
+                        // PID 61 of a Secure System B device (issue #331), so
+                        // the plan can name a group address that leaves or
+                        // joins Data Secure. Informational: a refused read
+                        // leaves it out.
+                        let flags = match planned {
+                            Some(plan) if secure_probe && !plan.is_sys7() && !parameters_only => {
+                                bussard_download::read_security_flags(dev.l4_mut())
+                                    .await
+                                    .ok()
+                                    .flatten()
+                            }
+                            _ => None,
+                        };
+                        Ok::<_, ServiceError>((r, resident, current, (preread, sys7, flags)))
                     };
                     let outcome = body(&mut dev).await;
                     // Keep a complete pre-flight's connection for the write
@@ -546,10 +559,12 @@ pub fn run(
             // connect-then-disconnect on the descriptor read is the diagnostic
             // pattern (see `descriptor_read_error`).
             let (connected, result, resident, current, preread, sys7, kept) = match session {
-                Ok(((r, resident, current, (preread, sys7)), kept)) => {
-                    (true, r, resident, current, preread, sys7, kept)
+                Ok(((r, resident, current, (preread, sys7, flags)), kept)) => {
+                    (true, r, resident, current, preread, (sys7, flags), kept)
                 }
-                Err(ServiceError::Mgmt(err)) => (false, Err(err), None, None, None, None, None),
+                Err(ServiceError::Mgmt(err)) => {
+                    (false, Err(err), None, None, None, (None, None), None)
+                }
                 Err(err) => return Err(anyhow::Error::new(err)),
             };
             anyhow::Ok((
@@ -573,7 +588,8 @@ pub fn run(
         runtime.block_on(handle.wait_connected(handle.reconnect_budget()));
     };
 
-    let (connected, device_mask, resident, facts, current, preread, sys7, kept) = probe;
+    let (connected, device_mask, resident, facts, current, preread, (sys7, live_flags), kept) =
+        probe;
     if let Some(l4) = kept {
         handover.keep(l4);
     }
@@ -676,6 +692,20 @@ pub fn run(
             return Ok(ExitCode::FAILURE);
         }
     };
+    // A group address that leaves or joins Data Secure (issue #331): the
+    // security program against the PID 61 the pre-flight read.
+    if let Some(line) = live_flags.as_deref().and_then(|flags| {
+        let links = model
+            .as_ref()
+            .and_then(|m| m.links.links.get(&target))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        bussard_service::security_change::from_flash_plan(target, &plan, links, flags)
+            .and_then(|change| change.change(model.as_ref()))
+    }) && !output.json
+    {
+        println!("{}", line.line());
+    }
 
     // The parameter-level plan (issue #109): what this flash changes in the
     // vendor's own words, before the memory-level plan. The current values were
@@ -879,6 +909,22 @@ pub fn run(
                     ),
                     Ok(false) => {}
                     Err(err) => eprintln!("warning: {err}"),
+                }
+                // And the group-object flags it wrote (PID 61, issue #331).
+                if let Some(objects) =
+                    bussard_service::security_change::flash_secured_objects(&plan)
+                {
+                    match bussard_service::security_change::record_security_flags(
+                        dir, target, &objects,
+                    ) {
+                        Ok(true) => println!(
+                            "recorded {target}'s group-object security flags (PID 61, {} \
+                             secured object(s)) in bussard.lock",
+                            objects.len()
+                        ),
+                        Ok(false) => {}
+                        Err(err) => eprintln!("warning: {err}"),
+                    }
                 }
             }
             if params_failure.is_some() {

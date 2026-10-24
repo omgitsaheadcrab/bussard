@@ -83,6 +83,23 @@ directory or a script from before these changes needs:
   the address plain, or route through a plain address into a logic input).
   `bussard validate` and `knx_validate` list them, `knx_add_link` refuses such
   a link, and `knx_plan_device` refuses to plan the plain device.
+
+- Switch KNX Data Secure off (or on) for one group address end to end
+  (#331). `bussard groups secure <GA> on|off` and `knx_set_group` with
+  `secure` change the three signals together: the group key in the key
+  store, the group's `secure` flag and every linked com-object's flag, in one
+  snapshot that keeps a copy of the encrypted key store, so `undo` restores
+  the very key. `on` generates a random group key as ETS does when the store
+  has none. `plan`/`apply` (and `knx_plan_device`/`knx_apply_device`) on a
+  Secure System B device read its group-object security flags (PID 61) and
+  list one security-object change naming the group address and the objects;
+  the apply rewrites the security object as a full ETS download does (group
+  key table without the entry, the objects' flags `0x00`) and records the
+  flags in the lock. `flash` prints the same line. The result tells Home
+  Assistant users to load a new `bussard keys export`. The write is oracle
+  pending: an ETS capture of 1.1.5 with 1/0/4 set to security Off must
+  compare identical before it runs on a real device (SAFETY.md).
+
 - `knx_remove_group` and `knx_discard_edits` (#305). `knx_remove_group`
   removes a group address from `groups.toml`; it is refused while a link uses
   the address (the reason lists the links and names `knx_remove_link`) and for

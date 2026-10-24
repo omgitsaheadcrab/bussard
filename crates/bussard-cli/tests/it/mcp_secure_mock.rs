@@ -156,6 +156,9 @@ struct SecurityLog {
     pid54: Vec<u8>,
     /// How many times PID 54 was read.
     pid54_reads: usize,
+    /// The group-object security flags (PID 61) the device holds, one octet
+    /// per group object, as the writes leave it (issue #331).
+    pid61: Vec<u8>,
 }
 
 /// The security object header fields of an `A_PropertyExt*` payload:
@@ -173,17 +176,31 @@ fn ext_header(data: &[u8]) -> Option<(u16, u16)> {
 fn secure_device(log: Arc<Mutex<SecurityLog>>) -> TestResult<MockDevice> {
     // The synthetic application, Loaded, with its parameter segment holding
     // threshold 7 (the model asks for 12) and the switch off.
-    secure_device_with(log, &["1/2/0"], &[(1, 20)], &[7, 0])
+    secure_device_with(log, &["1/2/0"], &[(1, 20)], &[7, 0], &[])
 }
 
 /// [`secure_device`] holding the address table `addresses`, the
-/// associations `associations` and the parameter octets `params`.
+/// associations `associations`, the parameter octets `params` and the
+/// group objects `secured` flagged `0x03` in PID 61.
 fn secure_device_with(
     log: Arc<Mutex<SecurityLog>>,
     addresses: &[&str],
     associations: &[(u16, u16)],
     params: &[u8],
+    secured: &[u16],
 ) -> TestResult<MockDevice> {
+    {
+        let mut flags = vec![0u8; usize::from(GO_COUNT)];
+        for object in secured {
+            if let Some(flag) = usize::from(*object)
+                .checked_sub(1)
+                .and_then(|i| flags.get_mut(i))
+            {
+                *flag = 0x03;
+            }
+        }
+        log.lock().map_err(|_| "log poisoned")?.pid61 = flags;
+    }
     let mut address_table = u16::try_from(addresses.len())?.to_be_bytes().to_vec();
     for address in addresses {
         address_table.extend_from_slice(&ga(address)?.raw().to_be_bytes());
@@ -237,10 +254,23 @@ fn secure_device_with(
                     ))
                 }
                 A_PROPERTY_EXT_VALUE_READ if pid == PID_GO_SECURITY_FLAGS => {
-                    // Only the element count (start 0) is asked for.
+                    // The element count (start 0), or the flags the device
+                    // holds (issue #331).
+                    let count = *data.get(5)?;
+                    let start = u16::from_be_bytes([*data.get(6)?, *data.get(7)?]);
+                    let log = log.lock().ok()?;
                     let mut out = header;
-                    out.extend_from_slice(&[1, 0, 0]);
-                    out.extend_from_slice(&GO_COUNT.to_be_bytes());
+                    if start == 0 {
+                        out.extend_from_slice(&[1, 0, 0]);
+                        out.extend_from_slice(&GO_COUNT.to_be_bytes());
+                    } else {
+                        let from = usize::from(start) - 1;
+                        let to = (from + usize::from(count)).min(log.pid61.len());
+                        let elements = log.pid61.get(from..to)?.to_vec();
+                        out.push(u8::try_from(elements.len()).ok()?);
+                        out.extend_from_slice(&start.to_be_bytes());
+                        out.extend_from_slice(&elements);
+                    }
                     Some(Reaction::Answer(A_PROPERTY_EXT_VALUE_RESPONSE, out))
                 }
                 A_PROPERTY_EXT_VALUE_READ if pid == PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE => {
@@ -268,6 +298,14 @@ fn secure_device_with(
                     let start = u16::from_be_bytes([*data.get(6)?, *data.get(7)?]);
                     if let Ok(mut log) = log.lock() {
                         let octets = data.get(8..).unwrap_or(&[]).to_vec();
+                        if pid == PID_GO_SECURITY_FLAGS && start > 0 {
+                            let from = usize::from(start) - 1;
+                            for (i, flag) in octets.iter().enumerate() {
+                                if let Some(slot) = log.pid61.get_mut(from + i) {
+                                    *slot = *flag;
+                                }
+                            }
+                        }
                         if pid == PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE {
                             if start == 0 {
                                 // The count-0 clear.
@@ -312,6 +350,13 @@ impl Server {
 
     /// [`Server::start`] with another keyring (or key store) file.
     fn start_with(dir: &Path, port: u16, extra: &[&str], keyring: &Path) -> TestResult<Server> {
+        let mut args = vec!["--no-model-edits"];
+        args.extend_from_slice(extra);
+        Server::spawn(dir, port, &args, keyring)
+    }
+
+    /// Starts the server with the model-edit tools and `extra` flags.
+    fn spawn(dir: &Path, port: u16, extra: &[&str], keyring: &Path) -> TestResult<Server> {
         let mut child = Command::new(env!("CARGO_BIN_EXE_bussard"))
             .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
             .env("BUSSARD_ADDRESS_PROBE_MS", "200")
@@ -322,7 +367,6 @@ impl Server {
             .arg(format!("127.0.0.1:{port}"))
             .arg("--keyring")
             .arg(keyring)
-            .arg("--no-model-edits")
             .args(extra)
             .env("BUSSARD_KEYRING_PASSWORD", PASSWORD)
             .env_remove("BUSSARD_ALLOW_REAL_GATEWAY")
@@ -567,6 +611,7 @@ fn test_mcp_apply_with_admit_tunnel_senders_writes_the_tunnel_address_into_pid54
                 &["1/2/0", "1/2/3"],
                 &[(1, 20), (2, 22)],
                 &[12, 0],
+                &[22],
             )?)
             .start(),
     )?;
@@ -674,6 +719,7 @@ fn test_mcp_plan_notes_a_secured_ga_only_unadmitted_tunnel_clients_can_write() -
                 &["1/2/0", "1/2/3"],
                 &[(1, 20), (2, 22)],
                 &[12, 0],
+                &[22],
             )?)
             .start(),
     )?;
@@ -785,6 +831,219 @@ fn test_mcp_wait_and_infer_see_a_secured_telegram_decrypted() -> TestResult {
     );
     assert_eq!(gw.stats().requests, 0, "the server transmitted");
     pusher.abort();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// The model of the unsecure test (issue #331): 1.1.10 sends 1/2/0 from
+/// object 20 and listens on the secured 1/2/3 (object 22) and 1/2/4 (object
+/// 23), with the key store `bussard.keys` holding the synthetic keyring and a
+/// second, made-up group key for 1/2/4.
+fn unsecure_model_dir(tag: &str) -> TestResult<PathBuf> {
+    let dir = model_dir(tag)?;
+    std::fs::write(
+        dir.join("groups.toml"),
+        "groups = [\n  { address = \"1/2/0\", name = \"Status\", dpt = \"1.001\" },\n  \
+         { address = \"1/2/3\", name = \"Secured level\", dpt = \"5.001\", secure = true },\n  \
+         { address = \"1/2/4\", name = \"Secured scene\", dpt = \"17.001\", secure = true },\n]\n",
+    )?;
+    std::fs::write(
+        dir.join("devices").join("1.1.10.toml"),
+        "address = \"1.1.10\"\nname = \"Secure actuator\"\n\n[security]\nactivated = true\n\n\
+         [parameters]\n\"thr@P-0_R-1\" = \"12\"\n\n\
+         [links]\n20.send = \"1/2/0\"\n22.listen = [\"1/2/3\"]\n23.listen = [\"1/2/4\"]\n",
+    )?;
+    let lock = std::fs::read_to_string(dir.join("bussard.lock"))?;
+    std::fs::write(
+        dir.join("bussard.lock"),
+        format!(
+            "{lock}objects = [\n  {{ number = 20, flags = \"CT\" }},\n  \
+             {{ number = 22, flags = \"CW\", secure = true }},\n  \
+             {{ number = 23, flags = \"CW\", secure = true }},\n]\n"
+        ),
+    )?;
+    let mut store = bussard_project::KeyStore::new("Synthetic");
+    store.merge_keyring(&keyring()?);
+    store
+        .group_keys
+        .insert(ga("1/2/4")?, Key16::new([0x33; 16]));
+    store.save(&dir, PASSWORD)?;
+    Ok(dir)
+}
+
+/// Issue #331, end to end on a Secure mock device: `knx_set_group` with
+/// `secure: false` takes 1/2/3's key out of the key store and clears the
+/// group's and object 22's flags; the plan of 1.1.10 is the one
+/// security-object change, the apply rewrites the group key table without
+/// the entry and clears object 22's flag, and a re-plan has nothing to do.
+/// The group write then goes out plain, `bussard keys export` leaves the key
+/// out, and `knx_undo` brings the flags and the very key back.
+#[test]
+fn test_mcp_unsecure_a_group_address_end_to_end() -> TestResult {
+    let rt = tokio::runtime::Runtime::new()?;
+    let log = Arc::new(Mutex::new(SecurityLog::default()));
+    let gw = rt.block_on(
+        MockGateway::builder()
+            .channel(0x58)
+            .keep_serving()
+            .idle_timeout(Duration::from_secs(120))
+            .device(secure_device_with(
+                Arc::clone(&log),
+                &["1/2/0", "1/2/3", "1/2/4"],
+                &[(1, 20), (2, 22), (3, 23)],
+                &[12, 0],
+                &[22, 23],
+            )?)
+            .start(),
+    )?;
+    let dir = unsecure_model_dir("unsecure")?;
+    let store_path = bussard_project::KeyStore::path(&dir);
+    let mut server = Server::spawn(
+        &dir,
+        gw.port(),
+        &["--allow-programming", "--allow-writes"],
+        &store_path,
+    )?;
+
+    // The device already runs the model: both GAs secured.
+    let plan = plan_when_connected(&mut server, "1.1.10")?;
+    assert_eq!(plan["ok"], true, "plan: {plan}");
+    assert_eq!(plan["noop"], true, "plan: {plan}");
+
+    // Security off for 1/2/3: one model change, the key out of the store.
+    let set = server.call("knx_set_group", json!({"ga": "1/2/3", "secure": false}))?;
+    assert_eq!(set["ok"], true, "set: {set}");
+    assert_eq!(set["key_store"]["group_key"], "removed", "set: {set}");
+    assert_eq!(
+        set["key_store"]["snapshot_keeps_key_store"], true,
+        "set: {set}"
+    );
+    let sentences = set["changes"].to_string();
+    assert!(
+        sentences.contains("Secured level (1/2/3) now runs plain (KNX Data Secure off)."),
+        "set: {set}"
+    );
+    assert!(
+        sentences.contains("Secure actuator (1.1.10): object 22 now runs plain"),
+        "set: {set}"
+    );
+    assert_eq!(
+        set["security"]["devices"],
+        json!([{"address": "1.1.10", "objects": [22]}]),
+        "set: {set}"
+    );
+    let note = set["note"].as_str().unwrap_or_default();
+    assert!(note.contains("Home Assistant"), "{note}");
+    assert!(note.contains("bussard keys export"), "{note}");
+    let store = bussard_project::KeyStore::load(&dir, PASSWORD)?.ok_or("no key store")?;
+    assert!(store.group_key(ga("1/2/3")?).is_none());
+    assert!(store.group_key(ga("1/2/4")?).is_some());
+    let groups = std::fs::read_to_string(dir.join("groups.toml"))?;
+    assert!(
+        !groups.contains("\"Secured level\", dpt = \"5.001\", secure"),
+        "{groups}"
+    );
+
+    // `bussard keys export` leaves the key out (the keyring Home Assistant loads).
+    let export = dir.join("ha.knxkeys");
+    let out = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .args(["--dir"])
+        .arg(&dir)
+        .args(["keys", "export"])
+        .arg(&export)
+        .env("BUSSARD_KEYRING_PASSWORD", PASSWORD)
+        .output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let exported = bussard_project::parse_keyring(&std::fs::read_to_string(&export)?, PASSWORD)?;
+    assert!(!exported.group_keys.contains_key(&ga("1/2/3")?));
+    assert!(exported.group_keys.contains_key(&ga("1/2/4")?));
+
+    // The plan: exactly one change, the security object.
+    let plan = server.call("knx_plan_device", json!({"address": "1.1.10"}))?;
+    assert_eq!(plan["ok"], true, "plan: {plan}");
+    assert_eq!(plan["noop"], false, "plan: {plan}");
+    let changes = plan["changes"].as_array().ok_or("no changes")?;
+    assert_eq!(changes.len(), 1, "plan: {plan}");
+    assert_eq!(changes[0]["subject"], "security", "plan: {plan}");
+    assert_eq!(changes[0]["mark"], "-", "plan: {plan}");
+    assert_eq!(
+        changes[0]["sentence"],
+        "security object: Data Secure off for 1/2/3 (Secured level): its group key leaves the \
+         group key table (PID 53) and object 22 loses its security flag (PID 61 0x03 to 0x00)",
+        "plan: {plan}"
+    );
+    assert_eq!(plan["writes"]["security_object"], true, "plan: {plan}");
+    assert!(
+        log.lock().map_err(|_| "log poisoned")?.controls.is_empty(),
+        "planning must not touch the security object"
+    );
+    let digest = plan["plan_digest"].as_str().ok_or("no plan_digest")?;
+
+    let applied = server.call(
+        "knx_apply_device",
+        json!({"address": "1.1.10", "plan_digest": digest}),
+    )?;
+    assert_eq!(applied["ok"], true, "apply: {applied}");
+    assert_eq!(applied["verified"], true, "apply: {applied}");
+    {
+        let log = log.lock().map_err(|_| "log poisoned")?;
+        // A full security-object program, as an ETS download writes it.
+        assert_eq!(log.controls, vec![0x04, 0x01, 0x02], "{log:?}");
+        let key_table: Vec<_> = log
+            .writes
+            .iter()
+            .filter(|w| w.0 == PID_GRP_KEY_TABLE)
+            .collect();
+        // The group key table rewritten from element 1 without 1/2/3: one
+        // element, address-table index 3 (1/2/4), then its key.
+        assert_eq!(key_table.len(), 1, "{log:?}");
+        assert_eq!((key_table[0].1, key_table[0].2), (1, 1));
+        assert_eq!(key_table[0].3.get(..2), Some(&[0u8, 3][..]));
+        assert_eq!(key_table[0].3.get(2..), Some(&[0x33u8; 16][..]));
+        // Object 22 is plain now, 23 still secured: the device takes a plain
+        // telegram on 1/2/3 from a non-Secure sender.
+        let secured: Vec<usize> = log
+            .pid61
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| **f != 0)
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert_eq!(secured, vec![23], "{log:?}");
+    }
+
+    // Nothing left to do.
+    let replan = server.call("knx_plan_device", json!({"address": "1.1.10"}))?;
+    assert_eq!(replan["noop"], true, "replan: {replan}");
+
+    // A group write on 1/2/3 now goes out plain.
+    let write = server.call("knx_write_group", json!({"ga": "1/2/3", "value": "50%"}))?;
+    assert_eq!(write["ok"], true, "write: {write}");
+    assert_eq!(write["secured"], false, "write: {write}");
+
+    // One undo restores all three signals, the very key included.
+    let undo = server.call("knx_undo", json!({}))?;
+    assert_eq!(undo["ok"], true, "undo: {undo}");
+    assert_eq!(undo["key_store"]["ok"], true, "undo: {undo}");
+    let store = bussard_project::KeyStore::load(&dir, PASSWORD)?.ok_or("no key store")?;
+    assert_eq!(store.group_key(ga("1/2/3")?), Some(&group_key()?));
+    let groups = std::fs::read_to_string(dir.join("groups.toml"))?;
+    assert!(
+        groups.contains("dpt = \"5.001\", secure = true"),
+        "{groups}"
+    );
+    // And the device needs the key and the flag back.
+    let plan = server.call("knx_plan_device", json!({"address": "1.1.10"}))?;
+    let sentences = plan["sentences"].as_str().unwrap_or_default();
+    assert!(
+        sentences.contains("+ security object: Data Secure on for 1/2/3 (Secured level)"),
+        "plan: {plan}"
+    );
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

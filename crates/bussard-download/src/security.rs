@@ -800,6 +800,34 @@ pub async fn read_security_sender_table<Ch: L4Channel>(
     }
 }
 
+/// Reads only the group-object security flags (PID 61) of the security
+/// object, the way [`read_security_object`] reads them: one octet per group
+/// object, element 1 first. `plan` and `apply` on a Secure device compare
+/// them with the flags the model asks for, so a group object that leaves (or
+/// joins) Data Secure is a plan change of its own (issue #331). Read-only.
+///
+/// Returns `Ok(None)` when the device refuses the read (count 0, a malformed
+/// answer): the flags are then unknown, not all plain.
+///
+/// # Errors
+///
+/// A transport-level management error.
+pub async fn read_security_flags<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+) -> Result<Option<Vec<u8>>, MgmtError> {
+    match property_ext::read_property_ext_table(
+        l4,
+        PropertyExtAddress::security(property_ext::PID_GO_SECURITY_FLAGS),
+        1,
+    )
+    .await
+    {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(MgmtError::ServiceRejected { .. } | MgmtError::MalformedResponse { .. }) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// The note for group objects whose PID 61 octet is not one ETS writes, or
 /// `None` when there are none. Lists the first eight.
 fn unconfirmed_flags_note(unconfirmed: &[(u16, u8)]) -> Option<String> {

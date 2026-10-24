@@ -3,7 +3,9 @@
 //! `bussard mcp --keyring` names an ETS `.knxkeys` export; its group keys
 //! secure `knx_read_group` / `knx_write_group` on a secured GA and decrypt
 //! secured telegrams re-decoded from a capture. The keyring is decrypted once
-//! per process (PBKDF2 is deliberately slow) and cached; a failed load is not
+//! per file version (PBKDF2 is deliberately slow) and cached; a keyring whose
+//! modification time or size changes (the key store after `knx_set_group`
+//! with `secure`, issue #331) is loaded again, and a failed load is not
 //! cached, so fixing `BUSSARD_KEYRING_PASSWORD` needs no restart. Nothing here
 //! returns or logs key material.
 
@@ -13,8 +15,22 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use bussard_service::{GroupKeys, SecureGroupError};
 
-/// The decrypted group keys per keyring path.
-static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<GroupKeys>>>> = OnceLock::new();
+/// The version of a keyring file the cache holds keys for: its modification
+/// time and size.
+type FileVersion = (Option<std::time::SystemTime>, u64);
+
+/// The cached keys of one keyring: the file version they were read from.
+type CachedKeys = (FileVersion, Arc<GroupKeys>);
+
+/// The decrypted group keys per keyring path, with the file version.
+static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedKeys>>> = OnceLock::new();
+
+/// The current version of the file at `path` (`(None, 0)` when unreadable).
+fn file_version(path: &Path) -> FileVersion {
+    std::fs::metadata(path)
+        .map(|m| (m.modified().ok(), m.len()))
+        .unwrap_or((None, 0))
+}
 
 /// The group keys of `keyring`, or `None` when the server has no keyring.
 ///
@@ -27,7 +43,12 @@ pub(crate) fn group_keys(keyring: Option<&Path>) -> Result<Option<Arc<GroupKeys>
         return Ok(None);
     };
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(keys) = cache.lock().ok().and_then(|c| c.get(path).cloned()) {
+    let version = file_version(path);
+    if let Some(keys) = cache.lock().ok().and_then(|c| {
+        c.get(path)
+            .filter(|(cached, _)| *cached == version)
+            .map(|(_, keys)| Arc::clone(keys))
+    }) {
         return Ok(Some(keys));
     }
     let keys = bussard_service::secure::load_group_keys(path)
@@ -42,7 +63,7 @@ pub(crate) fn group_keys(keyring: Option<&Path>) -> Result<Option<Arc<GroupKeys>
             reason
         })?;
     if let Ok(mut c) = cache.lock() {
-        c.insert(path.to_path_buf(), Arc::clone(&keys));
+        c.insert(path.to_path_buf(), (version, Arc::clone(&keys)));
     }
     Ok(Some(keys))
 }

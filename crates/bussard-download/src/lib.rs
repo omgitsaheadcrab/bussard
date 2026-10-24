@@ -111,8 +111,9 @@ pub use program::{
 pub use security::{
     DeviceSecurityView, GO_FLAGS_SECURE, GroupKeyEntry, MAX_SEQUENCE, SecureSenderEntry,
     SecurityInputs, SecurityPlanError, SecurityProgram, SecurityReadback, build_security_program,
-    decode_sender_table, device_security_view, program_security_object, read_security_object,
-    read_security_sender_table, secured_senders, security_inputs_for, sender_table_bytes,
+    decode_sender_table, device_security_view, program_security_object, read_security_flags,
+    read_security_object, read_security_sender_table, secured_senders, security_inputs_for,
+    sender_table_bytes,
 };
 pub use sweep::{
     AppSweep, FamilyCoverage, ImageClass, ParseClass, PlanClass, ProductSweep, RankedReason,

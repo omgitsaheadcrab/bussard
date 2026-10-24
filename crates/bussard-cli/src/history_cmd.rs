@@ -310,7 +310,38 @@ pub fn run_undo(dir: &Path, target: Option<&str>, json: bool) -> anyhow::Result<
         .unwrap_or_default();
 
     let undo_snapshot = history.restore(&target.id)?;
+    // A group address whose Data Secure state the undo flips gets its key
+    // back from the snapshot's key store copy, or loses it (issue #331).
+    let key_notes: Result<Vec<String>, String> = match &working {
+        Some(before)
+            if !bussard_service::group_security::security_changes(before, &restored).is_empty() =>
+        {
+            let password =
+                bussard_model::dotenv::var(bussard_service::secure::KEYRING_PASSWORD_ENV).ok();
+            bussard_service::group_security::restore_group_keys(
+                dir,
+                &history.snapshot_dir(&target.id),
+                Some(&history.snapshot_dir(&undo_snapshot)),
+                before,
+                &restored,
+                password.as_deref(),
+            )
+            .map_err(|err| {
+                format!(
+                    "the model files are restored, but the key store did not follow: {err}. Fix \
+                     that and run `bussard groups secure <GA> on|off` for the group addresses \
+                     whose security the undo changed."
+                )
+            })
+        }
+        _ => Ok(Vec::new()),
+    };
     if json {
+        let key_store = match &key_notes {
+            Ok(notes) if notes.is_empty() => serde_json::Value::Null,
+            Ok(notes) => serde_json::json!({"ok": true, "sentences": notes}),
+            Err(reason) => serde_json::json!({"ok": false, "reason": reason}),
+        };
         crate::output::print(
             crate::output::schema::UNDO,
             &serde_json::json!({
@@ -318,9 +349,18 @@ pub fn run_undo(dir: &Path, target: Option<&str>, json: bool) -> anyhow::Result<
                 "created_at": target.manifest.created_at,
                 "undo_snapshot": undo_snapshot.to_string(),
                 "changes": changes.changes,
+                "key_store": key_store,
             }),
         )?;
         return Ok(ExitCode::SUCCESS);
+    }
+    match &key_notes {
+        Ok(notes) => {
+            for note in notes {
+                println!("{note}");
+            }
+        }
+        Err(reason) => eprintln!("warning: {reason}"),
     }
     println!(
         "Restored the model files to snapshot {} ({}).",

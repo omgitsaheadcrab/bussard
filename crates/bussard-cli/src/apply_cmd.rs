@@ -346,11 +346,14 @@ pub(crate) fn apply_desired(
                 // The device's PID 54, only to see whether it already admits
                 // the tunnelling addresses (issue #297).
                 let senders = plan_cmd::read_admission_table(l4, &read, &tunnel).await?;
-                anyhow::Ok((read, identified, params, senders))
+                // PID 61 on a secured session (issue #331): a group object
+                // that leaves or joins Data Secure is a change of its own.
+                let flags = plan_cmd::read_security_flags(l4, &read, tool_key.is_some()).await?;
+                anyhow::Ok((read, identified, params, senders, flags))
             })
             .await
     });
-    let (read, identified, params, live_senders) = read?;
+    let (read, identified, params, live_senders, live_flags) = read?;
     let established = identified.established;
     let write_seed = crate::device_facts::seed_of(established.as_ref());
 
@@ -413,6 +416,19 @@ pub(crate) fn apply_desired(
     if let (Some(built), Some(admission)) = (built.as_mut(), admission.as_ref()) {
         admission.add_to(&mut built.plan, &report);
     }
+    // A group address that left or joined Data Secure (issue #331): the
+    // device's PID 61 against the flags the security object will receive.
+    let security_change = match (&security, live_flags.as_deref()) {
+        (Some(inputs), Some(flags)) if sys7_live.is_none() => Some(
+            bussard_service::security_change::SecurityObjectChange::compare(
+                target, &desired, inputs, flags,
+            ),
+        ),
+        _ => None,
+    };
+    if let (Some(built), Some(change)) = (built.as_mut(), security_change.as_ref()) {
+        change.add_to(&mut built.plan, &report, model);
+    }
     match &built {
         Some(built) => {
             if let Some(hash) = write.plan_hash
@@ -460,7 +476,9 @@ pub(crate) fn apply_desired(
     // object is written inside the table download.
     let admits =
         matches!(origin, DesiredSource::Model) && admission.as_ref().is_some_and(|a| a.changes());
-    let tables_change = !report.is_noop() || admits;
+    let flags_change = matches!(origin, DesiredSource::Model)
+        && security_change.as_ref().is_some_and(|c| c.changes());
+    let tables_change = !report.is_noop() || admits || flags_change;
     if !tables_change && partial.is_none() {
         return Ok(ExitCode::SUCCESS);
     }
@@ -593,6 +611,20 @@ pub(crate) fn apply_desired(
                         "recorded {target}'s security individual address table (PID 54, {} \
                          sender(s)) in bussard.lock",
                         inputs.senders.len()
+                    ),
+                    Ok(false) => {}
+                    Err(err) => eprintln!("warning: {err}"),
+                }
+                // And the group-object flags it wrote (PID 61, issue #331).
+                match bussard_service::security_change::record_security_flags(
+                    dir,
+                    target,
+                    &inputs.secure_objects,
+                ) {
+                    Ok(true) => println!(
+                        "recorded {target}'s group-object security flags (PID 61, {} secured \
+                         object(s)) in bussard.lock",
+                        inputs.secure_objects.len()
                     ),
                     Ok(false) => {}
                     Err(err) => eprintln!("warning: {err}"),

@@ -263,19 +263,21 @@ fn by_subject(changes: &ChangeSet) -> BTreeMap<Subject, (Vec<String>, Vec<bool>)
     let mut out: BTreeMap<Subject, (Vec<String>, Vec<bool>)> = BTreeMap::new();
     for change in &changes.changes {
         let subject = match change.kind {
-            ChangeKind::ParameterChanged | ChangeKind::LinkAdded | ChangeKind::LinkRemoved => {
-                change
-                    .device
-                    .as_deref()
-                    .and_then(|d| d.parse::<IndividualAddress>().ok())
-                    .map(Subject::Device)
-            }
+            ChangeKind::ParameterChanged
+            | ChangeKind::LinkAdded
+            | ChangeKind::LinkRemoved
+            | ChangeKind::ObjectSecurityChanged => change
+                .device
+                .as_deref()
+                .and_then(|d| d.parse::<IndividualAddress>().ok())
+                .map(Subject::Device),
             ChangeKind::GroupAdded
             | ChangeKind::GroupRemoved
             | ChangeKind::GroupRenamed
             | ChangeKind::GroupDptChanged
             | ChangeKind::GroupDescriptionChanged
-            | ChangeKind::GroupProtectionChanged => change
+            | ChangeKind::GroupProtectionChanged
+            | ChangeKind::GroupSecurityChanged => change
                 .group
                 .as_deref()
                 .and_then(|g| g.parse::<GroupAddress>().ok())
