@@ -413,6 +413,52 @@ jobs:
           cargo nextest run -p bussard-download --profile ci \
             -E 'binary(it) & test(/^(flash_mock|flash_mock_system7|sys7_jung_m2_plan|sys7_theben_0701_plan)::/)'
 
+  # The flash-then-plan loop against knx-sim (issue #346,
+  # scripts/sim-catalog-loop.sh) on a curated subset of the product catalog:
+  # the ABB i-bus actuator, the Jung F50 push-button, the Theben Meteodata and
+  # two MDT 0705 applications (the list is SUBSET in the script). Each is
+  # flashed with its defaults and two seeded generated configurations, and
+  # every plan after a flash, an apply of a partial change and a re-flash must
+  # be a no-op. The sim runs as a separate process on loopback; no bussard
+  # crate links it. The archives are fetched from the vendors through
+  # `bussard import-product` (tests-support/product-corpus/fetch.sh) and cached;
+  # vendor data never enters git. The whole corpus runs nightly
+  # (sim-catalog-nightly.yml). Known failures are listed in
+  # tests-support/product-corpus/sim-loop-baseline.json.
+  sim-catalog-loop:
+    name: sim-catalog-loop (curated subset)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+          # Both workspaces: the bussard root and knx-sim, as sim-conformance.
+          workspaces: |
+            .
+            knx-sim
+          shared-key: rust-sim-conformance
+
+      - name: Cache the subset's vendor archives
+        uses: actions/cache@v4
+        with:
+          path: tests-support/product-corpus/cache
+          key: sim-loop-subset-${{ hashFiles('scripts/sim-catalog-loop.sh', 'data/product-index.json') }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Flash-then-plan loop (curated subset)
+        run: scripts/sim-catalog-loop.sh --subset --configs 2
+
   # Optional interop job: build thelsing/knx's knx-linux-ip demo as an EXTERNAL
   # process and drive bussard's management ladder against it over KNXnet/IP
   # routing multicast. Ubuntu-only (the demo is #ifdef __linux__), and kept OFF

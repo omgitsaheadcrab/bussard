@@ -57,3 +57,10 @@ path = "junit.xml"
 fail-fast = false
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 10 }
+
+# The knx-sim flash-then-plan loop (scripts/sim-catalog-loop.sh, #346): one
+# in-process shard flashes dozens of applications, each a minute or more on a
+# loaded runner, so it gets an hour before nextest stops it.
+[[profile.corpus.overrides]]
+filter = 'test(/^sim_catalog_loop::/)'
+slow-timeout = { period = "300s", terminate-after = 12 }

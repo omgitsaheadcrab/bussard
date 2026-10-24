@@ -32,6 +32,19 @@ impl Segment {
         let req_end = addr as u64 + len as u64;
         addr as u64 >= self.base as u64 && req_end <= end
     }
+
+    /// True if the two segments share an address.
+    pub fn overlaps(&self, other: &Segment) -> bool {
+        let (a0, a1) = (
+            u64::from(self.base),
+            u64::from(self.base) + u64::from(self.len),
+        );
+        let (b0, b1) = (
+            u64::from(other.base),
+            u64::from(other.base) + u64::from(other.len),
+        );
+        a0 < b1 && b0 < a1
+    }
 }
 
 /// The reason a memory write was rejected.
@@ -79,6 +92,51 @@ impl Memory {
     pub fn allocate(&mut self, owner: u8, base: u32, len: u32) {
         self.segments.retain(|s| s.owner != owner);
         self.segments.push(Segment { owner, base, len });
+    }
+
+    /// Allocate one more segment for `owner` at `base` of `len` bytes, keeping
+    /// the owner's other segments. A System 7 load-state machine owns several
+    /// absolute segments at once (the Theben 0701 LSM 3 holds `0x1C00`,
+    /// `0x4400`, `0x4800` and `0x4C00`), and a later partial download writes
+    /// into any of them without allocating again. Only a segment of the same
+    /// owner that overlaps the new range is dropped, so a re-flash with the
+    /// same layout starts clean.
+    pub fn allocate_additional(&mut self, owner: u8, base: u32, len: u32) {
+        let new = Segment { owner, base, len };
+        self.segments
+            .retain(|s| s.owner != owner || !s.overlaps(&new));
+        self.segments.push(new);
+    }
+
+    /// Whether `[base, base+len)` overlaps a segment some other object owns.
+    pub fn overlaps_other(&self, owner: u8, base: u32, len: u32) -> bool {
+        let new = Segment { owner, base, len };
+        self.segments
+            .iter()
+            .any(|s| s.owner != owner && s.overlaps(&new))
+    }
+
+    /// The lowest 4 KiB-aligned base at or above `from` where `len` bytes
+    /// overlap no segment of another object.
+    pub fn free_base(&self, owner: u8, from: u32, len: u32) -> u32 {
+        let mut base = from;
+        while let Some(end) = self
+            .segments
+            .iter()
+            .filter(|s| s.owner != owner && s.overlaps(&Segment { owner, base, len }))
+            .map(|s| s.base.saturating_add(s.len))
+            .max()
+        {
+            base = end.saturating_add(0xFFF) & !0xFFF;
+        }
+        base
+    }
+
+    /// Whether any segment owned by `owner` covers `addr`.
+    pub fn owner_covers(&self, owner: u8, addr: u32) -> bool {
+        self.segments
+            .iter()
+            .any(|s| s.owner == owner && s.contains(addr, 1))
     }
 
     /// Erase the segment owned by `owner`: drop its allocation and every cell
@@ -196,6 +254,21 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_allocate_additional_keeps_the_owners_other_segments() -> Result<(), MemoryError> {
+        let mut m = Memory::new();
+        m.allocate_additional(3, 0x4400, 0x400);
+        m.allocate_additional(3, 0x4800, 0x400);
+        m.write(3, 0x480C, &[0x55])?;
+        m.write(3, 0x4400, &[0x01])?;
+        assert!(m.owner_covers(3, 0x4400) && m.owner_covers(3, 0x4BFF));
+        // An overlapping allocation of the same owner replaces the old one.
+        m.allocate_additional(3, 0x4700, 0x200);
+        assert!(!m.owner_covers(3, 0x4400));
+        assert!(m.owner_covers(3, 0x4700));
+        Ok(())
+    }
 
     #[test]
     fn test_erase_owner_clears_only_that_segment() -> Result<(), MemoryError> {

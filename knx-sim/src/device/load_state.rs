@@ -6,10 +6,23 @@ use crate::wire::IndividualAddress;
 
 use super::{
     Device, DeviceError, DeviceReaction, LoadEvent, LoadState, PID_LOAD_STATE_CONTROL,
-    Sys7LoadStateMachine, Sys7Step, profile, sys7_lsm,
+    PID_TABLE_REFERENCE, Property, Sys7LoadStateMachine, Sys7Step, profile, sys7_lsm,
 };
 
 impl Device {
+    /// Whether `[base, base+size)` covers the base of a table object
+    /// (1 to 3) other than `object`, or overlaps another object's segment.
+    fn overlaps_table_base(&self, object: u8, base: u32, size: u32) -> bool {
+        let end = u64::from(base) + u64::from(size);
+        let covers_table = self.loadables.iter().any(|(&idx, o)| {
+            idx != object
+                && (1..=3).contains(&idx)
+                && u64::from(o.base) >= u64::from(base)
+                && u64::from(o.base) < end
+        });
+        covers_table || self.memory.overlaps_other(object, base, size)
+    }
+
     pub(super) fn on_load_state_write(
         &mut self,
         tool: IndividualAddress,
@@ -41,7 +54,26 @@ impl Device {
             }
         };
         if let LoadEvent::AllocRelSegment { size } = event {
-            let base = state.base;
+            let mut base = state.base;
+            // A real device places a relative segment where it has room and
+            // reports the place via PID_TABLE_REFERENCE. The fixed bases fit
+            // small segments; a large one (the ABB i-bus `M-0002_A-A0ED-10`
+            // sizes object 5 at 75 662 bytes from 0xB000) would cover a
+            // table's base and take its writes. The tables (objects 1 to 3)
+            // keep their low bases, which the group-comm parse reads as u16;
+            // any other object that would overlap one moves above 0xFFFF.
+            if !(1..=3).contains(&object) && self.overlaps_table_base(object, base, size) {
+                base = self.memory.free_base(object, 0x1_0000, size);
+                if let Some(state) = self.loadables.get_mut(&object) {
+                    state.base = base;
+                }
+                if let Some(io) = self.objects.get_mut(&object) {
+                    io.set_property(
+                        PID_TABLE_REFERENCE,
+                        Property::read_only(base.to_be_bytes().to_vec()),
+                    );
+                }
+            }
             self.memory.allocate(object, base, size);
         }
         self.emit(Event::LoadStateChanged {
@@ -127,14 +159,14 @@ impl Device {
                 // Reserve the absolute segment for this LSM. A subtype-0x02 (Task)
                 // record with a base already allocated for the LSM is a descriptor
                 // commit rather than a fresh allocation, so only (re)allocate when
-                // the address is not already inside the LSM's open segment.
+                // the address is not already inside one of the LSM's segments.
+                // An LSM keeps every segment it allocated, so a partial
+                // download can write into any of them.
                 let start = u32::from(start);
-                let already = self
-                    .memory
-                    .segment_of(lsm_index)
-                    .is_some_and(|seg| seg.contains(start, 1));
+                let already = self.memory.owner_covers(lsm_index, start);
                 if !(subtype == 0x02 && already) {
-                    self.memory.allocate(lsm_index, start, length as u32);
+                    self.memory
+                        .allocate_additional(lsm_index, start, length as u32);
                 }
             }
             Sys7Step::TaskCommitted { address: _ } => {
@@ -273,6 +305,52 @@ mod tests {
         // LoadCompleted
         dev.handle_cemi(&data(&dev, 0x3D7, &[0x04, 0x05, 0x10, 0x01, 0x02]))?;
         assert_eq!(dev.load_state(4), Some(LoadState::Loaded));
+        Ok(())
+    }
+
+    #[test]
+    fn test_large_segment_moves_off_the_table_bases() -> Result<(), Box<dyn std::error::Error>> {
+        // The ABB i-bus `M-0002_A-A0ED-10` sizes object 5 at 75 662 bytes.
+        // From its fixed base 0xB000 that would cover the association table's
+        // 0xC000, and a later partial download's table write would land in
+        // object 5's segment and be refused. The device places it above 0xFFFF
+        // and reports that base, so the tables keep theirs.
+        let mut dev = system_b_device()?;
+        connect(&mut dev)?;
+        dev.handle_cemi(&data(&dev, 0x3D1, &[0x00, 0xff, 0xff, 0xff, 0xff]))?;
+        dev.handle_cemi(&data(&dev, 0x3D7, &[0x05, 0x05, 0x10, 0x01, 0x01]))?;
+        dev.handle_cemi(&data(
+            &dev,
+            0x3D7,
+            &[0x05, 0x05, 0x10, 0x01, 0x03, 0x0b, 0x00, 0x01, 0x27, 0x8e],
+        ))?;
+        let seg = dev.memory().segment_of(5).ok_or("object 5 has a segment")?;
+        assert_eq!((seg.base, seg.len), (0x1_0000, 0x0001_278e));
+        let reported = dev
+            .objects
+            .get(&5)
+            .and_then(|o| o.property(PID_TABLE_REFERENCE))
+            .map(|p| p.value.clone());
+        assert_eq!(reported, Some(vec![0x00, 0x01, 0x00, 0x00]));
+        dev.handle_cemi(&data(&dev, 0x3D7, &[0x05, 0x05, 0x10, 0x01, 0x02]))?;
+
+        // The association table still allocates at, and takes writes to, 0xC000.
+        dev.handle_cemi(&data(&dev, 0x3D7, &[0x02, 0x05, 0x10, 0x01, 0x01]))?;
+        dev.handle_cemi(&data(
+            &dev,
+            0x3D7,
+            &[0x02, 0x05, 0x10, 0x01, 0x03, 0x0b, 0x00, 0x00, 0x00, 0x1e],
+        ))?;
+        assert_eq!(
+            dev.memory().segment_of(2).map(|s| (s.base, s.len)),
+            Some((0xC000, 0x1e))
+        );
+        dev.handle_cemi(&data(
+            &dev,
+            0x280 | 4,
+            &[0xc0, 0x00, 0x00, 0x01, 0x00, 0x02],
+        ))?;
+        assert_eq!(dev.memory().read(0xC000, 4), vec![0x00, 0x01, 0x00, 0x02]);
         Ok(())
     }
 

@@ -104,6 +104,18 @@ pub struct ProductData {
     /// could never pass), so the simulated device seeds PID 78 from it.
     /// `None` when the procedure carries no such compare.
     pub hardware_type_marker: Option<Vec<u8>>,
+    /// Every device-object (object 0) property the application's own
+    /// `LdCtrlCompareProp` preflights expect, as `(PID, value)` from their
+    /// `InlineData`: an ABB i-bus program compares `PID_ORDER_INFO` (15) with
+    /// its hardware's id. A factory device of that hardware holds exactly
+    /// these values, so the simulated device serves them.
+    pub device_compare_props: Vec<(u8, Vec<u8>)>,
+    /// Every property the application's `LdCtrlWriteProp` steps write, as
+    /// `(object index, PID, value length)`. A real device of that hardware
+    /// accepts those writes (an ABB i-bus program writes the PEI type to
+    /// object 4 or 5 PID 16, others object 0 PID 52 or 86), so the simulated
+    /// device seeds each one writable where it lacks it.
+    pub written_props: Vec<(u8, u8, usize)>,
 }
 
 impl ProductData {

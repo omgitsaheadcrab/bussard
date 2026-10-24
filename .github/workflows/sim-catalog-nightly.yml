@@ -1,0 +1,73 @@
+# The flash-then-plan loop against knx-sim over the whole product corpus
+# (issue #346, scripts/sim-catalog-loop.sh), nightly and on demand. Not a
+# required check: the required `sim-catalog-loop` job in ci.yml runs a curated
+# subset. Each of the 12 shards fetches the corpus from the vendors through
+# `bussard import-product` (tests-support/product-corpus/fetch.sh, cached),
+# runs its share with --update-baseline and uploads the rewritten baseline and
+# its per-shard reports. Merge the shards' baselines by hand and commit the
+# result to tests-support/product-corpus/sim-loop-baseline.json.
+name: sim-catalog-nightly
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sim-catalog-loop:
+    name: sim-catalog-loop (full corpus, shard ${{ matrix.shard }}/12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+          workspaces: |
+            .
+            knx-sim
+          shared-key: rust-sim-conformance
+
+      - name: Cache the vendor corpus
+        uses: actions/cache@v4
+        with:
+          path: tests-support/product-corpus/cache
+          key: product-corpus-${{ hashFiles('tests-support/product-corpus/corpus.txt', 'data/product-index.json') }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Fetch the corpus
+        # A vendor download that fails is reported and skipped; the loop runs
+        # on what arrived.
+        run: |
+          cargo build --quiet --bin bussard
+          tests-support/product-corpus/fetch.sh || true
+
+      - name: Flash-then-plan loop (shard ${{ matrix.shard }} of 12)
+        env:
+          BUSSARD_PRODUCT_CORPUS: ${{ github.workspace }}/tests-support/product-corpus
+        run: scripts/sim-catalog-loop.sh --shard ${{ matrix.shard }}/12 --configs 2 --update-baseline
+
+      - name: Upload the baseline and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-loop-shard-${{ matrix.shard }}
+          path: |
+            tests-support/product-corpus/sim-loop-baseline.json
+            target/sim-loop/report/

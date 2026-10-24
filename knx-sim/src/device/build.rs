@@ -91,6 +91,22 @@ fn object_type_for(object_index: u8) -> u16 {
     }
 }
 
+/// Seeds, writable and zero, every property the application's own
+/// `LdCtrlWriteProp` steps write and the device does not already serve: the
+/// real hardware accepts those writes (an ABB i-bus program writes the PEI type
+/// to object 4 or 5 PID 16 before its image, others object 0 PID 52 or 86),
+/// and a write the simulated device refused would go unanswered and time the
+/// flash out.
+fn seed_written_props(objects: &mut BTreeMap<u8, InterfaceObject>, product: &ProductData) {
+    for &(object, pid, len) in &product.written_props {
+        if let Some(io) = objects.get_mut(&object)
+            && !io.has_property(pid)
+        {
+            io.set_property(pid, Property::writable(vec![0x00; len]));
+        }
+    }
+}
+
 impl Device {
     /// Build the System B device (the original construction path).
     pub(super) fn build_system_b(
@@ -152,6 +168,11 @@ impl Device {
             0x4E,
             Property::read_only(vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x54]),
         );
+        // The values the application's own CompareProp preflights expect win
+        // over the stand-ins above: a factory device of this hardware holds them.
+        for (pid, value) in &product.device_compare_props {
+            device_object.set_property(*pid, Property::read_only(value.clone()));
+        }
         objects.insert(0, device_object);
 
         // A System B device also exposes a KNX-object association table
@@ -206,6 +227,7 @@ impl Device {
             );
         }
 
+        seed_written_props(&mut objects, product);
         let mut device = Self {
             address,
             profile,
@@ -278,6 +300,11 @@ impl Device {
         // (`d5 00 0e 10 01` -> 00) and writes it (`d7 00 0e 10 01 04`) during the
         // download housekeeping; seed it writable so that flow is accepted.
         device_object.set_property(0x0E, Property::writable(vec![0x00]));
+        // The values the application's own CompareProp preflights expect win
+        // over the stand-ins above: a factory device of this hardware holds them.
+        for (pid, value) in &product.device_compare_props {
+            device_object.set_property(*pid, Property::read_only(value.clone()));
+        }
         objects.insert(0, device_object);
 
         // The System 7 LSM index → interface-object type map: LSM 1 = address
@@ -336,6 +363,7 @@ impl Device {
             );
         }
 
+        seed_written_props(&mut objects, product);
         let mut device = Self {
             address,
             profile,

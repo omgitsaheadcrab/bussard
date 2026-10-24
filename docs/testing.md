@@ -90,6 +90,58 @@ $ BUSSARD_ORACLE_ROWS=captures/campaign/rows/rows-house-16.txt BUSSARD_ORACLE_RO
 The ungated `test_offline_oracle_check_skips_a_row_without_its_capture` runs
 the script's `--check` path on every CI run (POSIX hosts with `python3`).
 
+## The flash-then-plan loop against knx-sim (`scripts/sim-catalog-loop.sh`)
+
+The loop (issue #346) runs every application of the corpus that bussard
+flashes and knx-sim models (masks `07B0`, `0705`, `0701`) through the
+programming cycle against a simulated device:
+
+1. Configurations: the vendor defaults, plus N seeded generated ones. A
+   generated one flips the parameters the product's pages are gated on (the
+   enable switches `bussard device` lists for an inactive page) with
+   probability 2/3 and gives any other shown parameter a random valid value
+   with probability 1/4, over a few rounds so a switch a flipped one shows
+   gets its turn. Each configuration links a few of the com-objects it shows.
+2. Each configuration is flashed to a factory-fresh simulated device with
+   `bussard flash`, and `bussard plan --json` must be a no-op: no change, no
+   table or parameter write, and the parameters decoded.
+3. On the last configuration: `bussard apply` of a partial change (up to
+   three parameters that keep the object table, one link removed, one
+   added), a plan (no-op), a full flash, a plan (no-op). Then the first
+   configuration is flashed over it without `--force`, and planned.
+4. Data Secure (the same cycle with security on, plus admission and
+   unsecuring a group address) is not part of the loop yet: it waits for the
+   secure group simulation (`feat/secure-group-sim`).
+
+```console
+$ export BUSSARD_PRODUCT_CORPUS="$PWD/tests-support/product-corpus"
+$ scripts/sim-catalog-loop.sh                          # the whole corpus
+$ scripts/sim-catalog-loop.sh --filter A-140C,A-A0ED   # some applications
+$ scripts/sim-catalog-loop.sh --subset                 # the curated CI subset
+```
+
+The script builds knx-sim's `serve` binary (release: it parses the archive at
+every start, ten times faster than a debug build) and runs the corpus-gated test
+`crates/bussard-cli/tests/it/sim_catalog_loop.rs` (gated on
+`BUSSARD_PRODUCT_CORPUS` and `BUSSARD_KNX_SIM_BIN`). The simulator runs as a
+separate process on a loopback port, one per configuration; no bussard crate
+links it, and every `bussard` command gets an explicit `127.0.0.1` gateway.
+The applications are split over eight test functions that nextest runs in
+parallel, and over runners with `--shard <k>/<n>`. `--configs N` sets the
+number of generated configurations (default 2), `--seed` the generator seed
+(default 346), so a failure replays with the same values.
+
+The summary lists every failing application with its first failing step and
+what differs (the plan's changed parameters, octets and links, or the last
+lines of a refused command). Each application's model, sim config, sim log and
+the device file of every configuration are kept under the work directory when
+`BUSSARD_SIM_LOOP_WORK` names one. Failures the loop knows about are listed
+with their step (and the issue that tracks them) in
+`tests-support/product-corpus/sim-loop-baseline.json`; an
+application that fails at another step, or is not listed, fails the run.
+`--update-baseline` rewrites the file from a run; review and commit the diff.
+New corpus applications join the loop on their own.
+
 ## ETS project exports
 
 | Variable | Tests |
@@ -126,7 +178,12 @@ write names its rows and their figures.
 ## CI
 
 The `corpus-sweep` job runs the committed-fixture sweep on every push and pull
-request. A `workflow_dispatch` run with the `product_corpus` input (or the
+request. The `sim-catalog-loop` job runs the flash-then-plan loop on every
+push and pull request over the curated subset (`--subset`), fetching only those
+archives from the vendors and caching them. The `sim-catalog-nightly` workflow
+runs it over the whole corpus in 12 shards every night (and on demand), with
+`--update-baseline`, and uploads each shard's baseline and reports as
+artifacts; it is not a required check. A `workflow_dispatch` run with the `product_corpus` input (or the
 repository variable `BUSSARD_PRODUCT_CORPUS`) set to a corpus path on the runner
 also runs every corpus-gated test above. A GitHub-hosted runner has no corpus
 (CI never downloads vendor data), so that path is for a self-hosted runner; the

@@ -166,6 +166,8 @@ fn parse_application_program(
     let mut segments: Vec<RelativeSegment> = Vec::new();
     let mut load_procedures: Vec<LoadProcedure> = Vec::new();
     let mut hardware_type_marker: Option<Vec<u8>> = None;
+    let mut device_compare_props: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut written_props: Vec<(u8, u8, usize)> = Vec::new();
 
     // Transient state while parsing a RelativeSegment (which has a child <Data>).
     let mut cur_segment: Option<RelativeSegment> = None;
@@ -257,17 +259,39 @@ fn parse_application_program(
                         });
                     }
                 }
+                b"LdCtrlWriteProp" if in_app => {
+                    let object = parse_u32(&e, "ObjIdx")?.and_then(|v| u8::try_from(v).ok());
+                    let pid = parse_u32(&e, "PropId")?.and_then(|v| u8::try_from(v).ok());
+                    let len = attr(&e, "InlineData")
+                        .and_then(|hex| decode_hex(&hex))
+                        .map_or(1, |v| v.len().max(1));
+                    if let (Some(object), Some(pid)) = (object, pid)
+                        && !written_props
+                            .iter()
+                            .any(|&(o, p, _)| o == object && p == pid)
+                    {
+                        written_props.push((object, pid, len));
+                    }
+                }
                 b"LdCtrlCompareProp" => {
                     // The object-0 PID 78 preflight carries the device's
                     // hardware-type marker as inline hex. Capture it so the
                     // simulated device can seed PID 78 with the value its own
                     // vendor procedure expects (see `ProductData`).
+                    let pid = parse_u32(&e, "PropId")?.unwrap_or(0);
                     if in_app
                         && parse_u32(&e, "ObjIdx")?.unwrap_or(u32::MAX) == 0
-                        && parse_u32(&e, "PropId")?.unwrap_or(0) == 78
                         && let Some(hex) = attr(&e, "InlineData")
+                        && let Some(value) = decode_hex(&hex)
                     {
-                        hardware_type_marker = decode_hex(&hex);
+                        if pid == 78 {
+                            hardware_type_marker = Some(value.clone());
+                        }
+                        if let Ok(pid) = u8::try_from(pid)
+                            && !device_compare_props.iter().any(|(p, _)| *p == pid)
+                        {
+                            device_compare_props.push((pid, value));
+                        }
                     }
                 }
                 _ => {}
@@ -355,6 +379,8 @@ fn parse_application_program(
         load_procedures,
         segments,
         hardware_type_marker,
+        device_compare_props,
+        written_props,
     }))
 }
 

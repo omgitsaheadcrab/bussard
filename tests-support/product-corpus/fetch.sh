@@ -29,7 +29,9 @@ set -euo pipefail
 # Resolve paths relative to this script so it works from any cwd.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-CORPUS_LIST="$SCRIPT_DIR/corpus.txt"
+# CORPUS_LIST overrides the list (scripts/sim-catalog-loop.sh --subset fetches
+# only its curated archives).
+CORPUS_LIST="${CORPUS_LIST:-$SCRIPT_DIR/corpus.txt}"
 CACHE_DIR="$SCRIPT_DIR/cache"
 INDEX_JSON="$REPO_ROOT/data/product-index.json"
 
