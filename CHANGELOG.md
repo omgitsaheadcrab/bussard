@@ -4,6 +4,10 @@ All notable changes to bussard are recorded here. The format follows
 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/), and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+Changes that have merged but are not yet folded into this file live as
+fragments under `changelog.d/`; `scripts/changelog.py render` prints the
+Unreleased section with them included.
+
 ## [Unreleased]
 
 The first release, planned as 0.1.0 (#92). This section describes what `main`

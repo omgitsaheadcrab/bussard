@@ -82,6 +82,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Changelog fragments
+        run: python3 scripts/changelog.py check
+
       # --all-targets makes clippy compile tests/benches/examples too, which
       # warms the exact same build graph the test job needs. Kept as its own
       # step so a clippy failure is clearly attributed.

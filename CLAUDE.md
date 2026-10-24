@@ -59,6 +59,12 @@ never gain a path dependency on a `crates/` member.
 Run `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
 and the test commands before committing, not just before merging.
 
+Changelog: a PR never edits `CHANGELOG.md` (every PR in flight would conflict
+on the same lines). Add a fragment under `changelog.d/<section>/<issue>-<slug>.md`
+holding the bullet as it will appear; `scripts/changelog.py check` validates
+them in CI and `scripts/changelog.py collect` folds them in before a release.
+See `changelog.d/README.md`.
+
 ## Dev Loop Speed
 
 Speed is a project goal for the CLI and for working on it. Wall time in a
@@ -73,10 +79,19 @@ session goes to linking and to waiting on the bus, so:
   workspace-wide fmt, clippy and test gate once, right before committing.
 - Never run two cargo invocations against the same `target/` at once; cargo
   serializes them on a lock and every session waits. A subagent that builds
-  must get its own worktree
-  (`git worktree add -b <branch> ../bussard-wt/<name> main`); each worktree
-  has its own `target/`.
+  must get its own worktree: `scripts/dev/worktree.sh <name> <branch>` creates
+  it off `origin/main` and warms its `target/` in the background. Each
+  worktree has its own `target/`; remove it when the PR has merged.
+- `sccache` is the rustc wrapper on the dev machine (`~/.cargo/config.toml`),
+  so a fresh worktree takes its dependency crates from the cache and only
+  compiles the workspace crates. `sccache --show-stats` shows the hit rate.
 - Do not sleep-poll a background command. The harness notifies on completion.
+  The same for pull requests: `scripts/dev/wait-pr.sh <n>` as a background
+  command exits when the checks finish and auto-merge lands the PR (or when
+  it needs a hand), so no timer-driven merge check is needed.
+- Subagents: point every implementation agent at `docs/agent-brief.md` and
+  keep the prompt to the task. The brief carries the current test commands,
+  the changelog rule, the PR steps and the report format.
 - Filter command output before it reaches the transcript: `--json` piped
   through `jq` or a short Python selector, wire traces through `grep`. Aim for
   under 50 lines per tool result; large outputs force context compaction.
