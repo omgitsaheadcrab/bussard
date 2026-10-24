@@ -605,6 +605,11 @@ impl BussardMcp {
             &model,
             facts.as_ref(),
         ));
+        // W040 (issue #348): keyring exports older than the key store.
+        extra.extend(bussard_model::keystore_meta::stale_export_diagnostics(
+            &model,
+            &self.state.dir,
+        ));
         ok(tools::validate_filtered(&model, extra, &filter))
     }
 
@@ -996,7 +1001,15 @@ impl BussardMcp {
                     }
                 };
             let sender = bussard_bus::ops::group_source(service.handle());
-            Some(check_sender_admission(Some(&model), ga, sender, &evidence))
+            // E038 (issue #348): a tunnel-only secured GA whose devices admit
+            // no tunnelling address is refused while admit_tunnel_senders is
+            // off.
+            Some(bussard_service::admission::check_tunnel_write(
+                Some(&model),
+                ga,
+                sender,
+                &evidence,
+            ))
         } else {
             None
         };

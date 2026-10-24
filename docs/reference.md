@@ -1252,8 +1252,8 @@ One file per application program, generated from the archives in `products/` by 
 | E002 | device file name does not match its `address` | error |
 | E003 | link references a com object the device doesn't have (a warning when the device has no com-object table at all, because nothing can be checked without product data) | error |
 | E004 | conflicting object/DPT sizes on one GA | error |
-| W005 | same size but different DPT subtypes on one GA (a main type alone, `1`, agrees with any of its subtypes, `1.017`) | warning |
-| W006 | more than one sending object on a GA | warning |
+| W005 | same size but different DPT main types on one GA (`5.001` against `6.010`). Subtypes of one main type agree (`1.001`, `1.005`, `1.019` on one 1-bit address is normal in ETS), as does a main type alone (`1`) | warning |
+| I006 | more than one sending object on a GA (normal in KNX: two push buttons on one light, a central function next to a local one; listed for review) | info |
 | E007 | impossible flags (no C flag; `send` without T) | error |
 | W008 | listening object with neither W nor U | warning |
 | I009 | orphaned com object (T or W, never linked) | info |
@@ -1284,8 +1284,16 @@ One file per application program, generated from the archives in `products/` by 
 | W034 | a secured GA (`secure = true`, keyed in the store) has no device sender, so only tunnel clients can write it, and a Secure device linked to it admits none of the store's tunnelling addresses (no `secure_senders` listing one, no keyring interface group entry for the GA): set `admit_tunnel_senders = true` under `[connection]` and apply the device, or assign the GA to a tunnelling connection in ETS. `knx_plan_device` adds the same sentence as a note for that device while the option is off (issue #297) | warning |
 | E035 | a device without KNX Data Secure (no `secure_capable` in the lock) sends on a GA that a Secure receiver takes secured (its object is marked `secure`, or the GA is). The receiver drops every plaintext telegram. The message names the sender, the GA, the secured receivers and the two ways out: make the GA plain, or send on a plain GA into a logic input of the receiver. `knx_add_link` refuses such a link and `knx_plan_device` refuses to plan the sender (issue #330) | error |
 | E036 | the reverse of E035: a Secure device sends secured on a GA that a device without KNX Data Secure listens to, and that receiver cannot decrypt it. `knx_add_link` and `knx_plan_device` refuse it the same way | error |
+| W037 | a Secure-capable device runs a secured GA but its security is not activated (ETS has not loaded its tool key): it still sends and expects plain telegrams. The message says whether ETS has Secure commissioning set up for it | warning |
+| E038 | write time only: a secured write to a GA no device sends on (W034) whose Secure devices admit none of the tunnelling addresses, while `admit_tunnel_senders` is off. `bussard write` and `knx_write_group` refuse it before sending | error |
+| W039 | a Secure-activated device sends on a secured GA, but `bussard.lock` records no `sequence_number` for it, so its receivers' sender tables (PID 54) can only be seeded from the keyring or with 0 | warning |
+| W040 | a keyring export `bussard keys export` wrote is older than the key store's last change, or `[home_assistant]` is configured and no export is newer than that change (`bussard.keys.meta.toml`) | warning |
+| W041 | a GA's `secure` flag and the `secure` flags of the Secure-capable objects linked to it disagree; the message names `bussard groups secure <ga> on\|off`, which sets the flag, the key store entry and the object flags together | warning |
+| W042 | import time only: `bussard import` secures again a GA the model ran plain, or `bussard keys import` puts back the group key of one; it names the devices the next apply secures | warning |
 
 `validate` runs E027 to I031 and W034 with `BUSSARD_KEYRING`, else the key store `bussard.keys`, else `connection.keyring` (the same codes for a store and an export); `knx_validate` runs them with the server's keyring. The rules see addresses only, never a key.
+
+The Data Secure invariants (issue #348) split over these codes: every device on a secured GA can run Data Secure (E035, E036), is activated (W037) and has its tool key in the key store (W028); the GA's key is in the store (W029); a tunnel-only GA admits the tunnel (W034, refused as E038 at write time); a Secure sender has a sequence source (W039); the group flag, the key store and the object flags agree (W029, W041); keyring consumers are not stale (W040); and an import that secures a plain GA again says so (W042). W037, W039 and W041 read the model only, W040 reads `bussard.keys.meta.toml`.
 
 These rules are opt-in and run only when `bussard.toml` carries a [`[lint]` table](#bussardtoml):
 

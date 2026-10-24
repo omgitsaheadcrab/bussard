@@ -632,7 +632,9 @@ non-Secure sender can switch it:
 ETS does, and is refused while a linked device is not Data Secure capable.
 An ETS re-import of a project that still marks the group address secure
 brings the flags back, and re-importing an old ETS keyring brings the key
-back: change the group address in ETS too.
+back: change the group address in ETS too. Both now say so (W042, issue #348): `bussard import`
+and `bussard keys import` print a warning that names the group address and
+the devices the next apply would secure again.
 
 ## The key store
 
@@ -672,6 +674,30 @@ command reads it unless `--keyring` or `BUSSARD_KEYRING` names an explicit
 file; `connection.keyring` in `bussard.toml` is deprecated and ignored (with
 a warning) when a store exists. `bussard validate` checks the model's
 secured devices and groups against it.
+
+**Stale keyring exports (W040, issue #348).** A keyring export is a copy:
+once the store changes, the consumer that loaded the export (Home Assistant,
+ETS, a visualisation) encrypts with keys the devices no longer use, or cannot
+read a newly secured address, and nothing on the bus says why. bussard
+records the time of every write that changes an existing store and of every
+`bussard keys export` in `bussard.keys.meta.toml` next to the store (paths
+and times only, no key; commit it with the store). `bussard validate` then
+warns about each recorded export that still exists and predates the last
+change, and, with `[home_assistant]` configured, when no export is newer
+than that change. Re-export and load the file again; the warning goes away
+with the new export.
+
+**The Data Secure invariants (issue #348)** are validation codes, so a
+broken secured link shows up before a write rather than after one: every
+device on a secured group address can run Data Secure (E035, E036), is
+activated (W037) and has its tool key in the store (W028); the address's
+key is in the store and its flag, the store and the object flags agree
+(W029, W041, both naming `bussard groups secure <ga> on|off` as the fix); a
+Secure sender has a sequence number recorded (W039). A secured group address
+only tunnel clients can write, whose devices admit no tunnelling address
+(W034), is refused at write time as E038 while `admit_tunnel_senders` is
+off: the devices would drop the telegram, and the gateway's confirmation
+would hide that.
 
 ## Secrets and the `.env` file
 

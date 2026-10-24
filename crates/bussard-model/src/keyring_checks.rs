@@ -169,8 +169,9 @@ pub fn validate_keyring(model: &Model, keyring: Option<&KeyringFacts>) -> Vec<Di
                         location,
                         format!(
                             "GA {ga} is marked `secure = true` but the keyring {file} has no \
-                             group key for it; export a current keyring from ETS or drop the \
-                             flag"
+                             group key for it; export a current keyring from ETS, or fix all \
+                             three signals at once: `bussard groups secure {ga} on` (keeps the \
+                             flag, adds a key) or `off` (runs it plain)"
                         ),
                     ));
                 } else if keyed && !group.secure {
@@ -181,7 +182,8 @@ pub fn validate_keyring(model: &Model, keyring: Option<&KeyringFacts>) -> Vec<Di
                         format!(
                             "the keyring {file} holds a group key for GA {ga}, but groups.toml \
                              does not mark it `secure = true`; secured devices on it expect \
-                             encrypted telegrams"
+                             encrypted telegrams. Fix all three signals at once: `bussard groups \
+                             secure {ga} off` (drops the key) or `on` (marks it secure)"
                         ),
                     ));
                 }

@@ -1,0 +1,13 @@
+# Secured group addresses no device sends on, written only through a tunnel
+# (Home Assistant): ETS assigned none of them to a tunnelling address, so the
+# Secure receivers drop a tunnel write (issue #297). Imported with the keyring.
+W034 groups.toml 0/0/1
+W034 groups.toml 1/0/10
+W034 groups.toml 1/0/2
+W034 groups.toml 1/0/4
+W034 groups.toml 1/0/8
+W034 groups.toml 1/1/23
+W034 groups.toml 3/0/10
+W034 groups.toml 3/0/8
+W034 groups.toml 3/1/18
+W034 groups.toml 3/1/22

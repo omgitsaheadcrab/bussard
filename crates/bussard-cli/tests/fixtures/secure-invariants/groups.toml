@@ -1,0 +1,4 @@
+groups = [
+  { address = "1/2/3", name = "Licht Flur", dpt = "1.001", secure = true },
+  { address = "1/2/4", name = "Licht Keller", dpt = "1.001" },
+]

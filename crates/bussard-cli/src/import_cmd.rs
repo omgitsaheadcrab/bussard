@@ -199,6 +199,9 @@ pub(crate) fn write_model(
     // Validation is part of import: the summary says what to fix next.
     crate::validate_cmd::print_summary(dir);
     if let Some((ours, merge, kept)) = merge_report {
+        // W042 (issue #348): a group address the model ran plain that the
+        // project secures again needs an apply on the devices it names.
+        crate::keys_cmd::print_warnings(&bussard_model::resecured_by_import(&ours, &to_save));
         crate::import_bundle::print_changes(&ours, &to_save);
         return Ok(report_merge(&merge, kept, choice));
     }

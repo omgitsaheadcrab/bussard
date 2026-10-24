@@ -1,0 +1,11 @@
+address = "1.1.10"
+name = "Secure actuator"
+
+[security]
+activated = true
+secure_commissioning = true
+
+[links]
+c21.send = "1/2/3"
+c22.listen = ["1/2/3"]
+c23.listen = ["1/2/4"]
