@@ -130,7 +130,8 @@ to a device follows these rules, and the PR template asks for each one.
 - Every write command ends with an independent read-back compared against the
   model (#319, #349). "Verified" never means "the sequence completed".
 - Model-side code never re-implements ETS Dynamic semantics. It calls the shared
-  Dynamic evaluator in `bussard-ets` (#345).
+  Dynamic evaluator (`bussard_model::dynamic`, moved there behind the
+  `DynamicSource` trait by #345 and re-exported by `bussard-ets`).
 - A silent success is a P1 bug: a result that says ok while the device does not
   match the model.
 
