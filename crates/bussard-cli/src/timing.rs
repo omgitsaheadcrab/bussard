@@ -38,7 +38,7 @@ pub fn time<T>(phase: &'static str, f: impl FnOnce() -> T) -> T {
 }
 
 /// The breakdown lines `--timing` prints: every recorded phase, then the
-/// model-parse and keyring-decrypt counts of the process.
+/// model-parse, product-model and keyring-decrypt counts of the process.
 pub fn report() -> Vec<String> {
     let mut lines: Vec<String> = PHASES
         .lock()
@@ -67,6 +67,10 @@ pub fn report() -> Vec<String> {
     lines.push(format!(
         "  model parses     {}   keyring decrypts {decrypts}",
         bussard_model::Model::parse_count(),
+    ));
+    let (yaml, cached) = bussard_model::ProductModels::load_counts();
+    lines.push(format!(
+        "  product models   {yaml} parsed from YAML, {cached} read from cache"
     ));
     lines
 }

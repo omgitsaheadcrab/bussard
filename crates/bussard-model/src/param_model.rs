@@ -14,7 +14,8 @@
 //! catch-all keep parsing tolerant of everything else.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -395,10 +396,14 @@ pub fn models_dirs(dir: &Path) -> [std::path::PathBuf; 1] {
 /// Missing or unparsable files are simply absent from the map (a missing model
 /// is an info-level note during validation, never a hard error). The `models/`
 /// directory is local-only vendor-derived data, so it is often absent entirely.
+///
+/// Each model is shared ([`Arc`]): a load is served from a process-wide memo
+/// and the JSON cache under [`MODEL_CACHE_DIR`] (issue #339), so a model file
+/// is parsed at most once per process and per change.
 #[derive(Debug, Clone, Default)]
 pub struct ProductModels {
     /// Parsed models keyed by application ref (the file stem).
-    pub by_app_ref: BTreeMap<String, ProductModel>,
+    pub by_app_ref: BTreeMap<String, Arc<ProductModel>>,
 }
 
 impl ProductModels {
@@ -423,13 +428,10 @@ impl ProductModels {
             let Some(app_ref) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
             if by_app_ref.contains_key(app_ref) {
                 continue;
             }
-            if let Ok(model) = ProductModel::from_yaml(&text, app_ref) {
+            if let Some(model) = cache::load(dir, &path, app_ref) {
                 by_app_ref.insert(app_ref.to_string(), model);
             }
         }
@@ -446,22 +448,24 @@ impl ProductModels {
             if by_app_ref.contains_key(app_ref) || app_ref.contains(['/', '\\']) {
                 continue;
             }
-            let Some(text) = dirs
+            let model = dirs
                 .iter()
-                .find_map(|d| std::fs::read_to_string(d.join(format!("{app_ref}.yaml"))).ok())
-            else {
-                continue;
-            };
-            if let Ok(model) = ProductModel::from_yaml(&text, app_ref) {
+                .find_map(|d| cache::load(dir, &d.join(format!("{app_ref}.yaml")), app_ref));
+            if let Some(model) = model {
                 by_app_ref.insert(app_ref.to_string(), model);
             }
         }
         Self { by_app_ref }
     }
 
+    /// Adds (or replaces) the model of `app_ref`.
+    pub fn insert(&mut self, app_ref: impl Into<String>, model: ProductModel) {
+        self.by_app_ref.insert(app_ref.into(), Arc::new(model));
+    }
+
     /// Looks up the model for an application ref, if loaded.
     pub fn get(&self, app_ref: &str) -> Option<&ProductModel> {
-        self.by_app_ref.get(app_ref)
+        self.by_app_ref.get(app_ref).map(|m| &**m)
     }
 
     /// The definition of the parameter an in-memory key (`<slug>@<ref>`) names
@@ -469,6 +473,275 @@ impl ProductModels {
     pub fn param_def(&self, app_ref: &str, key: &str) -> Option<&ParamDef> {
         let id = key_to_param_id(key)?;
         self.get(app_ref)?.parameters.get(&id)
+    }
+
+    /// How many product-model files this process has parsed from YAML (a
+    /// memo and JSON-cache miss) and read from the JSON cache: what
+    /// `--timing` reports.
+    pub fn load_counts() -> (usize, usize) {
+        cache::counts()
+    }
+}
+
+/// Where the converted product models are cached as JSON under a model
+/// directory (issue #339), next to [`MODELS_DIR`] rather than inside it: the
+/// model loader fingerprints `models/`, and a cache written there would
+/// invalidate its memo. `.bussard/` is disposable, so a missing cache only
+/// costs a parse.
+pub const MODEL_CACHE_DIR: &str = ".bussard/model-cache";
+
+/// The JSON cache file of application `app_ref` under model directory `dir`.
+pub fn model_cache_path(dir: &Path, app_ref: &str) -> PathBuf {
+    dir.join(MODEL_CACHE_DIR).join(format!("{app_ref}.json"))
+}
+
+/// Converts the product model YAML `yaml`, just written to
+/// `<dir>/.bussard/models/<app_ref>.yaml`, and stores the result in the JSON
+/// cache and the process memo, so the first command after an import does not
+/// parse it. The conversion is [`ProductModel::from_yaml`], the same as a
+/// load's. Best effort: a text that does not parse or does not match the file
+/// on disk, or a cache that cannot be written, is skipped.
+pub fn cache_written_model(dir: &Path, app_ref: &str, yaml: &str) {
+    if app_ref.contains(['/', '\\']) {
+        return;
+    }
+    let path = dir.join(MODELS_DIR).join(format!("{app_ref}.yaml"));
+    cache::store_written(dir, &path, app_ref, yaml);
+}
+
+/// The model the JSON cache holds for `app_ref` under model directory `dir`,
+/// when its header matches `.bussard/models/<app_ref>.yaml` on disk and this
+/// build; `None` when it is missing, stale or unreadable. Bypasses the memo:
+/// what a test or a diagnostic checks the cache with.
+pub fn cached_product_model(dir: &Path, app_ref: &str) -> Option<ProductModel> {
+    if app_ref.contains(['/', '\\']) {
+        return None;
+    }
+    let path = dir.join(MODELS_DIR).join(format!("{app_ref}.yaml"));
+    cache::read_cache(dir, app_ref, cache::Stamp::of(&path)?)
+}
+
+/// The process-wide memo and the JSON cache behind [`ProductModels`] (issue
+/// #339): a product model is parsed from YAML once per process and change,
+/// and across processes only when its JSON cache is missing or stale.
+mod cache {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use serde::{Deserialize, Serialize};
+
+    use super::{MODEL_FORMAT, ProductModel, model_cache_path};
+
+    /// The cache file layout; a cache of another one is ignored and rewritten.
+    pub(super) const CACHE_SCHEMA: u32 = 1;
+
+    /// YAML parses so far (memo and cache misses).
+    static YAML_PARSES: AtomicUsize = AtomicUsize::new(0);
+    /// JSON cache reads so far.
+    static CACHE_READS: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(test)]
+    thread_local! {
+        /// This thread's (YAML parses, cache reads): what a unit test counts,
+        /// unaffected by tests running in parallel threads.
+        pub(super) static THREAD_COUNTS: std::cell::Cell<(usize, usize)> =
+            const { std::cell::Cell::new((0, 0)) };
+    }
+
+    /// Counts one YAML parse.
+    fn count_parse() {
+        YAML_PARSES.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        THREAD_COUNTS.with(|c| c.set((c.get().0 + 1, c.get().1)));
+    }
+
+    /// Counts one cache read.
+    fn count_cache_read() {
+        CACHE_READS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        THREAD_COUNTS.with(|c| c.set((c.get().0, c.get().1 + 1)));
+    }
+
+    /// Drops the memo entry of `path`, so the next load goes to the cache.
+    #[cfg(test)]
+    pub(super) fn forget(path: &Path) {
+        if let Ok(mut memo) = MEMO.lock()
+            && let Some(map) = memo.as_mut()
+        {
+            map.remove(path);
+        }
+    }
+
+    /// The identity of a model file on disk: its length and modification
+    /// time. A rewrite changes at least one of them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Stamp {
+        len: u64,
+        mtime: SystemTime,
+    }
+
+    impl Stamp {
+        /// The stamp of the file at `path`, if it exists and has a time.
+        pub(super) fn of(path: &Path) -> Option<Self> {
+            let meta = std::fs::metadata(path).ok()?;
+            Some(Self {
+                len: meta.len(),
+                mtime: meta.modified().ok()?,
+            })
+        }
+
+        /// The modification time as (seconds, nanoseconds) since the epoch,
+        /// which round-trips a `SystemTime` exactly. `None` before the epoch.
+        fn mtime_parts(self) -> Option<(u64, u32)> {
+            let d = self.mtime.duration_since(UNIX_EPOCH).ok()?;
+            Some((d.as_secs(), d.subsec_nanos()))
+        }
+    }
+
+    /// One memoized model: the stamp it was parsed at and the model.
+    type MemoEntry = (Stamp, Arc<ProductModel>);
+
+    /// The memo, keyed by the model file's path.
+    static MEMO: Mutex<Option<HashMap<PathBuf, MemoEntry>>> = Mutex::new(None);
+
+    /// The cache file's header: everything that must match the YAML on disk
+    /// and this build for the cached model to stand for it.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct Header {
+        schema: u32,
+        model_format: u32,
+        application: String,
+        yaml_len: u64,
+        yaml_mtime_secs: u64,
+        yaml_mtime_nanos: u32,
+    }
+
+    impl Header {
+        /// The header a cache of `app_ref` at `stamp` must carry.
+        fn expected(app_ref: &str, stamp: Stamp) -> Option<Self> {
+            let (secs, nanos) = stamp.mtime_parts()?;
+            Some(Self {
+                schema: CACHE_SCHEMA,
+                model_format: MODEL_FORMAT,
+                application: app_ref.to_string(),
+                yaml_len: stamp.len,
+                yaml_mtime_secs: secs,
+                yaml_mtime_nanos: nanos,
+            })
+        }
+    }
+
+    /// A cache file as read: the header, then the model.
+    #[derive(Deserialize)]
+    struct CacheFileIn {
+        header: Header,
+        model: ProductModel,
+    }
+
+    /// A cache file as written.
+    #[derive(Serialize)]
+    struct CacheFileOut<'a> {
+        header: &'a Header,
+        model: &'a ProductModel,
+    }
+
+    /// (YAML parses, JSON cache reads) so far.
+    pub(super) fn counts() -> (usize, usize) {
+        (
+            YAML_PARSES.load(Ordering::Relaxed),
+            CACHE_READS.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The memoized model of `path`, if memoized at `stamp`.
+    fn memo_get(path: &Path, stamp: Stamp) -> Option<Arc<ProductModel>> {
+        let memo = MEMO.lock().ok()?;
+        let (at, model) = memo.as_ref()?.get(path)?;
+        (*at == stamp).then(|| Arc::clone(model))
+    }
+
+    /// Memoizes `model` as the content of `path` at `stamp`.
+    fn memo_put(path: &Path, stamp: Stamp, model: &Arc<ProductModel>) {
+        if let Ok(mut memo) = MEMO.lock() {
+            memo.get_or_insert_with(HashMap::new)
+                .insert(path.to_path_buf(), (stamp, Arc::clone(model)));
+        }
+    }
+
+    /// The model the JSON cache holds for `app_ref`, if its header matches.
+    pub(super) fn read_cache(dir: &Path, app_ref: &str, stamp: Stamp) -> Option<ProductModel> {
+        let expected = Header::expected(app_ref, stamp)?;
+        let bytes = std::fs::read(model_cache_path(dir, app_ref)).ok()?;
+        let file: CacheFileIn = serde_json::from_slice(&bytes).ok()?;
+        (file.header == expected).then_some(file.model)
+    }
+
+    /// Writes the JSON cache of `app_ref` atomically (temp file and rename).
+    /// Errors are ignored: the cache is an optimization.
+    fn write_cache(dir: &Path, app_ref: &str, stamp: Stamp, model: &ProductModel) {
+        let Some(header) = Header::expected(app_ref, stamp) else {
+            return;
+        };
+        let cache = model_cache_path(dir, app_ref);
+        let Ok(json) = serde_json::to_vec(&CacheFileOut {
+            header: &header,
+            model,
+        }) else {
+            return;
+        };
+        let Some(parent) = cache.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let tmp = cache.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, json).is_err() || std::fs::rename(&tmp, &cache).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// The product model in file `path` (application `app_ref`, under model
+    /// directory `dir`): from the memo, else the JSON cache, else parsed from
+    /// the YAML (and cached). `None` when the file is missing or unparsable.
+    pub(super) fn load(dir: &Path, path: &Path, app_ref: &str) -> Option<Arc<ProductModel>> {
+        let stamp = Stamp::of(path)?;
+        if let Some(model) = memo_get(path, stamp) {
+            return Some(model);
+        }
+        if let Some(model) = read_cache(dir, app_ref, stamp) {
+            count_cache_read();
+            let model = Arc::new(model);
+            memo_put(path, stamp, &model);
+            return Some(model);
+        }
+        let text = std::fs::read_to_string(path).ok()?;
+        count_parse();
+        let model = Arc::new(ProductModel::from_yaml(&text, app_ref).ok()?);
+        // Remember it only when the file did not change under the read.
+        if Stamp::of(path) == Some(stamp) {
+            write_cache(dir, app_ref, stamp, &model);
+            memo_put(path, stamp, &model);
+        }
+        Some(model)
+    }
+
+    /// Converts `yaml`, the text just written to `path`, and caches it.
+    pub(super) fn store_written(dir: &Path, path: &Path, app_ref: &str, yaml: &str) {
+        let Some(stamp) = Stamp::of(path) else {
+            return;
+        };
+        if stamp.len != yaml.len() as u64 {
+            return;
+        }
+        let Ok(model) = ProductModel::from_yaml(yaml, app_ref) else {
+            return;
+        };
+        write_cache(dir, app_ref, stamp, &model);
+        memo_put(path, stamp, &Arc::new(model));
     }
 }
 
@@ -679,5 +952,198 @@ parameters:
         assert_eq!(enum_code(&l, "Ein"), None, "ambiguous");
         assert_eq!(enum_code(&l, "aus"), None, "exact match only");
         assert_eq!(enum_code(&l, "0"), None, "already a code");
+    }
+
+    type TestErr = Box<dyn std::error::Error>;
+    /// (YAML parses, cache reads) a load cost.
+    type Cost = (usize, usize);
+    /// One way to break the cache file.
+    type Breaker = Box<dyn Fn(&CacheScratch) -> Result<(), TestErr>>;
+
+    /// A scratch model directory holding `.bussard/models/<app>.yaml`.
+    struct CacheScratch {
+        dir: PathBuf,
+        yaml: PathBuf,
+    }
+
+    impl CacheScratch {
+        const APP: &'static str = "M-1_A-1";
+
+        fn new(tag: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            // Only portable file-name characters: a Debug-formatted
+            // SystemTime holds braces and colons, which Windows rejects.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let dir = std::env::temp_dir().join(format!(
+                "bussard-model-cache-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(dir.join(MODELS_DIR))?;
+            let yaml = dir.join(MODELS_DIR).join(format!("{}.yaml", Self::APP));
+            std::fs::write(&yaml, REFS_YAML)?;
+            Ok(Self { dir, yaml })
+        }
+
+        /// Loads the model; returns it with the (parses, cache reads) it cost.
+        fn load(&self) -> Result<(Arc<ProductModel>, Cost), TestErr> {
+            let before = cache::THREAD_COUNTS.with(std::cell::Cell::get);
+            let models = ProductModels::load_apps(&self.dir, [Self::APP]);
+            let after = cache::THREAD_COUNTS.with(std::cell::Cell::get);
+            let model = models
+                .by_app_ref
+                .get(Self::APP)
+                .cloned()
+                .ok_or("the model loads")?;
+            Ok((model, (after.0 - before.0, after.1 - before.1)))
+        }
+
+        fn cache(&self) -> PathBuf {
+            model_cache_path(&self.dir, Self::APP)
+        }
+
+        /// Rewrites one field of the cache file's header.
+        fn edit_header(
+            &self,
+            field: &str,
+            value: serde_json::Value,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let mut json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(self.cache())?)?;
+            json["header"][field] = value;
+            std::fs::write(self.cache(), serde_json::to_vec(&json)?)?;
+            Ok(())
+        }
+
+        /// Sets the YAML's modification time `secs` seconds into the future.
+        fn touch(&self, secs: u64) -> Result<(), Box<dyn std::error::Error>> {
+            let at = std::time::SystemTime::now() + std::time::Duration::from_secs(secs);
+            std::fs::File::options()
+                .write(true)
+                .open(&self.yaml)?
+                .set_modified(at)?;
+            Ok(())
+        }
+    }
+
+    impl Drop for CacheScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn test_load_apps_memo_hit_and_miss() -> Result<(), Box<dyn std::error::Error>> {
+        let s = CacheScratch::new("memo")?;
+        let (first, cost) = s.load()?;
+        assert_eq!(cost, (1, 0), "a cold load parses the YAML");
+        assert!(s.cache().is_file(), "and writes the cache");
+        let (again, cost) = s.load()?;
+        assert_eq!(cost, (0, 0), "a second load is a memo hit");
+        assert!(Arc::ptr_eq(&first, &again), "sharing the parsed model");
+        let all = ProductModels::load(&s.dir);
+        assert!(Arc::ptr_eq(&first, &all.by_app_ref[CacheScratch::APP]));
+
+        // A rewrite of another length is parsed again.
+        std::fs::write(&s.yaml, REFS_YAML.replace("Regenalarm", "Regenalarm2"))?;
+        let (changed, cost) = s.load()?;
+        assert_eq!(cost, (1, 0));
+        assert!(
+            changed
+                .parameters
+                .values()
+                .any(|p| p.text.as_deref() == Some("Regenalarm2"))
+        );
+
+        // A rewrite of the same length is parsed again by its new mtime.
+        std::fs::write(&s.yaml, REFS_YAML.replace("Regenalarm", "Regenalarx"))?;
+        s.touch(5)?;
+        let (changed, cost) = s.load()?;
+        assert_eq!(cost, (1, 0));
+        assert!(
+            changed
+                .parameters
+                .values()
+                .any(|p| p.text.as_deref() == Some("Regenalarx"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_apps_reads_a_matching_cache() -> Result<(), Box<dyn std::error::Error>> {
+        let s = CacheScratch::new("hit")?;
+        let (parsed, _) = s.load()?;
+        cache::forget(&s.yaml);
+        let (cached, cost) = s.load()?;
+        assert_eq!(cost, (0, 1), "a new process reads the JSON cache");
+        assert_eq!(format!("{parsed:?}"), format!("{cached:?}"));
+        Ok(())
+    }
+
+    /// Every header mismatch and a corrupt file fall back to the YAML and
+    /// rewrite the cache.
+    #[test]
+    fn test_load_apps_rejects_a_stale_cache() -> Result<(), Box<dyn std::error::Error>> {
+        let s = CacheScratch::new("stale")?;
+        s.load()?;
+        let breaks: [(&str, Breaker); 6] = [
+            ("len", Box::new(|s| s.edit_header("yaml_len", 1.into()))),
+            (
+                "mtime secs",
+                Box::new(|s| s.edit_header("yaml_mtime_secs", 1.into())),
+            ),
+            (
+                "mtime nanos",
+                Box::new(|s| s.edit_header("yaml_mtime_nanos", 7.into())),
+            ),
+            (
+                "schema",
+                Box::new(|s| s.edit_header("schema", (cache::CACHE_SCHEMA + 1).into())),
+            ),
+            (
+                "model format",
+                Box::new(|s| s.edit_header("model_format", (MODEL_FORMAT - 1).into())),
+            ),
+            (
+                "corrupt",
+                Box::new(|s| Ok(std::fs::write(s.cache(), b"{\"header\": nope")?)),
+            ),
+        ];
+        for (what, break_it) in breaks {
+            break_it(&s)?;
+            assert!(
+                cached_product_model(&s.dir, CacheScratch::APP).is_none(),
+                "{what}"
+            );
+            cache::forget(&s.yaml);
+            let (_, cost) = s.load()?;
+            assert_eq!(cost, (1, 0), "{what}: parsed from YAML");
+            assert!(
+                cached_product_model(&s.dir, CacheScratch::APP).is_some(),
+                "{what}: rewritten"
+            );
+        }
+
+        // A YAML touched after the cache was written makes it stale too.
+        s.touch(10)?;
+        assert!(cached_product_model(&s.dir, CacheScratch::APP).is_none());
+        cache::forget(&s.yaml);
+        let (_, cost) = s.load()?;
+        assert_eq!(cost, (1, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_cache_written_model_seeds_the_cache() -> Result<(), Box<dyn std::error::Error>> {
+        let s = CacheScratch::new("written")?;
+        cache_written_model(&s.dir, CacheScratch::APP, REFS_YAML);
+        assert!(cached_product_model(&s.dir, CacheScratch::APP).is_some());
+        let (_, cost) = s.load()?;
+        assert_eq!(cost, (0, 0), "the write seeded the memo");
+        cache::forget(&s.yaml);
+        let (_, cost) = s.load()?;
+        assert_eq!(cost, (0, 1), "and the cache");
+        Ok(())
     }
 }

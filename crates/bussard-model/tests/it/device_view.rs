@@ -84,9 +84,7 @@ fn model() -> Result<Model, Box<dyn std::error::Error>> {
 
 fn products() -> Result<ProductModels, Box<dyn std::error::Error>> {
     let mut products = ProductModels::default();
-    products
-        .by_app_ref
-        .insert(APP.to_string(), ProductModel::from_yaml(PRODUCT, APP)?);
+    products.insert(APP.to_string(), ProductModel::from_yaml(PRODUCT, APP)?);
     Ok(products)
 }
 

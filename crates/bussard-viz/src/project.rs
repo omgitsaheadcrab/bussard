@@ -864,7 +864,7 @@ fahren.listen = ["0/1/0"]
 "#
         );
         let mut products = ProductModels::default();
-        products.by_app_ref.insert(
+        products.insert(
             PARAM_APP.to_string(),
             bussard_model::ProductModel::from_yaml(&yaml, PARAM_APP)?,
         );

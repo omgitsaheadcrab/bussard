@@ -204,7 +204,7 @@ fn test_model_and_download_evaluators_reach_the_same_refs_on_every_fixture() -> 
             .flat_map(|b| b.parameters.iter().cloned())
             .collect();
         let mut products = ProductModels::default();
-        products.by_app_ref.insert(id.to_string(), product.clone());
+        products.insert(id.to_string(), product.clone());
         let scenarios = scenarios(&app, &product);
         compared += scenarios.len();
         for values in scenarios {
@@ -262,9 +262,7 @@ fn meteo(
         .ok_or("the archive carries no Meteodata application")?
         .clone();
     let mut products = ProductModels::default();
-    products
-        .by_app_ref
-        .insert(METEO_APP.to_string(), product_model(&app)?);
+    products.insert(METEO_APP.to_string(), product_model(&app)?);
     Ok((model, products, app))
 }
 

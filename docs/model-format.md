@@ -24,6 +24,7 @@ knx/
   .bussard/history/     snapshots of the model files
   .bussard/facts/       @generated device facts per device, local only (reference.md)
   .bussard/models/      @generated product models, rebuilt from products/ when missing
+  .bussard/model-cache/ the product models converted to JSON, rebuilt when a model changes
 ```
 
 A file is either fully user-owned or fully generated. Of the model files

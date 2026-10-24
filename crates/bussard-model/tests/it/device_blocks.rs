@@ -12,10 +12,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use bussard_model::capabilities::{cache_path, capability_lookup};
+use bussard_model::capabilities::capability_lookup;
 use bussard_model::device_view::{
     device_view, ignored_overrides, parameter_pages, parameter_visibility, unindexed_parameters,
 };
+use bussard_model::param_model::model_cache_path;
 use bussard_model::{IndividualAddress, Model, ProductModel, ProductModels};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -76,9 +77,7 @@ fn model() -> Result<Model, Box<dyn std::error::Error>> {
 
 fn products() -> Result<ProductModels, Box<dyn std::error::Error>> {
     let mut products = ProductModels::default();
-    products
-        .by_app_ref
-        .insert(APP.to_string(), ProductModel::from_yaml(PRODUCT, APP)?);
+    products.insert(APP.to_string(), ProductModel::from_yaml(PRODUCT, APP)?);
     Ok(products)
 }
 
@@ -334,8 +333,8 @@ fn test_capability_lookup_finds_a_choice_on_an_inactive_page() -> TestResult {
 fn test_capability_lookup_caches_the_model_and_rebuilds_a_stale_cache() -> TestResult {
     let scratch = Scratch::new("cache")?;
     let model = Model::load(scratch.path())?;
-    let cache = cache_path(scratch.path(), APP);
-    assert!(!cache.exists());
+    // The model load already read the product model, through the cache.
+    let cache = model_cache_path(scratch.path(), APP);
     let first = capability_lookup(&model, scratch.path(), "brightness", 50);
     assert!(cache.is_file(), "the lookup caches the parsed model");
 

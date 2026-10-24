@@ -41,9 +41,7 @@ fn test_name_parameters_uses_the_product_model_text() -> TestResult {
         "parameters:\n  - id: {APP}_P-1312\n    text: Night setback\n    type: !int\n      min: 0\n"
     );
     let mut products = ProductModels::default();
-    products
-        .by_app_ref
-        .insert(APP.to_string(), ProductModel::from_yaml(&yaml, APP)?);
+    products.insert(APP.to_string(), ProductModel::from_yaml(&yaml, APP)?);
     name_parameters(&mut changes, [&new, &old], &products);
     assert_eq!(
         changes.changes[0].sentence,
@@ -60,9 +58,7 @@ fn enum_products() -> Result<ProductModels, Box<dyn std::error::Error>> {
          - {{ value: 5, text: Kurzer und langer Tastendruck }}\n"
     );
     let mut products = ProductModels::default();
-    products
-        .by_app_ref
-        .insert(APP.to_string(), ProductModel::from_yaml(&yaml, APP)?);
+    products.insert(APP.to_string(), ProductModel::from_yaml(&yaml, APP)?);
     Ok(products)
 }
 

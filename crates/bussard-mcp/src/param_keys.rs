@@ -803,7 +803,7 @@ brightness.send = "4/1/5"
         let mut products = ProductModels::default();
         let mut product = ProductModel::from_yaml(PRODUCT, APP)?;
         change(&mut product);
-        products.by_app_ref.insert(APP.to_string(), product);
+        products.insert(APP.to_string(), product);
         let ia: IndividualAddress = "1.1.30".parse()?;
         let ctx = KeyContext::new(&model, &products, ia);
         Ok((model, ctx, ia))

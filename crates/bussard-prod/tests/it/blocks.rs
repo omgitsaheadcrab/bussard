@@ -11,7 +11,9 @@
 use std::path::PathBuf;
 
 use bussard_model::blocks::BlockKind;
-use bussard_model::param_model::{MODEL_FORMAT, model_is_current};
+use bussard_model::param_model::{
+    MODEL_FORMAT, cached_product_model, model_cache_path, model_is_current,
+};
 use bussard_prod::product_model::write_product_models;
 use bussard_prod::{ApplicationProgram, ProductData, parse_application_program};
 
@@ -122,6 +124,28 @@ fn test_ref_values_for_carries_ref_level_values() -> TestResult {
         values.into_iter().collect::<Vec<_>>(),
         [("P-13_R-13".to_string(), "4".to_string())]
     );
+    Ok(())
+}
+
+/// Issue #339: the import writes each model's JSON cache from the YAML it
+/// just wrote, so the first load after it reads JSON instead of YAML.
+#[test]
+fn test_write_product_models_leaves_a_valid_cache() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let product = ProductData {
+        applications: vec![app()?],
+        ..ProductData::default()
+    };
+    write_product_models(&product, dir.path())?;
+    assert!(model_cache_path(dir.path(), APP).is_file());
+    let cached = cached_product_model(dir.path(), APP).ok_or("the cache matches the YAML")?;
+    let yaml = std::fs::read_to_string(
+        dir.path()
+            .join(".bussard/models")
+            .join(format!("{APP}.yaml")),
+    )?;
+    let parsed = bussard_model::ProductModel::from_yaml(&yaml, APP)?;
+    assert_eq!(format!("{cached:?}"), format!("{parsed:?}"));
     Ok(())
 }
 

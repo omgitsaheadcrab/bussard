@@ -9,80 +9,20 @@
 //! says, per match, whether the page or channel holding it is active and,
 //! when it is not, what enables it (the [`crate::device_view`] analysis).
 //!
-//! Parsing a product model's YAML is slow next to a search, so each model is
-//! cached as JSON under `.bussard/lookup/<application>.json`, rebuilt when
-//! the model file is newer than the cache or the cache is of another format.
+//! Parsing a product model's YAML is slow next to a search; the models come
+//! through [`ProductModels::load_apps`], which memoizes them and caches them
+//! as JSON under [`crate::param_model::MODEL_CACHE_DIR`] (issue #339).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::address::IndividualAddress;
 use crate::blocks::ref_param_id;
 use crate::device_view::{BlockRow, EnableStep, device_view};
 use crate::loader::Model;
-use crate::param_model::{MODELS_DIR, ParamDef, ParamKind, ProductModel, ProductModels};
-
-/// Where the lookup caches live under a model directory.
-pub const LOOKUP_DIR: &str = ".bussard/lookup";
-
-/// The cache format; a cache of another one is rebuilt.
-const CACHE_FORMAT: u32 = 1;
-
-/// One cache file.
-#[derive(Debug, Serialize, Deserialize)]
-struct CacheFile {
-    format: u32,
-    application: String,
-    model: ProductModel,
-}
-
-/// The cache file of application `app` under model directory `dir`.
-pub fn cache_path(dir: &Path, app: &str) -> PathBuf {
-    dir.join(LOOKUP_DIR).join(format!("{app}.json"))
-}
-
-/// The product model of `app`, through its lookup cache: read from the cache
-/// when it is at least as new as `.bussard/models/<app>.yaml`, else parsed
-/// from the YAML and cached (best effort; a cache that cannot be written is
-/// skipped). `None` when there is no model file.
-pub fn cached_model(dir: &Path, app: &str) -> Option<ProductModel> {
-    if app.contains(['/', '\\']) {
-        return None;
-    }
-    let yaml = dir.join(MODELS_DIR).join(format!("{app}.yaml"));
-    let yaml_time = std::fs::metadata(&yaml).and_then(|m| m.modified()).ok()?;
-    let cache = cache_path(dir, app);
-    let fresh = std::fs::metadata(&cache)
-        .and_then(|m| m.modified())
-        .is_ok_and(|t| t >= yaml_time);
-    if fresh
-        && let Ok(bytes) = std::fs::read(&cache)
-        && let Ok(file) = serde_json::from_slice::<CacheFile>(&bytes)
-        && file.format == CACHE_FORMAT
-        && file.application == app
-    {
-        return Some(file.model);
-    }
-    let text = std::fs::read_to_string(&yaml).ok()?;
-    let model = ProductModel::from_yaml(&text, app).ok()?;
-    let file = CacheFile {
-        format: CACHE_FORMAT,
-        application: app.to_string(),
-        model,
-    };
-    if let Ok(json) = serde_json::to_vec(&file)
-        && let Some(parent) = cache.parent()
-        && std::fs::create_dir_all(parent).is_ok()
-    {
-        let tmp = cache.with_extension(format!("json.{}.tmp", std::process::id()));
-        if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &cache).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
-    Some(file.model)
-}
+use crate::param_model::{ParamDef, ParamKind, ProductModel, ProductModels};
 
 /// One matching parameter, or one of its choices, on a page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -294,13 +234,7 @@ pub fn capability_lookup(model: &Model, dir: &Path, query: &str, limit: usize) -
         .values()
         .filter_map(|d| d.device.product.as_ref()?.application_ref.as_deref())
         .collect();
-    let mut by_app_ref = BTreeMap::new();
-    for app in apps {
-        if let Some(m) = cached_model(dir, app) {
-            by_app_ref.insert(app.to_string(), m);
-        }
-    }
-    let products = ProductModels { by_app_ref };
+    let products = ProductModels::load_apps(dir, apps);
     let hits: HashMap<&str, Vec<Hit<'_>>> = products
         .by_app_ref
         .iter()
