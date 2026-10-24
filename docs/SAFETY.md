@@ -592,14 +592,19 @@ again.
 
 ### Switching Data Secure off for one group address
 
-**Status: oracle pending (issue #331).** Do not run this on a real device
-until an ETS capture has confirmed the write. The owner captures an ETS
-download of 1.1.5 with 1/0/4 set to security Off, and
-`scripts/campaign/95-offline-oracle.sh --keyring` must report the PID 53,
-PID 54 and PID 61 writes of that row identical against a model where
-`bussard groups secure 1/0/4 off` ran (a copy of the model, never the live
-`knx/` of another session). Until then it is tested against the Secure mock
-device only.
+**Status: oracle verified on 2026-10-24.** An ETS download of 1.1.5 (ABB
+switch actuator, System B, Data Secure) with 1/0/4 and 1/0/5 set to security
+Off (`1-1-5-no-secure-ga.pcapng`) was compared with
+`scripts/campaign/95-offline-oracle.sh --keyring` against a copy of the model
+where `bussard groups secure 1/0/4 off` and `1/0/5 off` had run: address and
+association tables identical, the group key table (PID 53) and the object
+security flags (PID 61) hash-equal, and the same differences every Secure row
+shows (ETS's commissioning writes of PID 51, 56 and 59, and the PID 54
+sequence numbers, which an offline run cannot know). The row is in the
+campaign rows file. Two conditions for that comparison: the keyring given to
+the oracle must be a key store export without the removed keys (the script
+hands the keyring to the bussard dry run too, where it overrides the key
+store), and the model copy must have `admit_tunnel_senders = false`.
 
 `bussard groups secure <GA> off` (or `knx_set_group` with `secure: false`)
 lets a Secure device run one group address plain, for example so a
