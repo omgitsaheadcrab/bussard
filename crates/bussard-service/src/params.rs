@@ -648,6 +648,9 @@ pub struct FlashedParameters {
     /// keyed as the device file keys them. Runtime-owned (device-managed)
     /// parameters are never listed, as in a plan.
     pub differences: Vec<DifferenceJson>,
+    /// How many parameter values the read-back decoded and compared (issue
+    /// #349); 0 when the memory was not compared.
+    pub compared: usize,
     /// Why the memory was not compared; `None` when it was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -712,6 +715,7 @@ pub async fn read_flashed_parameters<Ch: L4Channel>(
 ) -> FlashedParameters {
     let noted = |note: String| FlashedParameters {
         differences: Vec::new(),
+        compared: 0,
         note: Some(note),
     };
     let plan = match bussard_download::plan_for_readback(product, app, model, target, device_mask) {
@@ -729,8 +733,10 @@ pub async fn read_flashed_parameters<Ch: L4Channel>(
     let device = model
         .and_then(|m| m.devices.get(&target))
         .map(|d| &d.device);
+    let compared = decoded.values.len();
     let (_, differences) = report(decoded);
     FlashedParameters {
+        compared,
         differences: differences
             .into_iter()
             .map(|d| DifferenceJson {

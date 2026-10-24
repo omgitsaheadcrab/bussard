@@ -399,6 +399,7 @@ mod tests {
                 resolved: Vec::new(),
                 sources: Vec::new(),
                 notes: Vec::new(),
+                group_objects: None,
             },
             own_ia,
             address_base: SYS7_ADDRESS_TABLE_ADDR,

@@ -332,6 +332,21 @@ pub fn run_export(dir: &Path, file: &Path, force: bool, json: bool) -> anyhow::R
         .iter()
         .map(|ia| ia.to_string())
         .collect();
+    // Verified means read back and compared (issue #349): the file as written,
+    // its signature checked, decrypted and its key set compared with the store.
+    let written = std::fs::read_to_string(file)
+        .with_context(|| format!("reading {} back", file.display()))?;
+    let check = store
+        .check_export(&written, &password)
+        .with_context(|| format!("reading {} back", file.display()))?;
+    let omitted = omitted_group_addresses(dir, &store, &check);
+    let carried: Vec<String> = check
+        .group_addresses
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let omitted_s: Vec<String> = omitted.iter().map(ToString::to_string).collect();
+    let leftovers = check.leftovers();
     if json {
         let value = serde_json::json!({
             "file": file.display().to_string(),
@@ -339,6 +354,10 @@ pub fn run_export(dir: &Path, file: &Path, force: bool, json: bool) -> anyhow::R
             "group_keys": export.group_keys,
             "interfaces": export.interfaces,
             "skipped_devices": skipped,
+            "verified": check.verified(),
+            "group_addresses": carried,
+            "omitted_group_addresses": omitted_s,
+            "leftovers": leftovers,
         });
         crate::output::print(crate::output::schema::KEYS_EXPORT, &value)?;
     } else {
@@ -355,9 +374,64 @@ pub fn run_export(dir: &Path, file: &Path, force: bool, json: bool) -> anyhow::R
                 skipped.join(", ")
             );
         }
+        println!(
+            "  group addresses carried: {}",
+            if carried.is_empty() {
+                "none".to_string()
+            } else {
+                carried.join(", ")
+            }
+        );
+        if !omitted_s.is_empty() {
+            println!(
+                "  group addresses omitted (secure in the model or the store, no key in the \
+                 export): {}",
+                omitted_s.join(", ")
+            );
+        }
+        if check.verified() {
+            println!("  verified: read back, decrypted and compared with the key store");
+        } else {
+            for leftover in &leftovers {
+                eprintln!("ERROR: {leftover}");
+            }
+        }
         println!("  keep it out of git: the model's .gitignore lists *.knxkeys");
     }
+    if !check.verified() {
+        eprintln!(
+            "ERROR: {} does not carry the key store's keys; do not hand it on",
+            file.display()
+        );
+        return Ok(ExitCode::FAILURE);
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The group addresses the model marks secure or the store keys that the
+/// export `check` read back does not carry, ascending. A model that does not
+/// load contributes nothing (the store's own keys are still checked).
+fn omitted_group_addresses(
+    dir: &Path,
+    store: &KeyStore,
+    check: &bussard_project::keystore::ExportCheck,
+) -> Vec<bussard_model::GroupAddress> {
+    let mut wanted: std::collections::BTreeSet<bussard_model::GroupAddress> =
+        store.group_keys.keys().copied().collect();
+    if let Ok(model) = bussard_model::Model::load(dir) {
+        wanted.extend(
+            model
+                .groups
+                .groups
+                .iter()
+                .filter(|(_, g)| g.secure)
+                .map(|(ga, _)| *ga),
+        );
+    }
+    wanted
+        .into_iter()
+        .filter(|ga| !check.group_addresses.contains(ga))
+        .collect()
 }
 
 /// Runs `bussard keys show`.

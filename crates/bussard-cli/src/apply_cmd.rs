@@ -530,8 +530,59 @@ pub(crate) fn apply_desired(
         }
         _ => None,
     };
-    if !tables_change {
-        return write_parameters(
+    // What the write means to leave on the device, for the independent
+    // read-back that ends every apply (issue #349).
+    let expected = bussard_service::verify::Expected {
+        tables: Some(desired.clone()),
+        group_objects: None,
+        parameters: match (partial, param_detail, write.product) {
+            (Some(_), Some(_), Some(product)) => {
+                product
+                    .app()
+                    .map(|app| bussard_service::verify::ExpectedParameters {
+                        product: &product.product,
+                        app,
+                        model,
+                        device_mask: live.mask,
+                    })
+            }
+            _ => None,
+        },
+        security: if tables_change {
+            security.as_ref().map(|inputs| {
+                bussard_service::verify::ExpectedSecurity::from_inputs(inputs, &desired.addresses)
+            })
+        } else {
+            None
+        },
+    };
+    let (code, read_back) = if tables_change {
+        write_tables_then_parameters(
+            &runtime,
+            service,
+            dir,
+            target,
+            source,
+            &desired,
+            sys7.as_ref().map(|(_, images)| images),
+            security.as_ref(),
+            &report,
+            origin,
+            model,
+            write_seed.clone(),
+            live.mask,
+            ParamWrite {
+                partial,
+                detail: param_detail,
+                backup: param_backup.as_deref(),
+            },
+            &tool_key,
+            &secure_seq,
+            &read_options,
+            &backup_path,
+        )?
+    } else {
+        write_parameters(
             &runtime,
             service,
             target,
@@ -542,10 +593,94 @@ pub(crate) fn apply_desired(
             &secure_seq,
             &read_options,
             param_backup.as_deref(),
-        );
-    }
+        )?
+    };
 
-    if let Some((_, images)) = &sys7
+    // A sequence that stopped before it wrote (an access denial, a lost
+    // connection) has its error; there is nothing new to read back.
+    if !read_back {
+        return Ok(code);
+    }
+    // Verified means read back and compared (issues #319, #349): a fresh
+    // session reads the tables, the written parameters and the security
+    // object, and compares them with the model. It reuses the read phase's
+    // checked facts and its authorize verdict, as the write did.
+    let readback_options = L4Options {
+        authorize: if write_seed.as_ref().is_some_and(|s| s.authorize_unanswered) {
+            bussard_service::Authorize::Skip
+        } else {
+            read_options.authorize
+        },
+        ..read_options.clone()
+    };
+    let readback = runtime.block_on(bussard_service::verify::read_back_on(
+        service,
+        target,
+        &readback_options,
+        write_seed.clone(),
+        &expected,
+    ));
+    for note in &readback.notes {
+        eprintln!("warning: {note}");
+    }
+    match readback.failure() {
+        Some(failure) => {
+            eprintln!("\nERROR: {} {target}: {failure}", origin.verb());
+            if code == ExitCode::SUCCESS {
+                recovery_notice(&backup_path, target);
+            }
+            Ok(ExitCode::FAILURE)
+        }
+        None => {
+            println!(
+                "read back from {target} and compared with the model: {}",
+                readback.summary()
+            );
+            if code == ExitCode::SUCCESS
+                && let Some(hint) = crate::export_cmd::stale_export_hint(dir)
+            {
+                eprintln!("{hint}");
+            }
+            Ok(code)
+        }
+    }
+}
+
+/// The parameter half of a write: the download, the read-back's plan and
+/// the backup to point at on a failure.
+#[derive(Clone, Copy)]
+struct ParamWrite<'a> {
+    partial: Option<&'a bussard_download::FlashPlan>,
+    detail: Option<&'a bussard_service::params::ParamDetail>,
+    backup: Option<&'a Path>,
+}
+
+/// Writes the tables (and the security object of a secured System B write),
+/// records what a verified write programmed, then writes the parameter
+/// octets that differ. Returns the exit code of the write sequence; the
+/// read-back after it decides whether the apply verified.
+#[allow(clippy::too_many_arguments)] // one write phase's context
+fn write_tables_then_parameters(
+    runtime: &tokio::runtime::Runtime,
+    service: &bussard_service::BusService,
+    dir: &Path,
+    target: IndividualAddress,
+    source: IndividualAddress,
+    desired: &DesiredTables,
+    images: Option<&Sys7TableImages>,
+    security: Option<&bussard_download::SecurityInputs>,
+    report: &PlanReport,
+    origin: &DesiredSource,
+    model: Option<&bussard_model::Model>,
+    write_seed: Option<bussard_mgmt::ConnectionSeed>,
+    mask: u16,
+    params: ParamWrite<'_>,
+    tool_key: &Option<bussard_secure::Key16>,
+    secure_seq: &bussard_secure::SequenceHighWater,
+    read_options: &L4Options,
+    backup_path: &Path,
+) -> anyhow::Result<(ExitCode, bool)> {
+    if let Some(images) = images
         && let Some((from, to)) = images.group_object_moved
     {
         println!(
@@ -556,7 +691,6 @@ pub(crate) fn apply_desired(
     }
 
     // Phase B (write): execute the load sequence and verify.
-    let mask = live.mask;
     // The same tunnel phase A used: its L4 session and bus lease are both
     // released by now, so the write phase simply takes the lease again.
     // Progress (issue #147): the table write emits no finer events, so the live
@@ -568,19 +702,10 @@ pub(crate) fn apply_desired(
     );
     let outcome = runtime.block_on(async {
         let channel = service.lease_channel().await?;
-        let secure = crate::secure_key::layer(&tool_key, &secure_seq);
-        let images = sys7.as_ref().map(|(_, images)| images);
+        let secure = crate::secure_key::layer(tool_key, secure_seq);
         anyhow::Ok(
             write_tables_seeded(
-                channel,
-                target,
-                source,
-                mask,
-                &desired,
-                images,
-                secure,
-                security.as_ref(),
-                write_seed,
+                channel, target, source, mask, desired, images, secure, security, write_seed,
             )
             .await,
         )
@@ -601,7 +726,7 @@ pub(crate) fn apply_desired(
             // The security object was written with this PID 54 table and the
             // write verified: record it in the lock, as `adopt` does (issue
             // #297), so the sender admission check sees it.
-            if let (Some(inputs), Some(_)) = (&security, model) {
+            if let (Some(inputs), Some(_)) = (security, model) {
                 match bussard_service::admission::record_secure_senders(
                     dir,
                     target,
@@ -630,27 +755,18 @@ pub(crate) fn apply_desired(
                     Err(err) => eprintln!("warning: {err}"),
                 }
             }
-            if partial.is_some() {
-                let code = write_parameters(
-                    &runtime,
-                    service,
-                    target,
-                    source,
-                    partial,
-                    param_detail,
-                    &tool_key,
-                    &secure_seq,
-                    &read_options,
-                    param_backup.as_deref(),
-                )?;
-                if code != ExitCode::SUCCESS {
-                    return Ok(code);
-                }
-            }
-            if let Some(hint) = crate::export_cmd::stale_export_hint(dir) {
-                eprintln!("{hint}");
-            }
-            Ok(ExitCode::SUCCESS)
+            write_parameters(
+                runtime,
+                service,
+                target,
+                source,
+                params.partial,
+                params.detail,
+                tool_key,
+                secure_seq,
+                read_options,
+                params.backup,
+            )
         }
         Ok(summary) => {
             eprintln!(
@@ -658,13 +774,13 @@ pub(crate) fn apply_desired(
                 origin.verb(),
                 summary.detail
             );
-            recovery_notice(&backup_path, target);
-            Ok(ExitCode::FAILURE)
+            recovery_notice(backup_path, target);
+            Ok((ExitCode::FAILURE, true))
         }
         Err(err) => {
             eprintln!("\nERROR: {} failed: {err}", origin.verb());
-            recovery_notice(&backup_path, target);
-            Ok(ExitCode::FAILURE)
+            recovery_notice(backup_path, target);
+            Ok((ExitCode::FAILURE, false))
         }
     }
 }
@@ -719,9 +835,9 @@ fn write_parameters(
     secure_seq: &bussard_secure::SequenceHighWater,
     read_options: &L4Options,
     backup: Option<&Path>,
-) -> anyhow::Result<ExitCode> {
+) -> anyhow::Result<(ExitCode, bool)> {
     let (Some(partial), Some(detail)) = (partial, detail) else {
-        return Ok(ExitCode::SUCCESS);
+        return Ok((ExitCode::SUCCESS, true));
     };
     let backup_note = |target: IndividualAddress| {
         if let Some(path) = backup {
@@ -751,12 +867,17 @@ fn write_parameters(
                 "parameters verified: {octets} changed octet(s) read back from {target}; the \
                  application is Loaded"
             );
-            Ok(ExitCode::SUCCESS)
+            Ok((ExitCode::SUCCESS, true))
         }
         (_, failure) => {
             eprintln!("\nERROR: {}", failure.unwrap_or_default());
             backup_note(target);
-            Ok(ExitCode::FAILURE)
+            // A download that stopped (`Failed`) wrote nothing more to read.
+            let wrote = !matches!(
+                outcome,
+                bussard_service::download::ParamWriteOutcome::Failed(_)
+            );
+            Ok((ExitCode::FAILURE, wrote))
         }
     }
 }

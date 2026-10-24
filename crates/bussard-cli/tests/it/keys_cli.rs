@@ -98,6 +98,24 @@ fn test_keys_import_show_export_round_trip() -> TestResult {
         exported.contains("1 device(s), 1 group key(s), 1 interface(s)"),
         "{exported}"
     );
+    // Issue #349: the written file is read back, decrypted and compared.
+    assert!(
+        exported.contains("group addresses carried: 1/2/3"),
+        "{exported}"
+    );
+    assert!(
+        exported.contains("verified: read back, decrypted and compared with the key store"),
+        "{exported}"
+    );
+    assert_no_secrets(&exported);
+    let json_out = model.parent().ok_or("no parent")?.join("export2.knxkeys");
+    let v: serde_json::Value = serde_json::from_str(&ok(&keys(
+        &model,
+        &["--json", "export", &json_out.to_string_lossy()],
+    )?)?)?;
+    assert_eq!(v["verified"], true, "{v}");
+    assert_eq!(v["group_addresses"], serde_json::json!(["1/2/3"]), "{v}");
+    assert_eq!(v["leftovers"], serde_json::json!([]), "{v}");
     let second = model.parent().ok_or("no parent")?.join("knx2");
     std::fs::create_dir_all(&second)?;
     ok(&keys(&second, &["import", &out_s])?)?;

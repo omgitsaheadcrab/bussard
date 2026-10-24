@@ -715,6 +715,7 @@ mod tests {
             ],
             sources: vec![("addresses", TableSource::Property)],
             notes: vec!["read via properties".to_string()],
+            group_objects: None,
         }
     }
 

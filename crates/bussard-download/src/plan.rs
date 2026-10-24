@@ -154,6 +154,7 @@ mod tests {
             resolved,
             sources: vec![("addresses", TableSource::Property)],
             notes: Vec::new(),
+            group_objects: None,
         }
     }
 

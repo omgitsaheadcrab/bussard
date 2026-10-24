@@ -221,6 +221,15 @@ async fn test_knx_plan_device_flashes_a_healthy_system7_device_without_force() -
     // Issue #319: the read-back after the flash matches the model.
     assert_eq!(done["result"]["verified"], true, "{done}");
     assert_eq!(done["result"]["parameters"]["verified"], true, "{done}");
+    // Issue #349: the read-back compared the tables too.
+    assert_eq!(
+        done["result"]["readback"]["compared"]["addresses"], 1,
+        "{done}"
+    );
+    assert_eq!(
+        done["result"]["readback"]["compared"]["associations"], 1,
+        "{done}"
+    );
 
     let (code, params) = gateway.with_device(device_ia()?, |dev| {
         (
@@ -340,6 +349,52 @@ async fn test_knx_apply_device_flash_whose_device_drops_a_write_is_not_verified(
     let key = differences[0]["key"].as_str().unwrap_or_default();
     assert!(key.starts_with("obj2"), "the device-file key: {done}");
     assert_eq!(differences[0]["model"], "On", "{done}");
+
+    client.cancel().await?;
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_knx_apply_device_flash_whose_device_drops_the_links_is_not_verified()
+-> anyhow::Result<()> {
+    // Issue #349: the device takes the download and reports every LSM
+    // Loaded, but loses its association table at the restart (the count
+    // octet at 0x4201 goes back to 0). The read-back compares the links and
+    // the table sizes with the model, so the flash is not verified and the
+    // lost link is named.
+    let dropping = device(&SYS7_CODE)?.with_hook(|dev, apci, _| {
+        if apci == bussard_testkit::consts::A_RESTART {
+            dev.memory.insert(
+                u32::from(bussard_download::SYS7_ASSOCIATION_TABLE_ADDR),
+                0x00,
+            );
+        }
+        None
+    });
+    let gateway = gateway(dropping).await?;
+    let dir = tempfile::tempdir()?;
+    write_model(dir.path())?;
+    let (client, task) = serve(dir.path(), &gateway).await?;
+
+    let done = plan_and_flash(&client).await?;
+    assert_eq!(done["state"], "done", "{done}");
+    let result = &done["result"];
+    assert_eq!(result["method"], "flash", "{done}");
+    assert_eq!(result["verified"], false, "{done}");
+    assert_eq!(result["ok"], false, "{done}");
+    // The parameters arrived; the links did not.
+    assert_eq!(result["readback"]["compared"]["parameters"], 2, "{done}");
+    let reason = result["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("object 1 -> 1/2/0") && reason.contains("association table"),
+        "the reason names the lost link: {done}"
+    );
+    let kinds: Vec<&str> = result["readback"]["leftovers"]
+        .as_array()
+        .map(|l| l.iter().filter_map(|x| x["kind"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(kinds, ["link", "association_table"], "{done}");
 
     client.cancel().await?;
     task.abort();

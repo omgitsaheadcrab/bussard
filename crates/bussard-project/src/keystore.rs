@@ -430,6 +430,79 @@ pub struct InterfaceSummary {
     pub group_addresses: usize,
 }
 
+/// What a written `.knxkeys` export holds, read back and decrypted, against
+/// the store it was made from (issue #349): `keys export` is verified only
+/// when the file carries every key the store meant to export. Addresses only,
+/// never key material.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ExportCheck {
+    /// The group addresses whose key the export carries, ascending.
+    pub group_addresses: Vec<GroupAddress>,
+    /// The store's group keys the export lacks, ascending.
+    pub missing_group_keys: Vec<GroupAddress>,
+    /// The group keys the export carries with another key than the store's.
+    pub changed_group_keys: Vec<GroupAddress>,
+    /// The devices whose tool key the export carries, ascending.
+    pub devices: Vec<IndividualAddress>,
+    /// The store's devices with a tool key the export lacks.
+    pub missing_devices: Vec<IndividualAddress>,
+    /// The devices the export carries with another tool key than the store's.
+    pub changed_devices: Vec<IndividualAddress>,
+    /// The store's interfaces (by individual address) the export lacks.
+    pub missing_interfaces: Vec<IndividualAddress>,
+}
+
+impl ExportCheck {
+    /// Whether the export carries the store's keys exactly.
+    pub fn verified(&self) -> bool {
+        self.missing_group_keys.is_empty()
+            && self.changed_group_keys.is_empty()
+            && self.missing_devices.is_empty()
+            && self.changed_devices.is_empty()
+            && self.missing_interfaces.is_empty()
+    }
+
+    /// One line per difference, naming the addresses; empty when verified.
+    pub fn leftovers(&self) -> Vec<String> {
+        let list = |items: &[String]| items.join(", ");
+        let gas = |v: &[GroupAddress]| list(&v.iter().map(ToString::to_string).collect::<Vec<_>>());
+        let ias =
+            |v: &[IndividualAddress]| list(&v.iter().map(ToString::to_string).collect::<Vec<_>>());
+        let mut out = Vec::new();
+        if !self.missing_group_keys.is_empty() {
+            out.push(format!(
+                "group key(s) missing from the export: {}",
+                gas(&self.missing_group_keys)
+            ));
+        }
+        if !self.changed_group_keys.is_empty() {
+            out.push(format!(
+                "group key(s) that differ from the store: {}",
+                gas(&self.changed_group_keys)
+            ));
+        }
+        if !self.missing_devices.is_empty() {
+            out.push(format!(
+                "tool key(s) missing from the export: {}",
+                ias(&self.missing_devices)
+            ));
+        }
+        if !self.changed_devices.is_empty() {
+            out.push(format!(
+                "tool key(s) that differ from the store: {}",
+                ias(&self.changed_devices)
+            ));
+        }
+        if !self.missing_interfaces.is_empty() {
+            out.push(format!(
+                "interface(s) missing from the export: {}",
+                ias(&self.missing_interfaces)
+            ));
+        }
+        out
+    }
+}
+
 /// A `.knxkeys` export produced by [`KeyStore::export_knxkeys`].
 pub struct KnxkeysExport {
     /// The signed XML document.
@@ -833,6 +906,50 @@ impl KeyStore {
             group_keys: self.group_keys.len(),
             interfaces: self.interfaces.len(),
         })
+    }
+
+    /// Reads a written export (`xml`, as [`export_knxkeys`](Self::export_knxkeys)
+    /// produced and the file now holds) back: verifies its signature,
+    /// decrypts it with `password` and compares its key set with this store
+    /// (issue #349). A device without a tool key is not expected, as the
+    /// export leaves it out.
+    ///
+    /// # Errors
+    ///
+    /// The export does not parse, its signature does not verify or it does
+    /// not decrypt with `password`.
+    pub fn check_export(&self, xml: &str, password: &str) -> Result<ExportCheck, KeyStoreError> {
+        let read = crate::keyring::parse_keyring(xml, password)?;
+        let mut check = ExportCheck::default();
+        let mut carried: Vec<GroupAddress> = read.group_keys.keys().copied().collect();
+        carried.sort();
+        check.group_addresses = carried;
+        for (ga, key) in &self.group_keys {
+            match read.group_keys.get(ga) {
+                None => check.missing_group_keys.push(*ga),
+                Some(got) if got.bytes() != key.bytes() => check.changed_group_keys.push(*ga),
+                Some(_) => {}
+            }
+        }
+        let mut devices: Vec<IndividualAddress> = read.devices.iter().map(|d| d.ia).collect();
+        devices.sort();
+        check.devices = devices;
+        for (ia, device) in &self.devices {
+            let Some(key) = &device.tool_key else {
+                continue;
+            };
+            match read.tool_key(*ia) {
+                None => check.missing_devices.push(*ia),
+                Some(got) if got.bytes() != key.bytes() => check.changed_devices.push(*ia),
+                Some(_) => {}
+            }
+        }
+        for interface in &self.interfaces {
+            if !read.interfaces.iter().any(|i| i.ia == interface.ia) {
+                check.missing_interfaces.push(interface.ia);
+            }
+        }
+        Ok(check)
     }
 
     /// The store as the [`Keyring`] shape the secure paths consume (tunnel
@@ -1772,6 +1889,35 @@ mod tests {
 
     /// ETS 6 exports carry `FDSK` and `SerialNumber` per device: the export
     /// writes them, the reader decrypts them, an import takes them.
+    #[test]
+    fn test_check_export_matches_the_written_file() -> TestResult {
+        let store = sample()?;
+        let export = store.export_knxkeys(PASSWORD)?;
+        let check = store.check_export(&export.xml, PASSWORD)?;
+        assert!(check.verified(), "{check:?}");
+        assert_eq!(check.group_addresses, vec![ga("1/2/3")?]);
+        assert_eq!(check.devices, vec![ia("1.1.10")?]);
+        assert!(check.leftovers().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_export_names_a_group_key_the_file_lacks() -> TestResult {
+        let mut store = sample()?;
+        let export = store.export_knxkeys(PASSWORD)?;
+        // A key the store holds that the written file does not carry.
+        store
+            .group_keys
+            .insert(ga("1/2/9")?, Key16::new([0x11; 16]));
+        let check = store.check_export(&export.xml, PASSWORD)?;
+        assert!(!check.verified());
+        assert_eq!(check.missing_group_keys, vec![ga("1/2/9")?]);
+        assert!(check.leftovers().iter().any(|l| l.contains("1/2/9")));
+        // A wrong password does not decrypt the file.
+        assert!(store.check_export(&export.xml, "not-the-password").is_err());
+        Ok(())
+    }
+
     #[test]
     fn test_export_and_import_carry_fdsk_and_serial() -> TestResult {
         let mut source = sample()?;

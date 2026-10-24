@@ -34,8 +34,8 @@ use bussard_mgmt::property_ext::{
 use bussard_model::GroupAddress;
 use bussard_secure::{Key16, SecurityAlgorithm, Sequence, encode_group};
 use bussard_testkit::consts::{
-    OT_ADDRESS_TABLE, OT_APPLICATION_PROGRAM, OT_ASSOCIATION_TABLE, OT_DEVICE,
-    OT_GROUP_OBJECT_TABLE, PID_PROGRAM_VERSION,
+    A_MEMORY_RESPONSE, A_MEMORY_WRITE, APCI_SELECTOR, OT_ADDRESS_TABLE, OT_APPLICATION_PROGRAM,
+    OT_ASSOCIATION_TABLE, OT_DEVICE, OT_GROUP_OBJECT_TABLE, PID_PROGRAM_VERSION,
 };
 use bussard_testkit::{MockDevice, MockGateway, Reaction, TestResult, ga, ia};
 use bussard_transport::cemi::{Apdu, CemiFrame, GroupData, MessageCode};
@@ -159,6 +159,34 @@ struct SecurityLog {
     /// The group-object security flags (PID 61) the device holds, one octet
     /// per group object, as the writes leave it (issue #331).
     pid61: Vec<u8>,
+    /// The group key table's (PID 53) element count, as the writes leave it
+    /// (the keys themselves are write-only, issue #349).
+    pid53: u16,
+    /// What the device acknowledges and then drops (issue #349).
+    dropped: Option<Dropped>,
+}
+
+/// A write the mock device acknowledges as written and does not store, so
+/// only a read-back can tell (issue #349).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dropped {
+    /// Every `A_PropertyExtValue_WriteCon` to this security-object property.
+    Pid(u16),
+    /// The memory writes into the association table's segment.
+    Associations,
+    /// The memory writes into the parameter segment.
+    Parameters,
+}
+
+impl Dropped {
+    /// The object whose segment this drops memory writes into.
+    fn segment(self) -> Option<u8> {
+        match self {
+            Dropped::Pid(_) => None,
+            Dropped::Associations => Some(2),
+            Dropped::Parameters => Some(APP_OBJECT),
+        }
+    }
 }
 
 /// The security object header fields of an `A_PropertyExt*` payload:
@@ -230,6 +258,23 @@ fn secure_device_with(
         .with_go_count(GO_COUNT)
         .with_data_secure(tool_key()?)
         .with_hook(move |_, apci, data| {
+            // A memory write into a dropped segment: echoed as written,
+            // never stored.
+            if apci & APCI_SELECTOR == A_MEMORY_WRITE
+                && let Some(object) = log.lock().ok()?.dropped.and_then(Dropped::segment)
+            {
+                let address = u32::from(u16::from_be_bytes([*data.first()?, *data.get(1)?]));
+                let base = bussard_testkit::device::segment_base_for(object);
+                if (base..base + 0x800).contains(&address) {
+                    let value = data.get(2..)?;
+                    let mut out = data.get(..2)?.to_vec();
+                    out.extend_from_slice(value);
+                    return Some(Reaction::Answer(
+                        A_MEMORY_RESPONSE | (u16::try_from(value.len()).ok()? & 0x3F),
+                        out,
+                    ));
+                }
+            }
             let (object_type, pid) = ext_header(data)?;
             if object_type != OT_SECURITY {
                 return None;
@@ -245,6 +290,10 @@ fn secure_device_with(
                     };
                     if let Ok(mut log) = log.lock() {
                         log.controls.push(event);
+                        // Unload empties the group key table.
+                        if event == 0x04 && log.dropped != Some(Dropped::Pid(PID_GRP_KEY_TABLE)) {
+                            log.pid53 = 0;
+                        }
                     }
                     let mut out = header;
                     out.extend_from_slice(&[0x00, state]);
@@ -273,6 +322,20 @@ fn secure_device_with(
                     }
                     Some(Reaction::Answer(A_PROPERTY_EXT_VALUE_RESPONSE, out))
                 }
+                A_PROPERTY_EXT_VALUE_READ if pid == PID_GRP_KEY_TABLE => {
+                    // Only the element count (start 0): the keys are
+                    // write-only.
+                    let start = u16::from_be_bytes([*data.get(6)?, *data.get(7)?]);
+                    let log = log.lock().ok()?;
+                    let mut out = header;
+                    if start == 0 {
+                        out.extend_from_slice(&[1, 0, 0]);
+                        out.extend_from_slice(&log.pid53.to_be_bytes());
+                    } else {
+                        out.extend_from_slice(&[0, 0, 0]);
+                    }
+                    Some(Reaction::Answer(A_PROPERTY_EXT_VALUE_RESPONSE, out))
+                }
                 A_PROPERTY_EXT_VALUE_READ if pid == PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE => {
                     let count = *data.get(5)?;
                     let start = u16::from_be_bytes([*data.get(6)?, *data.get(7)?]);
@@ -296,8 +359,14 @@ fn secure_device_with(
                 A_PROPERTY_EXT_VALUE_WRITE_CON => {
                     let count = *data.get(5)?;
                     let start = u16::from_be_bytes([*data.get(6)?, *data.get(7)?]);
-                    if let Ok(mut log) = log.lock() {
+                    if let Ok(mut log) = log.lock()
+                        && log.dropped != Some(Dropped::Pid(pid))
+                    {
                         let octets = data.get(8..).unwrap_or(&[]).to_vec();
+                        if pid == PID_GRP_KEY_TABLE && start > 0 {
+                            let last = start.saturating_add(u16::from(count)).saturating_sub(1);
+                            log.pid53 = log.pid53.max(last);
+                        }
                         if pid == PID_GO_SECURITY_FLAGS && start > 0 {
                             let from = usize::from(start) - 1;
                             for (i, flag) in octets.iter().enumerate() {
@@ -502,6 +571,21 @@ fn test_mcp_apply_on_a_keyring_listed_device_reprograms_the_security_object() ->
     assert_eq!(applied["secured"], true, "apply: {applied}");
     assert_eq!(applied["parameters"]["written"], true, "apply: {applied}");
     assert_eq!(applied["parameters"]["octets"], 1, "apply: {applied}");
+    // Issue #349: verified means read back and compared, with the counts.
+    let readback = &applied["readback"];
+    assert_eq!(readback["verified"], true, "apply: {applied}");
+    assert_eq!(readback["leftovers"], json!([]), "apply: {applied}");
+    assert_eq!(readback["compared"]["addresses"], 2, "apply: {applied}");
+    assert_eq!(readback["compared"]["associations"], 2, "apply: {applied}");
+    assert_eq!(readback["compared"]["group_keys"], 1, "apply: {applied}");
+    assert_eq!(
+        readback["compared"]["secured_objects"], 1,
+        "apply: {applied}"
+    );
+    assert!(
+        readback["compared"]["parameters"].as_u64() >= Some(1),
+        "apply: {applied}"
+    );
     let (params, app_state, plain_refused) = gw.with_device(ia("1.1.10")?, |dev| {
         (
             dev.table_image(APP_OBJECT).unwrap_or_default(),
@@ -1046,5 +1130,232 @@ fn test_mcp_unsecure_a_group_address_end_to_end() -> TestResult {
     );
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// Issue #349: a gateway serving the secured 1.1.10 whose device drops
+/// `dropped` (acknowledged, never stored), and the model directory to apply
+/// to. `admit` turns `admit_tunnel_senders` on, so PID 54 receives the
+/// tunnelling address 1.1.200.
+fn dropping_bench(
+    rt: &tokio::runtime::Runtime,
+    tag: &str,
+    dropped: Option<Dropped>,
+    admit: bool,
+) -> TestResult<(MockGateway, Arc<Mutex<SecurityLog>>, PathBuf)> {
+    let log = Arc::new(Mutex::new(SecurityLog {
+        dropped,
+        ..SecurityLog::default()
+    }));
+    let gw = rt.block_on(
+        MockGateway::builder()
+            .channel(0x59)
+            .tunnel_address(0x11C8)
+            .keep_serving()
+            .idle_timeout(Duration::from_secs(120))
+            .device(secure_device(Arc::clone(&log))?)
+            .start(),
+    )?;
+    let dir = model_dir(tag)?;
+    if admit {
+        std::fs::write(
+            dir.join("bussard.toml"),
+            "[connection]\ntransport = \"tunnel\"\ngateway = \"192.0.2.1:3671\"\n\
+             admit_tunnel_senders = true\n",
+        )?;
+    }
+    Ok((gw, log, dir))
+}
+
+/// Plans and applies 1.1.10 over `bussard mcp` against a device that drops
+/// `dropped`, and returns the apply's result.
+fn apply_over_mcp(tag: &str, dropped: Option<Dropped>, admit: bool) -> TestResult<Value> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let (gw, _log, dir) = dropping_bench(&rt, tag, dropped, admit)?;
+    let mut server = Server::start(&dir, gw.port(), &["--allow-programming"])?;
+    let plan = plan_when_connected(&mut server, "1.1.10")?;
+    assert_eq!(plan["ok"], true, "plan: {plan}");
+    let digest = plan["plan_digest"].as_str().ok_or("no plan_digest")?;
+    let applied = server.call(
+        "knx_apply_device",
+        json!({"address": "1.1.10", "plan_digest": digest}),
+    )?;
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(applied)
+}
+
+/// Runs `bussard apply 1.1.10 --yes --keyring` against a device that drops
+/// `dropped`: whether it succeeded, its stdout and its stderr.
+fn apply_over_cli(
+    tag: &str,
+    dropped: Option<Dropped>,
+    admit: bool,
+) -> TestResult<(bool, String, String)> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let (gw, _log, dir) = dropping_bench(&rt, tag, dropped, admit)?;
+    let out = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
+        .env("BUSSARD_KEYRING_PASSWORD", PASSWORD)
+        .env_remove("BUSSARD_ALLOW_REAL_GATEWAY")
+        .env_remove("BUSSARD_KEYRING")
+        .arg("apply")
+        .arg("1.1.10")
+        .arg("--yes")
+        .arg("--dir")
+        .arg(&dir)
+        .arg("--gateway")
+        .arg(format!("127.0.0.1:{}", gw.port()))
+        .arg("--keyring")
+        .arg(keyring_path())
+        .stdin(Stdio::null())
+        .output()?;
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+/// Asserts that an MCP apply did not verify and names `item` among its
+/// read-back leftovers.
+fn assert_mcp_names(applied: &Value, kind: &str, item: &str) {
+    assert_eq!(applied["ok"], false, "apply: {applied}");
+    assert_eq!(applied["verified"], false, "apply: {applied}");
+    assert_eq!(applied["readback"]["verified"], false, "apply: {applied}");
+    let named = applied["readback"]["leftovers"]
+        .as_array()
+        .is_some_and(|l| {
+            l.iter()
+                .any(|x| x["kind"] == kind && x["item"].as_str().is_some_and(|i| i.contains(item)))
+        });
+    assert!(named, "{kind} {item} not named: {applied}");
+    let reason = applied["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains(item), "the reason names {item}: {applied}");
+}
+
+/// Asserts that a CLI apply failed and named `item` on stderr.
+fn assert_cli_names(run: &(bool, String, String), item: &str) {
+    let (success, stdout, stderr) = run;
+    assert!(!success, "the apply must fail: {stdout}\n{stderr}");
+    assert!(
+        stderr.contains("not verified") && stderr.contains(item),
+        "{item} not named: {stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn test_mcp_apply_readback_names_a_dropped_security_flag() -> TestResult {
+    let applied = apply_over_mcp(
+        "drop-pid61",
+        Some(Dropped::Pid(PID_GO_SECURITY_FLAGS)),
+        false,
+    )?;
+    assert_mcp_names(
+        &applied,
+        "security_flag",
+        "group object 22 security flag (PID 61)",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_mcp_apply_readback_names_a_dropped_group_key_table() -> TestResult {
+    let applied = apply_over_mcp("drop-pid53", Some(Dropped::Pid(PID_GRP_KEY_TABLE)), false)?;
+    assert_mcp_names(&applied, "group_key_table", "group key table (PID 53)");
+    Ok(())
+}
+
+#[test]
+fn test_mcp_apply_readback_names_a_dropped_secure_sender() -> TestResult {
+    let applied = apply_over_mcp(
+        "drop-pid54",
+        Some(Dropped::Pid(PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE)),
+        true,
+    )?;
+    assert_mcp_names(&applied, "secure_sender", "secure sender 1.1.200 (PID 54)");
+    Ok(())
+}
+
+#[test]
+fn test_mcp_apply_readback_names_a_dropped_link() -> TestResult {
+    let applied = apply_over_mcp("drop-link", Some(Dropped::Associations), false)?;
+    assert_mcp_names(&applied, "link", "object 22 -> 1/2/3");
+    Ok(())
+}
+
+#[test]
+fn test_mcp_apply_readback_names_a_dropped_parameter() -> TestResult {
+    let applied = apply_over_mcp("drop-param", Some(Dropped::Parameters), false)?;
+    assert_mcp_names(&applied, "parameter", "thr");
+    Ok(())
+}
+
+#[test]
+fn test_cli_apply_readback_reports_the_counts_when_healthy() -> TestResult {
+    let (success, stdout, stderr) = apply_over_cli("cli-healthy", None, true)?;
+    assert!(success, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(
+            "read back from 1.1.10 and compared with the model: 2 group address(es), 2 \
+             association(s)"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "1 group key(s) (PID 53), 1 secure sender(s) (PID 54), 1 secured object(s) (PID 61)"
+        ),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_cli_apply_readback_names_a_dropped_security_flag() -> TestResult {
+    let run = apply_over_cli(
+        "cli-drop-pid61",
+        Some(Dropped::Pid(PID_GO_SECURITY_FLAGS)),
+        false,
+    )?;
+    assert_cli_names(&run, "group object 22 security flag (PID 61)");
+    Ok(())
+}
+
+#[test]
+fn test_cli_apply_readback_names_a_dropped_group_key_table() -> TestResult {
+    let run = apply_over_cli(
+        "cli-drop-pid53",
+        Some(Dropped::Pid(PID_GRP_KEY_TABLE)),
+        false,
+    )?;
+    assert_cli_names(&run, "group key table (PID 53)");
+    Ok(())
+}
+
+#[test]
+fn test_cli_apply_readback_names_a_dropped_secure_sender() -> TestResult {
+    let run = apply_over_cli(
+        "cli-drop-pid54",
+        Some(Dropped::Pid(PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE)),
+        true,
+    )?;
+    assert_cli_names(&run, "secure sender 1.1.200 (PID 54)");
+    Ok(())
+}
+
+#[test]
+fn test_cli_apply_readback_names_a_dropped_link() -> TestResult {
+    let run = apply_over_cli("cli-drop-link", Some(Dropped::Associations), false)?;
+    assert_cli_names(&run, "object 22 -> 1/2/3");
+    Ok(())
+}
+
+#[test]
+fn test_cli_apply_readback_names_a_dropped_parameter() -> TestResult {
+    let run = apply_over_cli("cli-drop-param", Some(Dropped::Parameters), false)?;
+    assert_cli_names(&run, "thr");
     Ok(())
 }
