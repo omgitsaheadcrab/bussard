@@ -242,7 +242,7 @@ async fn test_model_lookup_finds_a_function_on_an_inactive_page() -> TestResult 
     );
     assert!(
         dir.path()
-            .join(format!(".bussard/lookup/{APP}.json"))
+            .join(format!(".bussard/model-cache/{APP}.json"))
             .is_file(),
         "the lookup caches the product model"
     );

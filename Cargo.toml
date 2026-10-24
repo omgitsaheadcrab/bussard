@@ -227,6 +227,12 @@ opt-level = 3
 opt-level = 3
 [profile.test.package.curve25519-dalek]
 opt-level = 3
+# The product-model YAML parse (issue #339) dominated every debug command and
+# test that loads a model with products; optimize the YAML parser like the crypto.
+[profile.test.package.serde_norway]
+opt-level = 3
+[profile.test.package.unsafe-libyaml-norway]
+opt-level = 3
 
 # `cargo test --doc` and any `cargo run` in tests use the `dev` profile, and the
 # CLI integration tests spawn the built `bussard` binary — which itself imports
@@ -272,6 +278,12 @@ opt-level = 3
 [profile.dev.package.flate2]
 opt-level = 3
 [profile.dev.package.miniz_oxide]
+opt-level = 3
+# The product-model YAML parse (issue #339) dominated every debug command that
+# loads a model with products; optimize the YAML parser like the crypto.
+[profile.dev.package.serde_norway]
+opt-level = 3
+[profile.dev.package.unsafe-libyaml-norway]
 opt-level = 3
 [profile.dev.package.crc32fast]
 opt-level = 3

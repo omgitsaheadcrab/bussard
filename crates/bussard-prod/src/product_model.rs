@@ -249,7 +249,8 @@ pub fn complete_models(dir: &Path, only: Option<&str>) -> Vec<String> {
 }
 
 /// Writes one model file per application program under
-/// `<dir>/.bussard/models/` and returns the file names, sorted.
+/// `<dir>/.bussard/models/`, with each converted model's JSON cache under
+/// `.bussard/model-cache/`, and returns the file names, sorted.
 ///
 /// # Errors
 ///
@@ -267,11 +268,14 @@ pub fn write_product_models(product: &ProductData, dir: &Path) -> Result<Vec<Str
         let yaml = serialize_model(&model)?;
         let file_name = format!("{}.yaml", app.id);
         let path = models_dir.join(&file_name);
-        std::fs::write(&path, yaml).map_err(|source| ModelError::Io {
+        std::fs::write(&path, &yaml).map_err(|source| ModelError::Io {
             what: "writing",
             path: path.clone(),
             source,
         })?;
+        // The converted model's JSON cache, so the first load after an
+        // import reads it instead of parsing the YAML (issue #339).
+        bussard_model::param_model::cache_written_model(dir, &app.id, &yaml);
         written.push(file_name);
     }
     written.sort();
