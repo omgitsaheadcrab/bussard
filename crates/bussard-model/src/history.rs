@@ -358,7 +358,10 @@ impl History {
     /// A summary comes from the manifest. A manifest written before summaries
     /// were stored gets it computed once, from the snapshot and the one before
     /// it, and written back best-effort: a write error never fails the
-    /// listing. A summary that cannot be computed is the empty string.
+    /// listing. A summary that cannot be computed (a snapshot model that no
+    /// longer loads) is the empty string, and is written back as such: snapshot
+    /// files never change, so retrying on every listing would only repeat the
+    /// failed loads.
     pub fn summaries(&self, snapshots: &[Snapshot], range: Range<usize>) -> Vec<String> {
         let end = range.end.min(snapshots.len());
         let mut out = Vec::new();
@@ -388,17 +391,13 @@ impl History {
                     }
                 }
             };
-            match computed {
-                Some(summary) => {
-                    let mut manifest = snapshot.manifest.clone();
-                    manifest.summary = Some(summary.clone());
-                    // Best-effort: the listing is read-only from the user's
-                    // point of view and must not fail on a backfill.
-                    let _ = self.write_manifest(&snapshot.id, &manifest);
-                    out.push(summary);
-                }
-                None => out.push(String::new()),
-            }
+            let summary = computed.unwrap_or_default();
+            let mut manifest = snapshot.manifest.clone();
+            manifest.summary = Some(summary.clone());
+            // Best-effort: the listing is read-only from the user's point of
+            // view and must not fail on a backfill.
+            let _ = self.write_manifest(&snapshot.id, &manifest);
+            out.push(summary);
         }
         out
     }
@@ -1101,8 +1100,10 @@ mod tests {
         assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[1].id, id);
         assert_eq!(snapshots[1].manifest.summary, None);
-        // The listing cannot compute it either, and says nothing.
+        // The listing cannot compute it either, says nothing, and records
+        // that so the next listing does not retry the failed loads.
         assert_eq!(history.summaries(&snapshots, 1..2), vec![String::new()]);
+        assert_eq!(history.list()?[1].manifest.summary, Some(String::new()));
 
         fs::remove_dir_all(&dir)?;
         Ok(())
