@@ -23,20 +23,24 @@
 #   --shard k/n        run the k-th of n runner shards (0-based), for CI
 #   --update-baseline  rewrite tests-support/product-corpus/sim-loop-baseline.json
 #                      from this run's failures; review and commit the diff
-#   --subset           only the curated applications below (the required CI
-#                      job); without BUSSARD_PRODUCT_CORPUS it fetches just their
-#                      archives into tests-support/product-corpus/cache first
+#   --subset           only the curated applications below (the CI job); an
+#                      application whose archive is not in the corpus is
+#                      reported as skipped, not failed
 #
 # Reports land in target/sim-loop/report (one JSON per shard); the summary at
 # the end lists every failing application with its first failing step.
-# Without a corpus the script stops: vendor data is never committed.
+# Without a corpus the script stops: vendor data is never committed, and the
+# script never downloads it (tests-support/product-corpus/fetch.sh does). An
+# archive missing from the corpus, or one that cannot be read, skips its
+# applications and does not fail the run.
 
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # The curated subset the required CI job runs (--subset): one line per
-# application, "<order number to fetch>|<application id filter>". The full
+# application, "<order number>|<application id filter>" (the order number is
+# what fetch.sh takes to put the archive in the corpus). The full
 # corpus runs nightly (.github/workflows/sim-catalog-nightly.yml). Add a line
 # to grow the subset; keep the job inside its 15-minute budget (ABB took
 # 111 s, the Jung F50 41 s, the Meteodata 23 s locally).
@@ -58,7 +62,7 @@ while [[ $# -gt 0 ]]; do
     --shard)   export BUSSARD_SIM_LOOP_SHARD="$2"; shift 2 ;;
     --update-baseline) update_baseline=1; shift ;;
     --subset)  subset=1; shift ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -67,14 +71,10 @@ if [[ $subset -eq 1 ]]; then
   filter=""
   for line in "${SUBSET[@]}"; do filter="${filter:+$filter,}${line#*|}"; done
   export BUSSARD_SIM_LOOP_FILTER="$filter"
-  if [[ -z "${BUSSARD_PRODUCT_CORPUS:-}" ]]; then
-    list="$(mktemp)"
-    for line in "${SUBSET[@]}"; do echo "${line%%|*}"; done | sort -u > "$list"
-    cargo build --quiet --manifest-path "$REPO/Cargo.toml" --bin bussard
-    CORPUS_LIST="$list" "$REPO/tests-support/product-corpus/fetch.sh"
-    rm -f "$list"
-    export BUSSARD_PRODUCT_CORPUS="$REPO/tests-support/product-corpus"
-  fi
+  # Read by the summary below, to name the subset applications that did not
+  # run because their archive is not in the corpus.
+  SIM_LOOP_SUBSET="$(printf '%s\n' "${SUBSET[@]}")"
+  export SIM_LOOP_SUBSET
 fi
 
 if [[ -z "${BUSSARD_PRODUCT_CORPUS:-}" ]]; then
@@ -138,6 +138,14 @@ for r in rows:
         skips[reason] = skips.get(reason, 0) + 1
 for reason, n in sorted(skips.items(), key=lambda kv: -kv[1]):
     print(f"  skip  {n:4} x {reason}")
+# --subset: an application with no row at all was never found, because its
+# archive is not in the corpus (not fetched, or not readable). It is skipped,
+# not failed. A sharded run only sees its own share, so it does not judge.
+if not os.environ.get("BUSSARD_SIM_LOOP_SHARD"):
+    for line in os.environ.get("SIM_LOOP_SUBSET", "").splitlines():
+        order, _, app = line.partition("|")
+        if app and not any(app in r["application"] for r in rows):
+            print(f"  skip  {app} ({order}): archive not in corpus")
 timed = [r for r in rows if r["outcome"] != "skip"]
 if timed:
     total = sum(r["seconds"] for r in timed)

@@ -120,6 +120,21 @@ $ scripts/sim-catalog-loop.sh --filter A-140C,A-A0ED   # some applications
 $ scripts/sim-catalog-loop.sh --subset                 # the curated CI subset
 ```
 
+The script reads the corpus and never downloads. To run the subset locally,
+cache its archives once (the order numbers are the first field of `SUBSET` in
+the script) and point the variable at the corpus:
+
+```console
+$ cargo build --bin bussard
+$ printf '%s\n' '2CDG 110 283 R0011' 52921ST 1409207 SCN-P360D3.03 > /tmp/subset.txt
+$ CORPUS_LIST=/tmp/subset.txt tests-support/product-corpus/fetch.sh
+$ BUSSARD_PRODUCT_CORPUS="$PWD/tests-support/product-corpus" \
+    scripts/sim-catalog-loop.sh --subset
+```
+
+An application whose archive is missing or unreadable is listed as
+`skip ... archive not in corpus` in the summary and does not fail the run.
+
 The script builds knx-sim's `serve` binary (release: it parses the archive at
 every start, ten times faster than a debug build) and runs the corpus-gated test
 `crates/bussard-cli/tests/it/sim_catalog_loop.rs` (gated on
@@ -178,9 +193,13 @@ write names its rows and their figures.
 ## CI
 
 The `corpus-sweep` job runs the committed-fixture sweep on every push and pull
-request. The `sim-catalog-loop` job runs the flash-then-plan loop on every
-push and pull request over the curated subset (`--subset`), fetching only those
-archives from the vendors and caching them. The `sim-catalog-nightly` workflow
+request. The `sim-catalog-loop` job runs the flash-then-plan loop over the
+curated subset (`--subset`) and needs the corpus like the corpus-gated tests:
+it runs only when the `product_corpus` input or the repository variable
+`BUSSARD_PRODUCT_CORPUS` names a corpus on the runner, and is skipped (green)
+otherwise. It never downloads from the vendor sites; a subset application
+whose archive is not in the corpus is reported as `skipped: archive not in
+corpus` and does not fail the run. The `sim-catalog-nightly` workflow
 runs it over the whole corpus in 12 shards every night (and on demand), with
 `--update-baseline`, and uploads each shard's baseline and reports as
 artifacts; it is not a required check. A `workflow_dispatch` run with the `product_corpus` input (or the
