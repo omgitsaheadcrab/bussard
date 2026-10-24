@@ -724,7 +724,8 @@ async fn test_edit_tools_report_only_their_change_and_new_warnings() -> TestResu
             "knx_set_group",
             json!({"ga": "0/1/3", "dpt": "1.009"}),
             vec!["Langzeit (0/1/3) changes type from 1.008 to 1.009."],
-            vec!["W005"],
+            // Two subtypes of one main type agree (W005 follows ETS, #348).
+            vec![],
         ),
         (
             "knx_set_group",

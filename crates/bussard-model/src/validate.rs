@@ -105,6 +105,7 @@ pub fn validate(model: &Model) -> Vec<Diagnostic> {
     check_orphans_and_unlinked(model, &mut diags);
     check_protected_gas(model, &mut diags);
     crate::secure_links::check_secure_links(model, &mut diags);
+    crate::secure_invariants::check_secure_invariants(model, &mut diags);
     // Opt-in topology/convention lints (issue #102). Without a `[lint]` table in
     // `bussard.toml` this contributes nothing, so existing models are unchanged.
     // The bus-current rule (L002) needs the on-disk product cache and therefore
@@ -136,6 +137,9 @@ pub fn validate_in_dir(model: &Model, dir: &Path) -> Vec<Diagnostic> {
     check_orphans_and_unlinked(model, &mut diags);
     check_protected_gas(model, &mut diags);
     crate::secure_links::check_secure_links(model, &mut diags);
+    crate::secure_invariants::check_secure_invariants(model, &mut diags);
+
+    crate::keystore_meta::check_stale_exports(model, dir, &mut diags);
 
     let models = ProductModels::load(dir);
     check_parameters(model, &models, dir, &mut diags);
@@ -515,25 +519,20 @@ fn check_duplicate_individual_addresses(model: &Model, diags: &mut Vec<Diagnosti
 /// The DPTs on one group address that conflict, rendered and sorted, or
 /// `None` when they agree (W005).
 ///
-/// A main-type-only declaration (`"1"`) is compatible with every subtype of
-/// that main type (`"1.017"`), so it is dropped when a subtype of its main
-/// type is present (issue #279). Two different subtypes of one main type, or
-/// two main types, still conflict.
+/// ETS links objects of one size freely: a switch (`1.001`), an enable
+/// (`1.003`), a day/night (`1.024`) or an alarm (`1.005`) object share one
+/// 1-bit address in every project it exports, and the receiver reads the bit
+/// the same way. So two subtypes of one main type agree (issue #348), as a
+/// main type alone (`"1"`) agrees with any of its subtypes (issue #279). Only
+/// two different main types of the same size conflict (`5.001` against
+/// `6.001`, `7.001` against `9.001`): the receiver decodes the bytes in
+/// another number format.
 fn conflicting_subtypes(dpts: &BTreeSet<Dpt>) -> Option<Vec<String>> {
-    let kept: Vec<String> = dpts
-        .iter()
-        .filter(|d| {
-            d.sub.is_some()
-                || !dpts
-                    .iter()
-                    .any(|other| other.main == d.main && other.sub.is_some())
-        })
-        .map(Dpt::to_string)
-        .collect();
-    (kept.len() > 1).then_some(kept)
+    let mains: BTreeSet<u16> = dpts.iter().map(|d| d.main).collect();
+    (mains.len() > 1).then(|| dpts.iter().map(Dpt::to_string).collect())
 }
 
-/// GA-level consistency: E004, W005, W006, W011, I010.
+/// GA-level consistency: E004, W005, I006, W011, I010.
 fn check_ga_consistency(model: &Model, diags: &mut Vec<Diagnostic>) {
     // For each GA, collect the sizes and DPT subtypes contributed by the group
     // definition and by every linked object, plus the senders.
@@ -613,25 +612,28 @@ fn check_ga_consistency(model: &Model, diags: &mut Vec<Diagnostic>) {
                 format!("conflicting sizes on GA {ga}: {}", described.join(", ")),
             ));
         } else if let Some(subs) = conflicting_subtypes(&info.subtypes) {
-            // W005: same size but different declared DPT subtypes.
+            // W005: same size but different DPT main types.
             diags.push(Diagnostic::new(
                 "W005",
                 Severity::Warning,
                 loc.clone(),
                 format!(
-                    "GA {ga} has one size but conflicting DPT subtypes: {}",
+                    "GA {ga} has one size but DPTs of different main types: {}; a receiver \
+                     decodes the value in another number format",
                     subs.join(", ")
                 ),
             ));
         }
 
-        // W006: more than one sender on a GA.
+        // I006: more than one sender on a GA. Normal in KNX (two push
+        // buttons on one light, a central function next to a local one), so
+        // ETS does not warn and neither does bussard; it is listed for review.
         if info.senders.len() > 1 {
             let mut senders = info.senders.clone();
             senders.sort();
             diags.push(Diagnostic::new(
-                "W006",
-                Severity::Warning,
+                "I006",
+                Severity::Info,
                 loc.clone(),
                 format!(
                     "GA {ga} has {} senders: {}",
@@ -837,8 +839,8 @@ mod tests {
         groups.insert(ga("1/0/0"), group("nodpt", None)); // W011 + used
         groups.insert(ga("1/0/1"), group("unlinked", Some("1.001"))); // I010
         groups.insert(ga("2/0/0"), group("sizeconflict", Some("1.001"))); // E004 (1 bit vs 2 byte)
-        groups.insert(ga("3/0/0"), group("subtypes", Some("1.001"))); // W005
-        groups.insert(ga("4/0/0"), group("multisend", Some("1.001"))); // W006
+        groups.insert(ga("3/0/0"), group("maintypes", Some("5.001"))); // W005
+        groups.insert(ga("4/0/0"), group("multisend", Some("1.001"))); // I006
 
         let mut links_map = BTreeMap::new();
         // Device 1.1.1: object with C+T links send to a GA not in groups (E001),
@@ -878,8 +880,8 @@ mod tests {
                 object: 7,
                 name: None,
                 send: None,
-                // object dpt 1.002 vs group dpt 1.001: same size (1 bit),
-                // different subtype -> W005.
+                // object dpt 6.010 vs group dpt 5.001: same size (1 byte),
+                // different main type -> W005.
                 listen: vec![ga("3/0/0")],
             }],
         );
@@ -903,7 +905,7 @@ mod tests {
                 listen: vec![ga("1/0/0")],
             }],
         );
-        // Two senders on 4/0/0 (W006).
+        // Two senders on 4/0/0 (I006).
         links_map.insert(
             ia("1.1.5"),
             vec![
@@ -941,15 +943,15 @@ mod tests {
                 vec![(5, com_object("o", Some("14.076"), "W"))], // 4 bytes vs 1 bit
             ),
         );
-        // 1.1.3 object 7: listen only, flags C only (no W) -> E025; dpt 1.002
-        // (same 1-bit size as group 3/0/0's 1.001 but different subtype -> W005).
+        // 1.1.3 object 7: listen only, flags C only (no W) -> E025; dpt 6.010
+        // (same 1-byte size as group 3/0/0's 5.001 but another main type -> W005).
         devices.insert(
             ia("1.1.3"),
             device(
                 "1.1.3",
                 "1.1.3",
                 vec![
-                    (7, com_object("o", Some("1.002"), "C")),
+                    (7, com_object("o", Some("6.010"), "C")),
                     // orphan with T flag, never linked -> I009
                     (8, com_object("orphan", Some("1.001"), "CT")),
                 ],
@@ -992,7 +994,7 @@ mod tests {
         );
         for expected in [
             "E001", "E002", "E003", "E004", "E007", "E012", "E013", "E014", "E024", "E025", "W005",
-            "W006", "W011", "I009", "I010",
+            "I006", "W011", "I009", "I010",
         ] {
             assert!(
                 found.contains(expected),
@@ -1264,10 +1266,13 @@ parameters:
             (&["1", "1.001"], None),
             (&["1"], None),
             (&["1.001", "1.001"], None),
-            (&["1", "1.001", "1.017"], Some(&["1.001", "1.017"])),
-            (&["1.001", "1.017"], Some(&["1.001", "1.017"])),
+            // Two subtypes of one main type agree, as ETS links them (#348).
+            (&["1", "1.001", "1.017"], None),
+            (&["1.001", "1.017"], None),
+            (&["1.001", "1.009", "1.019"], None),
             (&["5", "5.001"], None),
-            (&["5.001", "5.010"], Some(&["5.001", "5.010"])),
+            (&["5.001", "5.010"], None),
+            (&["5.001", "6.010"], Some(&["5.001", "6.010"])),
             // A main type only with a subtype of another main type still
             // conflicts (same size, different types).
             (&["5", "6.010"], Some(&["5", "6.010"])),

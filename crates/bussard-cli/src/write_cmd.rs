@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use anyhow::{Context, anyhow};
 use bussard_bus::BusError;
 use bussard_model::{GroupAddress, Model};
-use bussard_service::admission::{self, Admission, AdmissionEvidence, check_sender_admission};
+use bussard_service::admission::{self, Admission, AdmissionEvidence};
 use bussard_service::{
     DptOverridePolicy, PreparedWrite, WriteCheck, WritePolicy, WriteRefusal, WriteValue,
     prepare_group_write,
@@ -119,7 +119,8 @@ pub fn run(
         // The tunnel's address is known once the tunnel is up: check that the
         // devices on a secured GA admit it before anything is sent.
         let source = bussard_bus::ops::group_source(service.handle());
-        let admission = secured.then(|| check_sender_admission(model_ref, ga, source, &evidence));
+        let admission =
+            secured.then(|| admission::check_tunnel_write(model_ref, ga, source, &evidence));
         let result = if admission.as_ref().is_some_and(Admission::is_refused) {
             None
         } else {

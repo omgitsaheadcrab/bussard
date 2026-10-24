@@ -95,6 +95,7 @@ pub fn import_neighbour(project: &Path, dir: &Path) {
                         report.group_keys_added.len(),
                         report.group_keys_rotated.len(),
                     );
+                    print_warnings(&rekeyed_warnings(dir, &report));
                 }
                 Err(err) => eprintln!(
                     "warning: the ETS keyring {} was not imported into the key store: {err:#}",
@@ -110,6 +111,28 @@ pub fn import_neighbour(project: &Path, dir: &Path) {
                 println!("  {}", p.display());
             }
         }
+    }
+}
+
+/// W042 (issue #348): the group keys an import added for group addresses the
+/// model in `dir` runs plain, each naming the devices the next apply would
+/// secure again. Empty without a loadable model.
+fn rekeyed_warnings(dir: &Path, report: &ImportReport) -> Vec<bussard_model::Diagnostic> {
+    let Ok(model) = bussard_model::Model::load(dir) else {
+        return Vec::new();
+    };
+    let added: Vec<bussard_model::GroupAddress> = report
+        .group_keys_added
+        .iter()
+        .filter_map(|ga| ga.parse().ok())
+        .collect();
+    bussard_model::rekeyed_by_keys_import(&model, &added)
+}
+
+/// Prints warnings as `warning[CODE]: message` on stderr.
+pub(crate) fn print_warnings(diags: &[bussard_model::Diagnostic]) {
+    for d in diags {
+        eprintln!("warning[{}]: {}", d.code, d.message);
     }
 }
 
@@ -152,6 +175,7 @@ fn load_existing(dir: &Path, password: &str) -> anyhow::Result<KeyStore> {
 pub fn run_import(dir: &Path, file: &Path, json: bool) -> anyhow::Result<ExitCode> {
     let path = KeyStore::path(dir);
     let (report, outcome) = import_quiet(dir, file)?;
+    let warnings = rekeyed_warnings(dir, &report);
 
     if json {
         let value = serde_json::json!({
@@ -161,10 +185,16 @@ pub fn run_import(dir: &Path, file: &Path, json: bool) -> anyhow::Result<ExitCod
             "backup": matches!(outcome, SaveOutcome::Written { backup: true }),
             "changed": report.changed(),
             "report": report,
+            "warnings": warnings.iter().map(|d| serde_json::json!({
+                "code": d.code,
+                "location": d.location,
+                "message": d.message,
+            })).collect::<Vec<_>>(),
         });
         crate::output::print(crate::output::schema::KEYS_IMPORT, &value)?;
     } else {
         print_report(&path, file, &report, outcome);
+        print_warnings(&warnings);
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -292,6 +322,11 @@ pub fn run_export(dir: &Path, file: &Path, force: bool, json: bool) -> anyhow::R
         .export_knxkeys(&password)
         .context("building the .knxkeys export")?;
     std::fs::write(file, &export.xml).with_context(|| format!("writing {}", file.display()))?;
+    // The export's time, so `validate` can tell when the key store changed
+    // after it (W040, issue #348).
+    if let Err(err) = bussard_model::KeyStoreMeta::record_export(dir, file) {
+        eprintln!("warning: the export was not recorded: {err}");
+    }
     let skipped: Vec<String> = export
         .skipped_devices
         .iter()

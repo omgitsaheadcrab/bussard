@@ -170,6 +170,18 @@ pub enum Admission {
         /// Every device on the group address.
         receivers: Vec<IndividualAddress>,
     },
+    /// Validation error E038 (issue #348): a write to a secured group address
+    /// only tunnel clients can write (W034), whose Secure devices admit none
+    /// of the key store's tunnelling addresses, while `[connection]
+    /// admit_tunnel_senders` is off. The devices would drop it: refuse.
+    TunnelGap {
+        /// The sender (the tunnel address).
+        sender: IndividualAddress,
+        /// The group address.
+        ga: GroupAddress,
+        /// The Secure devices that admit no tunnelling address, ascending.
+        receivers: Vec<IndividualAddress>,
+    },
     /// No evidence either way (no read-back yet, no ETS assignment): send,
     /// and say that delivery is not confirmed.
     Unknown {
@@ -189,19 +201,37 @@ impl Admission {
         match self {
             Admission::Admitted { .. } => "admitted",
             Admission::Refused { .. } => "refused",
+            Admission::TunnelGap { .. } => "refused",
             Admission::Unknown { .. } => "unknown",
         }
     }
 
     /// Whether the telegram must not be sent.
     pub fn is_refused(&self) -> bool {
-        matches!(self, Admission::Refused { .. })
+        matches!(
+            self,
+            Admission::Refused { .. } | Admission::TunnelGap { .. }
+        )
     }
 
     /// The refusal sentence, for [`Admission::Refused`]:
     /// `1.1.5 does not list the tunnel address 1.1.25 as a secure sender of
     /// 1/0/4; …`.
     pub fn refusal(&self) -> Option<String> {
+        if let Admission::TunnelGap {
+            sender,
+            ga,
+            receivers,
+        } = self
+        {
+            let devices: Vec<String> = receivers.iter().map(ToString::to_string).collect();
+            return Some(format!(
+                "E038: secured {ga} has no device sender, so only tunnel clients write it, and \
+                 {} admit none of the tunnelling addresses (W034); with `admit_tunnel_senders` \
+                 off they would discard this telegram from {sender}.",
+                devices.join(", ")
+            ));
+        }
         let Admission::Refused {
             sender,
             ga,
@@ -221,14 +251,15 @@ impl Admission {
     /// How to admit the tunnel addresses, the "see below" of
     /// [`refusal`](Self::refusal).
     pub fn admit_hint(&self) -> Option<String> {
-        let Admission::Refused {
-            ga,
-            receiver,
-            receivers,
-            ..
-        } = self
-        else {
-            return None;
+        let (ga, receiver, receivers) = match self {
+            Admission::Refused {
+                ga,
+                receiver,
+                receivers,
+                ..
+            } => (ga, receiver, receivers),
+            Admission::TunnelGap { ga, receivers, .. } => (ga, receivers.first()?, receivers),
+            _ => return None,
         };
         let devices: Vec<String> = receivers.iter().map(ToString::to_string).collect();
         Some(format!(
@@ -379,6 +410,39 @@ pub fn check_sender_admission(
                 receivers: unknown,
             }
         }
+    }
+}
+
+/// [`check_sender_admission`] for a secured group **write** (issue #348):
+/// a verdict without evidence on a group address only tunnel clients can
+/// write becomes [`Admission::TunnelGap`] (validation error E038) when the
+/// model leaves `[connection] admit_tunnel_senders` off and [`tunnel_gaps`]
+/// reports `ga`. That is the write-time form of warning W034. With the
+/// setting on, the verdict is unchanged: the next apply admits the tunnel
+/// addresses.
+pub fn check_tunnel_write(
+    model: Option<&Model>,
+    ga: GroupAddress,
+    sender: IndividualAddress,
+    evidence: &AdmissionEvidence,
+) -> Admission {
+    let admission = check_sender_admission(model, ga, sender, evidence);
+    let Some(m) = model else {
+        return admission;
+    };
+    if !matches!(admission, Admission::Unknown { .. }) || admit_tunnel_senders(model) {
+        return admission;
+    }
+    match tunnel_gaps(m, |g| g == ga, evidence, None)
+        .into_iter()
+        .find(|gap| gap.ga == ga)
+    {
+        Some(gap) => Admission::TunnelGap {
+            sender,
+            ga,
+            receivers: gap.devices,
+        },
+        None => admission,
     }
 }
 
@@ -1002,6 +1066,31 @@ mod tests {
         assert!(tunnel_gaps(&sent, keyed, &evidence, None).is_empty());
         // No tunnelling address in the store: nothing to name.
         assert!(tunnel_gaps(&model, keyed, &AdmissionEvidence::default(), None).is_empty());
+        Ok(())
+    }
+
+    /// E038 (issue #348): the W034 gap refuses a write while
+    /// `admit_tunnel_senders` is off, and only then.
+    #[test]
+    fn test_check_tunnel_write_gap_without_admit_setting_is_e038() -> TestResult {
+        let evidence = evidence("1.1.25", &[])?;
+        let model = model(&[])?;
+        let admission = check_tunnel_write(Some(&model), ga("1/0/4")?, ia("1.1.25")?, &evidence);
+        assert!(admission.is_refused(), "{admission:?}");
+        assert_eq!(admission.label(), "refused");
+        let refusal = admission.refusal().unwrap_or_default();
+        assert!(refusal.starts_with("E038: secured 1/0/4"), "{refusal}");
+        assert!(refusal.contains("1.1.5"), "{refusal}");
+        assert!(admission.admit_hint().is_some());
+
+        let mut admit = model.clone();
+        admit.config.connection.admit_tunnel_senders = true;
+        let admission = check_tunnel_write(Some(&admit), ga("1/0/4")?, ia("1.1.25")?, &evidence);
+        assert_eq!(admission.label(), "unknown");
+        // An ETS assignment admits the tunnel: no refusal.
+        let assigned = super::tests::evidence("1.1.25", &["1/0/4"])?;
+        let admission = check_tunnel_write(Some(&model), ga("1/0/4")?, ia("1.1.25")?, &assigned);
+        assert_eq!(admission.label(), "admitted");
         Ok(())
     }
 

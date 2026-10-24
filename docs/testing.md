@@ -95,6 +95,7 @@ the script's `--check` path on every CI run (POSIX hosts with `python3`).
 | Variable | Tests |
 |---|---|
 | `BUSSARD_ETS_PROJECT` | `ets_golden.rs`: the `A-D141-22` inactive-channel fill and the `A-2088-11` plan that ends at the restart. The path of a `.knxproj` whose product XML is not encrypted. |
+| `BUSSARD_ETS_PROJECTS` | `bussard-cli` `import_corpus_clean.rs` (issue #348): `bussard import` of every `.knxproj` in this directory (else the one `BUSSARD_ETS_PROJECT` names), then `bussard validate`, reports no error and no warning. `BUSSARD_PROJECT_PASSWORD` opens the exports; a `<stem>.knxkeys` next to an export is imported with `BUSSARD_KEYRING_PASSWORD`. A project with a genuine ETS-level problem lists its expected `CODE location` lines in `<stem>.expect` next to it or in `crates/bussard-cli/tests/fixtures/import-clean/`. Run it with `--profile corpus`; it takes a few minutes. |
 
 ## A model snapshot with the Meteodata (`BUSSARD_METEO_SNAPSHOT`)
 

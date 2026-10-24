@@ -32,6 +32,7 @@ pub mod flags;
 pub mod history;
 pub mod identity;
 pub mod keyring_checks;
+pub mod keystore_meta;
 pub mod lint;
 pub mod loader;
 pub mod lock_products;
@@ -40,6 +41,7 @@ pub mod param_model;
 pub mod reconcile;
 pub mod scaffold;
 pub mod schema;
+pub mod secure_invariants;
 pub mod secure_links;
 pub mod tests_schema;
 pub mod toml_io;
@@ -68,12 +70,14 @@ pub use files::{
 pub use flags::{Flags, FlagsParseError};
 pub use history::{History, HistoryError, Snapshot, SnapshotId, SnapshotReason};
 pub use keyring_checks::{KeyringFacts, KeyringStatus, validate_keyring};
+pub use keystore_meta::{KEYSTORE_META_FILE, KeyStoreMeta, KeyStoreMetaError, KeyringExport};
 pub use lint::{GroupsLint, LintConfig, TopologyLint, lint};
 pub use loader::{LoadError, LoadedDevice, Model, SaveError, import_language, load_config};
 pub use lock_products::{PinError, PinReport, pin_products, sha256_file};
 pub use merge::{Conflict, MergeReport, merge, normalize_spellings};
 pub use param_model::{ParamDef, ParamKind, ProductModel, ProductModels};
 pub use scaffold::{Plan, PlanRoom, Scheme, scaffold, scaffold_file};
+pub use secure_invariants::{rekeyed_by_keys_import, resecured_by_import};
 pub use secure_links::{ConflictKind, SecureLinkConflict, secure_link_conflicts};
 pub use tests_schema::{
     Expectation, TestCase, TestFileError, TestSuite, WriteStep, load_tests, load_tests_in_dir,

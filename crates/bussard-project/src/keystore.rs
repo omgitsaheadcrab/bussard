@@ -581,9 +581,22 @@ impl KeyStore {
     ///
     /// An I/O failure (the previous store is left in place) or an encryption
     /// failure.
+    ///
+    /// A write that changes an existing store records the time in
+    /// `bussard.keys.meta.toml` ([`bussard_model::KeyStoreMeta`], issue
+    /// #348), so `validate` can name the keyring exports it made stale.
+    /// Creating the store records nothing: it holds what the imported ETS
+    /// keyring holds. A metadata file that cannot be written is logged, not
+    /// an error: the store itself is saved.
     pub fn save(&self, dir: &Path, password: &str) -> Result<SaveOutcome, KeyStoreError> {
         let xml = self.to_xml(password)?;
-        write_atomic(dir, &xml)
+        let outcome = write_atomic(dir, &xml)?;
+        if outcome == (SaveOutcome::Written { backup: true })
+            && let Err(err) = bussard_model::KeyStoreMeta::record_change(dir)
+        {
+            tracing::warn!("recording the key store change: {err}");
+        }
+        Ok(outcome)
     }
 
     /// Merges a decrypted `.knxkeys` export into the store (issue #241):
