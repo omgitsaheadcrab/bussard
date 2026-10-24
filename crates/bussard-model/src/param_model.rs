@@ -970,10 +970,15 @@ parameters:
         const APP: &'static str = "M-1_A-1";
 
         fn new(tag: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            // Only portable file-name characters: a Debug-formatted
+            // SystemTime holds braces and colons, which Windows rejects.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
             let dir = std::env::temp_dir().join(format!(
-                "bussard-model-cache-{tag}-{}-{:?}",
-                std::process::id(),
-                std::time::SystemTime::now()
+                "bussard-model-cache-{tag}-{}-{nanos}",
+                std::process::id()
             ));
             std::fs::create_dir_all(dir.join(MODELS_DIR))?;
             let yaml = dir.join(MODELS_DIR).join(format!("{}.yaml", Self::APP));
