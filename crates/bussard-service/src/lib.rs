@@ -62,6 +62,7 @@ pub mod policy;
 pub mod restore;
 pub mod secure;
 pub mod security_change;
+pub mod verify;
 pub mod write;
 
 pub use bus::{Authorize, BusService, Device, L4Options, Management, SourcePolicy};

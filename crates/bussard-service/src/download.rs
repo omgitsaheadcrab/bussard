@@ -135,9 +135,10 @@ pub struct FlashRun<'a> {
 }
 
 /// Runs `plan` on the device, then `after` on the session's last connection
-/// (the one the post-restart verification ran on) when the flash verified,
-/// before the disconnect. `after` gets `None` back when the flash failed or
-/// did not verify.
+/// (the one the post-restart verification ran on) when the download ran to
+/// its end, verified or not, before the disconnect: the read-back after a
+/// write (issue #349) names what an unverified flash left differing. `after`
+/// is not run (`None`) when the download failed.
 ///
 /// The session is disconnected on every path, a mid-flash failure included,
 /// so a failed download never leaves the L4 session open.
@@ -173,7 +174,7 @@ pub async fn flash_session<R>(
     .await;
     let verified = result.as_ref().is_ok_and(|outcome| outcome.ok());
     observer.finished(verified);
-    let extra = if verified {
+    let extra = if result.is_ok() {
         Some(after(session.l4()).await)
     } else {
         None

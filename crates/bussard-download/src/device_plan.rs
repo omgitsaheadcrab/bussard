@@ -522,6 +522,7 @@ mod tests {
             resolved: Vec::new(),
             sources: Vec::new(),
             notes: Vec::new(),
+            group_objects: None,
         })
     }
 

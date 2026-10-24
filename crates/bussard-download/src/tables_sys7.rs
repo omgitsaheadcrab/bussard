@@ -286,6 +286,7 @@ pub async fn read_sys7_tables<Ch: L4Channel>(
                 ("associations", TableSource::Memory),
             ],
             notes,
+            group_objects: group_object_image.first().map(|c| u16::from(*c)),
         },
         own_ia,
         address_base,

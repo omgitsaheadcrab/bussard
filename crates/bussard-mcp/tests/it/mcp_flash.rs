@@ -406,6 +406,13 @@ async fn test_knx_apply_device_flashes_a_parameter_that_shows_a_com_object() -> 
     assert_eq!(result["verified"], true, "{done}");
     assert_eq!(result["method"], "flash", "{done}");
     assert_eq!(result["parameters"]["written"], true, "{done}");
+    // Issue #349: the flash's read-back compared the parameters; this
+    // application's download loads no table object, so the tables it did
+    // not write are not compared.
+    let readback = &result["readback"];
+    assert_eq!(readback["verified"], true, "{done}");
+    assert_eq!(readback["compared"]["parameters"], 2, "{done}");
+    assert!(readback["compared"]["addresses"].is_null(), "{done}");
     let backup = result["parameter_backup"].as_str().unwrap_or_default();
     assert!(Path::new(backup).is_file(), "parameter backup {backup}");
 

@@ -592,12 +592,13 @@ fn next_step(status: &Value) -> String {
         ),
         _ if status["result"]["ok"] == true => format!(
             "Done: tell the human the outcome of job {job} on {address} (result.verified, \
-             result.parameters) and the backup paths. A new knx_plan_device for {address} \
-             reports nothing to do."
+             result.readback.compared, result.parameters) and the backup paths. A new \
+             knx_plan_device for {address} reports nothing to do."
         ),
         _ => format!(
             "Job {job} on {address} did not verify: tell the human result.reason or \
-             result.detail and result.recovery, and the backup paths."
+             result.detail, what result.readback.leftovers still differs, and \
+             result.recovery, and the backup paths."
         ),
     }
 }

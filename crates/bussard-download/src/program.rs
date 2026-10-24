@@ -484,6 +484,7 @@ mod tests {
             resolved,
             sources: Vec::new(),
             notes: Vec::new(),
+            group_objects: None,
         }
     }
 

@@ -157,6 +157,14 @@ fn test_flash_system7_same_application_proceeds_without_force() -> TestResult {
     let (stdout, stderr) = text(&out);
     assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(stdout.contains("parameters match the model"), "{stdout}");
+    // Issue #349: the read-back compared the links and the parameters.
+    assert!(
+        stdout.contains(
+            "read back from 1.1.7 and compared with the model: 1 group address(es), 1 \
+             association(s), 2 parameter(s)"
+        ),
+        "{stdout}"
+    );
     assert!(stderr.contains("already runs this application"), "{stderr}");
     assert!(stderr.contains("the code matches"), "{stderr}");
     assert!(!stderr.contains("could not identify"), "{stderr}");
@@ -233,6 +241,35 @@ fn test_flash_system7_parameter_lost_on_the_device_fails_with_the_parameter() ->
     assert!(
         stderr.contains("still differ from the model") && stderr.contains("obj2"),
         "the error names the parameter: {stderr}"
+    );
+    assert!(!stdout.contains("flash verified"), "{stdout}");
+    Ok(())
+}
+
+/// Issue #349: a device that reports every LSM Loaded but lost its
+/// association table at the restart fails the flash: the read-back names the
+/// link and the table size, and the exit is non-zero.
+#[test]
+fn test_flash_system7_links_lost_on_the_device_fail_with_the_link() -> TestResult {
+    let device = system7_device(device_ia()?, &SYS7_CODE).with_hook(|dev, apci, _| {
+        if apci == bussard_testkit::consts::A_RESTART {
+            dev.memory.insert(
+                u32::from(bussard_download::SYS7_ASSOCIATION_TABLE_ADDR),
+                0x00,
+            );
+        }
+        None
+    });
+    let bench = Bench::start_with(device, SYS7_APP_XML)?;
+    let out = bench.flash(&[])?;
+    let (stdout, stderr) = text(&out);
+    assert!(
+        !out.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("object 1 -> 1/2/0") && stderr.contains("association table"),
+        "the error names the link: {stderr}"
     );
     assert!(!stdout.contains("flash verified"), "{stdout}");
     Ok(())

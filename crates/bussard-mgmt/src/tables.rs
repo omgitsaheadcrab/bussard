@@ -168,6 +168,10 @@ pub struct DeviceTables {
     pub sources: Vec<(&'static str, TableSource)>,
     /// Human-readable notes (group-object-table status, skipped entries, …).
     pub notes: Vec<String>,
+    /// The group object table's element count, when the device let it be read
+    /// (the count a flash's read-back compares, issue #349). `None` when the
+    /// table is absent or unreadable.
+    pub group_objects: Option<u16>,
 }
 
 /// Errors from table read-back, wrapping the management-layer errors.
@@ -277,12 +281,16 @@ pub async fn read_tables<Ch: L4Channel>(l4: &mut Layer4Connection<Ch>) -> Result
 
     // Group object table: nice-to-have. Count its entries if readable (either
     // path); its per-entry descriptors are not decoded — see the module docs.
+    let mut group_objects = None;
     match find_object(&objects, OT_GROUP_OBJECT_TABLE) {
         Some(go_index) => match group_object_count(l4, go_index).await? {
-            Some((count, source)) => notes.push(format!(
-                "group object table: {count} entr{} via {source} (descriptors not decoded — send/listen direction unavailable)",
-                if count == 1 { "y" } else { "ies" }
-            )),
+            Some((count, source)) => {
+                group_objects = Some(count);
+                notes.push(format!(
+                    "group object table: {count} entr{} via {source} (descriptors not decoded — send/listen direction unavailable)",
+                    if count == 1 { "y" } else { "ies" }
+                ));
+            }
             None => notes.push(
                 "group object table present but not readable on either path; skipped".to_string(),
             ),
@@ -317,6 +325,7 @@ pub async fn read_tables<Ch: L4Channel>(l4: &mut Layer4Connection<Ch>) -> Result
         resolved,
         sources,
         notes,
+        group_objects,
     })
 }
 

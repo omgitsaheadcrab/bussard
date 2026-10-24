@@ -839,15 +839,17 @@ pub fn run(
         &restart_started,
         handed_over,
         async |l4| {
-            bussard_service::params::read_flashed_parameters(
-                l4,
+            // Issue #349: the tables, the group-object count and the
+            // security object too, through the one post-write read-back.
+            let expected = bussard_service::verify::Expected::for_flash(
+                plan_ref,
                 &product_data,
                 app,
                 model.as_ref(),
                 target,
                 device_mask,
-            )
-            .await
+            );
+            bussard_service::verify::read_back(l4, &expected).await
         },
     ));
     if output.verbose > 0 {
@@ -872,13 +874,16 @@ pub fn run(
             // The application is loaded; the parameters must match the model
             // too, or the flash did not do what the plan said (issue #319).
             let params_failure = flashed.as_ref().and_then(|f| f.failure());
-            let not_compared = flashed.as_ref().and_then(|f| f.note.as_ref());
+            let not_compared = flashed
+                .as_ref()
+                .and_then(|f| f.parameters.as_ref())
+                .and_then(|p| p.note.as_ref());
             if let Some(failure) = &params_failure {
-                eprintln!("\nERROR: {failure}");
+                eprintln!("\nERROR: flash {target}: {failure}");
                 eprintln!(
                     "the application program {} is {} on {target}, but the device does not \
-                     hold the model's parameters; run `bussard plan {target}` to see what is \
-                     left",
+                     hold the model's configuration; run `bussard plan {target}` to see what \
+                     is left",
                     plan.identity.id, verify.load_state,
                 );
             } else if let Some(note) = not_compared {
@@ -893,6 +898,21 @@ pub fn run(
                      parameters match the model",
                     plan.identity.id, verify.load_state,
                 );
+            }
+            if let Some(readback) = &flashed {
+                for note in readback
+                    .notes
+                    .iter()
+                    .filter(|n| !n.starts_with("parameters not compared"))
+                {
+                    eprintln!("warning: {note}");
+                }
+                if params_failure.is_none() {
+                    println!(
+                        "read back from {target} and compared with the model: {}",
+                        readback.summary()
+                    );
+                }
             }
             // Advisory findings (issue #145) do not fail the flash.
             for warning in &verify.warnings {
@@ -934,6 +954,10 @@ pub fn run(
         }
         Ok(verify) => {
             eprintln!("\nERROR: flash did not verify: {verify:?}");
+            // Issue #349: the read-back names what differs.
+            if let Some(failure) = flashed.as_ref().and_then(|f| f.failure()) {
+                eprintln!("ERROR: flash {target}: {failure}");
+            }
             recovery_notice(target);
             Ok(ExitCode::FAILURE)
         }

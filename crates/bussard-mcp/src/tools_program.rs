@@ -1216,6 +1216,8 @@ impl BussardMcp {
             "snapshot": snapshot,
         });
         Ok(Prepared {
+            model: std::sync::Arc::clone(&model),
+            product: product.source,
             target,
             gateway,
             dir,
@@ -1242,6 +1244,8 @@ impl BussardMcp {
     /// failure is the result (`ok: false` with the reason and the recovery).
     async fn apply_write(&self, tier: &ProgrammingTier, job: &str, p: Prepared) -> Value {
         let Prepared {
+            model,
+            product,
             target,
             gateway,
             dir,
@@ -1297,131 +1301,256 @@ impl BussardMcp {
              knx_plan_device reports nothing to do."
         );
 
-        // The tables first, when a link changes.
-        if tables_change {
-            tier.jobs.step(
-                job,
-                "writing the group-address and association tables, then reading them back",
-            );
-            let lease = match handle.lease().await {
-                Ok(lease) => lease,
-                Err(e) => {
+        // What the write means to leave on the device, for the read-back
+        // that ends every apply (issue #349).
+        let expected = bussard_service::verify::Expected {
+            tables: Some(desired.clone()),
+            group_objects: None,
+            parameters: match (&param_write, &product) {
+                (Some(_), Some(source)) => {
+                    source
+                        .app()
+                        .map(|app| bussard_service::verify::ExpectedParameters {
+                            product: &source.product,
+                            app,
+                            model: Some(&model),
+                            device_mask: tables.mask,
+                        })
+                }
+                _ => None,
+            },
+            security: if tables_change {
+                security.as_ref().map(|inputs| {
+                    bussard_service::verify::ExpectedSecurity::from_inputs(
+                        inputs,
+                        &desired.addresses,
+                    )
+                })
+            } else {
+                None
+            },
+        };
+
+        // Whether a write stopped before it reached the device (no lease, a
+        // sequence error): its error is the result, and there is nothing new
+        // to read back.
+        let mut stopped = false;
+        'write: {
+            // The tables first, when a link changes.
+            if tables_change {
+                tier.jobs.step(
+                    job,
+                    "writing the group-address and association tables, then reading them back",
+                );
+                let lease = match handle.lease().await {
+                    Ok(lease) => lease,
+                    Err(e) => {
+                        stopped = true;
+                        merge(
+                            &mut result,
+                            json!({
+                                "ok": false,
+                                "verified": false,
+                                "reason": format!("could not lease the bus: {e}"),
+                                "recovery": recovery,
+                            }),
+                        );
+                        break 'write;
+                    }
+                };
+                let outcome = write_tables_secured(
+                    LeaseChannel::new(lease),
+                    target,
+                    source,
+                    tables.mask,
+                    &desired,
+                    images.as_ref(),
+                    bussard_service::secure::layer(&tool_key, &high_water),
+                    security.as_ref(),
+                )
+                .await;
+                let verified = matches!(&outcome, Ok(summary) if summary.ok);
+                stopped = outcome.is_err();
+                tracing::info!(
+                    "audit: knx_apply_device {target} tables via {gateway}: {}; backup {backup_path}",
+                    if verified { "verified" } else { "FAILED" }
+                );
+                tier.jobs.progress(
+                    job,
+                    "tables",
+                    json!(if verified { "verified" } else { "failed" }),
+                );
+                merge(
+                    &mut result,
+                    match outcome {
+                        Ok(summary) => json!({
+                            "ok": summary.ok,
+                            "verified": summary.ok,
+                            "security_object": security_json(security.as_ref(), &desired, false),
+                            "address_state": summary.address_state.to_string(),
+                            "association_state": summary.association_state.to_string(),
+                            "resulting_address_count": report.resulting_address_count,
+                            "resulting_association_count": report.resulting_association_count,
+                            "detail": if summary.ok { Value::Null } else { Value::String(summary.detail) },
+                            "recovery": if summary.ok { Value::Null } else { Value::String(recovery.clone()) },
+                        }),
+                        Err(err) => json!({
+                            "ok": false,
+                            "verified": false,
+                            "reason": format!("the write failed: {err}"),
+                            "recovery": recovery.clone(),
+                        }),
+                    },
+                );
+                if !verified {
+                    if param_write.is_some() {
+                        result["parameters"] = json!({
+                            "written": false,
+                            "reason": "not written: the table write did not verify",
+                        });
+                    }
+                    break 'write;
+                }
+                // The security object was written with this PID 54 table and the
+                // write verified: record it in the lock, as `adopt` does (issue
+                // #297), so the sender admission check sees it.
+                if let Some(inputs) = &security {
+                    match bussard_service::admission::record_secure_senders(
+                        &dir,
+                        target,
+                        &inputs.senders,
+                    ) {
+                        Ok(recorded) => result["secure_senders_recorded"] = json!(recorded),
+                        Err(err) => {
+                            tracing::warn!("{err}");
+                            result["secure_senders_recorded"] = json!(false);
+                            result["secure_senders_note"] = json!(err.to_string());
+                        }
+                    }
+                    // And the group-object flags it wrote (PID 61, issue #331).
+                    match bussard_service::security_change::record_security_flags(
+                        &dir,
+                        target,
+                        &inputs.secure_objects,
+                    ) {
+                        Ok(recorded) => result["security_flags_recorded"] = json!(recorded),
+                        Err(err) => {
+                            tracing::warn!("{err}");
+                            result["security_flags_recorded"] = json!(false);
+                            result["security_flags_note"] = json!(err.to_string());
+                        }
+                    }
+                }
+            }
+
+            // Then the parameter octets that differ, with the CLI's engine
+            // (issue #274): the parameter-only download, verified by reading the
+            // memory back.
+            if let Some((partial, detail)) = param_write {
+                let Some(service) = self.state().bus.service() else {
                     merge(
                         &mut result,
                         json!({
                             "ok": false,
                             "verified": false,
-                            "reason": format!("could not lease the bus: {e}"),
-                            "recovery": recovery,
+                            "reason": "the bus is not wired",
                         }),
                     );
-                    return result;
-                }
-            };
-            let outcome = write_tables_secured(
-                LeaseChannel::new(lease),
-                target,
-                source,
-                tables.mask,
-                &desired,
-                images.as_ref(),
-                bussard_service::secure::layer(&tool_key, &high_water),
-                security.as_ref(),
-            )
-            .await;
-            let verified = matches!(&outcome, Ok(summary) if summary.ok);
-            tracing::info!(
-                "audit: knx_apply_device {target} tables via {gateway}: {}; backup {backup_path}",
-                if verified { "verified" } else { "FAILED" }
-            );
-            tier.jobs.progress(
-                job,
-                "tables",
-                json!(if verified { "verified" } else { "failed" }),
-            );
-            merge(
-                &mut result,
-                match outcome {
-                    Ok(summary) => json!({
-                        "ok": summary.ok,
-                        "verified": summary.ok,
-                        "security_object": security_json(security.as_ref(), &desired, false),
-                        "address_state": summary.address_state.to_string(),
-                        "association_state": summary.association_state.to_string(),
-                        "resulting_address_count": report.resulting_address_count,
-                        "resulting_association_count": report.resulting_association_count,
-                        "detail": if summary.ok { Value::Null } else { Value::String(summary.detail) },
-                        "recovery": if summary.ok { Value::Null } else { Value::String(recovery.clone()) },
-                    }),
-                    Err(err) => json!({
-                        "ok": false,
-                        "verified": false,
-                        "reason": format!("the write failed: {err}"),
-                        "recovery": recovery.clone(),
-                    }),
-                },
-            );
-            if !verified {
-                if param_write.is_some() {
-                    result["parameters"] = json!({
-                        "written": false,
-                        "reason": "not written: the table write did not verify",
-                    });
-                }
-                return result;
-            }
-            // The security object was written with this PID 54 table and the
-            // write verified: record it in the lock, as `adopt` does (issue
-            // #297), so the sender admission check sees it.
-            if let Some(inputs) = &security {
-                match bussard_service::admission::record_secure_senders(
-                    &dir,
+                    break 'write;
+                };
+                tier.jobs.step(
+                    job,
+                    format!(
+                        "writing {} parameter octet(s)",
+                        built.plan.writes.parameter_octets
+                    ),
+                );
+                let read_options = L4Options {
+                    source: SourcePolicy::Known(source),
+                    tool_key: tool_key.clone(),
+                    high_water: high_water.clone(),
+                    authorize: Authorize::BestEffort(bussard_mgmt::apci::FREE_ACCESS_KEY),
+                    ..L4Options::default()
+                };
+                let mut observer = JobObserver {
+                    jobs: &tier.jobs,
+                    job,
+                    what: PARAMETER_DOWNLOAD,
+                };
+                let outcome = bussard_service::download::write_parameters(
+                    service,
                     target,
-                    &inputs.senders,
-                ) {
-                    Ok(recorded) => result["secure_senders_recorded"] = json!(recorded),
-                    Err(err) => {
-                        tracing::warn!("{err}");
-                        result["secure_senders_recorded"] = json!(false);
-                        result["secure_senders_note"] = json!(err.to_string());
-                    }
+                    source,
+                    partial,
+                    detail,
+                    tool_key.clone(),
+                    high_water.clone(),
+                    &read_options,
+                    &mut observer,
+                )
+                .await;
+                stopped = matches!(
+                    outcome,
+                    Ok(bussard_service::download::ParamWriteOutcome::Failed(_)) | Err(_)
+                );
+                let (ok, parameters) = match outcome {
+                    Ok(bussard_service::download::ParamWriteOutcome::Verified { octets }) => (
+                        true,
+                        json!({
+                            "written": true,
+                            "verified": true,
+                            "octets": octets,
+                            "changed": built.parameters,
+                        }),
+                    ),
+                    Ok(failed) => (
+                        false,
+                        json!({
+                            "written": false,
+                            "verified": false,
+                            "reason": failed.failure(),
+                        }),
+                    ),
+                    Err(err) => (
+                        false,
+                        json!({
+                            "written": false,
+                            "verified": false,
+                            "reason": format!("the parameter read-back failed: {}", chain(&err)),
+                        }),
+                    ),
+                };
+                tracing::info!(
+                    "audit: knx_apply_device {target} parameters via {gateway}: {}",
+                    if ok { "verified" } else { "FAILED" }
+                );
+                result["parameters"] = parameters;
+                result["ok"] = json!(ok);
+                result["verified"] = json!(ok);
+                if !ok {
+                    result["recovery"] = json!(format!(
+                        "The parameter memory before the write is backed up at {}. If the \
+                         application still reads Loaded, re-planning and re-applying {target} \
+                         rewrites only the octets that still differ; otherwise recover with a full \
+                         `bussard flash --force {target}` at the CLI. Do not assume the device works \
+                         until a new knx_plan_device reports nothing to do.",
+                        param_backup_path.as_deref().unwrap_or("(no backup)")
+                    ));
                 }
-                // And the group-object flags it wrote (PID 61, issue #331).
-                match bussard_service::security_change::record_security_flags(
-                    &dir,
-                    target,
-                    &inputs.secure_objects,
-                ) {
-                    Ok(recorded) => result["security_flags_recorded"] = json!(recorded),
-                    Err(err) => {
-                        tracing::warn!("{err}");
-                        result["security_flags_recorded"] = json!(false);
-                        result["security_flags_note"] = json!(err.to_string());
-                    }
-                }
+            } else if let Some(why) = &built.parameters_skipped {
+                result["parameters"] = json!({"written": false, "reason": why});
             }
         }
 
-        // Then the parameter octets that differ, with the CLI's engine
-        // (issue #274): the parameter-only download, verified by reading the
-        // memory back.
-        if let Some((partial, detail)) = param_write {
-            let Some(service) = self.state().bus.service() else {
-                merge(
-                    &mut result,
-                    json!({
-                        "ok": false,
-                        "verified": false,
-                        "reason": "the bus is not wired",
-                    }),
-                );
-                return result;
-            };
+        // Verified means read back and compared (issues #319, #349): a fresh
+        // session reads the tables, the written parameters and the security
+        // object back and compares them with the model.
+        if let Some(service) = self.state().bus.service().filter(|_| !stopped) {
             tier.jobs.step(
                 job,
                 format!(
-                    "writing {} parameter octet(s)",
-                    built.plan.writes.parameter_octets
+                    "reading {target} back (tables, parameters, security object) to compare it \
+                     with the model"
                 ),
             );
             let read_options = L4Options {
@@ -1431,69 +1560,41 @@ impl BussardMcp {
                 authorize: Authorize::BestEffort(bussard_mgmt::apci::FREE_ACCESS_KEY),
                 ..L4Options::default()
             };
-            let mut observer = JobObserver {
-                jobs: &tier.jobs,
-                job,
-                what: PARAMETER_DOWNLOAD,
-            };
-            let outcome = bussard_service::download::write_parameters(
+            let readback = bussard_service::verify::read_back_on(
                 service,
                 target,
-                source,
-                partial,
-                detail,
-                tool_key.clone(),
-                high_water.clone(),
                 &read_options,
-                &mut observer,
+                None,
+                &expected,
             )
             .await;
-            let (ok, parameters) = match outcome {
-                Ok(bussard_service::download::ParamWriteOutcome::Verified { octets }) => (
-                    true,
-                    json!({
-                        "written": true,
-                        "verified": true,
-                        "octets": octets,
-                        "changed": built.parameters,
-                    }),
-                ),
-                Ok(failed) => (
-                    false,
-                    json!({
-                        "written": false,
-                        "verified": false,
-                        "reason": failed.failure(),
-                    }),
-                ),
-                Err(err) => (
-                    false,
-                    json!({
-                        "written": false,
-                        "verified": false,
-                        "reason": format!("the parameter read-back failed: {}", chain(&err)),
-                    }),
-                ),
-            };
             tracing::info!(
-                "audit: knx_apply_device {target} parameters via {gateway}: {}",
-                if ok { "verified" } else { "FAILED" }
+                "audit: knx_apply_device {target} read-back via {gateway}: {}",
+                if readback.verified {
+                    "verified"
+                } else {
+                    "NOT VERIFIED"
+                }
             );
-            result["parameters"] = parameters;
-            result["ok"] = json!(ok);
-            result["verified"] = json!(ok);
-            if !ok {
-                result["recovery"] = json!(format!(
-                    "The parameter memory before the write is backed up at {}. If the \
-                     application still reads Loaded, re-planning and re-applying {target} \
-                     rewrites only the octets that still differ; otherwise recover with a full \
-                     `bussard flash --force {target}` at the CLI. Do not assume the device works \
-                     until a new knx_plan_device reports nothing to do.",
-                    param_backup_path.as_deref().unwrap_or("(no backup)")
-                ));
+            result["readback"] = json!(readback);
+            if let Some(failure) = readback.failure() {
+                // Say what is left first; a write failure already reported
+                // stays in `write_reason`.
+                if let Some(previous) = result.get("reason").filter(|r| !r.is_null()).cloned() {
+                    result["write_reason"] = previous;
+                }
+                result["ok"] = json!(false);
+                result["verified"] = json!(false);
+                result["reason"] = json!(failure);
+                if result.get("recovery").is_none_or(Value::is_null) {
+                    result["recovery"] = json!(format!(
+                        "The items listed still differ from the model on {target}. The \
+                         pre-apply state is backed up at {backup_path}. Plan {target} again \
+                         with knx_plan_device and re-apply; do not report the change as done \
+                         until a plan reports nothing to do."
+                    ));
+                }
             }
-        } else if let Some(why) = &built.parameters_skipped {
-            result["parameters"] = json!({"written": false, "reason": why});
         }
         if result.get("ok").is_none() {
             result["ok"] = json!(true);
@@ -1551,6 +1652,11 @@ impl BussardMcp {
 
 /// What an apply whose pre-flight passed carries into its write.
 struct Prepared {
+    /// The model the plan was made from (the read-back compares with it).
+    model: std::sync::Arc<Model>,
+    /// The product data the parameters are decoded with, when the lock pins
+    /// it (a flash takes it for its own read-back).
+    product: Option<ProductSource>,
     /// The device.
     target: IndividualAddress,
     /// The resolved gateway, for the audit line.
@@ -2348,6 +2454,7 @@ mod tests {
             resolved: Vec::new(),
             sources: Vec::new(),
             notes: Vec::new(),
+            group_objects: None,
         })
     }
 
