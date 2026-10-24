@@ -27,7 +27,7 @@ type EtsSegment = (String, String, Vec<Option<u8>>);
 
 /// The ETS segment fixture, parsed into `(case, segment suffix, bytes)`.
 fn ets_segments() -> TestResult<Vec<EtsSegment>> {
-    let text = include_str!("fixtures/sys7_ets_parameter_segments.txt");
+    let text = include_str!("../fixtures/sys7_ets_parameter_segments.txt");
     let mut out = Vec::new();
     for line in text
         .lines()

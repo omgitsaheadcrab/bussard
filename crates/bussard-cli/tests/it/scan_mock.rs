@@ -685,8 +685,8 @@ fn test_scan_without_confirmations_falls_back_to_timeout() -> TestResult {
 /// (`BUSSARD_SCAN_MEASURE=con`) or without (`=plain`) negative confirmations.
 /// Prints wall-clock and request counts. Ignored: the `plain` run takes about
 /// 12.5 minutes. Run with
-/// `BUSSARD_SCAN_MEASURE=con cargo nextest run -p bussard-cli --test scan_mock
-/// --run-ignored only measure_full_line --no-capture`.
+/// `BUSSARD_SCAN_MEASURE=con cargo nextest run -p bussard-cli --test it
+/// --run-ignored only scan_mock::measure_full_line --no-capture`.
 #[test]
 #[ignore = "measurement, minutes of wall-clock"]
 fn measure_full_line_sweep() -> TestResult {

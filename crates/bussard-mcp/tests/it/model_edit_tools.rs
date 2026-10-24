@@ -401,7 +401,7 @@ async fn test_show_device_lists_a_channel_and_its_toml() -> TestResult {
 }
 
 /// The fixture of a keyed device with its product model (see
-/// `bussard-model/tests/device_view.rs`).
+/// `bussard-model/tests/it/device_view.rs`).
 const KEYED_LOCK: &str = r#"version = 3
 
 [[device]]

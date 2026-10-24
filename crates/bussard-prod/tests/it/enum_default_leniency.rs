@@ -18,7 +18,7 @@ use bussard_prod::{compute_parameter_image, parse_application_program};
 #[test]
 fn test_compute_parameter_image_vendor_enum_default_passes_through()
 -> Result<(), Box<dyn std::error::Error>> {
-    let xml = include_bytes!("fixtures/enum_default_not_a_member.app.xml");
+    let xml = include_bytes!("../fixtures/enum_default_not_a_member.app.xml");
     let app = parse_application_program("M-00FA_A-0006-11-ABCD-O000A", xml)?;
 
     let images = compute_parameter_image(&app, &BTreeMap::new(), &BTreeMap::new())?;

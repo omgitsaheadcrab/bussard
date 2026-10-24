@@ -194,11 +194,13 @@ jobs:
       - name: Conformance sweep (committed fixtures)
         # Fixtures only, even on a run with a corpus: the step below runs the
         # corpus-gated tests once.
+        # The integration half skips the leading module (the test's file
+        # under tests/it/), so the words match the test's own name as before.
         env:
           BUSSARD_PRODUCT_CORPUS: ""
         run: |
           cargo nextest run -p bussard-download --profile ci \
-            -E 'test(sweep) + test(golden) + test(corpus)'
+            -E '(kind(lib) & (test(sweep) + test(golden) + test(corpus))) + (kind(test) & test(/^[a-z0-9_]+::.*(sweep|golden|corpus)/))'
 
       # Every corpus-gated test (docs/testing.md), the full 500-product sweep
       # included, only when a corpus is available. The job-level `env` above
@@ -210,7 +212,7 @@ jobs:
         run: |
           cargo nextest run --profile corpus \
             -p bussard-download -p bussard-prod -p bussard-cli \
-            -E 'binary(flash_corpus) | binary(flash_dryrun_system7) | binary(ets_golden) | binary(sys7_jung_m2_plan) | binary(param_readback_roundtrip) | binary(parameter_image) | binary(sys7_visible_parameters) | binary(selected) | binary(flash_dry_run)'
+            -E 'binary(it) & test(/^(flash_corpus|flash_dryrun_system7|ets_golden|sys7_jung_m2_plan|param_readback_roundtrip|parameter_image|sys7_visible_parameters|selected|flash_dry_run)::/)'
 
   # cargo-deny is the automated guard for bussard's central "never GPL"
   # constraint: the license allow-list in deny.toml fails this job if any crate
@@ -400,7 +402,7 @@ jobs:
       - name: bussard mock-flash conformance
         run: |
           cargo nextest run -p bussard-download --profile ci \
-            -E 'binary(flash_mock) + binary(flash_mock_system7) + binary(sys7_jung_m2_plan) + binary(sys7_theben_0701_plan)'
+            -E 'binary(it) & test(/^(flash_mock|flash_mock_system7|sys7_jung_m2_plan|sys7_theben_0701_plan)::/)'
 
   # Optional interop job: build thelsing/knx's knx-linux-ip demo as an EXTERNAL
   # process and drive bussard's management ladder against it over KNXnet/IP
@@ -720,7 +722,7 @@ jobs:
 
   # Optional frontend smoke test: boot the `bussard viz` server in-process and
   # drive the actual DOM with headless Chrome (see
-  # crates/bussard-viz/tests/browser_smoke.rs). Ubuntu-only, because GitHub's
+  # crates/bussard-viz/tests/it/browser_smoke.rs). Ubuntu-only, because GitHub's
   # ubuntu runners ship `google-chrome` preinstalled; macOS/Windows runners do
   # not reliably, and the test skips gracefully when no Chrome is found anyway.
   #

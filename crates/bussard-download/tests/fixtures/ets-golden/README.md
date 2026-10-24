@@ -14,7 +14,7 @@ They contain no group addresses.
 | `helios-obj3.hex` | Helios KWL KNX connect | `M-0112_A-0003-10-*-O0115` | group-object table, 130 octets (count 64) |
 | `helios-obj4.hex` | same | same | parameter segment, 32 octets |
 
-The F50 capture is the ETS 6 download of 2026-09-16. `tests/ets_golden.rs`
+The F50 capture is the ETS 6 download of 2026-09-16. `tests/it/ets_golden.rs`
 rebuilds each image from the vendor product (corpus cache, not committed), the
 device's linked object numbers with their per-object flags and com-object refs,
 and its non-default parameters (ref ids and values only).

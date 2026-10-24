@@ -386,7 +386,7 @@ independent implementation (Calimero) against the same device and diff the frame
 "can bussard flash this today?" check. `fetch.sh` reads `corpus.txt` (one order number
 per index entry) and runs `bussard import-product --order-number … --yes-download` for
 each, downloading and checksum-verifying every file into a git-ignored `cache/`. The
-env-gated test `crates/bussard-download/tests/flash_corpus.rs` then dry-runs `plan_flash`
+env-gated test `crates/bussard-download/tests/it/flash_corpus.rs` then dry-runs `plan_flash`
 over every application program in the cache and reports which lower to an executable
 plan, which are refused, and, for the refused System B apps, which load-procedure op
 blocked them. With `BUSSARD_PRODUCT_CORPUS` unset the test skips green, so CI never

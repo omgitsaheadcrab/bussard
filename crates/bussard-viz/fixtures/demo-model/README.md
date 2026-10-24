@@ -13,7 +13,7 @@ cargo run -p bussard-viz --example dump_fixture -- \
   > crates/bussard-viz/assets/fixture-model.json
 ```
 
-`tests/fixture_model.rs` fails if the two drift apart.
+`tests/it/fixture_model.rs` fails if the two drift apart.
 
 Everything in here is invented. Never point `dump_fixture` at a real `knx/`
 directory and commit the result: the projection carries the room names, device

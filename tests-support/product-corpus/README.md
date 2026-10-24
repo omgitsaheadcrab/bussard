@@ -21,9 +21,9 @@ running the fetch script, which re-downloads and re-verifies every file.
 | `corpus.txt`      | One order number per index entry, with a type/mask comment. The fetch driver. |
 | `fetch.sh`        | Downloads each order number via `bussard import-product`, caching under `cache/vendor/`. |
 | `cache/`          | Local-only download cache (git-ignored). Created by `fetch.sh`. |
-| `fixture-conformance.json` / `.md` | Checked-in conformance baseline for the **committed fabricated fixtures** (`crates/bussard-download/tests/fixtures/corpus/`). Regenerated + diffed by `tests/sweep_fixtures.rs` in normal CI — no vendor data. |
+| `fixture-conformance.json` / `.md` | Checked-in conformance baseline for the **committed fabricated fixtures** (`crates/bussard-download/tests/fixtures/corpus/`). Regenerated + diffed by `tests/it/sweep_fixtures.rs` in normal CI — no vendor data. |
 | `conformance-manifest.json` / `.md` | Checked-in conformance baseline for the **full real corpus**, regenerated on a machine that holds the cache (see below). The env-gated sweep fails on a regression against it. Absent on a clean checkout. |
-| (the tests)       | `crates/bussard-download/tests/flash_corpus.rs` (env-gated on `BUSSARD_PRODUCT_CORPUS`), `tests/sweep_fixtures.rs` + `tests/golden_images.rs` (always-on, fixture-based). The sweep engine is `bussard_download::sweep`. |
+| (the tests)       | `crates/bussard-download/tests/it/flash_corpus.rs` (env-gated on `BUSSARD_PRODUCT_CORPUS`), `tests/it/sweep_fixtures.rs` + `tests/it/golden_images.rs` (always-on, fixture-based). The sweep engine is `bussard_download::sweep`. |
 
 ## Conformance sweep
 
@@ -72,7 +72,7 @@ tests-support/product-corpus/fetch.sh
 
 # 3. Run the flashability sweep against the cache (absolute path).
 BUSSARD_PRODUCT_CORPUS="$(pwd)/tests-support/product-corpus/cache" \
-    cargo test -p bussard-download --test flash_corpus -- --nocapture
+    cargo test -p bussard-download --test it flash_corpus:: -- --nocapture
 ```
 
 Point `BUSSARD_PRODUCT_CORPUS` at an **absolute** path: the test binary runs with

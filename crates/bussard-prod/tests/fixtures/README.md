@@ -22,7 +22,7 @@ two real panels landed in.
 ## Intended tests
 
 Wrap the XML into a one-file `.knxprod` (same helper shape as
-`crates/bussard-prod/tests/knxprod.rs::build_knxprod`), then:
+`crates/bussard-prod/tests/it/knxprod.rs::build_knxprod`), then:
 
 1. **`bussard-prod`** — `compute_parameter_image` returns `Err` naming this
    parameter and the non-member value `3`. Pin the message shape.

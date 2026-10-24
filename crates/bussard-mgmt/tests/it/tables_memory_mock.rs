@@ -396,7 +396,7 @@ async fn test_read_tables_disconnect_on_memory_read_is_an_error() -> TestResult 
 
 /// Request count and wall-clock of the table read with a 200 ms answer delay
 /// (the Data Secure devices of the speed deep dive). Run by hand:
-/// `cargo test -p bussard-mgmt --test tables_memory_mock -- --ignored --nocapture`.
+/// `cargo test -p bussard-mgmt --test it tables_memory_mock:: -- --ignored --nocapture`.
 #[tokio::test]
 #[ignore = "measurement, about a minute of 200 ms answer delays"]
 async fn measure_read_tables_requests_and_wall_clock() -> TestResult {

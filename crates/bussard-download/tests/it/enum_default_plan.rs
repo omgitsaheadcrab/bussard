@@ -17,7 +17,8 @@ use bussard_download::plan_flash;
 #[test]
 fn test_plan_flash_vendor_enum_default_no_longer_refused() -> Result<(), Box<dyn std::error::Error>>
 {
-    let xml = include_bytes!("../../bussard-prod/tests/fixtures/enum_default_not_a_member.app.xml");
+    let xml =
+        include_bytes!("../../../bussard-prod/tests/fixtures/enum_default_not_a_member.app.xml");
     let app = bussard_prod::parse_application_program("M-00FA_A-0006-11-ABCD-O000A", xml)?;
 
     plan_flash(

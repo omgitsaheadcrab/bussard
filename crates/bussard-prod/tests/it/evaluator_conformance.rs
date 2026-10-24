@@ -27,23 +27,23 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 const FIXTURES: &[(&str, &[u8])] = &[
     (
         "M-00FA_A-0298-10-0000",
-        include_bytes!("fixtures/blocks_app.xml"),
+        include_bytes!("../fixtures/blocks_app.xml"),
     ),
     (
         "A",
-        include_bytes!("../../bussard-download/tests/fixtures/param-readback/app.xml"),
+        include_bytes!("../../../bussard-download/tests/fixtures/param-readback/app.xml"),
     ),
     (
         "M-00FA_A-00D1-10-0001",
-        include_bytes!("../../bussard-project/tests/fixtures/dynamic_tree.app.xml"),
+        include_bytes!("../../../bussard-project/tests/fixtures/dynamic_tree.app.xml"),
     ),
     (
         "M-00FA_A-00D2-10-0001",
-        include_bytes!("../../bussard-project/tests/fixtures/default_params.app.xml"),
+        include_bytes!("../../../bussard-project/tests/fixtures/default_params.app.xml"),
     ),
     (
         "M-00FA_A-00D1-10-0001",
-        include_bytes!("../../bussard-ets/tests/fixtures/dynamic_tree.app.xml"),
+        include_bytes!("../../../bussard-ets/tests/fixtures/dynamic_tree.app.xml"),
     ),
 ];
 

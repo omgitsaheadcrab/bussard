@@ -1,0 +1,50 @@
+//! The integration tests of `bussard-cli`, linked as one binary.
+//!
+//! Each module is a former `tests/<module>.rs` file. One binary instead of
+//! one per file saves a link against the full dependency graph per file;
+//! nextest still runs every test in its own process.
+
+mod adopt_mock;
+mod assign_mock;
+mod audit_cli;
+mod backup_replace_mock;
+mod bundle_diff_cli;
+mod commission_mock;
+mod confirm_output;
+mod default_dir_cli;
+mod describe_mock;
+mod device_cli;
+mod device_facts_mock;
+mod device_pages;
+mod docs_consistency;
+mod dotenv_cli;
+mod flash_dry_run;
+mod flash_parameters_mock;
+mod flash_sys7_mock;
+mod global_options;
+mod groups_cli;
+mod history_cli;
+mod import_cli;
+mod import_product_file;
+mod import_product_index;
+mod init_tunnels_mock;
+mod ipsecure_cli;
+mod keyring_tunnel_only;
+mod keys_cli;
+mod learn_mock;
+mod learn_secure_mock;
+mod line_mock;
+mod mcp_ha_stdio;
+mod mcp_parameters_mock;
+mod mcp_secure_mock;
+mod mcp_stdio;
+mod plan_mock;
+mod product_store_cli;
+mod reconstruct_line_mock;
+mod reconstruct_mock;
+mod scan_mock;
+mod secure_capture_oracle;
+mod secure_group_mock;
+mod test_runner_mock;
+mod validate_keyring_cli;
+mod write_gate;
