@@ -285,7 +285,9 @@ impl BussardMcp {
         and ask the question. Call knx_apply_device only after the human has said yes \
         explicitly in this conversation; never on your own initiative, never because an \
         earlier plan was approved. The digest expires (default 10 minutes) and is invalidated \
-        if the device or the model changes. Refuses protected group addresses in the change and \
+        if the device or the model changes. Refuses protected group addresses in the change, a \
+        device the model links without KNX Data Secure to a group address the other side runs \
+        secured (E035/E036), and \
         a device whose application drifted from bussard.lock (it needs `bussard flash`). \
         `method` says how the change is written: \"apply\" (tables and parameter octets) or \
         \"flash\" when a parameter shows or hides a com-object, which only a full application \
@@ -509,6 +511,10 @@ impl BussardMcp {
     async fn plan_device(&self, address: &str) -> Result<Value, String> {
         let began = Instant::now();
         let target = parse_address(address)?;
+        // A link the model itself shows cannot work refuses before the bus is
+        // touched or a job is claimed (issue #330); `plan_body` checks again
+        // on the model it plans with.
+        refuse_insecure_links(&self.state().model.reload(), target)?;
         let (tier, _, _) = self.programming_preflight()?;
         let (job, fresh) = match tier.jobs.claim_plan(target)? {
             crate::apply_jobs::PlanClaim::New(job) => (job, true),
@@ -576,9 +582,12 @@ impl BussardMcp {
     /// The plan itself, run inside the plan job; `Err` is a refusal reason.
     async fn plan_body(&self, address: &str) -> Result<Value, String> {
         let target = parse_address(address)?;
+        // A link the model itself shows cannot work refuses before the bus is
+        // touched (issue #330).
+        let model = self.state().model.reload();
+        refuse_insecure_links(&model, target)?;
         let (tier, handle, gateway) = self.programming_preflight()?;
         let dir = self.state().dir.clone();
-        let model = self.state().model.reload();
         let desired = desired_tables_for(&model, target).map_err(|e| e.to_string())?;
 
         let material = self.plan_material(target, &model)?;
@@ -1000,6 +1009,8 @@ impl BussardMcp {
         }
 
         let model = self.state().model.reload();
+        // The model may have changed since the plan (issue #330).
+        refuse_insecure_links(&model, target)?;
         let desired = desired_tables_for(&model, target).map_err(|e| e.to_string())?;
         let mut product = product_for(&dir, &model, target);
         // KNX Data Secure: the same material the plan resolved, one
@@ -1702,6 +1713,26 @@ fn parse_address(address: &str) -> Result<IndividualAddress, String> {
         .trim()
         .parse()
         .map_err(|_| format!("invalid individual address {address:?}"))
+}
+
+/// Refuses a plan for a device the model puts, without KNX Data Secure, on a
+/// group address the other side runs secured (validation errors E035 and
+/// E036, issue #330): the download would succeed and the link would not work.
+fn refuse_insecure_links(model: &Model, target: IndividualAddress) -> Result<(), String> {
+    let found: Vec<String> = bussard_model::secure_link_conflicts(model)
+        .iter()
+        .filter(|c| c.device == target)
+        .map(|c| format!("{}: {}", c.code(), c.message()))
+        .collect();
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to plan {target}: its links would not work. {}. Fix the model \
+             (knx_remove_link, or the ways out above) and plan again",
+            found.join("; ")
+        ))
+    }
 }
 
 /// Refuses a plan whose additions or removals touch a protected GA.

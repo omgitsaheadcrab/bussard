@@ -104,6 +104,7 @@ pub fn validate(model: &Model) -> Vec<Diagnostic> {
     check_ga_consistency(model, &mut diags);
     check_orphans_and_unlinked(model, &mut diags);
     check_protected_gas(model, &mut diags);
+    crate::secure_links::check_secure_links(model, &mut diags);
     // Opt-in topology/convention lints (issue #102). Without a `[lint]` table in
     // `bussard.toml` this contributes nothing, so existing models are unchanged.
     // The bus-current rule (L002) needs the on-disk product cache and therefore
@@ -134,6 +135,7 @@ pub fn validate_in_dir(model: &Model, dir: &Path) -> Vec<Diagnostic> {
     check_ga_consistency(model, &mut diags);
     check_orphans_and_unlinked(model, &mut diags);
     check_protected_gas(model, &mut diags);
+    crate::secure_links::check_secure_links(model, &mut diags);
 
     let models = ProductModels::load(dir);
     check_parameters(model, &models, dir, &mut diags);

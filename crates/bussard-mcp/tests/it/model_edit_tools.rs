@@ -911,3 +911,100 @@ async fn test_discard_edits_group_created_in_session() -> TestResult {
     std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
+
+/// A model with the secured GA 1/0/4 and the plain GA 1/0/5, the Secure
+/// actuator 1.1.5 listening to both, and the weather station 1.1.202 without
+/// KNX Data Secure (issue #330).
+fn secure_model_dir(tag: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join(format!(
+        "bussard-mcp-secure-{tag}-{}-{:?}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("devices"))?;
+    std::fs::write(
+        dir.join("groups.toml"),
+        "groups = [\n  { address = \"1/0/4\", name = \"Licht Kueche aussen\", dpt = \"1.001\", secure = true },\n  \
+         { address = \"1/0/5\", name = \"Licht Kueche Logik\", dpt = \"1.001\" },\n]\n",
+    )?;
+    std::fs::write(
+        dir.join("devices").join("1.1.5.toml"),
+        "address = \"1.1.5\"\nname = \"Switch actuator\"\n\n[links]\n\
+         schalten.listen = [\"1/0/4\"]\nlogik.listen = [\"1/0/5\"]\n",
+    )?;
+    std::fs::write(
+        dir.join("devices").join("1.1.202.toml"),
+        "address = \"1.1.202\"\nname = \"Weather station\"\n",
+    )?;
+    std::fs::write(
+        dir.join("bussard.lock"),
+        "version = 3\n\n[[device]]\naddress = \"1.1.5\"\nsecure_capable = true\n\
+         objects = [\n  { number = 3, key = \"schalten\", dpt = \"1.001\", flags = \"CWU\", secure = true },\n  \
+         { number = 4, key = \"logik\", dpt = \"1.001\", flags = \"CWU\" },\n]\n\n\
+         [[device]]\naddress = \"1.1.202\"\n\
+         objects = [\n  { number = 18, key = \"c18\", dpt = \"1.001\", flags = \"CRT\" },\n]\n",
+    )?;
+    Ok(dir)
+}
+
+/// Linking a device without Data Secure as sender on a GA a Secure receiver
+/// takes secured is refused with E035 and the ways out; the same link onto
+/// a plain GA is accepted (issue #330).
+#[tokio::test]
+async fn test_add_link_refuses_plain_sender_on_secured_ga() -> TestResult {
+    let dir = secure_model_dir("plain-sender")?;
+    let before = Model::load(&dir)?;
+    assert!(
+        bussard_model::secure_link_conflicts(&before).is_empty(),
+        "the fixture starts clean"
+    );
+    let (client, task) = connect(server_over(&dir)?).await?;
+
+    let res = call(
+        &client,
+        "knx_add_link",
+        json!({"address": "1.1.202", "com_object": 18, "ga": "1/0/4", "role": "send"}),
+    )
+    .await;
+    assert_ne!(res["ok"], true, "{res}");
+    let text = res.to_string();
+    for needle in [
+        "E035",
+        "1.1.202 object 18",
+        "1/0/4",
+        "1.1.5 object 3",
+        "logic input",
+    ] {
+        assert!(text.contains(needle), "{needle}: {res}");
+    }
+    // Nothing was written.
+    let ia: bussard_model::IndividualAddress = "1.1.202".parse()?;
+    assert!(
+        Model::load(&dir)?
+            .links
+            .links
+            .get(&ia)
+            .is_none_or(|l| l.is_empty())
+    );
+
+    let res = call(
+        &client,
+        "knx_add_link",
+        json!({"address": "1.1.202", "com_object": 18, "ga": "1/0/5", "role": "send"}),
+    )
+    .await;
+    assert_eq!(res["ok"], true, "{res}");
+    let saved = Model::load(&dir)?;
+    let ga: bussard_model::GroupAddress = "1/0/5".parse()?;
+    assert!(
+        saved.links.links[&ia]
+            .iter()
+            .any(|l| l.object == 18 && l.send == Some(ga))
+    );
+
+    client.cancel().await?;
+    task.abort();
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}

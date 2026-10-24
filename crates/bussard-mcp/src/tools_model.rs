@@ -438,7 +438,9 @@ impl BussardMcp {
         define yet is added there, named `<channel or device name> <object function>` with the \
         object's DPT, and reported in groups_declared. This edits FILES ONLY: the device \
         keeps its current wiring until knx_plan_device and knx_apply_device push it (the \
-        result's next_step says how at this server's tier). Protected group addresses are refused outright. Returns the change as sentences: quote \
+        result's next_step says how at this server's tier). Protected group addresses are refused outright. \
+        A link that puts a device without KNX Data Secure on a group address the other side runs \
+        secured (validation E035/E036) is refused with the ways out. Returns the change as sentences: quote \
         them to the human before she confirms."
     )]
     async fn knx_add_link(
@@ -459,6 +461,7 @@ impl BussardMcp {
 
         self.edit("knx_add_link", label, move |model| {
             refuse_protected(model, ga)?;
+            let insecure_before = bussard_model::secure_link_conflicts(model);
             if !model.devices.contains_key(&ia) {
                 return Err(format!(
                     "{ia} is not a device in this model; add its device file first"
@@ -509,7 +512,7 @@ impl BussardMcp {
                     link.listen.sort();
                 }
             }
-            Ok(())
+            refuse_new_insecure_link(&insecure_before, model, ga)
         })
     }
 
@@ -1241,6 +1244,34 @@ fn links_using(model: &Model, ga: GroupAddress) -> Vec<String> {
 /// Whether a GA is protected in `groups`.
 fn model_groups_protected(groups: &bussard_model::schema::Groups, ga: GroupAddress) -> bool {
     groups.groups.get(&ga).is_some_and(|g| g.protected)
+}
+
+/// Refuses an edit that makes a device without Data Secure send on a group
+/// address a receiver takes secured, or listen to one a Secure sender sends
+/// secured (validation errors E035 and E036, issue #330). Only a conflict on
+/// `ga` that `before` did not already have counts, so an old one elsewhere
+/// does not block an unrelated link.
+fn refuse_new_insecure_link(
+    before: &[bussard_model::SecureLinkConflict],
+    model: &Model,
+    ga: GroupAddress,
+) -> Result<(), String> {
+    let same = |a: &bussard_model::SecureLinkConflict, b: &bussard_model::SecureLinkConflict| {
+        a.kind == b.kind && a.device == b.device && a.object == b.object && a.ga == b.ga
+    };
+    let new: Vec<String> = bussard_model::secure_link_conflicts(model)
+        .iter()
+        .filter(|c| c.ga == ga && !before.iter().any(|b| same(b, c)))
+        .map(|c| format!("{}: {}", c.code(), c.message()))
+        .collect();
+    if new.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "refused, the link would not work: {}",
+            new.join("; ")
+        ))
+    }
 }
 
 /// Refuses an edit that touches a protected GA.
