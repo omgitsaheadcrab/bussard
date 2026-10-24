@@ -79,12 +79,9 @@ session goes to linking and to waiting on the bus, so:
   workspace-wide fmt, clippy and test gate once, right before committing.
 - Never run two cargo invocations against the same `target/` at once; cargo
   serializes them on a lock and every session waits. A subagent that builds
-  must get its own worktree: `scripts/dev/worktree.sh <name> <branch>` creates
-  it off `origin/main` and warms its `target/` in the background. Each
-  worktree has its own `target/`; remove it when the PR has merged.
-- `sccache` is the rustc wrapper on the dev machine (`~/.cargo/config.toml`),
-  so a fresh worktree takes its dependency crates from the cache and only
-  compiles the workspace crates. `sccache --show-stats` shows the hit rate.
+  must get its own worktree
+  (`git worktree add -b <branch> ../bussard-wt/<name> origin/main`); each
+  worktree has its own `target/`. Remove it when the PR has merged.
 - Do not sleep-poll a background command. The harness notifies on completion.
   The same for pull requests: `scripts/dev/wait-pr.sh <n>` as a background
   command exits when the checks finish and auto-merge lands the PR (or when

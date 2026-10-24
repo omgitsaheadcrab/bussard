@@ -41,6 +41,3 @@ website/site/
 
 # The TOML conversion of the private house model (phase 1 of the TOML switch).
 /knx-toml/
-
-# Warm-up log of scripts/dev/worktree.sh
-.warm.log

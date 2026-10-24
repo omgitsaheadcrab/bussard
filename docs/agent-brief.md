@@ -15,8 +15,6 @@ between tasks belongs here.
 - Never contact a real gateway. `bussard.yaml` defaults to the owner's house,
   so every bus test uses the `bussard-testkit` mocks on `127.0.0.1:0`, and
   every CLI invocation in a test passes an explicit loopback `--gateway`.
-- Your worktree may still be warming (`.warm.log`): a first cargo command that
-  waits on the target lock is expected, not a hang.
 
 ## Commands
 
