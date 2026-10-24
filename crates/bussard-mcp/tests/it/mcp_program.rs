@@ -1041,3 +1041,52 @@ async fn test_knx_plan_device_lists_a_value_on_an_unshown_ref_as_ignored() -> an
     assert!(sentences.contains(line), "{sentences}");
     h.stop().await
 }
+
+/// A plan for a device the model links, without KNX Data Secure, as sender on
+/// a group address a Secure receiver takes secured is refused before the bus
+/// is touched (E035, issue #330).
+#[tokio::test]
+async fn test_knx_plan_device_refuses_plain_sender_on_secured_ga() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join("devices"))?;
+    std::fs::write(
+        dir.path().join("groups.toml"),
+        "groups = [\n  { address = \"1/0/4\", name = \"Licht\", dpt = \"1.001\", secure = true },\n]\n",
+    )?;
+    std::fs::write(
+        dir.path().join("devices").join("1.1.5.toml"),
+        "address = \"1.1.5\"\nname = \"Actuator\"\n\n[links]\nschalten.listen = [\"1/0/4\"]\n",
+    )?;
+    std::fs::write(
+        dir.path().join("devices").join("1.1.202.toml"),
+        "address = \"1.1.202\"\nname = \"Weather station\"\n\n[links]\nc18.send = \"1/0/4\"\n",
+    )?;
+    std::fs::write(
+        dir.path().join("bussard.lock"),
+        "version = 3\n\n[[device]]\naddress = \"1.1.5\"\nsecure_capable = true\n\
+         objects = [\n  { number = 3, key = \"schalten\", dpt = \"1.001\", flags = \"CWU\", secure = true },\n]\n\n\
+         [[device]]\naddress = \"1.1.202\"\n\
+         objects = [\n  { number = 18, key = \"c18\", dpt = \"1.001\", flags = \"CRT\" },\n]\n",
+    )?;
+    // Loopback discard port: the refusal comes before any bus access.
+    let connection = ConnectionConfig::tunnel(SocketAddrV4::new([127, 0, 0, 1].into(), 9));
+    let (client, server_task) = serve(
+        dir.path(),
+        connection,
+        Duration::from_secs(600),
+        false,
+        None,
+    )
+    .await?;
+
+    let res = call(&client, "knx_plan_device", json!({"address": "1.1.202"})).await?;
+    assert_eq!(res["refused"], true, "{res}");
+    let reason = res["reason"].as_str().unwrap_or_default();
+    for needle in ["E035", "1.1.202 object 18", "1/0/4", "1.1.5 object 3"] {
+        assert!(reason.contains(needle), "{needle}: {reason}");
+    }
+
+    client.cancel().await?;
+    server_task.abort();
+    Ok(())
+}

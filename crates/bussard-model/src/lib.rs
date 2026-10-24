@@ -40,6 +40,7 @@ pub mod param_model;
 pub mod reconcile;
 pub mod scaffold;
 pub mod schema;
+pub mod secure_links;
 pub mod tests_schema;
 pub mod toml_io;
 pub mod validate;
@@ -73,6 +74,7 @@ pub use lock_products::{PinError, PinReport, pin_products, sha256_file};
 pub use merge::{Conflict, MergeReport, merge, normalize_spellings};
 pub use param_model::{ParamDef, ParamKind, ProductModel, ProductModels};
 pub use scaffold::{Plan, PlanRoom, Scheme, scaffold, scaffold_file};
+pub use secure_links::{ConflictKind, SecureLinkConflict, secure_link_conflicts};
 pub use tests_schema::{
     Expectation, TestCase, TestFileError, TestSuite, WriteStep, load_tests, load_tests_in_dir,
 };

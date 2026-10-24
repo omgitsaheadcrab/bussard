@@ -47,4 +47,5 @@ mod secure_capture_oracle;
 mod secure_group_mock;
 mod test_runner_mock;
 mod validate_keyring_cli;
+mod validate_secure_links_cli;
 mod write_gate;

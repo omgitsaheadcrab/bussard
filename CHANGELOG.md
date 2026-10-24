@@ -75,6 +75,14 @@ directory or a script from before these changes needs:
   `knx_apply_device` also answers `started` when its pre-flight read outlasts
   the same wait; a pre-flight that refuses after that ends the job with
   `result.refused: true` and nothing written.
+- Validation errors E035 and E036 for links that cannot work under KNX Data
+  Secure (#330). E035: a device without Data Secure sends on a group address
+  that a Secure receiver takes secured, so the receiver drops every telegram.
+  E036: the reverse, a Secure sender on a group address a plain device listens
+  to. The message names the devices, the group address and the ways out (make
+  the address plain, or route through a plain address into a logic input).
+  `bussard validate` and `knx_validate` list them, `knx_add_link` refuses such
+  a link, and `knx_plan_device` refuses to plan the plain device.
 - `knx_remove_group` and `knx_discard_edits` (#305). `knx_remove_group`
   removes a group address from `groups.toml`; it is refused while a link uses
   the address (the reason lists the links and names `knx_remove_link`) and for
