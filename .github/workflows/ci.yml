@@ -420,15 +420,24 @@ jobs:
   # flashed with its defaults and two seeded generated configurations, and
   # every plan after a flash, an apply of a partial change and a re-flash must
   # be a no-op. The sim runs as a separate process on loopback; no bussard
-  # crate links it. The archives are fetched from the vendors through
-  # `bussard import-product` (tests-support/product-corpus/fetch.sh) and cached;
-  # vendor data never enters git. The whole corpus runs nightly
-  # (sim-catalog-nightly.yml). Known failures are listed in
+  # crate links it. The whole corpus runs nightly (sim-catalog-nightly.yml).
+  # Known failures are listed in
   # tests-support/product-corpus/sim-loop-baseline.json.
+  #
+  # Gated on BUSSARD_PRODUCT_CORPUS exactly like the corpus-gated tests in
+  # corpus-sweep: empty on a normal push/PR, so the job is skipped green. A
+  # `workflow_dispatch` run can supply a path, and a repository variable of the
+  # same name works for a runner that keeps a corpus around. The job never
+  # downloads from the vendor sites: a live fetch made a required check depend
+  # on search.abb.com and downloads.jung.de (#346 follow-up). An application of
+  # the subset whose archive is not in the corpus is reported as skipped.
   sim-catalog-loop:
     name: sim-catalog-loop (curated subset)
+    if: ${{ inputs.product_corpus || vars.BUSSARD_PRODUCT_CORPUS }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      BUSSARD_PRODUCT_CORPUS: ${{ inputs.product_corpus || vars.BUSSARD_PRODUCT_CORPUS }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -446,12 +455,6 @@ jobs:
             .
             knx-sim
           shared-key: rust-sim-conformance
-
-      - name: Cache the subset's vendor archives
-        uses: actions/cache@v4
-        with:
-          path: tests-support/product-corpus/cache
-          key: sim-loop-subset-${{ hashFiles('scripts/sim-catalog-loop.sh', 'data/product-index.json') }}
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
