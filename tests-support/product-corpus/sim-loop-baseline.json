@@ -1,0 +1,196 @@
+{
+  "_comment": "Known failures of the knx-sim flash-then-plan loop (scripts/sim-catalog-loop.sh, issue #346): application id to the step that fails first. A listed application that fails at another step, or passes, is reported; regenerate with --update-baseline.",
+  "source": "shard 0/6 of 2026-10-25, loaded machine: incomplete; the nightly (sim-catalog-nightly.yml) fills it in",
+  "known_failures": {
+    "M-0002_A-0807-71-40F1-O0007": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0002_A-4202-33-7DB7-O0007": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0002_A-4280-15-D18C-O0007": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0002_A-488A-11-4A38": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0002_A-6127-96-0D4C-O0007": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0004_A-7066-11-94AD-O000A": {
+      "step": "plan after flash[0] (defaults)",
+      "reason": "object 1 now sends 1/0/2 (ga 1/0/2)",
+      "issue": "unclassified"
+    },
+    "M-0004_A-7068-11-E40A-O000A": {
+      "step": "plan after flash[0] (defaults)",
+      "reason": "object 1 now sends 1/0/1 (ga 1/0/1)",
+      "issue": "unclassified"
+    },
+    "M-0007_A-20BA-11-05A3-O000A": {
+      "step": "plan after flash[0] (defaults)",
+      "reason": "object 12 now sends 1/0/2 (ga 1/0/2)",
+      "issue": "unclassified"
+    },
+    "M-0007_A-4204-13-5531": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0007_A-4204-37-62C1": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0007_A-4309-11-EFA2": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0007_A-4A22-11-687D": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0007_A-4A24-11-EBC3": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0007_A-6321-80-3A4E": {
+      "step": "plan after flash[0] (defaults)",
+      "reason": "object 40 now sends 1/0/2 (ga 1/0/2)",
+      "issue": "unclassified"
+    },
+    "M-0007_A-FF11-15-6DA8-O00FC": {
+      "step": "plan after flash[1] (generated 1)",
+      "reason": "object 3 now listens on 1/0/2 (ga 1/0/2)",
+      "issue": "unclassified"
+    },
+    "M-0048_A-140C-14-A512": {
+      "step": "flash[0] (defaults) over the last",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): resident : another application (the code segment M-0048_A-140C-14-A512_AS-4400 at 0x4400 differs from M-0048_A-140C-14-A512's at offset 21 (the device holds 0x4B, the product 0x4F): the device runs another application or version)",
+      "issue": 355
+    },
+    "M-0071_A-1130-82-F217": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0071_A-1221-1E-EC8F": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0071_A-1231-22-E232": {
+      "step": "flash[1] (generated 1)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0071_A-2311-11-D0E8": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0071_A-3222-11-1137": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0071_A-4221-20-2CC1": {
+      "step": "flash[0] (defaults)",
+      "reason": "pre-flight: no application is loaded on 1.1.10 — the device is factory-fresh.",
+      "issue": "unclassified"
+    },
+    "M-0083_A-0023-39-723D": {
+      "step": "flash[0] (defaults) over the last",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): resident : another application (the code segment M-0083_A-0023-39-723D_AS-4400 at 0x4400 differs from M-0083_A-0023-39-723D's at offset 9 (the device holds 0x13, the product 0x17): the device runs another application or version)",
+      "issue": 355
+    },
+    "M-0083_A-003D-26-EF07": {
+      "step": "flash[0] (defaults) over the last",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): resident : another application (the code segment M-0083_A-003D-26-EF07_AS-4400 at 0x4400 differs from M-0083_A-003D-26-EF07's at offset 13 (the device holds 0x13, the product 0x17): the device runs another application or version)",
+      "issue": 355
+    },
+    "M-0083_A-0040-26-D2EF": {
+      "step": "plan after apply",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): parameters: parameters not decoded: the code segment M-0083_A-0040-26-D2EF_AS-4400 at 0x4400 differs from M-0083_A-0040-26-D2EF's at offset 13 (the device holds 0x17, the product 0x13): the device runs another application or version. Run `bussard flash --force` to replace it.",
+      "issue": 355
+    },
+    "M-0083_A-0041-14-2975": {
+      "step": "plan after flash[0] (defaults)",
+      "reason": "object 11 now listens on 1/0/4 (ga 1/0/4)",
+      "issue": "unclassified"
+    },
+    "M-0083_A-004C-11-F0BB": {
+      "step": "flash after apply",
+      "reason": "procedure   : 21 step(s); re-run with -v for the memory-level plan",
+      "issue": "unclassified"
+    },
+    "M-0083_A-006D-44-E3C8": {
+      "step": "flash[0] (defaults) over the last",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): resident : another application (the code segment M-0083_A-006D-44-E3C8_AS-4400 at 0x4400 differs from M-0083_A-006D-44-E3C8's at offset 9 (the device holds 0x4B, the product 0x93): the device runs another application or version)",
+      "issue": 355
+    },
+    "M-0083_A-0072-44-49AB": {
+      "step": "flash[0] (defaults) over the last",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): resident : another application (the code segment M-0083_A-0072-44-49AB_AS-4400 at 0x4400 differs from M-0083_A-0072-44-49AB's at offset 6 (the device holds 0x07, the product 0x00): the device runs another application or version)",
+      "issue": 355
+    },
+    "M-0083_A-0074-44-7B27": {
+      "step": "flash[0] (defaults) over the last",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): resident : another application (the code segment M-0083_A-0074-44-7B27_AS-4400 at 0x4400 differs from M-0083_A-0074-44-7B27's at offset 5 (the device holds 0x0B, the product 0x4B): the device runs another application or version)",
+      "issue": 355
+    },
+    "M-0083_A-0076-44-685A": {
+      "step": "flash[0] (defaults) over the last",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): resident : another application (the code segment M-0083_A-0076-44-685A_AS-4400 at 0x4400 differs from M-0083_A-0076-44-685A's at offset 5 (the device holds 0x0B, the product 0x4B): the device runs another application or version)",
+      "issue": 355
+    },
+    "M-0083_A-0093-13-E3BA": {
+      "step": "plan after apply",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): parameters: parameters not decoded: the code segment M-0083_A-0093-13-E3BA_AS-4400 at 0x4400 differs from M-0083_A-0093-13-E3BA's at offset 21 (the device holds 0x43, the product 0x47): the device runs another application or version. Run `bussard flash --force` to replace it.",
+      "issue": 355
+    },
+    "M-0083_A-009B-15-E0CF": {
+      "step": "flash[0] (defaults) over the last",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): resident : another application (the code segment M-0083_A-009B-15-E0CF_AS-4400 at 0x4400 differs from M-0083_A-009B-15-E0CF's at offset 5 (the device holds 0xDB, the product 0x43): the device runs another application or version)",
+      "issue": 355
+    },
+    "M-0083_A-013F-31-1DDA": {
+      "step": "flash[0] (defaults) over the last",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): resident : another application (the code segment M-0083_A-013F-31-1DDA_AS-4400 at 0x4400 differs from M-0083_A-013F-31-1DDA's at offset 5 (the device holds 0xDB, the product 0x13): the device runs another application or version)",
+      "issue": 355
+    },
+    "M-0083_A-0221-21-FCE5": {
+      "step": "flash[0] (defaults) over the last",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): resident : another application (the code segment M-0083_A-0221-21-FCE5_AS-4400 at 0x4400 differs from M-0083_A-0221-21-FCE5's at offset 9 (the device holds 0x47, the product 0xD3): the device runs another application or version)",
+      "issue": 355
+    },
+    "M-0083_A-0222-21-0004": {
+      "step": "flash[0] (defaults) over the last",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): resident : another application (the code segment M-0083_A-0222-21-0004_AS-4400 at 0x4400 differs from M-0083_A-0222-21-0004's at offset 9 (the device holds 0xDB, the product 0xD3): the device runs another application or version)",
+      "issue": 355
+    },
+    "M-0083_A-022A-21-9551": {
+      "step": "flash[0] (defaults) over the last",
+      "reason": "Known failure, see issue #355 (System 7 identity sample treats configured AS-4400 octets as code): resident : another application (the code segment M-0083_A-022A-21-9551_AS-4400 at 0x4400 differs from M-0083_A-022A-21-9551's at offset 9 (the device holds 0xD7, the product 0xD3): the device runs another application or version)",
+      "issue": 355
+    },
+    "M-00B6_A-4548-01-884E": {
+      "step": "plan after flash[0] (defaults)",
+      "reason": "object 5 now sends 1/0/6 (ga 1/0/6)",
+      "issue": "unclassified"
+    }
+  }
+}

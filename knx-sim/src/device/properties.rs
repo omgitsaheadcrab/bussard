@@ -262,6 +262,32 @@ impl Device {
             });
         }
 
+        // PID_MCB_TABLE (27) is device-computed on read (see `on_property_read`),
+        // but a load procedure may seed it first: the Jung F50 push-button
+        // (`M-0004_A-D142-21`) writes the expected 10-octet entry to object 4
+        // with `LdCtrlWriteProp` before it streams the segment, and the real
+        // device accepts that write. Accept it on a loadable object while it is
+        // Loading, echo it, and keep computing the read from the stored bytes.
+        if pid == PID_MCB_TABLE && self.load_state(object) == Some(LoadState::Loading) {
+            let mut data = vec![
+                object,
+                pid,
+                (count << 4) | ((start >> 8) as u8 & 0x0F),
+                (start & 0xFF) as u8,
+            ];
+            data.extend_from_slice(value);
+            self.emit(Event::PropertyWritten {
+                device: self.address,
+                object,
+                pid,
+            });
+            let resp = self.respond(tool, 0x3D6, &data);
+            return Ok(DeviceReaction {
+                responses: vec![resp],
+                did_master_reset: false,
+            });
+        }
+
         let io = self
             .objects
             .get_mut(&object)
@@ -486,6 +512,47 @@ mod tests {
                 .unwrap_or(true),
             "a refused write must not create or fill PID_TABLE"
         );
+        Ok(())
+    }
+
+    const PID_PEI_TYPE: u8 = 16;
+
+    #[test]
+    fn test_load_procedure_property_write_is_echoed() -> Result<(), Box<dyn std::error::Error>> {
+        // An ABB i-bus load procedure (`M-0002_A-A0ED-10`) writes the PEI type
+        // with `LdCtrlWriteProp ObjIdx=4 PropId=16 InlineData=0A` before the
+        // image. A real System B device accepts it; the simulator must answer
+        // too, or the tool waits on a dropped telegram.
+        let mut pd = crate::testfixtures::synthetic_mdt_sys7_product();
+        pd.objects.push(crate::prod::LoadableObject {
+            lsm_index: 4,
+            name: "application program".into(),
+            max_size: None,
+            image: Vec::new(),
+        });
+        pd.written_props.push((4, PID_PEI_TYPE, 1));
+        let mut dev = Device::from_product_with_overrides(
+            IndividualAddress::new(1, 1, 2),
+            &pd,
+            LoadState::Unloaded,
+            ProfileOverrides {
+                mask: Some("07B0".into()),
+                ..Default::default()
+            },
+            std::sync::Arc::new(crate::bus::event::RecordingSink::new()),
+        )?;
+        connect(&mut dev)?;
+        dev.handle_cemi(&data(&dev, 0x3D1, &[0x00, 0xff, 0xff, 0xff, 0xff]))?;
+
+        let write = data(&dev, 0x3D7, &[0x04, PID_PEI_TYPE, 0x10, 0x01, 0x0A]);
+        let reaction = dev.handle_cemi(&write)?;
+        assert_eq!(prop_response_value(&reaction), vec![0x0A]);
+        let stored = dev
+            .objects
+            .get(&4)
+            .and_then(|o| o.property(PID_PEI_TYPE))
+            .map(|p| p.value.clone());
+        assert_eq!(stored, Some(vec![0x0A]));
         Ok(())
     }
 

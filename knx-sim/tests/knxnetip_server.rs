@@ -53,6 +53,8 @@ fn synthetic_system_b_product() -> ProductData {
         load_procedures: Vec::new(),
         segments: Vec::new(),
         hardware_type_marker: None,
+        device_compare_props: Vec::new(),
+        written_props: Vec::new(),
     }
 }
 

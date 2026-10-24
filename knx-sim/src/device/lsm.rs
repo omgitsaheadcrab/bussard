@@ -295,10 +295,22 @@ impl Sys7LoadStateMachine {
                 self.task_committed = false;
                 Ok(Sys7Step::State(LoadState::Unloaded))
             }
-            // StartLoading from Unloaded or Loaded (re-flash) enters Loading.
-            (LoadState::Unloaded | LoadState::Loaded, E::StartLoading) => {
+            // StartLoading from Unloaded enters Loading with no descriptor.
+            (LoadState::Unloaded, E::StartLoading) => {
                 self.state = LoadState::Loading;
                 self.task_committed = false;
+                Ok(Sys7Step::State(LoadState::Loading))
+            }
+            // StartLoading from Loaded opens the LSM for an in-place partial
+            // download: the segments and the task descriptor of the last load
+            // stay, so the LoadCompleted that follows the octet writes needs no
+            // new TaskSegment. ETS's partial parameter download of a Theben
+            // 0701 device (1.1.202) sends StartLoading, the differing octets and
+            // LoadCompleted, nothing else. A full re-flash unloads first, which
+            // clears the descriptor, so its TaskSegment is still required.
+            (LoadState::Loaded, E::StartLoading) => {
+                self.state = LoadState::Loading;
+                self.task_committed = true;
                 Ok(Sys7Step::State(LoadState::Loading))
             }
             // StartLoading while already Loading is idempotent: the post-restart
@@ -479,6 +491,39 @@ mod tests {
                 Err(Sys7TransitionError::MissingTaskSegment)
             );
             assert_eq!(lsm.state(), LoadState::Error);
+        }
+
+        #[test]
+        fn test_sys7_partial_download_from_loaded_needs_no_task_segment() {
+            // ETS's partial parameter download (Theben 0701, 1.1.202): open the
+            // loaded LSM, write the differing octets, complete. No allocation,
+            // no TaskSegment: the descriptor of the last load stays.
+            let mut lsm = Sys7LoadStateMachine::new(LoadState::Loaded);
+            assert_eq!(
+                lsm.apply(E::StartLoading),
+                Ok(Sys7Step::State(LoadState::Loading))
+            );
+            assert_eq!(
+                lsm.apply(E::LoadCompleted),
+                Ok(Sys7Step::State(LoadState::Loaded))
+            );
+        }
+
+        #[test]
+        fn test_sys7_reload_after_unload_still_needs_task_segment() {
+            let mut lsm = Sys7LoadStateMachine::new(LoadState::Loaded);
+            assert_eq!(
+                lsm.apply(E::Unload),
+                Ok(Sys7Step::State(LoadState::Unloaded))
+            );
+            assert_eq!(
+                lsm.apply(E::StartLoading),
+                Ok(Sys7Step::State(LoadState::Loading))
+            );
+            assert_eq!(
+                lsm.apply(E::LoadCompleted),
+                Err(Sys7TransitionError::MissingTaskSegment)
+            );
         }
 
         #[test]

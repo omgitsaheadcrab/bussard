@@ -47,6 +47,7 @@ mod reconstruct_mock;
 mod scan_mock;
 mod secure_capture_oracle;
 mod secure_group_mock;
+mod sim_catalog_loop;
 mod test_runner_mock;
 mod validate_invariants_cli;
 mod validate_keyring_cli;
