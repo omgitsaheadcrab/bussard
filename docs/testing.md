@@ -80,6 +80,19 @@ temporary directory and never write to the snapshot.
 | bussard-prod | `evaluator_conformance.rs` | the page evaluator and the download's Dynamic evaluator reach the same refs for the device's values, and every "ignored" value is one the image leaves out (#326) |
 | bussard-mcp | `capabilities.rs` | `knx_set_parameter helligkeitsschwelle@P-7305_R-7305` is taken once C4's function is Helligkeitssensor, without "Wenn Temperatur" being set (#326) |
 
+## Offline oracle coverage
+
+`scripts/campaign/95-offline-oracle.sh` replays an ETS download capture
+against a bussard dry run and compares the two images per row. An "identical"
+verdict counts only as far as the row reaches: the coverage figure is the
+number of compared octets over the placed octets, per segment and per page,
+from `knxtrace imgdiff` and the summary table of the oracle script. A row
+below the threshold, or with a placed page it never compares, is "not
+comparable" rather than "identical". The figure, the threshold and the capture
+plan for devices without a row are defined in
+[#347](https://github.com/tmbo/bussard/issues/347). A PR that changes a device
+write names its rows and their figures.
+
 ## CI
 
 The `corpus-sweep` job runs the committed-fixture sweep on every push and pull

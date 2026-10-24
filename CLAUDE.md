@@ -114,6 +114,26 @@ shortened wait from capture or live evidence cited in a comment, and report
 request counts and wall-clock before/after. It is closed only after a live run
 on the reference installation.
 
+## Device Writes
+
+Two process failures cost more than any single bug: the MCP flash
+reimplemented the CLI's identity gate (#314), and a thin oracle row reported
+"identical" while the mask bug shipped (#320). A change to what bussard writes
+to a device follows these rules, and the PR template asks for each one.
+
+- Reuse the existing write path in `bussard-service` or `bussard-download`. The
+  CLI and the MCP server call the same function. A new write path needs a
+  reason stated in the PR.
+- Name the `scripts/campaign/95-offline-oracle.sh` row(s) that cover the change
+  and their coverage figure (#347). When no row covers it, add the capture plan
+  entry instead.
+- Every write command ends with an independent read-back compared against the
+  model (#319, #349). "Verified" never means "the sequence completed".
+- Model-side code never re-implements ETS Dynamic semantics. It calls the shared
+  Dynamic evaluator in `bussard-ets` (#345).
+- A silent success is a P1 bug: a result that says ok while the device does not
+  match the model.
+
 ## Rust Edition and Toolchain
 
 - Edition: **2024**, set once in `[workspace.package]` (do not set it per crate).
