@@ -370,7 +370,13 @@ def cmd_image(args) -> int:
 
 
 def cmd_imgdiff(args) -> int:
-    report = memimage.compare(args.plan_dir, args.image_dir)
+    report = memimage.compare(
+        args.plan_dir,
+        args.image_dir,
+        min_coverage=args.min_coverage,
+        page_size=args.page_size,
+        scope=[x for x in args.scope.split(",") if x] if args.scope else None,
+    )
     if args.json:
         print(json.dumps(report, indent=2))
     else:
@@ -458,6 +464,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("plan_dir")
     p.add_argument("image_dir")
     p.add_argument("--json", action="store_true")
+    p.add_argument(
+        "--min-coverage",
+        type=float,
+        default=memimage.DEFAULT_MIN_COVERAGE,
+        help="percent of bussard's placed octets the capture must cover for a match to "
+        "count as identical (default %(default)s)",
+    )
+    p.add_argument(
+        "--page-size",
+        type=int,
+        default=memimage.DEFAULT_PAGE_SIZE,
+        help="memory page size of the per-page coverage (default %(default)s)",
+    )
+    p.add_argument(
+        "--scope",
+        help="comma-separated regions the verdict and coverage judge (addr, assoc, gobj, par, "
+        "seg0x4800, ...); default: all",
+    )
     p.set_defaults(func=cmd_imgdiff)
 
     return parser

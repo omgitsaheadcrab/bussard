@@ -807,6 +807,67 @@ class TestImage(unittest.TestCase):
         self.assertEqual((par["fill_diff_octets"], par["fill_diff_offsets"]), (1, [0]))
         self.assertIn("1 of them ETS never wrote", "\n".join(memimage.render(report)))
 
+    def test_compare_full_coverage_stays_identical(self):
+        ets = self.tmpdir()
+        main(["image", self.download_capture(), "--device", "1.1.5", "--out", ets])
+        plan_dir = self.write_plan(
+            [self.step(1, "parameters", 4, "p.bin", 16), self.step(2, "table", 1, "t.bin", 4)],
+            {"p.bin": b"\xaa\xaa\x01\x02\x03" + b"\xaa" * 11, "t.bin": b"\x00\x01\x08\x01"},
+        )
+        report = memimage.compare(plan_dir, ets)
+        self.assertEqual(report["verdict"], memimage.IDENTICAL)
+        cov = report["coverage"]
+        self.assertEqual((cov["placed"], cov["compared"], cov["percent"]), (20, 20, 100.0))
+        self.assertFalse(cov["thin"])
+        self.assertIn("coverage 100.0 %", "\n".join(memimage.render(report)))
+
+    def test_compare_thin_row_is_not_comparable(self):
+        """Issue #347: one matching octet out of many placed is no evidence."""
+        ets = self.tmpdir()
+        main(["image", self.download_capture(), "--device", "1.1.5", "--out", ets])
+        # An absolute parameter segment at 0x4000 (the capture's filled
+        # 16-octet allocation with 3 written octets) with placed octets on two
+        # pages; only the first page is in the capture.
+        data = bytearray(0x200)
+        data[0:16] = b"\xaa\xaa\x01\x02\x03" + b"\xaa" * 11
+        step = self.step(1, "parameters", None, "p.bin", len(data), address=0x4000)
+        step["image"]["placed"] = {"octets": 12, "ranges": [[2, 4], [0x100, 0x10A]]}
+        plan_dir = self.write_plan([step], {"p.bin": bytes(data)})
+        report = memimage.compare(plan_dir, ets)
+        par = report["regions"][0]
+        self.assertEqual(par["verdict"], memimage.IDENTICAL)
+        self.assertEqual((par["placed"], par["placed_compared"]), (12, 2))
+        self.assertEqual(report["verdict"], memimage.NOT_COMPARABLE)
+        cov = report["coverage"]
+        self.assertTrue(cov["thin"])
+        self.assertEqual(cov["blind_pages"], ["0x4100"])
+        self.assertIn("thin", report["reason"])
+        # A lower threshold still flags the uncompared page.
+        relaxed = memimage.compare(plan_dir, ets, min_coverage=10.0)
+        self.assertEqual(relaxed["verdict"], memimage.NOT_COMPARABLE)
+        self.assertNotIn("<", relaxed["coverage"]["reason"])
+        # The CLI exit code stays 0 for not comparable (only differs fails).
+        self.assertEqual(main(["imgdiff", plan_dir, ets]), 0)
+
+    def test_compare_scope_judges_only_named_regions(self):
+        """A tables-only capture (a security change) is judged on its tables."""
+        ets = self.tmpdir()
+        main(["image", self.download_capture(), "--device", "1.1.5", "--out", ets])
+        par = self.step(1, "parameters", None, "p.bin", 0x200, address=0x4000)
+        par["image"]["placed"] = {"octets": 10, "ranges": [[0x100, 0x10A]]}
+        plan_dir = self.write_plan(
+            [par, self.step(2, "table", 1, "t.bin", 4)],
+            {"p.bin": bytes(0x200), "t.bin": b"\x00\x01\x08\x01"},
+        )
+        whole = memimage.compare(plan_dir, ets)
+        self.assertEqual(whole["verdict"], memimage.DIFFERS)
+        scoped = memimage.compare(plan_dir, ets, scope=["addr"])
+        self.assertEqual(scoped["verdict"], memimage.IDENTICAL)
+        self.assertEqual(scoped["coverage"]["percent"], 100.0)
+        self.assertEqual([r["in_scope"] for r in scoped["regions"]], [False, True])
+        self.assertIn("(out of scope)", "\n".join(memimage.render(scoped)))
+        self.assertEqual(memimage.region_short("app segment 0x4800"), "seg0x4800")
+
 
 def ext_write(obj_type: int, pid: int, count: int, index: int, data: bytes, seq: int = 0) -> bytes:
     """A_PropertyExtValue_WriteCon on instance 1 of an object type."""

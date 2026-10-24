@@ -26,6 +26,18 @@ many octets, the first differing offset, both hex excerpts), or not comparable
 values where both sides carry one (bytes, or the hash when redacted). That
 parity gets its own verdict next to the image verdict. This is the offline
 conformance oracle of the physical campaign (issue #89).
+
+A diff is only as strong as what it compared. `compare` also reports the
+coverage (issue #347): of the octets bussard places, how many the capture
+holds a value for. A region's placed octets are the ones a parameter placement
+wrote (the dump's `placed` record) when the image carries one, else every
+octet bussard writes (all of a table or code image, or its `0xFF` mask
+octets). Coverage is counted per region and per memory page (256 octets by
+default). A row whose images match but whose coverage is below the threshold
+(50 % of the placed octets by default), or that has a page with placed octets
+and none compared, is "not comparable" (thin), never "identical": ETS
+read-compared or skipped what the device already held, so the capture carries
+no evidence for those octets.
 """
 
 from __future__ import annotations
@@ -51,6 +63,27 @@ DIFFERS = "differs"
 NOT_COMPARABLE = "not-comparable"
 
 EXCERPT = 8  # octets shown on each side of a first difference
+
+# The coverage rule of issue #347: a matching row is "identical" only when at
+# least this share of the placed octets was compared and no page with placed
+# octets went uncompared.
+DEFAULT_MIN_COVERAGE = 50.0
+DEFAULT_PAGE_SIZE = 256
+
+# Short region names, as the oracle summary and `--scope` spell them.
+_SHORT = {
+    "address table": "addr",
+    "association table": "assoc",
+    "group-object table": "gobj",
+    "parameters": "par",
+}
+
+
+def region_short(name: str) -> str:
+    """`addr`, `assoc`, `gobj`, `par`, `seg0x4800`, `app(obj4)`: a region's short name."""
+    return _SHORT.get(
+        name, name.replace("app segment ", "seg").replace("application ", "app")
+    )
 
 
 def sha256(data: bytes) -> str:
@@ -336,8 +369,72 @@ def _region_name(plan: dict, step: dict) -> str:
     return "application (obj%s)" % image.get("object")
 
 
-def compare(plan_dir: str, image_dir: str) -> Dict[str, object]:
-    """Diffs bussard's dry-run images against the composed ETS image."""
+def _placed_offsets(image: dict, ours: bytes, mask: Optional[bytes]) -> List[int]:
+    """The offsets of `image` the coverage counts (see the module doc)."""
+    placed = image.get("placed")
+    if placed and placed.get("ranges"):
+        return [i for lo, hi in placed["ranges"] for i in range(lo, min(hi, len(ours)))]
+    return [i for i in range(len(ours)) if mask is None or i >= len(mask) or mask[i] == 0xFF]
+
+
+def _page_name(key) -> str:
+    if isinstance(key, int):
+        return "0x%04X" % key
+    return "%s+0x%X" % key
+
+
+def coverage(
+    regions: List[Dict[str, object]],
+    min_percent: float = DEFAULT_MIN_COVERAGE,
+) -> Dict[str, object]:
+    """The row's coverage from its regions' per-page counts."""
+    placed = sum(int(r.get("placed", 0)) for r in regions)
+    compared = sum(int(r.get("placed_compared", 0)) for r in regions)
+    pages = []
+    for r in regions:
+        for page in r.get("pages", []):
+            pages.append(dict(page, region=r["region"]))
+    blind = [p for p in pages if p["placed"] and not p["compared"]]
+    percent = 100.0 * compared / placed if placed else 0.0
+    reasons = []
+    if not placed:
+        reasons.append("bussard places no octets")
+    elif percent < min_percent:
+        reasons.append(
+            "%d of %d placed octets compared (%.1f %% < %.0f %%)"
+            % (compared, placed, percent, min_percent)
+        )
+    if blind:
+        reasons.append(
+            "%d page(s) with placed octets and none compared: %s"
+            % (len(blind), ", ".join(p["page"] for p in blind[:6]))
+        )
+    return {
+        "placed": placed,
+        "compared": compared,
+        "percent": round(percent, 1),
+        "min_percent": min_percent,
+        "pages": len(pages),
+        "blind_pages": [p["page"] for p in blind],
+        "thin": bool(reasons),
+        "reason": "; ".join(reasons),
+    }
+
+
+def compare(
+    plan_dir: str,
+    image_dir: str,
+    min_coverage: float = DEFAULT_MIN_COVERAGE,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    scope: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    """Diffs bussard's dry-run images against the composed ETS image.
+
+    `scope` names the regions (short names, see `region_short`) the verdict
+    and the coverage are judged on, for a capture that by design downloads
+    only part of the device (a security change rewrites the tables); every
+    other region is still diffed and shown, as out of scope. `None` judges all.
+    """
     with open(os.path.join(plan_dir, "plan.json"), encoding="utf-8") as fh:
         plan = json.load(fh)
     ets = EtsMemory(image_dir)
@@ -354,14 +451,16 @@ def compare(plan_dir: str, image_dir: str) -> Dict[str, object]:
         if image.get("mask_file"):
             with open(os.path.join(plan_dir, image["mask_file"]), "rb") as fh:
                 mask = fh.read()
+        placed_offsets = _placed_offsets(image, ours, mask)
         addr = image.get("address")
         if addr is None:
             obj = image.get("object")
             base = ets.bases.get(obj) if obj is not None else None
             if base is None:
-                results.append(
-                    _result(step, name, ours, NOT_COMPARABLE, "no ETS base for object %s" % obj)
-                )
+                rec = _result(step, name, ours, NOT_COMPARABLE, "no ETS base for object %s" % obj)
+                rec["compared"] = 0
+                _add_coverage(rec, placed_offsets, set(), None, "obj%s" % obj, page_size)
+                results.append(rec)
                 continue
             addr = base + int(image.get("offset") or 0)
         compared = diffs = fill_diffs = 0
@@ -387,6 +486,8 @@ def compare(plan_dir: str, image_dir: str) -> Dict[str, object]:
         rec = _result(step, name, ours, IDENTICAL, "")
         rec["address"] = addr
         rec["compared"] = compared
+        known = {i for i in placed_offsets if ets.get(addr + i) is not None}
+        _add_coverage(rec, placed_offsets, known, addr, None, page_size)
         if compared == 0:
             rec["verdict"] = NOT_COMPARABLE
             rec["reason"] = "ETS wrote nothing in 0x%06X..0x%06X" % (addr, addr + len(ours))
@@ -415,18 +516,28 @@ def compare(plan_dir: str, image_dir: str) -> Dict[str, object]:
     # verdict the pre-flash gate reads, so a known extra property write does
     # not hide whether the memory images match.
     props = compare_properties(plan, image_dir)
-    verdicts = {r["verdict"] for r in results}
+    for r in results:
+        r["in_scope"] = scope is None or region_short(r["region"]) in scope
+    judged = [r for r in results if r["in_scope"]]
+    verdicts = {r["verdict"] for r in judged}
+    cov = coverage(judged, min_coverage)
+    cov["scope"] = list(scope) if scope is not None else None
+    reason = ""
     if DIFFERS in verdicts:
         overall = DIFFERS
-    elif IDENTICAL in verdicts:
+    elif IDENTICAL in verdicts and not cov["thin"]:
         overall = IDENTICAL
     else:
+        # Matching octets from a thin capture are not evidence (issue #347).
         overall = NOT_COMPARABLE
+        reason = "thin: " + cov["reason"] if IDENTICAL in verdicts else "nothing compared"
     return {
         "device": plan.get("device"),
         "application": plan.get("application", {}).get("id"),
         "system": plan.get("system"),
         "verdict": overall,
+        "reason": reason,
+        "coverage": cov,
         "regions": results,
         "ets_only_octets": len(ets_only),
         "ets_only_ranges": _ranges(ets_only)[:20],
@@ -651,6 +762,32 @@ def compare_properties(plan: dict, image_dir: str) -> Dict[str, object]:
     }
 
 
+def _add_coverage(
+    rec: dict,
+    offsets: List[int],
+    known: set,
+    addr: Optional[int],
+    label: Optional[str],
+    page_size: int,
+) -> None:
+    """Adds the placed/compared counts of one region, per page, to `rec`."""
+    pages: Dict[object, List[int]] = {}
+    for i in offsets:
+        if addr is not None:
+            key = (addr + i) // page_size * page_size
+        else:
+            key = (label, i // page_size * page_size)
+        counts = pages.setdefault(key, [0, 0])
+        counts[0] += 1
+        if i in known:
+            counts[1] += 1
+    rec["placed"] = len(offsets)
+    rec["placed_compared"] = len(known)
+    rec["pages"] = [
+        {"page": _page_name(k), "placed": v[0], "compared": v[1]} for k, v in pages.items()
+    ]
+
+
 def _result(step: dict, name: str, ours: bytes, verdict: str, reason: str) -> dict:
     return {
         "step": step["index"],
@@ -676,8 +813,29 @@ def render(report: Dict[str, object]) -> List[str]:
         "%s %s (System %s): %s"
         % (report["device"], report["application"], report["system"], report["verdict"])
     ]
+    cov = report.get("coverage")
+    if cov:
+        blind = cov["blind_pages"]
+        lines.append(
+            "  coverage %.1f %% (%d of %d placed octets compared; %d of %d page(s) uncompared%s)%s"
+            % (
+                cov["percent"],
+                cov["compared"],
+                cov["placed"],
+                len(blind),
+                cov["pages"],
+                ": " + ", ".join(blind[:8]) + (", ..." if len(blind) > 8 else "") if blind else "",
+                ": THIN (needs %.0f %% and every page)" % cov["min_percent"] if cov["thin"] else "",
+            )
+        )
+    if cov and cov.get("scope") is not None:
+        lines.append("  scope: %s (other regions are shown, not judged)" % ",".join(cov["scope"]))
     for r in report["regions"]:
         head = "  step %3d %-22s %6d octets  " % (r["step"], r["region"], r["length"])
+        if not r.get("in_scope", True):
+            head += "(out of scope) "
+        if "placed" in r:
+            head += "[%d/%d placed] " % (r["placed_compared"], r["placed"])
         if r["verdict"] == IDENTICAL:
             lines.append(head + "identical (%d compared)" % r["compared"])
         elif r["verdict"] == DIFFERS:

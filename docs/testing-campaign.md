@@ -259,14 +259,36 @@ matched write reports `no-value`; the structural check (what is written, where,
 how long, in which order) still runs. The property parity has its own verdict
 and does not change the image verdict or the exit code.
 
+`imgdiff` also reports the coverage (issue #347): of the octets bussard
+places (the octets a parameter placement wrote, or every written octet of a
+table or code image; the dump's `placed` record), how many the capture holds a
+value for, per region and per 256-octet page. ETS read-compares or skips what
+the device already holds, so a capture can match while proving nothing. A
+matching row whose coverage is below `--min-coverage` (default 50 %), or that
+has a page with placed octets and none compared, is `not comparable` (thin),
+never `identical`. `--scope addr,assoc` judges only the named regions, for a
+capture that by design rewrites part of the device (a security change); the
+others are still shown.
+
 `95-offline-oracle.sh` runs all three for a list of devices and prints one
-summary table. A row is `device|capture|product|application|note`. The product
+summary table with a coverage column. A row is
+`device|capture|product|application|note|coverage|options`; the last two are
+optional: the coverage recorded for the row, and `expect=<verdict>` or
+`scope=<regions>`. A `#@ <options>` line sets `--keyring`, `--dir`,
+`--no-admit` or `--min-coverage` for the whole file. `--check` exits 1 when a
+row with its capture present gives another verdict than expected (identical by
+default) or less than its recorded coverage; the corpus-gated test
+`offline_oracle.rs` runs it (see [testing.md](testing.md)). The product
 may be a `.knxprod`, a `.knxproj` project export (name the application, the
 export holds every device's), `wrapper.zip!inner/file.knxprod` to pick one file
 out of a vendor ZIP, or `-` when there is no product data (the row is reported
 as not comparable with the note). Paths may contain spaces; only the ends of a
-field are trimmed. `--keyring <file.knxkeys>` is passed to `knxtrace image` and
-to the bussard dry run, with the password from `BUSSARD_KEYRING_PASSWORD`. The
+field are trimmed. `--keyring <file.knxkeys>` is passed to `knxtrace image`
+only, with the password from `BUSSARD_KEYRING_PASSWORD`; the bussard dry run
+plans with the model's key store, as a flash would, so an ETS keyring never
+re-adds a key the model removed. The dry run honours the model's
+`admit_tunnel_senders`; `--no-admit` plans without it (PID 54 then compares
+with an ETS download that did not admit the tunnelling senders). The
 summary adds `props=ok(n)` or `props=differs(...)` for the property parity. Results land in `captures/campaign/<date>/offline-oracle/`
 unless `--out` says otherwise. A row file names real captures, so keep it
 under `captures/` as well.
