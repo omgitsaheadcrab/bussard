@@ -391,6 +391,13 @@ mod memo {
     }
 }
 
+/// This thread's model parses so far: what a unit test elsewhere in the crate
+/// counts, unaffected by tests running in parallel threads.
+#[cfg(test)]
+pub(crate) fn thread_parse_count() -> usize {
+    memo::THREAD_PARSES.with(std::cell::Cell::get)
+}
+
 /// See [`models_fingerprint`].
 type ModelsFingerprint = Vec<(String, u64, Option<std::time::SystemTime>)>;
 

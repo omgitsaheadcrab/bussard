@@ -992,7 +992,7 @@ bussard keeps its own history so undo works without git:
 
 ```
 knx/.bussard/history/20260922T101112Z-001/
-  manifest.json     # {"reason": {"command", "args"}, "gateway", "result", "bussard_version", "created_at"}
+  manifest.json     # {"reason": {"command", "args"}, "gateway", "result", "bussard_version", "created_at", "summary"}
   bussard.toml
   groups.toml
   bussard.lock

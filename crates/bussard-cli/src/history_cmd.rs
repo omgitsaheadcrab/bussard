@@ -134,10 +134,11 @@ pub fn run_status(dir: &Path, json: bool, raw: bool) -> anyhow::Result<ExitCode>
 pub fn run_history(dir: &Path, json: bool) -> anyhow::Result<ExitCode> {
     let history = History::open(dir);
     let snapshots = history.list().context("reading .bussard/history")?;
+    let summaries = history.summaries(&snapshots, 0..snapshots.len());
 
     if json {
         let mut rows = Vec::new();
-        for (index, snapshot) in snapshots.iter().enumerate() {
+        for (index, (snapshot, summary)) in snapshots.iter().zip(&summaries).enumerate() {
             rows.push(serde_json::json!({
                 "index": index + 1,
                 "id": snapshot.id,
@@ -146,7 +147,7 @@ pub fn run_history(dir: &Path, json: bool) -> anyhow::Result<ExitCode> {
                 "args": snapshot.manifest.reason.args,
                 "gateway": snapshot.manifest.gateway,
                 "result": snapshot.manifest.result,
-                "summary": summary_of(&history, &snapshots, index),
+                "summary": summary,
             }));
         }
         crate::output::print(
@@ -164,14 +165,13 @@ pub fn run_history(dir: &Path, json: bool) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    for (index, snapshot) in snapshots.iter().enumerate() {
+    for (index, (snapshot, summary)) in snapshots.iter().zip(&summaries).enumerate() {
         println!(
             "{:>3}  {}  {}",
             index + 1,
             snapshot.id,
             reason_line(snapshot)
         );
-        let summary = summary_of(&history, &snapshots, index);
         if !summary.is_empty() {
             println!("     {summary}");
         }
@@ -424,22 +424,6 @@ fn reason_line(snapshot: &Snapshot) -> String {
         line.push_str(&format!(" ({})", manifest.result));
     }
     line
-}
-
-/// The one-line plain-language summary of what a snapshot changed, compared
-/// with the snapshot before it. Empty when it cannot be computed.
-fn summary_of(history: &History, snapshots: &[Snapshot], index: usize) -> String {
-    let Ok(new) = history.load(&snapshots[index].id) else {
-        return String::new();
-    };
-    let old = match index.checked_sub(1) {
-        Some(previous) => match history.load(&snapshots[previous].id) {
-            Ok(model) => model,
-            Err(_) => return String::new(),
-        },
-        None => return "the first snapshot of the model".to_string(),
-    };
-    describe(&old, &new).summary()
 }
 
 /// An empty model, used as the "before" of the very first snapshot.
