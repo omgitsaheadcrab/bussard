@@ -1163,7 +1163,7 @@ with count 0, as a real device is expected to. Whether a real device serves
 multi-element reads of PID 61 and PID 54 has not been observed yet; the halving
 falls back to single elements if it does not.
 
-### 11.2 Switching one group address's security off or on `[issue #331; the write shape follows §11.1, the removal is INFERRED, oracle pending]`
+### 11.2 Switching one group address's security off or on `[issue #331; the write shape follows §11.1, the removal is VERIFIED against the 2026-10-24 capture `1-1-5-no-secure-ga.pcapng`, see SAFETY.md]`
 
 KNX lets one group address run plain on a device that stays Data Secure: the
 device keeps its tool key and the other keyed group addresses, and the
