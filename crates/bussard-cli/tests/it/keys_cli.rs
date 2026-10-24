@@ -7,7 +7,7 @@ use std::process::{Command, Output};
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 /// The synthetic keyring the secure tests share.
-const SYNTHETIC: &str = include_str!("../../../knx-sim/examples/secure/synthetic.knxkeys");
+const SYNTHETIC: &str = include_str!("../../../../knx-sim/examples/secure/synthetic.knxkeys");
 
 /// Its made-up password.
 const PASSWORD: &str = "synthetic-keyring-pw";

@@ -977,7 +977,7 @@ Write commands refuse an unsupported device mask during the pre-flight, before
 any write. Support differs by command. This table is the single source: it is
 rendered from `MaskProfile::capabilities` in `bussard-mgmt`, the same table the
 refusals and `bussard audit` use, and a test
-(`crates/bussard-cli/tests/docs_consistency.rs`) fails when it drifts.
+(`crates/bussard-cli/tests/it/docs_consistency.rs`) fails when it drifts.
 
 <!-- mask-table:start -->
 | Mask | Family | Medium | `plan` / `apply` | `flash` | `reconstruct` | `describe` | Notes |

@@ -29,7 +29,7 @@ thiserror = { workspace = true }
 axum = { workspace = true }
 
 [features]
-# `browser-tests`: enables tests/browser_smoke.rs, a headless-Chrome smoke test
+# `browser-tests`: enables tests/it/browser_smoke.rs, a headless-Chrome smoke test
 # of the frontend DOM. Off by default, so the default build/test is completely
 # unaffected. Run with `cargo nextest run -p bussard-viz --features browser-tests`.
 #

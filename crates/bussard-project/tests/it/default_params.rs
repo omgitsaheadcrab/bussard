@@ -13,7 +13,7 @@ use bussard_project::facts::{apply_facts, derive_facts, refresh_facts};
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const APP_ID: &str = "M-00FA_A-00D2-10-0001";
-const APP_XML: &[u8] = include_bytes!("fixtures/default_params.app.xml");
+const APP_XML: &[u8] = include_bytes!("../fixtures/default_params.app.xml");
 
 fn fresh_device() -> Result<Device, Box<dyn std::error::Error>> {
     Ok(Device {

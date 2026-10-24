@@ -14,7 +14,7 @@
 //! Never regenerate the checked-in fixture from a real `knx/` directory: the
 //! projection carries that building's room names, device names and complete
 //! group-address plan, and the file is embedded in every release binary and
-//! served at `/assets/fixture-model.json`. `tests/fixture_model.rs` fails if the
+//! served at `/assets/fixture-model.json`. `tests/it/fixture_model.rs` fails if the
 //! shipped fixture stops being the demo model.
 
 use std::path::PathBuf;

@@ -22,7 +22,7 @@ type TestResult = anyhow::Result<()>;
 
 const APP: &str = "M-00FA_A-0298-10-0000";
 
-const PRODUCT: &str = include_str!("../../bussard-model/tests/fixtures/blocks_app.yaml");
+const PRODUCT: &str = include_str!("../../../bussard-model/tests/fixtures/blocks_app.yaml");
 
 const LOCK: &str = r#"version = 3
 

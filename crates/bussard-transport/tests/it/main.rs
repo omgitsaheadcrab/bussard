@@ -1,0 +1,10 @@
+//! The integration tests of `bussard-transport`, linked as one binary.
+//!
+//! Each module is a former `tests/<module>.rs` file. One binary instead of
+//! one per file saves a link against the full dependency graph per file;
+//! nextest still runs every test in its own process.
+
+mod codec_fuzz;
+mod mock_gateway;
+mod secure_tunnel;
+mod wire_trace_off;

@@ -16,7 +16,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 const APP_ID: &str = "M-00FA_A-00D1-10-0001";
 
 fn app() -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
-    let xml = include_bytes!("fixtures/dynamic_tree.app.xml");
+    let xml = include_bytes!("../fixtures/dynamic_tree.app.xml");
     Ok(parse_application_program(APP_ID, xml)?)
 }
 

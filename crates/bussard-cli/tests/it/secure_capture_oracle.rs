@@ -8,7 +8,7 @@
 //! BUSSARD_SECURE_KEYRING=<keys.knxkeys> \
 //! BUSSARD_KEYRING_PASSWORD=<password> \
 //! BUSSARD_SECURE_DEVICE=<individual address> \
-//! cargo test -p bussard-cli --test secure_capture_oracle -- --ignored --nocapture
+//! cargo test -p bussard-cli --test it secure_capture_oracle:: -- --ignored --nocapture
 //! ```
 //!
 //! `test_security_object_program_matches_ets` also compares the security
@@ -655,7 +655,7 @@ fn test_security_object_program_matches_ets() -> TestResult {
 /// `BUSSARD_KEYRING_PASSWORD` (no device needed):
 ///
 /// ```text
-/// cargo test -p bussard-cli --test secure_capture_oracle \
+/// cargo test -p bussard-cli --test it secure_capture_oracle:: \
 ///   test_group_addressed_capture_frames_verify -- --ignored --nocapture
 /// ```
 ///

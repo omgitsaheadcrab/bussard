@@ -14,7 +14,7 @@
 //! The result serializes to a stable, sorted [`SweepManifest`] that is checked
 //! in and diffs over time: a new refusal or a new panic shows up as a manifest
 //! change in review, which is the regression gate (see the env-gated corpus test
-//! in `tests/flash_corpus.rs`).
+//! in `tests/it/flash_corpus.rs`).
 //!
 //! # Panics are contained, never silent
 //!

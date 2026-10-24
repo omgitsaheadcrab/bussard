@@ -17,7 +17,7 @@ use zip::write::SimpleFileOptions;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const APP_ID: &str = "M-00FA_A-00D1-10-0001";
-const APP_XML: &[u8] = include_bytes!("fixtures/dynamic_tree.app.xml");
+const APP_XML: &[u8] = include_bytes!("../fixtures/dynamic_tree.app.xml");
 
 /// A project with one device on 1.1.30 running the fixture program: a
 /// channel label, a heating delay, the first output's mode (an enum) and the

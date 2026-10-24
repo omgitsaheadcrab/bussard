@@ -7,7 +7,7 @@ sweep has committed regression coverage that runs in normal CI without the big,
 git-ignored vendor cache. Real `.knxprod` files are copyrighted and are never
 committed (see `tests-support/product-corpus/README.md`).
 
-The sweep test (`tests/sweep_fixtures.rs`) assembles these snippets into
+The sweep test (`tests/it/sweep_fixtures.rs`) assembles these snippets into
 one-file/`multi-app` `.knxprod` ZIPs in a temp dir, runs the real
 `read_knxprod` + `sweep_corpus` pipeline over them, and asserts each lands in the
 bucket its shape implies. It also renders the committed baseline

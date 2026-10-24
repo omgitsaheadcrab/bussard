@@ -22,7 +22,7 @@
 #
 # Then run the flashability sweep:
 #     BUSSARD_PRODUCT_CORPUS=tests-support/product-corpus/cache \
-#         cargo test -p bussard-download --test flash_corpus -- --nocapture
+#         cargo test -p bussard-download --test it flash_corpus:: -- --nocapture
 #
 set -euo pipefail
 
@@ -118,7 +118,7 @@ ls -1 "$CACHE_DIR/vendor/"*.knxprod 2>/dev/null | sed 's/^/  /' || echo "  (none
 echo
 echo "Run the flashability sweep with:"
 echo "  BUSSARD_PRODUCT_CORPUS=$CACHE_DIR \\"
-echo "      cargo test -p bussard-download --test flash_corpus -- --nocapture"
+echo "      cargo test -p bussard-download --test it flash_corpus:: -- --nocapture"
 
 if [[ "$failed" -gt 0 ]]; then
     exit 1

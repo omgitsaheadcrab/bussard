@@ -26,7 +26,7 @@ pub const INDEX_HTML: &str = include_str!("../assets/index.html");
 /// `fixtures/demo-model/` installation, used by `main.js` as the standalone
 /// development fallback when `/api/model` is unreachable. It must never be
 /// regenerated from a real `knx/` directory — it ships inside every release
-/// binary. See `tests/fixture_model.rs`.
+/// binary. See `tests/it/fixture_model.rs`.
 pub fn asset(name: &str) -> Option<Asset> {
     let (body, content_type) = match name {
         "index.html" => (INDEX_HTML, "text/html; charset=utf-8"),

@@ -7,6 +7,13 @@ $ cargo nextest run --workspace --profile ci
 $ cargo test --workspace --doc
 ```
 
+Each crate links its integration tests into one binary, `it`: the files live
+in `tests/it/`, and `tests/it/main.rs` declares each one as a module. A test's
+name starts with its file's module, so `test(/^flash_mock::/)` selects one file
+and `cargo test -p bussard-download --test it flash_mock::` runs it. The
+`virtual_device` and `virtual_device_flash` suites of `bussard-cli` stay
+separate binaries, since CI runs them by name against an external device.
+
 Some tests read data that is never committed: copyrighted vendor product
 archives (`.knxprod`) and ETS project exports. They are gated on an
 environment variable and skip green without it, so CI and a fresh clone pass
@@ -28,21 +35,18 @@ directory itself. Every gated test resolves all three to the vendor directory.
 $ export BUSSARD_PRODUCT_CORPUS="$PWD/tests-support/product-corpus"
 $ cargo nextest run --profile corpus \
     -p bussard-download -p bussard-prod -p bussard-cli \
-    -E 'binary(flash_corpus) | binary(flash_dryrun_system7) | binary(ets_golden)
-        | binary(sys7_jung_m2_plan) | binary(param_readback_roundtrip)
-        | binary(parameter_image) | binary(sys7_visible_parameters)
-        | binary(selected) | binary(flash_dry_run)'
+    -E 'binary(it) & test(/^(flash_corpus|flash_dryrun_system7|ets_golden|sys7_jung_m2_plan|param_readback_roundtrip|parameter_image|sys7_visible_parameters|selected|flash_dry_run)::/)'
 ```
 
 The `corpus` nextest profile (`.config/nextest.toml`) allows a test 20 minutes:
 the three `flash_corpus` sweeps plan every application of ~500 archives and
 take several minutes each in a debug build. Run one file while iterating, for
-example `cargo nextest run --profile corpus -p bussard-download --test
-sys7_jung_m2_plan`.
+example `cargo nextest run --profile corpus -p bussard-download --test it
+sys7_jung_m2_plan::`.
 
 The gated tests:
 
-| Crate | Test file | What it checks |
+| Crate | Test file (`tests/it/`) | What it checks |
 |---|---|---|
 | bussard-download | `flash_corpus.rs` | the conformance sweep against `conformance-manifest.json`, no duplicate consecutive allocations, extended-memory applications lower to executable plans |
 | bussard-download | `flash_dryrun_system7.rs` | System 7 plans for MDT `A-000E`, Theben FIX2 `M-0048_A-4947` (ends at the terminal restart), Zennio LUMENTO, Jung `A-A011`, the Meteodata Hawk verify-mode profile, and the Meteodata C4 page octets the write mask owns (#320) |
@@ -71,7 +75,7 @@ The archive `M-0048_A-140C-14-EB70.knxprod` is read from `BUSSARD_METEO_KNXPROD`
 else from `<snapshot>/../../../products/`. The tests copy what they need into a
 temporary directory and never write to the snapshot.
 
-| Crate | Test file | What it checks |
+| Crate | Test file (`tests/it/`) | What it checks |
 |---|---|---|
 | bussard-prod | `evaluator_conformance.rs` | the page evaluator and the download's Dynamic evaluator reach the same refs for the device's values, and every "ignored" value is one the image leaves out (#326) |
 | bussard-mcp | `capabilities.rs` | `knx_set_parameter helligkeitsschwelle@P-7305_R-7305` is taken once C4's function is Helligkeitssensor, without "Wenn Temperatur" being set (#326) |

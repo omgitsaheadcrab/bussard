@@ -22,7 +22,7 @@ const APP: &str = "M-00FA_A-0298-10-0000";
 fn app() -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
     Ok(parse_application_program(
         APP,
-        include_bytes!("fixtures/blocks_app.xml"),
+        include_bytes!("../fixtures/blocks_app.xml"),
     )?)
 }
 

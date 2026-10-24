@@ -11,7 +11,7 @@ use bussard_ets::application::{LoadOp, parse_application_program};
 /// `LoadOp::Raw`, which would refuse the whole download procedure at pre-flight.
 #[test]
 fn test_parse_application_program_compare_rel_mem() -> Result<(), Box<dyn std::error::Error>> {
-    let xml = include_bytes!("fixtures/ldctrl_compare_rel_mem.app.xml");
+    let xml = include_bytes!("../fixtures/ldctrl_compare_rel_mem.app.xml");
     let app = parse_application_program("M-00FA_A-0001-11-ABCD-O000A", xml)?;
 
     let ops: Vec<&LoadOp> = app
