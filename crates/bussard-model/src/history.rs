@@ -37,6 +37,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -145,7 +146,16 @@ pub struct Manifest {
     /// When the snapshot was taken, RFC3339 in UTC.
     #[serde(default)]
     pub created_at: String,
+    /// The one-line plain-language summary of what the snapshot changed
+    /// against the one before it, computed when it was taken (issue #340).
+    /// `None` in a manifest written before summaries were stored, or when the
+    /// summary could not be computed; [`History::summaries`] fills it in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
+
+/// The summary of the very first snapshot, which has nothing to compare with.
+pub const FIRST_SNAPSHOT_SUMMARY: &str = "the first snapshot of the model";
 
 /// The reason to record with a snapshot, built fluently at the call site.
 ///
@@ -203,7 +213,7 @@ impl SnapshotReason {
     }
 
     /// Turns the reason into a manifest, stamping the time and version.
-    fn into_manifest(self, created_at: String) -> Manifest {
+    fn into_manifest(self, created_at: String, summary: Option<String>) -> Manifest {
         Manifest {
             reason: Reason {
                 command: self.command,
@@ -213,6 +223,7 @@ impl SnapshotReason {
             result: self.result,
             bussard_version: env!("CARGO_PKG_VERSION").to_string(),
             created_at,
+            summary,
         }
     }
 }
@@ -285,7 +296,37 @@ impl History {
     /// Only the model files (`bussard.toml`, `groups.toml`, `bussard.lock`,
     /// `tests.toml`, `ha.toml`, `devices/*.toml`) are copied; product data,
     /// captures, keyrings and project files never are.
+    ///
+    /// The manifest records a one-line summary of what changed since the
+    /// previous snapshot, so `bussard history` never loads a model. A summary
+    /// that cannot be computed (a model that does not load) is left out; it
+    /// never refuses the snapshot.
     pub fn snapshot(&self, reason: SnapshotReason) -> Result<SnapshotId, HistoryError> {
+        let summary = self.working_summary();
+        self.write_snapshot(reason, summary)
+    }
+
+    /// The summary of the working model against the latest snapshot, or
+    /// `None` when either does not load.
+    fn working_summary(&self) -> Option<String> {
+        let latest = self.latest().ok()?;
+        let working = self.working_model().ok()?;
+        match latest {
+            Some(latest) => {
+                let previous = self.load(&latest.id).ok()?;
+                Some(describe(&previous, &working).summary())
+            }
+            None => Some(FIRST_SNAPSHOT_SUMMARY.to_string()),
+        }
+    }
+
+    /// Copies the current model files into a new snapshot whose manifest
+    /// carries `summary`.
+    fn write_snapshot(
+        &self,
+        reason: SnapshotReason,
+        summary: Option<String>,
+    ) -> Result<SnapshotId, HistoryError> {
         let now = SystemTime::now();
         let id = self.next_id(now)?;
         let target = self.snapshot_dir(&id);
@@ -306,18 +347,60 @@ impl History {
             }
         }
 
-        let manifest = reason.into_manifest(rfc3339(now));
-        let path = target.join(MANIFEST);
-        let text =
-            serde_json::to_string_pretty(&manifest).map_err(|source| HistoryError::Manifest {
-                path: path.clone(),
-                source,
-            })?;
-        fs::write(&path, format!("{text}\n")).map_err(|source| HistoryError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        let manifest = reason.into_manifest(rfc3339(now), summary);
+        self.write_manifest(&id, &manifest)?;
         Ok(id)
+    }
+
+    /// The one-line summary of every snapshot in `range` of `snapshots` (the
+    /// output of [`list`](History::list)), in order.
+    ///
+    /// A summary comes from the manifest. A manifest written before summaries
+    /// were stored gets it computed once, from the snapshot and the one before
+    /// it, and written back best-effort: a write error never fails the
+    /// listing. A summary that cannot be computed is the empty string.
+    pub fn summaries(&self, snapshots: &[Snapshot], range: Range<usize>) -> Vec<String> {
+        let end = range.end.min(snapshots.len());
+        let mut out = Vec::new();
+        // The last snapshot model loaded, so a run of old manifests loads each
+        // snapshot once rather than twice.
+        let mut loaded: Option<(usize, Model)> = None;
+        for index in range.start..end {
+            let snapshot = &snapshots[index];
+            if let Some(summary) = &snapshot.manifest.summary {
+                out.push(summary.clone());
+                continue;
+            }
+            let computed = match index.checked_sub(1) {
+                None => Some(FIRST_SNAPSHOT_SUMMARY.to_string()),
+                Some(previous) => {
+                    let old = match loaded.take() {
+                        Some((at, model)) if at == previous => Ok(model),
+                        _ => self.load(&snapshots[previous].id),
+                    };
+                    match (old, self.load(&snapshot.id)) {
+                        (Ok(old), Ok(new)) => {
+                            let summary = describe(&old, &new).summary();
+                            loaded = Some((index, new));
+                            Some(summary)
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            match computed {
+                Some(summary) => {
+                    let mut manifest = snapshot.manifest.clone();
+                    manifest.summary = Some(summary.clone());
+                    // Best-effort: the listing is read-only from the user's
+                    // point of view and must not fail on a backfill.
+                    let _ = self.write_manifest(&snapshot.id, &manifest);
+                    out.push(summary);
+                }
+                None => out.push(String::new()),
+            }
+        }
+        out
     }
 
     /// Every snapshot, oldest first.
@@ -468,12 +551,14 @@ impl History {
                 }
                 let reason = SnapshotReason::new("external edit")
                     .with_result("model files changed outside bussard");
-                Ok(Some(self.snapshot(reason)?))
+                let summary = describe(&old, &working).summary();
+                Ok(Some(self.write_snapshot(reason, Some(summary))?))
             }
             None => {
                 let reason = SnapshotReason::new("external edit")
                     .with_result("baseline recorded (no earlier snapshot)");
-                Ok(Some(self.snapshot(reason)?))
+                let summary = FIRST_SNAPSHOT_SUMMARY.to_string();
+                Ok(Some(self.write_snapshot(reason, Some(summary))?))
             }
         }
     }
@@ -533,6 +618,25 @@ impl History {
             }
         }
         Ok(undo)
+    }
+
+    /// Writes one snapshot's manifest, through a temporary file and a rename:
+    /// a backfill interrupted halfway must not leave a manifest that no longer
+    /// parses, because [`list`](History::list) skips such a snapshot.
+    fn write_manifest(&self, id: &SnapshotId, manifest: &Manifest) -> Result<(), HistoryError> {
+        let dir = self.snapshot_dir(id);
+        let path = dir.join(MANIFEST);
+        let text =
+            serde_json::to_string_pretty(manifest).map_err(|source| HistoryError::Manifest {
+                path: path.clone(),
+                source,
+            })?;
+        let partial = dir.join(format!("{MANIFEST}.partial"));
+        fs::write(&partial, format!("{text}\n")).map_err(|source| HistoryError::Io {
+            path: partial.clone(),
+            source,
+        })?;
+        fs::rename(&partial, &path).map_err(|source| HistoryError::Io { path, source })
     }
 
     /// Reads one snapshot's manifest.
@@ -884,6 +988,123 @@ mod tests {
         assert!(!history.has_model_files());
         assert!(history.snapshot_if_changed_externally()?.is_none());
         assert!(!dir.exists(), "a hook must not create a model directory");
+        Ok(())
+    }
+
+    /// Renames the one group, so each call is a model change.
+    fn rename_group(dir: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        fs::write(
+            dir.join("groups.toml"),
+            format!(
+                "groups = [\n  {{ address = \"3/0/4\", name = \"{name}\", dpt = \"1.008\" }},\n]\n"
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// A history of `count` snapshots, each after a group rename.
+    fn history_of(
+        tag: &str,
+        count: usize,
+    ) -> Result<(PathBuf, History), Box<dyn std::error::Error>> {
+        let dir = model_dir(tag)?;
+        let history = History::open(&dir);
+        for n in 0..count {
+            if n > 0 {
+                rename_group(&dir, &format!("Blind {n}"))?;
+            }
+            history.snapshot(SnapshotReason::new("edit").with_args([n.to_string()]))?;
+        }
+        Ok((dir, history))
+    }
+
+    #[test]
+    fn test_summaries_reads_the_stored_summaries_without_a_parse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (dir, history) = history_of("summaries", 4)?;
+        let snapshots = history.list()?;
+        assert_eq!(snapshots.len(), 4);
+        assert!(snapshots.iter().all(|s| s.manifest.summary.is_some()));
+
+        let before = crate::loader::thread_parse_count();
+        let summaries = history.summaries(&snapshots, 0..snapshots.len());
+        assert_eq!(
+            crate::loader::thread_parse_count(),
+            before,
+            "no model parse"
+        );
+        assert_eq!(summaries[0], FIRST_SNAPSHOT_SUMMARY);
+        for (index, summary) in summaries.iter().enumerate().skip(1) {
+            let old = history.load(&snapshots[index - 1].id)?;
+            let new = history.load(&snapshots[index].id)?;
+            assert_eq!(summary, &describe(&old, &new).summary());
+            assert!(!summary.is_empty());
+        }
+        assert_eq!(history.summaries(&snapshots, 2..9), summaries[2..].to_vec());
+
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_summaries_backfills_a_manifest_without_one() -> Result<(), Box<dyn std::error::Error>> {
+        // More snapshots than the load memo keeps, so a recompute must parse.
+        let (dir, history) = history_of("backfill", 7)?;
+        let stored = history.summaries(&history.list()?, 0..7);
+        // Strip the summaries, as in a manifest written before #340.
+        for snapshot in history.list()? {
+            let path = history.snapshot_dir(&snapshot.id).join(MANIFEST);
+            let mut json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+            if let Some(object) = json.as_object_mut() {
+                object.remove("summary");
+            }
+            fs::write(&path, serde_json::to_string_pretty(&json)?)?;
+        }
+        let snapshots = history.list()?;
+        assert!(snapshots.iter().all(|s| s.manifest.summary.is_none()));
+
+        let before = crate::loader::thread_parse_count();
+        assert_eq!(history.summaries(&snapshots, 0..7), stored);
+        assert!(crate::loader::thread_parse_count() > before, "computed");
+
+        let snapshots = history.list()?;
+        let backfilled: Vec<Option<String>> = snapshots
+            .iter()
+            .map(|s| s.manifest.summary.clone())
+            .collect();
+        assert_eq!(
+            backfilled,
+            stored.iter().cloned().map(Some).collect::<Vec<_>>()
+        );
+
+        let before = crate::loader::thread_parse_count();
+        assert_eq!(history.summaries(&snapshots, 0..7), stored);
+        assert_eq!(crate::loader::thread_parse_count(), before, "read back");
+
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_snapshot_succeeds_when_the_previous_snapshot_does_not_load()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (dir, history) = history_of("unloadable", 1)?;
+        let first = history.list()?.remove(0);
+        fs::write(
+            history.snapshot_dir(&first.id).join("groups.toml"),
+            "groups = [ not toml",
+        )?;
+        rename_group(&dir, "Kitchen blind")?;
+
+        let id = history.snapshot(SnapshotReason::new("edit"))?;
+        let snapshots = history.list()?;
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[1].id, id);
+        assert_eq!(snapshots[1].manifest.summary, None);
+        // The listing cannot compute it either, and says nothing.
+        assert_eq!(history.summaries(&snapshots, 1..2), vec![String::new()]);
+
+        fs::remove_dir_all(&dir)?;
         Ok(())
     }
 

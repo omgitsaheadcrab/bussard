@@ -278,20 +278,11 @@ impl BussardMcp {
         let limit = args.limit.unwrap_or(50).clamp(1, 500) as usize;
         let start = snapshots.len().saturating_sub(limit);
 
+        let summaries = history.summaries(&snapshots, start..snapshots.len());
+
         let mut rows = Vec::new();
-        for (index, snapshot) in snapshots.iter().enumerate().skip(start) {
-            let summary = match index.checked_sub(1) {
-                Some(previous) => {
-                    match (
-                        history.load(&snapshots[previous].id),
-                        history.load(&snapshot.id),
-                    ) {
-                        (Ok(old), Ok(new)) => describe(&old, &new).summary(),
-                        _ => String::new(),
-                    }
-                }
-                None => "the first snapshot of the model".to_string(),
-            };
+        for ((index, snapshot), summary) in snapshots.iter().enumerate().skip(start).zip(summaries)
+        {
             rows.push(json!({
                 "index": index + 1,
                 "id": snapshot.id,
