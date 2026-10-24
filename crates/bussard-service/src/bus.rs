@@ -10,7 +10,9 @@
 use std::time::Duration;
 
 use bussard_bus::{Bus, BusHandle};
-use bussard_mgmt::{DeviceConnection, Layer4Connection, LeaseChannel, MgmtError, Timeouts};
+use bussard_mgmt::{
+    DeviceConnection, Layer4Connection, LeaseChannel, MgmtError, ProbeMemo, Timeouts,
+};
 use bussard_model::IndividualAddress;
 use bussard_secure::{Key16, SequenceHighWater};
 use bussard_transport::ConnectionConfig;
@@ -97,6 +99,10 @@ pub struct BusService {
     /// #172), shared by every clone so a long-lived server never repeats a
     /// sequence number.
     group_high_water: SequenceHighWater,
+    /// The source-address probe that passed on the current tunnel instance
+    /// (issue #341), shared by every clone so a long-lived server probes once
+    /// per tunnel.
+    probe_memo: ProbeMemo,
 }
 
 impl BusService {
@@ -137,6 +143,7 @@ impl BusService {
             policy,
             gate,
             group_high_water: SequenceHighWater::new(),
+            probe_memo: ProbeMemo::new(),
         })
     }
 
@@ -161,6 +168,7 @@ impl BusService {
             policy,
             gate,
             group_high_water: SequenceHighWater::new(),
+            probe_memo: ProbeMemo::new(),
         })
     }
 
@@ -213,12 +221,17 @@ impl BusService {
     /// The source address for a management session, checked against the bus
     /// unless `skip` (see [`SourcePolicy::Check`]).
     ///
+    /// The probe runs once per tunnel instance (issue #341): after it passed,
+    /// later checks on the same, unbroken connection reuse that result. A
+    /// reconnect, a re-established tunnel or a different assigned address
+    /// probes again; an occupied address refuses every time.
+    ///
     /// # Errors
     ///
     /// [`ServiceError::SourceCheck`] when a device answers at that address or
     /// the probe cannot run.
     pub async fn checked_source(&self, skip: bool) -> Result<IndividualAddress, ServiceError> {
-        Ok(bussard_mgmt::checked_source(&self.handle, skip).await?)
+        Ok(self.probe_memo.checked_source(&self.handle, skip).await?)
     }
 
     /// Opens a management session to `target`: resolves the source, leases the

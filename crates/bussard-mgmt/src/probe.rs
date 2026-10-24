@@ -42,7 +42,9 @@
 //! *Response* selector and nothing else, and keeps waiting after an echo until a
 //! real response arrives or the budget runs out.
 
-use bussard_bus::BusHandle;
+use std::sync::{Arc, Mutex};
+
+use bussard_bus::{BusHandle, BusState};
 use bussard_model::IndividualAddress;
 
 use crate::apci;
@@ -137,6 +139,15 @@ pub async fn checked_source(
         tracing::debug!(%source, "source-address check skipped");
         return Ok(source);
     }
+    probe_source(handle, source).await
+}
+
+/// Probes `source` with [`probe_timeouts_from_env`] and turns an occupant into
+/// the refusal.
+async fn probe_source(
+    handle: &BusHandle,
+    source: IndividualAddress,
+) -> std::result::Result<IndividualAddress, SourceCheckError> {
     let probe = probe_own_address(handle, source, probe_timeouts_from_env())
         .await
         .map_err(|error| SourceCheckError::Probe {
@@ -153,6 +164,94 @@ pub async fn checked_source(
             mask,
         }),
     }
+}
+
+/// Remembers that the source-address probe passed on one tunnel instance, so
+/// a long-lived surface (the MCP server) probes once per tunnel rather than
+/// once per device operation (issue #341).
+///
+/// The memo is keyed on [`BusHandle::connection_generation`] and the source
+/// address: a reconnect, a tunnel that re-establishes itself, or a different
+/// assigned address all make the next [`checked_source`](Self::checked_source)
+/// probe again. Only a passed probe is remembered; an occupied address or a
+/// failed probe refuses every time. Cloning shares the memo.
+///
+/// A memo never outlives the [`BusHandle`] it was filled from, so a probe
+/// result never carries over to another process or another bus.
+#[derive(Debug, Clone, Default)]
+pub struct ProbeMemo {
+    passed: Arc<Mutex<Option<ProbePassed>>>,
+}
+
+/// The tunnel instance and address a probe passed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProbePassed {
+    generation: u64,
+    source: IndividualAddress,
+}
+
+impl ProbeMemo {
+    /// An empty memo: the first check probes.
+    pub fn new() -> ProbeMemo {
+        ProbeMemo::default()
+    }
+
+    /// [`checked_source`](crate::probe::checked_source), skipping the probe
+    /// when one already passed for this source on the current, still
+    /// connected tunnel instance of `handle`.
+    ///
+    /// # Errors
+    ///
+    /// As [`checked_source`](crate::probe::checked_source).
+    pub async fn checked_source(
+        &self,
+        handle: &BusHandle,
+        skip: bool,
+    ) -> std::result::Result<IndividualAddress, SourceCheckError> {
+        let source = bussard_bus::ops::group_source(handle);
+        if skip {
+            tracing::debug!(%source, "source-address check skipped");
+            return Ok(source);
+        }
+        // Read the generation before probing: a reconnect during the probe
+        // moves it on, so the result is then recorded against a tunnel that
+        // is already gone and the next call probes again.
+        let generation = handle.connection_generation();
+        let current = ProbePassed { generation, source };
+        if connected(handle) && self.get() == Some(current) {
+            tracing::debug!(
+                %source,
+                "source-address check passed earlier on this tunnel; not probing again"
+            );
+            return Ok(source);
+        }
+        let checked = probe_source(handle, source).await?;
+        if connected(handle) && handle.connection_generation() == generation {
+            self.set(Some(current));
+        }
+        Ok(checked)
+    }
+
+    /// Forgets a passed probe, so the next check probes again.
+    pub fn clear(&self) {
+        self.set(None);
+    }
+
+    fn get(&self) -> Option<ProbePassed> {
+        // A poisoned lock reads as "never passed": the safe side is to probe.
+        self.passed.lock().ok().and_then(|slot| *slot)
+    }
+
+    fn set(&self, value: Option<ProbePassed>) {
+        if let Ok(mut slot) = self.passed.lock() {
+            *slot = value;
+        }
+    }
+}
+
+/// Whether the bus is up right now.
+fn connected(handle: &BusHandle) -> bool {
+    handle.status() == BusState::Connected
 }
 
 /// Probes whether a device on the bus answers at `address` — the address this

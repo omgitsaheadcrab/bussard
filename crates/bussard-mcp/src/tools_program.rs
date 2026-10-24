@@ -14,6 +14,8 @@
 //! 2. **The source-address probe.** Both tools refuse when a device already
 //!    answers at the tunnel's own individual address
 //!    ([`bussard_mgmt::checked_source`]), exactly like the CLI device commands.
+//!    The probe runs once per tunnel instance (issue #341): a passed probe is
+//!    reused until the bus reconnects, a refusal is never remembered.
 //! 3. **The plan digest.** `knx_plan_device` reads the live tables, computes the
 //!    plan and returns a `plan_digest`: SHA-256 over the device address, the
 //!    model's links and parameter values for it, the desired tables, the
@@ -97,7 +99,7 @@ use bussard_service::params::{
     resolve_product,
 };
 use bussard_service::secure::{SecureMaterial, ToolKeySource};
-use bussard_service::{Authorize, FactsCache, L4Options, SourcePolicy};
+use bussard_service::{Authorize, BusService, FactsCache, L4Options, SourcePolicy};
 use bussard_transport::ConnectionConfig;
 use bussard_transport::write_gate::{check_write_gate, gateway_display};
 use rmcp::ErrorData;
@@ -444,7 +446,7 @@ impl BussardMcp {
 impl BussardMcp {
     /// The tier, the write gate and the connected bus every programming call
     /// needs, or the refusal saying which is missing.
-    fn programming_preflight(&self) -> Result<(&ProgrammingTier, BusHandle, String), String> {
+    fn programming_preflight(&self) -> Result<(&ProgrammingTier, BusService, String), String> {
         let state = self.state();
         let Some(tier) = state.programming.as_ref() else {
             return Err(
@@ -454,13 +456,13 @@ impl BussardMcp {
         let gateway = gateway_display(&tier.connection);
         check_write_gate(&tier.connection, tier.allow_remote_gateway)
             .map_err(|refused| refused.to_string())?;
-        let Some(handle) = state.bus.handle() else {
+        let Some(service) = state.bus.service() else {
             return Err("the bus is not wired".into());
         };
         if state.bus.state() != ConnState::Connected {
             return Err(state.bus.not_connected_reason());
         }
-        Ok((tier, handle.clone(), gateway))
+        Ok((tier, service.clone(), gateway))
     }
 
     /// The Data Secure material for `target` from the server's keyring: its
@@ -586,7 +588,7 @@ impl BussardMcp {
         // touched (issue #330).
         let model = self.state().model.reload();
         refuse_insecure_links(&model, target)?;
-        let (tier, handle, gateway) = self.programming_preflight()?;
+        let (tier, service, gateway) = self.programming_preflight()?;
         let dir = self.state().dir.clone();
         let desired = desired_tables_for(&model, target).map_err(|e| e.to_string())?;
 
@@ -602,7 +604,7 @@ impl BussardMcp {
         let mut warm = self.warm().lock().await;
         warm.release().await;
         let (_, read) = read_device(
-            &handle,
+            &service,
             target,
             &tool_key,
             &SequenceHighWater::new(),
@@ -992,7 +994,8 @@ impl BussardMcp {
         digest: &str,
         plan_hash: Option<&str>,
     ) -> Result<Prepared, String> {
-        let (_, handle, gateway) = self.programming_preflight()?;
+        let (_, service, gateway) = self.programming_preflight()?;
+        let handle = service.handle().clone();
         let dir = self.state().dir.clone();
 
         // The digest must name a plan this session produced, for this device,
@@ -1030,7 +1033,7 @@ impl BussardMcp {
         let tunnel = self.admitted_tunnel(&model, tool_key.is_some())?;
         let high_water = SequenceHighWater::new();
         let (source, read) = read_device(
-            &handle,
+            &service,
             target,
             &tool_key,
             &high_water,
@@ -1845,7 +1848,9 @@ struct DeviceRead {
     go_flags: Option<Vec<u8>>,
 }
 
-/// Checks the source address, then reads the device on one layer-4 session:
+/// Checks the source address (once per tunnel instance, issue #341: the
+/// service remembers a passed probe until the bus reconnects), then reads the
+/// device on one layer-4 session:
 /// the device facts and the identity verdict, the live tables, and with
 /// `product` the parameter memory (the same session `bussard apply` reads
 /// on). Returns the checked source for the write phase.
@@ -1854,7 +1859,7 @@ struct DeviceRead {
 /// `A_SecureData`; `None` is the unchanged plain path.
 #[allow(clippy::too_many_arguments)] // one read's context; a struct would only move it
 async fn read_device(
-    handle: &BusHandle,
+    service: &BusService,
     target: IndividualAddress,
     tool_key: &Option<Key16>,
     high_water: &SequenceHighWater,
@@ -1863,10 +1868,9 @@ async fn read_device(
     product: Option<&ProductSource>,
     tunnel: &[IndividualAddress],
 ) -> Result<(IndividualAddress, DeviceRead), String> {
-    let source = bussard_mgmt::checked_source(handle, false)
-        .await
-        .map_err(|e| chain(&e))?;
-    let lease = handle
+    let source = service.checked_source(false).await.map_err(|e| chain(&e))?;
+    let lease = service
+        .handle()
         .lease()
         .await
         .map_err(|e| format!("could not lease the bus: {e}"))?;

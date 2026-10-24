@@ -15,10 +15,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use bussard_mcp::McpConfig;
+use bussard_mgmt::apci::A_DEVICE_DESCRIPTOR_READ;
 use bussard_model::{GroupAddress, IndividualAddress};
-use bussard_testkit::consts::OT_ASSOCIATION_TABLE;
+use bussard_testkit::consts::{OT_ASSOCIATION_TABLE, TUNNEL_IA_RAW};
 use bussard_testkit::{MockDevice, MockGateway};
 use bussard_transport::ConnectionConfig;
+use bussard_transport::cemi::{Apdu, Destination};
 use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
 use serde_json::{Value, json};
@@ -31,6 +33,12 @@ fn ga(s: &str) -> anyhow::Result<GroupAddress> {
 
 fn device_ia() -> anyhow::Result<IndividualAddress> {
     Ok("1.1.4".parse()?)
+}
+
+/// The individual address the mock gateway assigns the tunnel, which the
+/// server speaks from.
+fn own_address() -> IndividualAddress {
+    IndividualAddress::from_raw(TUNNEL_IA_RAW)
 }
 
 fn be16(v: u16) -> Vec<u8> {
@@ -119,6 +127,17 @@ impl Harness {
         reply_wait: Option<Duration>,
         read_wait: Option<Duration>,
     ) -> anyhow::Result<Harness> {
+        Harness::start_line(plan_ttl, reply_wait, read_wait, Vec::new()).await
+    }
+
+    /// [`Harness::start_waits`] with `extra` devices on the line next to
+    /// 1.1.4.
+    async fn start_line(
+        plan_ttl: Duration,
+        reply_wait: Option<Duration>,
+        read_wait: Option<Duration>,
+        extra: Vec<MockDevice>,
+    ) -> anyhow::Result<Harness> {
         // Keep serving after a DISCONNECT so a second connection finds the
         // same device with the same state.
         let gateway = MockGateway::builder()
@@ -126,6 +145,7 @@ impl Harness {
             .keep_serving()
             .idle_timeout(Duration::from_secs(60))
             .device(system_b_device(false)?)
+            .devices(extra)
             .start()
             .await?;
 
@@ -164,6 +184,22 @@ impl Harness {
 
     fn writes(&self) -> anyhow::Result<usize> {
         Ok(self.gateway.with_device(device_ia()?, |dev| dev.writes)?)
+    }
+
+    /// How many source-address probes reached the gateway: an
+    /// `A_DeviceDescriptor_Read` addressed to the tunnel's own individual
+    /// address (issue #341).
+    fn probes(&self) -> anyhow::Result<usize> {
+        let own = Destination::Individual(own_address());
+        Ok(self
+            .gateway
+            .sent()?
+            .iter()
+            .filter(|frame| {
+                frame.destination == own
+                    && matches!(frame.apdu, Apdu::Other { apci, .. } if apci == A_DEVICE_DESCRIPTOR_READ)
+            })
+            .count())
     }
 
     /// The gateway's bound port.
@@ -1089,4 +1125,79 @@ async fn test_knx_plan_device_refuses_plain_sender_on_secured_ga() -> anyhow::Re
     client.cancel().await?;
     server_task.abort();
     Ok(())
+}
+
+/// Two plans on one tunnel probe the source address once (issue #341): the
+/// second reuses the probe that passed on the same, unbroken connection.
+#[tokio::test]
+async fn test_knx_plan_device_probes_once_per_tunnel() -> anyhow::Result<()> {
+    let h = Harness::start(Duration::from_secs(600)).await?;
+
+    let first = h
+        .call("knx_plan_device", json!({"address": "1.1.4"}))
+        .await?;
+    assert_eq!(first["ok"], true, "first plan: {first}");
+    assert_eq!(h.probes()?, 1, "the first plan probes");
+
+    let second = h
+        .call("knx_plan_device", json!({"address": "1.1.4"}))
+        .await?;
+    assert_eq!(second["ok"], true, "second plan: {second}");
+    assert_eq!(
+        h.probes()?,
+        1,
+        "the second plan on the same tunnel does not"
+    );
+    assert_eq!(h.writes()?, 0, "planning must not write");
+
+    h.stop().await
+}
+
+/// A reconnect starts a new tunnel instance, so the next plan probes again.
+#[tokio::test]
+async fn test_knx_plan_device_probes_again_after_a_reconnect() -> anyhow::Result<()> {
+    let h = Harness::start(Duration::from_secs(600)).await?;
+
+    let first = h
+        .call("knx_plan_device", json!({"address": "1.1.4"}))
+        .await?;
+    assert_eq!(first["ok"], true, "first plan: {first}");
+    assert_eq!(h.probes()?, 1);
+
+    let reconnected = h.call("knx_bus_reconnect", json!({})).await?;
+    assert_eq!(reconnected["ok"], true, "reconnect: {reconnected}");
+    assert_eq!(reconnected["bus"]["connected"], true, "{reconnected}");
+
+    let second = h
+        .call("knx_plan_device", json!({"address": "1.1.4"}))
+        .await?;
+    assert_eq!(second["ok"], true, "second plan: {second}");
+    assert_eq!(h.probes()?, 2, "the plan after a reconnect probes again");
+
+    h.stop().await
+}
+
+/// A device answering at the server's own address refuses the first plan,
+/// as before issue #341, and the refusal is not remembered as a pass: the
+/// next plan probes and refuses again. Nothing is written.
+#[tokio::test]
+async fn test_knx_plan_device_refuses_an_occupied_source_on_every_call() -> anyhow::Result<()> {
+    let occupant = MockDevice::system_b(own_address());
+    let h = Harness::start_line(Duration::from_secs(600), None, None, vec![occupant]).await?;
+
+    for attempt in 1..=2 {
+        let plan = h
+            .call("knx_plan_device", json!({"address": "1.1.4"}))
+            .await?;
+        assert_eq!(plan["refused"], true, "attempt {attempt}: {plan}");
+        let reason = plan["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains(&format!("already answers at {}", own_address())),
+            "attempt {attempt}: {reason}"
+        );
+        assert_eq!(h.probes()?, attempt, "attempt {attempt} probes");
+    }
+    assert_eq!(h.writes()?, 0, "a refused plan must not write");
+
+    h.stop().await
 }

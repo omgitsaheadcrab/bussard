@@ -479,3 +479,42 @@ async fn test_state_changes_stores_reconnecting_without_a_receiver() -> TestResu
     let _ = handle.close().await;
     Ok(())
 }
+
+/// The connection generation stays put on an unbroken connection and moves on
+/// with a requested reconnect, so a per-tunnel fact keyed on it (the
+/// source-address probe, issue #341) is dropped with the old tunnel.
+#[tokio::test]
+async fn test_connection_generation_changes_on_reconnect() -> TestResult {
+    let gw = MockGateway::builder()
+        .channel(CHANNEL)
+        .keep_serving()
+        .start()
+        .await?;
+    let (handle, _task) = Bus::connect(ConnectionConfig::tunnel(gw.addr()));
+    assert!(handle.wait_connected(Duration::from_secs(3)).await);
+
+    let first = handle.connection_generation();
+    handle
+        .send(CemiFrame::group_write_packed(
+            ga("1/2/3")?,
+            ia("1.1.10")?,
+            &[1],
+        ))
+        .await?;
+    assert_eq!(
+        handle.connection_generation(),
+        first,
+        "traffic on the same connection keeps the generation"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), handle.reconnect()).await??;
+    assert_eq!(handle.status(), BusState::Connected);
+    assert_ne!(
+        handle.connection_generation(),
+        first,
+        "a reconnect starts a new generation"
+    );
+
+    handle.close().await?;
+    Ok(())
+}

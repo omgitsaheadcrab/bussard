@@ -164,7 +164,7 @@ impl BussardMcp {
         target: IndividualAddress,
         file: &Path,
     ) -> Result<Planned, String> {
-        let (_, handle, _) = self.programming_preflight()?;
+        let (_, service, _) = self.programming_preflight()?;
         let dir = self.state().dir.clone();
         let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
         let backup: ParameterBackup = read_parameter_backup(file).map_err(|e| chain(&e))?;
@@ -179,7 +179,7 @@ impl BussardMcp {
         let tool_key = material.tool_key.clone();
         let high_water = SequenceHighWater::new();
         let (checked, read) = read_device(
-            &handle,
+            &service,
             target,
             &tool_key,
             &high_water,

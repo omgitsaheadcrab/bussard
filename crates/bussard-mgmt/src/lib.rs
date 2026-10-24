@@ -95,8 +95,8 @@ pub use memory::{
     write_memory_verified,
 };
 pub use probe::{
-    ADDRESS_PROBE_MS_ENV, AddressProbe, SourceCheckError, checked_source, probe_own_address,
-    probe_own_address_on, probe_timeouts_from_env,
+    ADDRESS_PROBE_MS_ENV, AddressProbe, ProbeMemo, SourceCheckError, checked_source,
+    probe_own_address, probe_own_address_on, probe_timeouts_from_env,
 };
 pub use profile::{
     KnxMedium, LsmRealisation, MaskCapabilities, MaskFamily, MaskProfile, Sys7Profile,

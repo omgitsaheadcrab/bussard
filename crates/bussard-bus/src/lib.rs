@@ -281,6 +281,9 @@ struct Shared {
     reconnect_budget: Duration,
     /// How many times the gateway link was lost since the actor started.
     link_losses: AtomicU64,
+    /// Bumped on every connection up and every connection loss or requested
+    /// reconnect, so two equal readings bracket one unbroken tunnel instance.
+    generation: AtomicU64,
     /// The fatal connect error the actor stopped on, if any.
     fatal: std::sync::Mutex<Option<String>>,
     /// The interface, for [`BusDiagnostics::interface`].
@@ -335,6 +338,7 @@ impl Bus {
             state_tx,
             reconnect_budget: config.reconnect.budget,
             link_losses: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
             fatal: std::sync::Mutex::new(None),
             interface: bussard_transport::write_gate::gateway_display(&config),
             diag: std::sync::Mutex::new(DiagState::default()),
@@ -511,6 +515,19 @@ impl BusHandle {
     /// coincided with a link loss, and so is worth retrying (issue #177).
     pub fn link_losses(&self) -> u64 {
         self.shared.link_losses.load(Ordering::Relaxed)
+    }
+
+    /// The tunnel instance the bus is on: a counter that changes whenever a
+    /// connection comes up, is lost, or is dropped for a requested
+    /// [`reconnect`](Self::reconnect), including a tunnel that re-establishes
+    /// itself (issue #177).
+    ///
+    /// Two equal readings, both taken while [`status`](Self::status) is
+    /// [`BusState::Connected`], bracket one unbroken connection. A caller
+    /// that remembers a per-connection fact (the source-address probe, issue
+    /// #341) keys it on this value.
+    pub fn connection_generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::SeqCst)
     }
 
     /// A [`watch::Receiver`] that observes every [`BusState`] transition.
@@ -711,6 +728,7 @@ impl Actor {
                         d.tunnel_user = user;
                         d.connected_since = Some(SystemTime::now());
                     });
+                    self.shared.generation.fetch_add(1, Ordering::SeqCst);
                     self.shared.set_state(BusState::Connected);
                     for reply in waiting.drain(..) {
                         let _ = reply.send(());
@@ -727,6 +745,8 @@ impl Actor {
                         forwarder.abort();
                     }
                     self.shared.diag(|d| d.connected_since = None);
+                    // Whatever ended `consume`, this connection is over.
+                    self.shared.generation.fetch_add(1, Ordering::SeqCst);
                     match outcome {
                         ActorOutcome::Closed | ActorOutcome::HandlesDropped => {
                             self.shared.set_state(BusState::Closed);
@@ -992,6 +1012,7 @@ async fn forward_link(mut link: watch::Receiver<LinkState>, shared: Arc<Shared>)
         match state {
             LinkState::Reconnecting => {
                 shared.link_losses.fetch_add(1, Ordering::Relaxed);
+                shared.generation.fetch_add(1, Ordering::SeqCst);
                 shared.diag(|d| {
                     d.last_error = Some(
                         "gateway connection lost; the tunnel is re-establishing itself".to_string(),
@@ -1013,6 +1034,7 @@ async fn forward_link(mut link: watch::Receiver<LinkState>, shared: Arc<Shared>)
                     );
                 }
                 tracing::info!("gateway connection re-established");
+                shared.generation.fetch_add(1, Ordering::SeqCst);
                 shared.diag(|d| d.connected_since = Some(SystemTime::now()));
                 shared.set_state(BusState::Connected);
             }
