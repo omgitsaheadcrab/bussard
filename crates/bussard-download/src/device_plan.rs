@@ -64,8 +64,9 @@ pub enum ChangeSubject {
     Object,
     /// A parameter value (the parameter memory).
     Parameter,
-    /// The KNX Data Secure security object (the security individual address
-    /// table, PID 54), issue #297.
+    /// The KNX Data Secure security object: the security individual address
+    /// table (PID 54, issue #297), the group key table (PID 53) and the
+    /// group-object security flags (PID 61, issue #331).
     Security,
 }
 
@@ -111,7 +112,8 @@ pub struct PlanWrites {
     /// How many parameter octets differ and are written.
     pub parameter_octets: usize,
     /// The security object is reprogrammed for a change of its own (the
-    /// tunnelling addresses `admit_tunnel_senders` admits, issue #297); the
+    /// tunnelling addresses `admit_tunnel_senders` admits, issue #297, or a
+    /// group address that leaves or joins Data Secure, issue #331); the
     /// tables are then rewritten too, since the security object is written
     /// inside the table download.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -188,7 +190,7 @@ impl PlanWrites {
         if let Some(full) = &self.full_image {
             parts.push(full.describe());
             if self.security_object {
-                parts.push("security object (PID 54)".to_string());
+                parts.push("security object (PID 53, 54, 61)".to_string());
             }
             return parts.join(", ");
         }
@@ -199,7 +201,7 @@ impl PlanWrites {
             parts.push(format!("association table ({})", entries(n)));
         }
         if self.security_object {
-            parts.push("security object (PID 54)".to_string());
+            parts.push("security object (PID 53, 54, 61)".to_string());
         }
         if self.parameter_octets > 0 {
             parts.push(format!(

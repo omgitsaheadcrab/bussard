@@ -73,6 +73,13 @@ pub struct SetGroupArgs {
     /// A free-text note for the humans reading the model.
     #[serde(default)]
     pub description: Option<String>,
+    /// KNX Data Secure for this group address. `false` removes its group key
+    /// from the key store and clears the `secure` flag of the group and of
+    /// every com-object linked to it on every device; `true` sets them and
+    /// keeps the key the store has, or generates a new random key as ETS
+    /// does. Omit it to leave security as it is.
+    #[serde(default)]
+    pub secure: Option<bool>,
 }
 
 /// Arguments for `knx_add_link` and `knx_remove_link`.
@@ -306,8 +313,14 @@ impl BussardMcp {
         and no device stores a group address's name or type; links that use it are pushed per \
         device with knx_plan_device and knx_apply_device. A group \
         address marked protected (safety-critical, e.g. a wind alarm) cannot be renamed or retyped \
-        here, and there is deliberately no way to set or clear that flag over MCP. Returns the \
-        change as sentences: quote them to the human."
+        here, and there is deliberately no way to set or clear that flag over MCP. `secure` \
+        switches KNX Data Secure for the group address: false removes its group key from the key \
+        store (bussard.keys) and clears the secure flag of the group and of every linked \
+        com-object on every device, true sets them and generates a group key when the store has \
+        none; one change, undone with knx_undo. The Secure devices linked to it then need \
+        knx_plan_device and knx_apply_device (their security object changes), and Home Assistant \
+        and every other keyring user need a new `bussard keys export`. Returns the change as \
+        sentences: quote them to the human."
     )]
     async fn knx_set_group(
         &self,
@@ -333,51 +346,16 @@ impl BussardMcp {
         };
         let description = args.description.clone();
         let name = args.name.clone();
-        let summary = format!("{ga}");
+        let summary = match args.secure {
+            Some(secure) => format!("{ga} secure={secure}"),
+            None => format!("{ga}"),
+        };
+        if let Some(secure) = args.secure {
+            return self.set_group_secure(ga, secure, name, dpt, description, summary);
+        }
 
         self.edit("knx_set_group", vec![summary], move |model| {
-            match model.groups.groups.get_mut(&ga) {
-                Some(group) => {
-                    if group.protected {
-                        let renaming = name.as_deref().is_some_and(|n| n != group.name);
-                        let retyping = dpt.is_some() && dpt != group.dpt;
-                        if renaming || retyping {
-                            return Err(format!(
-                                "{ga} ({:?}) is protected: renaming or retyping it is refused over \
-                                 MCP. A human can edit groups.toml directly.",
-                                group.name
-                            ));
-                        }
-                    }
-                    if let Some(name) = name {
-                        group.name = name;
-                    }
-                    if let Some(dpt) = dpt {
-                        group.dpt = Some(dpt);
-                    }
-                    if let Some(description) = description {
-                        group.description = Some(description);
-                    }
-                }
-                None => {
-                    let Some(name) = name else {
-                        return Err(format!(
-                            "{ga} is not in the model yet; pass `name` to create it"
-                        ));
-                    };
-                    model.groups.groups.insert(
-                        ga,
-                        Group {
-                            name,
-                            dpt,
-                            description,
-                            protected: false,
-                            secure: false,
-                        },
-                    );
-                }
-            }
-            Ok(())
+            edit_group_fields(model, ga, name, dpt, description)
         })
     }
 
@@ -756,6 +734,37 @@ impl BussardMcp {
             Ok(id) => id,
             Err(err) => return refusal(format!("the restore failed: {err}")),
         };
+        // A group address whose Data Secure state the undo flips gets its
+        // key back from the snapshot's key store copy, or loses it (#331).
+        let key_store = match &before {
+            Some(b)
+                if !bussard_service::group_security::security_changes(b, &restored).is_empty() =>
+            {
+                let password =
+                    bussard_model::dotenv::var(bussard_service::secure::KEYRING_PASSWORD_ENV).ok();
+                Some(
+                    match bussard_service::group_security::restore_group_keys(
+                        &dir,
+                        &history.snapshot_dir(&target.id),
+                        Some(&history.snapshot_dir(&undo_snapshot)),
+                        b,
+                        &restored,
+                        password.as_deref(),
+                    ) {
+                        Ok(notes) => json!({"ok": true, "sentences": notes}),
+                        Err(err) => json!({
+                            "ok": false,
+                            "reason": format!(
+                                "the model files are restored, but the key store did not \
+                                 follow: {err}. Fix that and run `bussard groups secure` for \
+                                 the group addresses whose security the undo changed."
+                            ),
+                        }),
+                    },
+                )
+            }
+            _ => None,
+        };
         self.state().model.reload();
         self.session_edits()
             .undone(target.id.as_str(), undo_snapshot.as_str(), &changes);
@@ -773,6 +782,9 @@ impl BussardMcp {
             "next_step": self.next_step(&changes),
         });
         put_changes(&mut result, &changes);
+        if let (Some(key_store), Some(map)) = (key_store, result.as_object_mut()) {
+            map.insert("key_store".to_string(), key_store);
+        }
         ok(result)
     }
 
@@ -1022,6 +1034,25 @@ impl BussardMcp {
     where
         F: FnOnce(&mut Model) -> Result<Option<String>, String>,
     {
+        self.edit_with_hook(tool, args, apply, None)
+    }
+
+    /// [`Self::edit_with_note`] with a step that runs after the history
+    /// snapshot and before the model files are saved (issue #331: the key
+    /// store copy and write of a security change). The hook gets the
+    /// snapshot directory and returns extra result fields; its refusal
+    /// leaves the model files untouched. With a hook the ladder runs even
+    /// when the model files would not change, since the hook may.
+    fn edit_with_hook<F>(
+        &self,
+        tool: &str,
+        args: Vec<String>,
+        apply: F,
+        hook: Option<SnapshotHook<'_>>,
+    ) -> Result<CallToolResult, ErrorData>
+    where
+        F: FnOnce(&mut Model) -> Result<Option<String>, String>,
+    {
         if self.state().no_model_edits {
             return refusal("this server was started with --no-model-edits");
         }
@@ -1049,7 +1080,7 @@ impl BussardMcp {
             .collect();
         let mut changes = describe(&before, &edited);
         settle_changes(&dir, &mut changes, [&edited, &before]);
-        if changes.is_empty() {
+        if changes.is_empty() && hook.is_none() {
             return ok(json!({
                 "ok": true,
                 "changes": [],
@@ -1060,13 +1091,21 @@ impl BussardMcp {
         let reason = SnapshotReason::new(format!("mcp {tool}"))
             .with_args(args)
             .with_result("before an MCP model edit");
-        let snapshot = match History::open(&dir).snapshot(reason) {
+        let history = History::open(&dir);
+        let snapshot = match history.snapshot(reason) {
             Ok(id) => id,
             Err(err) => {
                 return refusal(format!(
                     "refusing to edit: the history snapshot could not be written ({err})"
                 ));
             }
+        };
+        let extra = match hook {
+            Some(hook) => match hook(&history.snapshot_dir(&snapshot)) {
+                Ok(extra) => extra,
+                Err(reason) => return refusal(reason),
+            },
+            None => serde_json::Map::new(),
         };
 
         if let Err(err) = edited.save(&dir) {
@@ -1090,10 +1129,141 @@ impl BussardMcp {
             "next_step": self.next_step(&changes),
         });
         put_changes(&mut result, &changes);
-        if let (Some(note), Some(map)) = (note, result.as_object_mut()) {
-            map.insert("note".to_string(), Value::String(note));
+        if let Some(map) = result.as_object_mut() {
+            if let Some(note) = note {
+                map.insert("note".to_string(), Value::String(note));
+            }
+            map.extend(extra);
         }
         ok(result)
+    }
+
+    /// `knx_set_group` with `secure` (issue #331): the group's and every
+    /// linked com-object's `secure` flag in the model, and the group key in
+    /// the key store, as one change with one snapshot (which keeps a copy of
+    /// the key store, so `knx_undo` restores all three).
+    fn set_group_secure(
+        &self,
+        ga: GroupAddress,
+        secure: bool,
+        name: Option<String>,
+        dpt: Option<Dpt>,
+        description: Option<String>,
+        summary: String,
+    ) -> Result<CallToolResult, ErrorData> {
+        use bussard_service::group_security as gs;
+        if self.state().no_model_edits {
+            return refusal("this server was started with --no-model-edits");
+        }
+        let dir = self.state().dir.clone();
+        let store_path = bussard_project::KeyStore::path(&dir);
+        // The key store is the only key source this edit changes: a server
+        // reading another keyring would keep securing the group address.
+        if let Some(keyring) = &self.state().keyring
+            && !same_file(keyring, &store_path)
+        {
+            return refusal(format!(
+                "this server reads its keys from {}, not from the key store {}: switching Data                  Secure for {ga} changes the key store only. Import that keyring with `bussard                  keys import`, then restart the server without --keyring.",
+                keyring.display(),
+                store_path.display()
+            ));
+        }
+        let password =
+            bussard_model::dotenv::var(bussard_service::secure::KEYRING_PASSWORD_ENV).ok();
+        // Fail before anything is written when the store cannot be changed.
+        if let Err(err) = gs::load_store(&dir, password.as_deref()) {
+            return refusal(format!("{err}; nothing was changed"));
+        }
+        let protected = Model::load(&dir)
+            .ok()
+            .is_some_and(|m| model_groups_protected(&m.groups, ga));
+        if protected {
+            return refusal(format!(
+                "{ga} is protected: switching its Data Secure state is refused over MCP. A human \
+                 can run `bussard groups secure {ga} {}` from the CLI.",
+                if secure { "on" } else { "off" }
+            ));
+        }
+        let edited: std::cell::RefCell<Option<gs::GroupSecurityEdit>> = Default::default();
+        let devices_note = std::cell::RefCell::new(String::new());
+        let apply = |model: &mut Model| -> Result<Option<String>, String> {
+            edit_group_fields(model, ga, name, dpt, description)?;
+            let edit = gs::edit_model(model, ga, secure)?;
+            let devices = edit.secure_devices(model);
+            *devices_note.borrow_mut() = if devices.is_empty() {
+                String::new()
+            } else {
+                let list: Vec<String> = devices.iter().map(ToString::to_string).collect();
+                format!(
+                    " The security object of {} changes: plan and apply {} to remove or add \
+                     the group key table entry (PID 53) and the objects' security flags \
+                     (PID 61).",
+                    list.join(", "),
+                    if devices.len() == 1 { "it" } else { "each" }
+                )
+            };
+            *edited.borrow_mut() = Some(edit);
+            Ok(Some(format!(
+                "{}{}",
+                gs::export_note(ga, secure),
+                devices_note.borrow()
+            )))
+        };
+        let hook_dir = dir.clone();
+        let hook: SnapshotHook<'_> = Box::new(move |snapshot_dir: &Path| {
+            let mut store = gs::load_store(&hook_dir, password.as_deref())
+                .map_err(|e| format!("{e}; nothing was changed"))?;
+            let kept = gs::keep_keystore(&hook_dir, snapshot_dir)
+                .map_err(|e| format!("{e}; nothing was changed"))?;
+            let action = gs::apply_group_key(&mut store, ga, secure)
+                .map_err(|e| format!("{e}; nothing was changed"))?;
+            if action.changed() {
+                let password = password.as_deref().unwrap_or_default();
+                gs::save_store(&hook_dir, &store, password)
+                    .map_err(|e| format!("{e}; nothing was changed"))?;
+            }
+            let mut extra = serde_json::Map::new();
+            extra.insert(
+                "key_store".to_string(),
+                json!({
+                    "group_key": action.label(),
+                    "sentence": action.sentence(ga),
+                    "snapshot_keeps_key_store": kept,
+                    "export_needed": true,
+                }),
+            );
+            Ok(extra)
+        });
+        let mut result = self.edit_with_hook("knx_set_group", vec![summary], apply, Some(hook));
+        if let (Ok(call), Some(edit)) = (&mut result, edited.borrow().as_ref()) {
+            let devices: Vec<Value> = edit
+                .devices
+                .iter()
+                .map(|(ia, objects)| json!({"address": ia.to_string(), "objects": objects}))
+                .collect();
+            if let Some(Value::Object(map)) = call.structured_content.as_mut()
+                && map.get("ok") == Some(&Value::Bool(true))
+            {
+                map.insert(
+                    "security".to_string(),
+                    json!({"ga": ga.to_string(), "secure": secure, "devices": devices}),
+                );
+            }
+        }
+        result
+    }
+}
+
+/// A step of [`BussardMcp::edit_with_hook`] that runs on the snapshot
+/// directory and returns extra result fields.
+type SnapshotHook<'a> =
+    Box<dyn FnOnce(&Path) -> Result<serde_json::Map<String, Value>, String> + 'a>;
+
+/// Whether two paths name the same file (canonical paths, else as given).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
     }
 }
 
@@ -1198,6 +1368,59 @@ impl Role {
             Role::Listen => "listen",
         }
     }
+}
+
+/// The name, type and note half of `knx_set_group`: creates the group address
+/// or updates its fields, refusing to rename or retype a protected one.
+fn edit_group_fields(
+    model: &mut Model,
+    ga: GroupAddress,
+    name: Option<String>,
+    dpt: Option<Dpt>,
+    description: Option<String>,
+) -> Result<(), String> {
+    match model.groups.groups.get_mut(&ga) {
+        Some(group) => {
+            if group.protected {
+                let renaming = name.as_deref().is_some_and(|n| n != group.name);
+                let retyping = dpt.is_some() && dpt != group.dpt;
+                if renaming || retyping {
+                    return Err(format!(
+                        "{ga} ({:?}) is protected: renaming or retyping it is refused over \
+                         MCP. A human can edit groups.toml directly.",
+                        group.name
+                    ));
+                }
+            }
+            if let Some(name) = name {
+                group.name = name;
+            }
+            if let Some(dpt) = dpt {
+                group.dpt = Some(dpt);
+            }
+            if let Some(description) = description {
+                group.description = Some(description);
+            }
+        }
+        None => {
+            let Some(name) = name else {
+                return Err(format!(
+                    "{ga} is not in the model yet; pass `name` to create it"
+                ));
+            };
+            model.groups.groups.insert(
+                ga,
+                Group {
+                    name,
+                    dpt,
+                    description,
+                    protected: false,
+                    secure: false,
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Parses the shared link-tool arguments.

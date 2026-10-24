@@ -401,6 +401,21 @@ impl BussardMcp {
                         }
                     }
                 }
+                // And the group-object flags it wrote (PID 61, issue #331).
+                if let Some(objects) =
+                    bussard_service::security_change::flash_secured_objects(&image.plan)
+                {
+                    match bussard_service::security_change::record_security_flags(
+                        ctx.dir, target, &objects,
+                    ) {
+                        Ok(recorded) => result["security_flags_recorded"] = json!(recorded),
+                        Err(err) => {
+                            tracing::warn!("{err}");
+                            result["security_flags_recorded"] = json!(false);
+                            result["security_flags_note"] = json!(err.to_string());
+                        }
+                    }
+                }
             }
             Ok(done) => {
                 result["ok"] = json!(false);

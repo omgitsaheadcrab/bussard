@@ -158,6 +158,8 @@ fn test_every_change_kind_has_at_least_one_golden() -> TestResult {
         ChangeKind::GroupDptChanged,
         ChangeKind::GroupDescriptionChanged,
         ChangeKind::GroupProtectionChanged,
+        ChangeKind::GroupSecurityChanged,
+        ChangeKind::ObjectSecurityChanged,
         ChangeKind::LinkAdded,
         ChangeKind::LinkRemoved,
         ChangeKind::DeviceAdded,

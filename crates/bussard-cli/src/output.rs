@@ -37,6 +37,8 @@ pub mod schema {
     pub const FLASH_PARAMETERS: u32 = 1;
     /// `bussard groups reserve --json`.
     pub const GROUPS_RESERVE: u32 = 1;
+    /// `bussard groups secure --json`.
+    pub const GROUPS_SECURE: u32 = 1;
     /// `bussard history --json`: `{ "snapshots": [...] }`.
     pub const HISTORY: u32 = 1;
     /// `bussard keys export --json`.

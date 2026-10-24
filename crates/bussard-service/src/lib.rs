@@ -51,6 +51,7 @@ pub mod error;
 pub mod facts;
 pub mod flash;
 pub mod group;
+pub mod group_security;
 /// The one wording per condition every surface reports (issue #228), from
 /// the transport crate so the libraries below this one share it.
 pub use bussard_transport::guidance;
@@ -60,6 +61,7 @@ pub mod params;
 pub mod policy;
 pub mod restore;
 pub mod secure;
+pub mod security_change;
 pub mod write;
 
 pub use bus::{Authorize, BusService, Device, L4Options, Management, SourcePolicy};

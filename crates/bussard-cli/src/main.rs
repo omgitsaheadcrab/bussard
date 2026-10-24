@@ -584,6 +584,24 @@ enum GroupsCommand {
         #[arg(long, value_enum)]
         scheme: Option<SchemeArg>,
     },
+    /// Switch KNX Data Secure on or off for one group address (issue #331).
+    ///
+    /// `off` removes the group key from the key store (`bussard.keys`) and
+    /// clears the `secure` flag of the group and of every com-object linked
+    /// to it on every device; `on` sets them and keeps the store's key, or
+    /// generates a new random one as ETS does. One change, snapshotted with
+    /// the key store, so `bussard undo` restores all three. Needs
+    /// `BUSSARD_KEYRING_PASSWORD`. The Secure devices linked to the group
+    /// address then need `bussard plan` and `bussard apply`, and every
+    /// keyring user (Home Assistant) a new `bussard keys export`.
+    Secure {
+        /// The group address, e.g. `1/0/4`.
+        #[arg(value_name = "GA")]
+        ga: String,
+        /// `on` or `off`.
+        #[arg(value_name = "on|off")]
+        state: String,
+    },
 }
 
 /// The `bussard keys` subcommands (issue #241).
@@ -1886,6 +1904,7 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
                 functions,
                 scheme,
             } => groups_cmd::run_reserve(dir, &room, &functions, scheme.map(Into::into), json),
+            GroupsCommand::Secure { ga, state } => groups_cmd::run_secure(dir, &ga, &state, json),
         },
         Command::ExportGroups { format, out } => export_groups_cmd::run(dir, format, &out),
         Command::Doc { out, format } => doc_cmd::run(dir, &out, format.into(), json),

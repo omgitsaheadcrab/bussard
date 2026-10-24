@@ -1,0 +1,3 @@
+groups = [
+  { address = "1/0/4", name = "Kitchen light", dpt = "1.001", secure = true },
+]

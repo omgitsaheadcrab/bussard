@@ -1163,6 +1163,66 @@ with count 0, as a real device is expected to. Whether a real device serves
 multi-element reads of PID 61 and PID 54 has not been observed yet; the halving
 falls back to single elements if it does not.
 
+### 11.2 Switching one group address's security off or on `[issue #331; the write shape follows §11.1, the removal is INFERRED, oracle pending]`
+
+KNX lets one group address run plain on a device that stays Data Secure: the
+device keeps its tool key and the other keyed group addresses, and the
+group address in question loses its group key and the security flag of the
+objects linked to it. ETS does this when the group address's security is set
+to Off and the device is downloaded again.
+
+**What bussard changes in the model.** `bussard groups secure <GA> off` and
+`knx_set_group` with `secure: false` remove the group key from the key store
+and clear `secure` on the group and on every com-object linked to it on
+every device, in one snapshot that keeps a copy of the encrypted key store
+(so `undo` gives the very key back). `on` sets the flags and keeps the key
+the store has, or generates a random 128-bit key, which is what ETS 6 does
+when a group address's security is switched on (the key is never derived
+from anything). A group object's flag covers all its group addresses, so
+`off` is refused while a linked object also links another secured group
+address, and `on` is refused while a linked device is not Data Secure
+capable.
+
+**What the device receives.** `plan` and `apply` on a Secure System B device
+read PID 61 over the secured session and compare it with the flags the model
+and the key store ask for. A difference is one plan line naming the group
+address and the objects, for example on 1.1.5:
+
+```
+- security object: Data Secure off for 1/0/4 (Licht Küche): its group key leaves the group key table (PID 53) and object 12 loses its security flag (PID 61 0x03 to 0x00)
+```
+
+PID 53 is write-only, so its side is derived: a group address the key store
+no longer keys, linked to an object whose flag is cleared, is the key that
+leaves the table. The apply rewrites the tables and then the whole security
+object in the §11.1 order, which is what a full ETS download of that device
+writes:
+
+| step | octets | what changes against the download before |
+|---|---|---|
+| PID 5 | `04` + 9 × `00`, then `01` + 9 × `00` | nothing |
+| PID 54 | count 1, start 0, `00 00`; then the senders from element 1 | a sender that only sent on the now plain group address drops out (§11.1 derives the senders from the secured group addresses the device listens to) |
+| PID 53 | from element 1, 18-octet elements `[address-table index:16][group key:16]`, ascending index, packed to the APDU budget | the element of the group address is not written; the others keep their index, because the group address stays linked and so stays in the address table. 1.1.5 with 16 keys and one removed: 15 elements, 11 from element 1 (198 octets) and 4 from element 12 |
+| PID 61 | from element 1, one octet per group object of the GO table, 211-element chunks | the objects linked to the group address go from `0x03` to `0x00` |
+| PID 5 | `02` + 9 × `00` | nothing |
+
+INFERRED until the oracle capture: that the device empties PID 53 on the
+security object's `Unload`, so the table written from element 1 replaces the
+old one and the last old element does not survive (ETS writes no count at
+element 0 of PID 53, §11.1); and what ETS writes for PID 53 when no keyed
+group address is left (bussard then writes nothing, as for a device without
+keys). Neither changes for the 1.1.5 case, which keeps 15 keys. The oracle
+is an ETS download of 1.1.5 with 1/0/4 set to security Off, compared with
+`scripts/campaign/95-offline-oracle.sh --keyring` (the property-write parity
+covers PID 53, PID 54 and PID 61) against a model where `bussard groups
+secure 1/0/4 off` ran; see [SAFETY.md](SAFETY.md#switching-data-secure-off-for-one-group-address).
+
+After a verified write, bussard records the flags it wrote in the lock's
+com-objects (`secure`), as it records PID 54 in `secure_senders`. A keyring
+user outside bussard (Home Assistant) still holds the old key and keeps
+sending secured, which the device drops once the group address is plain:
+it needs a new `bussard keys export`.
+
 ---
 
 ## 12. Test plan

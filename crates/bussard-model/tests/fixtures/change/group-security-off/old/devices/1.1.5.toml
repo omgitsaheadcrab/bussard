@@ -1,0 +1,5 @@
+address = "1.1.5"
+name = "Kitchen actuator"
+
+[links]
+12.listen = ["1/0/4"]

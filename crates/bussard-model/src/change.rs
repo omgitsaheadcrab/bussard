@@ -51,6 +51,12 @@ pub enum ChangeKind {
     GroupDescriptionChanged,
     /// A group address's `protected:` flag was set or cleared.
     GroupProtectionChanged,
+    /// A group address's `secure` flag (KNX Data Secure) was set or cleared
+    /// (issue #331).
+    GroupSecurityChanged,
+    /// The `secure` flag of one or more com-objects of a device was set or
+    /// cleared (issue #331): the device's security object changes.
+    ObjectSecurityChanged,
     /// A com-object gained a sending or listening group address.
     LinkAdded,
     /// A com-object lost a sending or listening group address.
@@ -745,6 +751,24 @@ fn group_field_changes(
                 .protected_if(protected),
         );
     }
+    if a.secure != b.secure {
+        let label = label_for_group(ga, b);
+        let sentence = if b.secure {
+            format!("{label} now runs secured (KNX Data Secure on).")
+        } else {
+            format!("{label} now runs plain (KNX Data Secure off).")
+        };
+        out.push(
+            Change::new(ChangeKind::GroupSecurityChanged, sentence)
+                .with_group(ga)
+                .with_field(
+                    "secure",
+                    Some(a.secure.to_string()),
+                    Some(b.secure.to_string()),
+                )
+                .protected_if(protected),
+        );
+    }
     if a.protected != b.protected {
         let label = label_for_group(ga, b);
         let sentence = if b.protected {
@@ -866,6 +890,59 @@ fn device_field_changes(
     }
     describe_channels(ia, a, b, out);
     describe_parameters(ia, a, b, out);
+    describe_object_security(ia, a, b, out);
+}
+
+/// Renders the com-objects whose `secure` flag changed (issue #331), one
+/// sentence per direction: `Kitchen actuator (1.1.5): object 12 now runs
+/// plain (KNX Data Secure off).`
+fn describe_object_security(ia: IndividualAddress, a: &Device, b: &Device, out: &mut Vec<Change>) {
+    let mut on: Vec<u16> = Vec::new();
+    let mut off: Vec<u16> = Vec::new();
+    for (number, after) in &b.com_objects {
+        let Some(before) = a.com_objects.get(number) else {
+            continue;
+        };
+        match (before.secure, after.secure) {
+            (false, true) => on.push(*number),
+            (true, false) => off.push(*number),
+            _ => {}
+        }
+    }
+    let device = if b.name.trim().is_empty() {
+        ia.to_string()
+    } else {
+        format!("{} ({ia})", b.name.trim())
+    };
+    for (objects, secure) in [(off, false), (on, true)] {
+        if objects.is_empty() {
+            continue;
+        }
+        let list: Vec<String> = objects.iter().map(u16::to_string).collect();
+        let noun = if objects.len() == 1 {
+            "object"
+        } else {
+            "objects"
+        };
+        let verb = if objects.len() == 1 { "runs" } else { "run" };
+        let how = if secure {
+            "secured (KNX Data Secure on)"
+        } else {
+            "plain (KNX Data Secure off)"
+        };
+        out.push(
+            Change::new(
+                ChangeKind::ObjectSecurityChanged,
+                format!("{device}: {noun} {} now {verb} {how}.", list.join(", ")),
+            )
+            .with_device(ia)
+            .with_field(
+                format!("objects.{}.secure", list.join(",")),
+                Some((!secure).to_string()),
+                Some(secure.to_string()),
+            ),
+        );
+    }
 }
 
 /// Renders channel renames (a channel added or removed comes with the

@@ -162,7 +162,7 @@ pub fn run(
     let product_ref = product.as_ref();
 
     let facts = crate::device_facts::cache(dir, model.is_some(), overrides.refresh_facts);
-    let (read_result, params, identity, _) = crate::plan_cmd::read_device(
+    let (read_result, params, identity, _, _) = crate::plan_cmd::read_device(
         config,
         target,
         &overrides,

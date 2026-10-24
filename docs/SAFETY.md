@@ -590,6 +590,45 @@ of a receiver without the assignment in ETS rewrites PID 54 without the
 tunnel addresses, and the next `plan` with the option on lists the change
 again.
 
+### Switching Data Secure off for one group address
+
+**Status: oracle pending (issue #331).** Do not run this on a real device
+until an ETS capture has confirmed the write. The owner captures an ETS
+download of 1.1.5 with 1/0/4 set to security Off, and
+`scripts/campaign/95-offline-oracle.sh --keyring` must report the PID 53,
+PID 54 and PID 61 writes of that row identical against a model where
+`bussard groups secure 1/0/4 off` ran (a copy of the model, never the live
+`knx/` of another session). Until then it is tested against the Secure mock
+device only.
+
+`bussard groups secure <GA> off` (or `knx_set_group` with `secure: false`)
+lets a Secure device run one group address plain, for example so a
+non-Secure sender can switch it:
+
+1. The key store loses the group key, `groups.toml` and the lock lose the
+   `secure` flags of the group and of every linked com-object. One snapshot
+   covers all three, with a copy of the encrypted key store, so `bussard
+   undo` (or `knx_undo`) restores them, the very key included. It needs
+   `BUSSARD_KEYRING_PASSWORD`, and it is refused while a linked object also
+   links another secured group address.
+2. `bussard plan <ia>` on each linked Secure device reads its group-object
+   security flags (PID 61) and lists one change: `- security object: Data
+   Secure off for 1/0/4 (…): its group key leaves the group key table (PID
+   53) and object 12 loses its security flag (PID 61 0x03 to 0x00)`. The
+   apply rewrites the tables and the whole security object as a full ETS
+   download does ([knx-secure-spec.md §11.2](knx-secure-spec.md)); a re-plan
+   then has nothing to do.
+3. Home Assistant, ETS and every other keyring user still hold the old key
+   and keep sending the group address secured, which the device drops once
+   it runs plain. Run `bussard keys export <file.knxkeys>` and load the new
+   export there.
+
+`on` is the reverse: it keeps the store's key or generates a random one as
+ETS does, and is refused while a linked device is not Data Secure capable.
+An ETS re-import of a project that still marks the group address secure
+brings the flags back, and re-importing an old ETS keyring brings the key
+back: change the group address in ETS too.
+
 ## The key store
 
 `knx/bussard.keys` is bussard's own copy of the KNX Secure key material

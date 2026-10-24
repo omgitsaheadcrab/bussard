@@ -439,6 +439,8 @@ The plan speaks the device file's words, grouped by channel:
 
 **Admitting the tunnel addresses (issue #297).** With `admit_tunnel_senders = true` under `[connection]` in `bussard.toml`, `plan` and `apply` on a KNX Data Secure System B device also read its security individual address table (PID 54). Every tunnelling address of the keyring or key store it does not list becomes one change, `+ the security individual address table (PID 54) admits the tunnelling addresses 1.1.22, 1.1.23 as secure senders (sequence 0, admit_tunnel_senders)`, with `subject` `security` and `writes.security_object` `true` in `--json`; the state hash covers the table read. Applying it rewrites the tables and the security object, whose summary line names the admitted tunnel addresses. Every verified secured write of the security object records the PID 54 table it wrote as the device's `secure_senders` in `bussard.lock` (`knx_apply_device` reports `secure_senders_recorded`), so the next secured write to the device's GAs is checked against it. With the option on, every secured `apply`, `apply --line` and `flash` keeps those addresses in PID 54. Off (the default), nothing is read and the security object is written exactly as before. This is what ETS does when group addresses are assigned to the interface's tunnelling addresses; see [SAFETY.md](SAFETY.md#secured-group-writes-from-bussard).
 
+**A group address that leaves or joins Data Secure (issue #331).** On a KNX Data Secure System B device read with a tool key, `plan` and `apply` also read the group-object security flags (PID 61) and compare them with the flags the model and the key store ask for. A difference is one change with `subject` `security`, naming the group address and the objects: `- security object: Data Secure off for 1/0/4 (Licht Küche): its group key leaves the group key table (PID 53) and object 12 loses its security flag (PID 61 0x03 to 0x00)` (or `+ … Data Secure on for …`), with `writes.security_object` `true`; the state hash covers the flags read. Applying it rewrites the tables and the whole security object, as a full ETS download does, and the verified write records the flags in the lock's com-objects (`knx_apply_device` reports `security_flags_recorded`). A device that refuses or does not answer the PID 61 read shows no such change; the write still programs the whole object. `bussard flash` prints the same line from its pre-flight read. See [`groups secure`](#bussard-groups-secure-ga-onoff) and [SAFETY.md](SAFETY.md#switching-data-secure-off-for-one-group-address) (oracle pending).
+
 | Flag / arg | Default | Meaning |
 |---|---|---|
 | `<ADDRESS>` | | The device to plan for, e.g. `1.1.4`. Omit with `--line`. |
@@ -691,6 +693,24 @@ Addressing under the two schemes:
 |---|---|---|---|
 | `floor-trade-block` | floor | trade | block start + role offset |
 | `function-floor` | trade | floor | block start + role offset |
+
+### `bussard groups secure <GA> on|off`
+
+Switch KNX Data Secure on or off for one group address (issue #331). bussard treats a group address as secured when the key store holds its group key, `groups.toml` marks it `secure`, or a linked com-object is `secure` in the lock, so the command changes all three:
+
+- `off` removes the group key from the key store (and the group address from every interface entry that lists it) and clears `secure` on the group and on every com-object linked to it on every device. Refused while a linked object also links another secured group address: a group object's security flag covers all its group addresses.
+- `on` sets the flags and keeps the key the store has, or generates a new random 128-bit key, as ETS 6 does when a group address's security is switched on. Refused while a linked device is not Data Secure capable in the model.
+
+```
+$ bussard groups secure 1/0/4 off
+Licht Küche (1/0/4) now runs plain (KNX Data Secure off).
+Aktor Küche (1.1.5): object 12 now runs plain (KNX Data Secure off).
+The key store no longer holds a group key for 1/0/4.
+The security object of 1.1.5 changes: run `bussard plan <ia>` and `bussard apply <ia>` for each to remove the group key table entry (PID 53) and the objects' security flags (PID 61).
+Home Assistant and every other keyring user (ETS, a visualisation) still hold the group key of 1/0/4 ...
+```
+
+It needs `BUSSARD_KEYRING_PASSWORD` and the key store `bussard.keys`; a `BUSSARD_KEYRING` or `connection.keyring` that bus commands read instead gets a warning, since it keeps the old state. The history snapshot taken first keeps a copy of the encrypted key store, so one `bussard undo` restores the flags and the very key. Afterwards `bussard plan` on each linked Secure device lists the security-object change (see [`plan`](#bussard-plan-ia)), and `bussard keys export` writes a keyring without the key for Home Assistant. The write is **oracle pending**: see [SAFETY.md](SAFETY.md#switching-data-secure-off-for-one-group-address). `--json` prints `ga`, `secure`, `changes`, `group_key`, `devices`, `plan_devices`, `snapshot`, `snapshot_keeps_key_store` and `note`.
 
 Floors and trades count from 1 (index 0 stays free for central functions, which also keeps the reserved `0/0/0` out of reach). Trades are `light` 1, `blind` 2, `heating` 3, `socket` 4. The middle level is three bits, so `function-floor` supports at most seven floors. Role offsets inside a block are fixed: a light block is switch (0), dim (1), value (2), switch status (3), value status (4); a blind block is move, step, position, slat, position status, slat status, moving status (0-6); a heating block is setpoint, operating mode, actual temperature, control value, setpoint status, operating mode status (0-5).
 
@@ -1388,7 +1408,7 @@ Bus operations share one rate limiter (minimum 250 ms between operations, at mos
 | `knx_run_tests` | `only` (list of test names, optional) | Runs `tests.toml` and returns the same report as `bussard test --json`, plus `refused_protected`. Registered only with `--allow-writes`. A test that writes a protected GA is refused whatever the file says; `manual` tests are skipped. |
 | `knx_describe_change` | `from`, `to` (snapshot ids, optional) | The change as plain sentences. With no arguments: the pending changes, i.e. the working model against the last snapshot. Files only. |
 | `knx_history` | `limit` (default 50, max 500) | The history snapshots with id, time, command, gateway and a one-line summary each. |
-| `knx_set_group` | `ga`, `name`, `dpt`, `description` (all but `ga` optional) | Creates or updates a group address. Creating one needs `name`. Refuses to rename or retype a `protected = true` GA; there is no parameter that sets or clears `protected`. |
+| `knx_set_group` | `ga`, `name`, `dpt`, `description`, `secure` (all but `ga` optional) | Creates or updates a group address. Creating one needs `name`. Refuses to rename or retype a `protected = true` GA; there is no parameter that sets or clears `protected`. `secure` switches KNX Data Secure as [`bussard groups secure`](#bussard-groups-secure-ga-onoff) does: the key store, the group's flag and every linked com-object's flag in one change, refused for a protected GA and when the server reads a keyring other than the key store. The result adds `key_store` (`group_key`: `removed`, `not_present`, `generated` or `kept`), `security` (the linked devices and objects) and a `note` naming the Secure devices to plan and apply and the `bussard keys export` Home Assistant needs. `knx_undo` restores the key store with the model (`key_store` in its result). |
 | `knx_remove_group` | `ga` | Removes a group address from `groups.toml`. Refused while any com object sends or listens to it: the reason lists each link (`1.1.5 object 3 listens`) and names `knx_remove_link` as the step before. Refuses a protected GA. Records a `group_removed` change ("Group address 1/0/22 (Kitchen door light) removed.") behind a snapshot, so `knx_undo` puts it back. Files only. |
 | `knx_add_link` | `address`, `com_object`, `ga`, `role` (`send`\|`listen`) | Binds a com object to a GA. `address` is the device's individual address; no other name is accepted (a client bridge strips a key named `device`). A com object has at most one sending GA, so an existing one is replaced. Refuses protected GAs. |
 | `knx_remove_link` | `address`, `com_object`, `ga`, `role` | Unbinds a com object from a GA. `address` is the device's individual address, as for `knx_add_link`. Refuses protected GAs. |

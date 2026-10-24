@@ -435,6 +435,11 @@ the join between the user's words and the vendor's ids:
   these rows back next to the senders the model's links imply (a sender the
   links imply takes the derived sequence), so a device keeps accepting senders
   the model does not describe. An import never writes it. Not key material.
+- An object's `secure` is set by the import (the project's group keys) and
+  by `bussard adopt` (the device's PID 61), changed with its group address by
+  `bussard groups secure` / `knx_set_group` with `secure` (issue #331), and
+  rewritten for the linked objects after a verified secured `apply` or
+  `flash` to the flags the security object received.
 
 ### Text language
 

@@ -627,6 +627,15 @@ impl BussardMcp {
         }
         let mut built = built_plan(&model, target, &gateway, &dir, &read, &report, &product);
         admit_in_plan(&mut built, target, &tunnel, &read, &report);
+        security_change_in_plan(
+            &mut built,
+            &model,
+            target,
+            &desired,
+            security.as_ref(),
+            &read,
+            &report,
+        );
         // A parameter change that shows or hides a com-object is written by a
         // full download (issue #303): the plan says `method: flash`.
         let flash = match built.needs_flash {
@@ -1037,6 +1046,15 @@ impl BussardMcp {
         let report = plan(tables, &desired);
         let mut built = built_plan(&model, target, &gateway, &dir, &read, &report, &product);
         admit_in_plan(&mut built, target, &tunnel, &read, &report);
+        security_change_in_plan(
+            &mut built,
+            &model,
+            target,
+            &desired,
+            security.as_ref(),
+            &read,
+            &report,
+        );
         // The flash a com-object change needs (issue #303), rebuilt from the
         // fresh read: its image is part of the digest.
         let flash = match built.needs_flash {
@@ -1363,6 +1381,19 @@ impl BussardMcp {
                         tracing::warn!("{err}");
                         result["secure_senders_recorded"] = json!(false);
                         result["secure_senders_note"] = json!(err.to_string());
+                    }
+                }
+                // And the group-object flags it wrote (PID 61, issue #331).
+                match bussard_service::security_change::record_security_flags(
+                    &dir,
+                    target,
+                    &inputs.secure_objects,
+                ) {
+                    Ok(recorded) => result["security_flags_recorded"] = json!(recorded),
+                    Err(err) => {
+                        tracing::warn!("{err}");
+                        result["security_flags_recorded"] = json!(false);
+                        result["security_flags_note"] = json!(err.to_string());
                     }
                 }
             }
@@ -1808,6 +1839,10 @@ struct DeviceRead {
     /// `admit_tunnel_senders` has tunnelling addresses to admit (issue #297);
     /// `None` otherwise or when the device refused the read.
     senders: Option<Vec<SecureSenderEntry>>,
+    /// The group-object security flags (PID 61), read on a secured session
+    /// of a System B device (issue #331); `None` on a plain session, on
+    /// System 7, or when the device refused the read.
+    go_flags: Option<Vec<u8>>,
 }
 
 /// Checks the source address, then reads the device on one layer-4 session:
@@ -1853,9 +1888,18 @@ async fn read_device(
     {
         tracing::debug!("{target} authorize (free access) did not grant: {err}");
     }
-    let read = read_on(&mut l4, target, dir, model, product, tunnel).await;
+    let read = read_on(
+        &mut l4,
+        target,
+        dir,
+        model,
+        product,
+        tunnel,
+        tool_key.is_some(),
+    )
+    .await;
     let _ = l4.disconnect().await;
-    let (read, check, params, senders) = read?;
+    let (read, check, params, senders, go_flags) = read?;
     match read {
         LiveRead::Tables(live) => Ok((
             source,
@@ -1864,6 +1908,7 @@ async fn read_device(
                 check,
                 params,
                 senders,
+                go_flags,
             },
         )),
         LiveRead::UnsupportedMask { address, mask } => Err(format!(
@@ -1875,7 +1920,9 @@ async fn read_device(
     }
 }
 
-/// The reads of [`read_device`] on its open session.
+/// The reads of [`read_device`] on its open session; `secured` says the
+/// session rides `A_SecureData`, so the security object can be read.
+#[allow(clippy::type_complexity)] // the five reads of one session, named at the caller
 async fn read_on<Ch: bussard_mgmt::L4Channel>(
     l4: &mut Layer4Connection<Ch>,
     target: IndividualAddress,
@@ -1883,12 +1930,14 @@ async fn read_on<Ch: bussard_mgmt::L4Channel>(
     model: &Model,
     product: Option<&ProductSource>,
     tunnel: &[IndividualAddress],
+    secured: bool,
 ) -> Result<
     (
         LiveRead,
         Option<IdentityCheck>,
         Option<ParamState>,
         Option<Vec<SecureSenderEntry>>,
+        Option<Vec<u8>>,
     ),
     String,
 > {
@@ -1922,7 +1971,45 @@ async fn read_on<Ch: bussard_mgmt::L4Channel>(
         }
         _ => None,
     };
-    Ok((read, identified.check, params, senders))
+    // PID 61 on a Secure System B device (issue #331): a group object that
+    // leaves or joins Data Secure is a plan change of its own.
+    let go_flags = match &read {
+        LiveRead::Tables(live) if secured && live.sys7().is_none() => {
+            // The session's last read: a device that refuses or does not
+            // answer leaves the flags unknown, and the plan shows no
+            // security-object change.
+            match bussard_download::read_security_flags(l4).await {
+                Ok(flags) => flags,
+                Err(err) => {
+                    tracing::debug!("{target}: PID 61 not read: {}", chain(&err));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    Ok((read, identified.check, params, senders, go_flags))
+}
+
+/// Adds the security-object change (issue #331) to `built`: the group
+/// objects whose security flag on the device (PID 61 as read) differs from
+/// the model and the key store, and the group keys that leave or join the
+/// group key table with them. Nothing without a secured read of PID 61.
+fn security_change_in_plan(
+    built: &mut BuiltPlan,
+    model: &Model,
+    target: IndividualAddress,
+    desired: &DesiredTables,
+    security: Option<&SecurityInputs>,
+    read: &DeviceRead,
+    report: &PlanReport,
+) {
+    if let (Some(inputs), Some(flags)) = (security, read.go_flags.as_deref()) {
+        bussard_service::security_change::SecurityObjectChange::compare(
+            target, desired, inputs, flags,
+        )
+        .add_to(&mut built.plan, report, Some(model));
+    }
 }
 
 /// Adds the `admit_tunnel_senders` change (issue #297) to `built`: the
@@ -2108,6 +2195,11 @@ fn live_digest(read: &DeviceRead) -> [u8; 32] {
         put(&mut h, b"pid54");
         put(&mut h, &bussard_download::sender_table_bytes(senders));
     }
+    // PID 61 when it was read (issue #331), likewise.
+    if let Some(flags) = &read.go_flags {
+        put(&mut h, b"pid61");
+        put(&mut h, flags);
+    }
     h.finalize().into()
 }
 
@@ -2237,6 +2329,7 @@ mod tests {
             check: None,
             params: None,
             senders: None,
+            go_flags: None,
         }
     }
 

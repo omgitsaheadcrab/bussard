@@ -391,7 +391,8 @@ impl Push {
                 ChangeKind::LinkAdded
                 | ChangeKind::LinkRemoved
                 | ChangeKind::DeviceAdded
-                | ChangeKind::DeviceProductChanged => {
+                | ChangeKind::DeviceProductChanged
+                | ChangeKind::ObjectSecurityChanged => {
                     push.links.insert(device);
                 }
                 ChangeKind::ParameterChanged => {

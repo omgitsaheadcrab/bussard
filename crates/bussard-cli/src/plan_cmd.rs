@@ -98,6 +98,53 @@ pub(crate) async fn read_admission_table<Ch: L4Channel>(
     }
 }
 
+/// Reads the device's group-object security flags (PID 61) on a secured
+/// session (`secured`) of a System B device (issue #331), as the session's
+/// last read. `None` when it is not read, or the device refuses or does not
+/// answer the read: the flags are then unknown and the plan shows no
+/// security-object change (the write still programs the whole object).
+pub(crate) async fn read_security_flags<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    read: &LiveRead,
+    secured: bool,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    match read {
+        LiveRead::Tables(live) if secured && live.sys7().is_none() => {
+            match bussard_download::read_security_flags(l4).await {
+                Ok(flags) => Ok(flags),
+                Err(err) => {
+                    tracing::debug!("{}: PID 61 not read: {err}", l4.target());
+                    Ok(None)
+                }
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The security-object change of `target` (issue #331): its PID 61 as read
+/// (`live`) against the flags the model and the key store's group keys ask
+/// for. `None` without a secured read of PID 61.
+pub(crate) fn security_change(
+    model: Option<&Model>,
+    target: IndividualAddress,
+    desired: &DesiredTables,
+    group_keys: Option<
+        &std::collections::HashMap<bussard_model::GroupAddress, bussard_secure::Key16>,
+    >,
+    live: Option<&[u8]>,
+) -> Option<bussard_service::security_change::SecurityObjectChange> {
+    let live = live?;
+    let empty = std::collections::HashMap::new();
+    let keys = group_keys.unwrap_or(&empty);
+    let inputs = bussard_download::security_inputs_for(model, target, desired, keys);
+    Some(
+        bussard_service::security_change::SecurityObjectChange::compare(
+            target, desired, &inputs, live,
+        ),
+    )
+}
+
 /// The `admit_tunnel_senders` comparison of `target` (issue #297), or `None`
 /// when there is nothing to admit (the option is off, no tool key, no
 /// tunnelling address) or the device is System 7, whose security object a
@@ -153,6 +200,7 @@ pub(crate) type DeviceRead = (
     Option<crate::param_readback::ParamState>,
     Option<bussard_model::identity::ReportedIdentity>,
     Option<Vec<bussard_download::SecureSenderEntry>>,
+    Option<Vec<u8>>,
 );
 
 /// Opens a read-only bus service, reads `target`'s live tables in one management
@@ -221,7 +269,9 @@ pub(crate) fn read_device(
                     };
                     // PID 54, for `admit_tunnel_senders` only (issue #297).
                     let senders = read_admission_table(l4, &read, tunnel).await?;
-                    anyhow::Ok((read, params, identity, senders))
+                    // PID 61 on a secured session (issue #331).
+                    let flags = read_security_flags(l4, &read, presented_tool_key).await?;
+                    anyhow::Ok((read, params, identity, senders, flags))
                 })
                 .await;
             // Close the bus cleanly (release the gateway tunnel slot), issue #31.
@@ -298,14 +348,14 @@ pub fn run(
 
     // `admit_tunnel_senders` (issue #297): the tunnelling addresses to admit,
     // when the device is written secured.
-    let secured = crate::secure_key::resolve(
+    let material = crate::secure_key::resolve_material(
         target,
         tool_key_source,
         crate::secure_key::model_activated(Some(model_ref), target),
-    )?
-    .is_some();
+    )?;
+    let secured = material.tool_key.is_some();
     let tunnel = crate::secure_key::admitted_tunnel(Some(model_ref), tool_key_source, secured)?;
-    let (read, params, identity, live_senders) = read_device(
+    let (read, params, identity, live_senders, live_flags) = read_device(
         config,
         target,
         &overrides,
@@ -337,6 +387,16 @@ pub fn run(
     );
     if let Some(admission) = &admission {
         admission.add_to(&mut built.plan, &report);
+    }
+    // A group address that left or joined Data Secure (issue #331).
+    if let Some(change) = security_change(
+        Some(model_ref),
+        target,
+        &desired,
+        material.group_keys.as_ref(),
+        live_flags.as_deref(),
+    ) {
+        change.add_to(&mut built.plan, &report, Some(model_ref));
     }
     let identity = identity.map(|reported| {
         bussard_model::identity::IdentityCheck::compare(

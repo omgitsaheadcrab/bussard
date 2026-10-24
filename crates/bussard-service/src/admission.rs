@@ -676,7 +676,7 @@ pub fn record_secure_senders(
 
 /// A short, stable digest of `text` (FNV-1a, 64 bits, hex), for the state
 /// hash suffix.
-fn short_digest(text: &str) -> String {
+pub(crate) fn short_digest(text: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.bytes() {
         hash ^= u64::from(byte);

@@ -123,6 +123,126 @@ pub fn run_reserve(
     })
 }
 
+/// Runs `bussard groups secure <GA> on|off` (issue #331): the group's and
+/// every linked com-object's `secure` flag, and the group key in the key
+/// store, as one change. The history snapshot taken first keeps a copy of
+/// the key store, so `bussard undo` restores all three.
+pub fn run_secure(dir: &Path, ga: &str, state: &str, json: bool) -> anyhow::Result<ExitCode> {
+    use bussard_service::group_security as gs;
+    let ga: bussard_model::GroupAddress = ga
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{ga:?} is not a group address like \"1/0/4\""))?;
+    let secure = match state.to_ascii_lowercase().as_str() {
+        "on" | "true" => true,
+        "off" | "false" => false,
+        other => bail!("{other:?} is neither `on` nor `off`"),
+    };
+    let password = bussard_model::dotenv::var(bussard_service::secure::KEYRING_PASSWORD_ENV).ok();
+    // Nothing is written unless the store loads.
+    let mut store = gs::load_store(dir, password.as_deref())?;
+    let before =
+        Model::load(dir).with_context(|| format!("loading the model in {}", dir.display()))?;
+    let mut edited = before.clone();
+    let edit = gs::edit_model(&mut edited, ga, secure).map_err(|reason| anyhow::anyhow!(reason))?;
+    let action = gs::apply_group_key(&mut store, ga, secure)?;
+    let changes = bussard_model::change::describe(&before, &edited);
+    if changes.is_empty() && !action.changed() {
+        if json {
+            crate::output::print(
+                crate::output::schema::GROUPS_SECURE,
+                &serde_json::json!({
+                    "ga": ga.to_string(),
+                    "secure": secure,
+                    "changes": [],
+                    "group_key": action.label(),
+                }),
+            )?;
+        } else {
+            println!(
+                "{ga} already runs {}; nothing changed.",
+                if secure { "secured" } else { "plain" }
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    crate::history_cmd::capture_external_edit(dir);
+    let snapshot = crate::history_cmd::snapshot(
+        dir,
+        bussard_model::history::SnapshotReason::new("groups secure")
+            .with_args([ga.to_string(), state.to_string()])
+            .with_result("before switching Data Secure for a group address"),
+    );
+    let kept = match &snapshot {
+        Some(id) => gs::keep_keystore(
+            dir,
+            &bussard_model::history::History::open(dir).snapshot_dir(id),
+        )?,
+        None => false,
+    };
+    if action.changed() {
+        gs::save_store(dir, &store, password.as_deref().unwrap_or_default())?;
+    }
+    edited
+        .save(dir)
+        .with_context(|| format!("saving the model in {}", dir.display()))?;
+    let devices = edit.secure_devices(&edited);
+    let note = gs::export_note(ga, secure);
+    if json {
+        let linked: Vec<serde_json::Value> = edit
+            .devices
+            .iter()
+            .map(|(ia, objects)| serde_json::json!({"address": ia.to_string(), "objects": objects}))
+            .collect();
+        crate::output::print(
+            crate::output::schema::GROUPS_SECURE,
+            &serde_json::json!({
+                "ga": ga.to_string(),
+                "secure": secure,
+                "changes": changes.changes,
+                "group_key": action.label(),
+                "devices": linked,
+                "plan_devices": devices.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "snapshot": snapshot.as_ref().map(ToString::to_string),
+                "snapshot_keeps_key_store": kept,
+                "note": note,
+            }),
+        )?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    print!("{}", bussard_model::change::render_text(&changes));
+    println!("{}", action.sentence(ga));
+    if !devices.is_empty() {
+        let list: Vec<String> = devices.iter().map(ToString::to_string).collect();
+        println!(
+            "The security object of {} changes: run `bussard plan <ia>` and `bussard apply \
+             <ia>` for each to {} the group key table entry (PID 53) and the objects' security \
+             flags (PID 61).",
+            list.join(", "),
+            if secure { "add" } else { "remove" }
+        );
+    }
+    println!("{note}");
+    // The edit changes the key store only: a keyring that bus commands read
+    // instead keeps the old state (issue #331).
+    let env =
+        bussard_model::dotenv::var_os(crate::conn_cmd::KEYRING_ENV).map(std::path::PathBuf::from);
+    if let Some(other) = crate::conn_cmd::resolve_keyring(None, env.as_deref(), dir)
+        .filter(|r| r.source != crate::conn_cmd::KeyringSource::Store)
+    {
+        eprintln!(
+            "warning: bus commands read their keys from {} ({}), not from the key store; it \
+             still has the old state of {ga}. Import it with `bussard keys import` and drop it.",
+            other.path.display(),
+            other.source.describe()
+        );
+    }
+    if let Some(id) = snapshot {
+        println!("`bussard undo` goes back to snapshot {id} (the key store included).");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The model's error and warning counts, `(0, 0)` when it does not load.
 fn validation_counts(dir: &Path) -> (usize, usize) {
     match Model::load(dir) {
