@@ -466,6 +466,46 @@ async fn test_flash_guidance_names_the_mcp_flash_at_the_programming_tier() -> Te
     Ok(())
 }
 
+/// Issue #332: a plan whose device read is slow becomes a job. The
+/// instructions, `knx_plan_device` and `knx_apply_status` all name the poll,
+/// and the status tool says a plan job's result is the plan with its digest.
+#[tokio::test]
+async fn test_plan_job_guidance_names_the_status_poll() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    write_model(dir.path())?;
+    let (client, task) = serve(dir.path(), TIERS[3]).await?;
+    let got = instructions(&client)?;
+    assert!(
+        got.contains("a plan whose device read is slow answers `started` the same way"),
+        "{got}"
+    );
+    let mut seen = 0;
+    for tool in client.list_all_tools().await? {
+        let description = tool.description.as_deref().unwrap_or_default();
+        match tool.name.as_ref() {
+            "knx_plan_device" => {
+                seen += 1;
+                assert!(description.contains("`started: true`"), "{description}");
+                assert!(description.contains("knx_apply_status"), "{description}");
+                assert!(
+                    description.contains("plan_digest included"),
+                    "{description}"
+                );
+            }
+            "knx_apply_status" => {
+                seen += 1;
+                assert!(description.contains("knx_plan_device"), "{description}");
+                assert!(description.contains("plan_digest"), "{description}");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(seen, 2, "both tools are registered at the programming tier");
+    client.cancel().await?;
+    task.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_instructions_read_and_programming_tiers_snapshot() -> TestResult {
     for (tier, expected) in [
@@ -544,8 +584,9 @@ const PROGRAMMING_INSTRUCTIONS: &str = "bussard: KNX as code over MCP. The insta
     the model (one plan sentence each), over KNX Data Secure when the server's keyring lists \
     the device. A plan without the device's product data writes the links only and says \
     why. knx_apply_device runs the write as a job: when it answers `started` with a job id, \
-    call knx_apply_status with that job until `done` is true and report its result; \
-    knx_last_apply recovers a device's latest result when a reply is lost. \
+    call knx_apply_status with that job until `done` is true and report its result; a plan \
+    whose device read is slow answers `started` the same way, and the finished job's result \
+    is the plan to show. knx_last_apply recovers a device's latest result when a reply is lost. \
     knx_restore_parameters replays a parameter backup an apply kept, with the same plan, \
     explicit yes and job flow. Still needs the CLI: `bussard flash` to load a new \
     application program, `bussard adopt`, `bussard replace` and `bussard commission`. A \

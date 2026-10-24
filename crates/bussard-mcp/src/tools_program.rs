@@ -172,6 +172,15 @@ impl ProgrammingTier {
         self.jobs.set_reply_wait(wait);
     }
 
+    /// Sets how long a call waits for its device read before it answers
+    /// with a job id: `knx_plan_device`'s read and `knx_apply_device`'s
+    /// pre-flight (issue #332; default
+    /// [`crate::apply_jobs::DEFAULT_REPLY_WAIT`], counted from the start of
+    /// the call). Tests shrink it to turn a slow read into a job.
+    pub fn set_read_wait(&self, wait: Duration) {
+        self.jobs.set_read_wait(wait);
+    }
+
     /// How long a plan stays valid.
     pub fn plan_ttl(&self) -> Duration {
         self.plan_ttl
@@ -289,7 +298,12 @@ impl BussardMcp {
         server's keyring, a KNX Data Secure device the keyring lists is read over A_SecureData \
         (the result says \"secured\": true) and `security_object` says what its security object \
         receives with the write (secured senders, keyed group addresses, secured objects; never \
-        a key): show that line to the human too. Only available with --allow-programming."
+        a key): show that line to the human too. Reading a device can take long (a Data Secure \
+        System B device reads its whole parameter memory): when the read does not end within \
+        about 20 s the call answers `started: true` with a `job` id instead of the plan; call \
+        knx_apply_status with that job every few seconds until `done` is true, and its `result` \
+        is the plan exactly as described here, plan_digest included. Only available with \
+        --allow-programming."
     )]
     async fn knx_plan_device(
         &self,
@@ -317,8 +331,10 @@ impl BussardMcp {
         false, done: true` (the verify outcome, `parameters` written, the backup paths); \
         otherwise it is `started: true` with the `job` id: call knx_apply_status with that job \
         until `done` is true, and knx_last_apply with the address recovers the result if a \
-        reply is lost. One apply at a time: a second call while a job runs is refused with \
-        its id. Tell the human the outcome and the backup paths. A KNX Data Secure device the \
+        reply is lost. A pre-flight read that outlasts about 20 s (a Data Secure device) also \
+        answers `started: true`; if it then refuses, the job ends with `result.refused: true` \
+        and nothing written. One job at a time: a second call while a job (an apply or a \
+        plan) runs is refused with its id. Tell the human the outcome and the backup paths. A KNX Data Secure device the \
         server's keyring lists is written over A_SecureData, its security object reprogrammed \
         with the tables, exactly as `bussard apply --keyring` does. A plan with `method: \
         \"flash\"` runs the full application download `bussard flash --yes` writes (the \
@@ -381,12 +397,15 @@ impl BussardMcp {
 
     /// `knx_apply_status` (registered only with `--allow-programming`).
     #[tool(
-        description = "Report one apply job started by knx_apply_device (issue #289): `state` \
+        description = "Report one job of the programming tier (issues #289, #332): an apply \
+        started by knx_apply_device or knx_restore_parameters, or a plan started by \
+        knx_plan_device (`kind`: apply or plan). `state` \
         (running, done, or interrupted when the server stopped mid-write), `done`, the current \
         `step`, `progress` (the table outcome, the download step, the segment position, the \
         octets the last segment wrote of those it may write), \
         the backup paths and, once done, `result`: the same result knx_apply_device returns \
-        inline (ok, verified, parameters, recovery). Reads only the server's job table and the \
+        inline (ok, verified, parameters, recovery), or for a plan job the plan exactly as \
+        knx_plan_device returns it (sentences, question, plan_digest). Reads only the server's job table and the \
         job record under .bussard/history; never touches the bus. Poll every few seconds while \
         `done` is false, then tell the human the outcome. Only available with \
         --allow-programming."
@@ -480,17 +499,84 @@ impl BussardMcp {
     }
 
     /// `knx_plan_device`'s body; `Err` is a refusal reason.
+    ///
+    /// Runs the plan as a job (issue #332): claims the one slot (or joins the
+    /// running plan job of the same device), computes the plan in a server
+    /// task, and answers with the plan when it is done within the read wait,
+    /// else with `started: true` and the job id. The bus is the running
+    /// apply's until it ends (issue #289), so a plan is refused while one
+    /// runs: waiting for it here could outlast the client's call budget.
     async fn plan_device(&self, address: &str) -> Result<Value, String> {
+        let began = Instant::now();
+        let target = parse_address(address)?;
+        let (tier, _, _) = self.programming_preflight()?;
+        let (job, fresh) = match tier.jobs.claim_plan(target)? {
+            crate::apply_jobs::PlanClaim::New(job) => (job, true),
+            crate::apply_jobs::PlanClaim::Running(job) => (job, false),
+        };
+        if fresh {
+            let me = self.clone();
+            let (id, address) = (job.clone(), address.to_string());
+            let worker = tokio::spawn(async move {
+                let plan = match me.plan_body(&address).await {
+                    Ok(plan) => plan,
+                    Err(reason) => refusal_json(&address, reason),
+                };
+                if let Some(tier) = me.state().programming.as_ref() {
+                    tier.jobs.finish(&id, plan);
+                }
+            });
+            self.watch_job(job.clone(), "plan", worker);
+        }
+        let wait = tier.jobs.read_wait().saturating_sub(began.elapsed());
+        if tier.jobs.wait(&job, wait).await {
+            // Answered inline, as before issue #332. The finished job stays
+            // in the table until the next plan of the device supersedes it,
+            // so a second caller that joined it reads the same plan.
+            return Ok(tier.jobs.result(&job).unwrap_or_else(|| json!({})));
+        }
+        Ok(json!({
+            "started": true,
+            "done": false,
+            "kind": "plan",
+            "job": job,
+            "address": target.to_string(),
+            "step": "reading the device",
+            "next_step": format!(
+                "Reading {target} takes longer than this call may wait (a Data Secure device \
+                 reads its whole parameter memory); the plan is computed in the server as job \
+                 {job}, and nothing is written. Tell the human the read is running, then call \
+                 knx_apply_status with job {job} every few seconds until `done` is true. Its \
+                 `result` is the plan: show it to the human and follow result.next_step. Do not \
+                 call knx_apply_device before you have shown that plan."
+            ),
+        }))
+    }
+
+    /// Finishes `job` with a failure when its task panics, so a panic never
+    /// leaves the slot claimed for good. `verb` names the job in the reason.
+    fn watch_job(&self, job: String, verb: &'static str, worker: tokio::task::JoinHandle<()>) {
+        let state = std::sync::Arc::clone(self.state());
+        tokio::spawn(async move {
+            if let Err(err) = worker.await
+                && let Some(tier) = state.programming.as_ref()
+            {
+                tier.jobs.finish(
+                    &job,
+                    json!({
+                        "ok": false,
+                        "verified": false,
+                        "reason": format!("the {verb} task stopped unexpectedly: {err}"),
+                    }),
+                );
+            }
+        });
+    }
+
+    /// The plan itself, run inside the plan job; `Err` is a refusal reason.
+    async fn plan_body(&self, address: &str) -> Result<Value, String> {
         let target = parse_address(address)?;
         let (tier, handle, gateway) = self.programming_preflight()?;
-        // The bus is the running apply's until it ends (issue #289): waiting
-        // for it here could outlast the client's call budget.
-        if let Some((job, device)) = tier.jobs.running() {
-            return Err(format!(
-                "an apply is running on this server (job {job} for {device}); call \
-                 knx_apply_status with job {job} until it is done, then plan again"
-            ));
-        }
         let dir = self.state().dir.clone();
         let model = self.state().model.reload();
         let desired = desired_tables_for(&model, target).map_err(|e| e.to_string())?;
@@ -763,31 +849,24 @@ impl BussardMcp {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let worker = tokio::spawn(work(self.clone(), job.clone(), started_tx));
         // A panic in the job must not leave the slot claimed for good.
-        let state = std::sync::Arc::clone(self.state());
-        let watched = job.clone();
-        tokio::spawn(async move {
-            if let Err(err) = worker.await
-                && let Some(tier) = state.programming.as_ref()
-            {
-                tier.jobs.finish(
-                    &watched,
-                    json!({
-                        "ok": false,
-                        "verified": false,
-                        "reason": format!("the {verb} task stopped unexpectedly: {err}"),
-                    }),
-                );
+        self.watch_job(job.clone(), verb, worker);
+        // The pre-flight reads the device, which can outlast the bridge on a
+        // Data Secure device (issue #332): past the read wait the call
+        // answers `started` and a later refusal ends the job instead.
+        let read_wait = tier.jobs.read_wait().saturating_sub(began.elapsed());
+        match tokio::time::timeout(read_wait, started_rx).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(reason))) => {
+                tier.jobs.abandon(&job);
+                return Err(reason);
             }
-        });
-        match started_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(reason)) => return Err(reason),
-            Err(_) => {
+            Ok(Err(_)) => {
                 return Err(format!(
                     "the {verb} of {target} stopped before its pre-flight ended; call \
                      knx_apply_status with job {job}"
                 ));
             }
+            Err(_) => return Ok(self.job_started(tier, &job, target)),
         }
         let wait = reply_wait.saturating_sub(began.elapsed());
         if tier.jobs.wait(&job, wait).await {
@@ -807,9 +886,14 @@ impl BussardMcp {
             );
             return Ok(result);
         }
+        Ok(self.job_started(tier, &job, target))
+    }
+
+    /// The `started: true` answer of a write job still running.
+    fn job_started(&self, tier: &ProgrammingTier, job: &str, target: IndividualAddress) -> Value {
         let mut status = tier
             .jobs
-            .status(&self.state().dir, &job)
+            .status(&self.state().dir, job)
             .unwrap_or_else(|| json!({}));
         merge(
             &mut status,
@@ -822,8 +906,10 @@ impl BussardMcp {
                     "The write to {target} continues in the server as job {job}; it is not done \
                      yet. Tell the human it is running, then call knx_apply_status with job \
                      {job} every few seconds until `done` is true and report its `result` (the \
-                     verify outcome, the parameters written, the backup paths). If the reply is \
-                     lost, knx_last_apply with address {target} returns the same job."
+                     verify outcome, the parameters written, the backup paths; or, when \
+                     result.refused is true, the pre-flight's reason: nothing was written). If \
+                     the reply is lost, knx_last_apply with address {target} returns the same \
+                     job."
                 ),
             }),
         );
@@ -831,7 +917,7 @@ impl BussardMcp {
             map.remove("result");
             map.remove("state");
         }
-        Ok(status)
+        status
     }
 
     /// One apply job: the pre-flight, then the write, holding the bus lock
@@ -859,7 +945,7 @@ impl BussardMcp {
         let prepared = match self.apply_preflight(tier, target, digest, plan_hash).await {
             Ok(prepared) => prepared,
             Err(reason) => {
-                tier.jobs.abandon(job);
+                tier.jobs.refuse(job, &reason);
                 let _ = started.send(Err(reason));
                 return;
             }
@@ -1385,7 +1471,7 @@ impl BussardMcp {
         let job = job.trim();
         tier.jobs.status(&self.state().dir, job).ok_or_else(|| {
             format!(
-                "no apply job {job:?} in this session or under .bussard/history; \
+                "no job {job:?} in this session or under .bussard/history; \
                  knx_last_apply with the device's address returns its latest job"
             )
         })
@@ -2095,12 +2181,18 @@ fn ok(value: Value) -> Result<CallToolResult, ErrorData> {
 
 /// A refusal, reported as a normal (structured) result the caller reads out.
 fn refusal(address: &str, reason: String) -> Result<CallToolResult, ErrorData> {
-    ok(json!({
+    ok(refusal_json(address, reason))
+}
+
+/// The JSON of a refusal: what [`refusal`] returns, and a refused plan
+/// job's result (issue #332).
+fn refusal_json(address: &str, reason: String) -> Value {
+    json!({
         "ok": false,
         "refused": true,
         "address": address,
         "reason": reason,
-    }))
+    })
 }
 
 #[cfg(test)]
