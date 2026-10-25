@@ -1,6 +1,6 @@
 //! The two evaluators of an application's Dynamic section agree (issue
 //! #326): the model side (`bussard_model::device_view`, over the product
-//! model's `blocks:` and `ref_values:`) and the download side
+//! model's pages and Dynamic tree) and the download side
 //! (`bussard_ets::dynamic::evaluate_dynamic`, over the application XML)
 //! reach the same parameter refs for the same values. The model side
 //! decides the plan's "ignored" notes and `knx_set_parameter`'s refusals,
@@ -26,31 +26,11 @@ use bussard_model::{IndividualAddress, Model, ProductModel, ProductModels};
 use bussard_prod::product_model::write_product_models;
 use bussard_prod::{ApplicationProgram, ProductData, parse_application_program};
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+use crate::value_sets::{
+    FIXTURES, RANDOM_SETS, Rng, candidates, corpus_vendor, knxprod_files, random_values, seed,
+};
 
-/// The fixture applications: (application id, XML).
-const FIXTURES: &[(&str, &[u8])] = &[
-    (
-        "M-00FA_A-0298-10-0000",
-        include_bytes!("../fixtures/blocks_app.xml"),
-    ),
-    (
-        "A",
-        include_bytes!("../../../bussard-download/tests/fixtures/param-readback/app.xml"),
-    ),
-    (
-        "M-00FA_A-00D1-10-0001",
-        include_bytes!("../../../bussard-project/tests/fixtures/dynamic_tree.app.xml"),
-    ),
-    (
-        "M-00FA_A-00D2-10-0001",
-        include_bytes!("../../../bussard-project/tests/fixtures/default_params.app.xml"),
-    ),
-    (
-        "M-00FA_A-00D1-10-0001",
-        include_bytes!("../../../bussard-ets/tests/fixtures/dynamic_tree.app.xml"),
-    ),
-];
+type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 /// The product model the importer writes for `app`.
 fn product_model(app: &ApplicationProgram) -> Result<ProductModel, Box<dyn std::error::Error>> {
@@ -201,11 +181,11 @@ fn test_model_and_download_evaluators_reach_the_same_refs_on_every_fixture() -> 
     for (id, xml) in FIXTURES {
         let app = parse_application_program(id, xml)?;
         let product = product_model(&app)?;
-        if product.blocks.is_empty() {
+        if product.blocks().is_empty() {
             continue;
         }
         let held: BTreeSet<String> = product
-            .blocks
+            .blocks()
             .iter()
             .flat_map(|b| b.parameters.iter().cloned())
             .collect();
@@ -284,12 +264,9 @@ fn test_meteodata_snapshot_evaluators_agree_and_ignore_only_unwritten_values() -
     let (model, products, app) = meteo(&snapshot, &archive)?;
     let address: IndividualAddress = "1.1.202".parse()?;
     let product = products.get(METEO_APP).ok_or("no product model")?;
-    assert_eq!(
-        product.ref_values.get("UP-2248_R-2262").map(String::as_str),
-        Some("4")
-    );
+    assert_eq!(product.ref_default("UP-2248_R-2262"), Some("4"));
     let held: BTreeSet<String> = product
-        .blocks
+        .blocks()
         .iter()
         .flat_map(|b| b.parameters.iter().cloned())
         .collect();
@@ -347,203 +324,6 @@ fn bussard_download_overrides(
 // Dynamic tree, so the evaluator gives the same answer over the model as
 // over the application XML.
 // ---------------------------------------------------------------------------
-
-/// A small seeded generator (SplitMix64) for the random value sets.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// A number below `n` (0 for `n` 0).
-    fn below(&mut self, n: u64) -> u64 {
-        if n == 0 { 0 } else { self.next() % n }
-    }
-
-    /// True once in `n` draws.
-    fn one_in(&mut self, n: u64) -> bool {
-        self.below(n) == 0
-    }
-}
-
-/// How many random value sets each application is compared under, besides
-/// the vendor defaults.
-const RANDOM_SETS: u64 = 50;
-
-/// One parameter ref a value set may set: its device-file keys (the ref
-/// itself, or one per module instance with the selector), the values its
-/// type allows and the values its `<choose>` tests name.
-struct Candidate {
-    keys: Vec<String>,
-    codes: Vec<i64>,
-    range: Option<(i64, i64)>,
-    tested: Vec<i64>,
-    controls: bool,
-}
-
-/// The values each `<choose>` ref's tests name, and every module instance
-/// with its definition.
-type TreeFacts = (BTreeMap<String, BTreeSet<i64>>, Vec<(String, String)>);
-
-/// Every `<choose>` ref with the values its tests name (and their
-/// neighbours, for the comparisons), every `<Assign>` source, and every
-/// module instance with its definition.
-fn tree_facts(app: &ApplicationProgram) -> TreeFacts {
-    use bussard_prod::dynamic::{DynamicNode, WhenTest};
-    fn visit(
-        nodes: &[DynamicNode],
-        tested: &mut BTreeMap<String, BTreeSet<i64>>,
-        modules: &mut Vec<(String, String)>,
-    ) {
-        for node in nodes {
-            match node {
-                DynamicNode::Choose {
-                    param_ref_id,
-                    whens,
-                } => {
-                    let set = tested.entry(param_ref_id.clone()).or_default();
-                    for w in whens {
-                        match &w.test {
-                            WhenTest::Values(vs) => set.extend(vs.iter().copied()),
-                            WhenTest::Compare { value, .. } => set.extend([
-                                value.saturating_sub(1),
-                                *value,
-                                value.saturating_add(1),
-                            ]),
-                            WhenTest::Default | WhenTest::Unknown(_) => {}
-                        }
-                    }
-                    for w in whens {
-                        visit(&w.children, tested, modules);
-                    }
-                }
-                DynamicNode::Channel { children, .. }
-                | DynamicNode::ParameterBlock { children, .. } => visit(children, tested, modules),
-                DynamicNode::Module { id, module_def, .. } => {
-                    modules.push((id.clone(), module_def.clone()))
-                }
-                DynamicNode::Assign {
-                    source: Some(source),
-                    ..
-                } => {
-                    tested.entry(source.clone()).or_default();
-                }
-                DynamicNode::ParameterRefRef(_)
-                | DynamicNode::ComObjectRefRef(_)
-                | DynamicNode::Assign { .. } => {}
-            }
-        }
-    }
-    let mut tested = BTreeMap::new();
-    let mut modules = Vec::new();
-    visit(&app.dynamic, &mut tested, &mut modules);
-    let mut defs: Vec<&String> = app.module_dynamics.keys().collect();
-    defs.sort();
-    for def in defs {
-        if let Some(body) = app.module_dynamics.get(def) {
-            visit(body, &mut tested, &mut modules);
-        }
-    }
-    modules.sort();
-    modules.dedup();
-    (tested, modules)
-}
-
-/// The refs a random value set draws from.
-fn candidates(app: &ApplicationProgram) -> Vec<Candidate> {
-    let (tested, modules) = tree_facts(app);
-    let prefix = format!("{}_", app.id);
-    let mut out = Vec::new();
-    let mut refs: Vec<&bussard_prod::ParameterRef> = app.parameter_refs.values().collect();
-    refs.sort_by(|a, b| a.id.cmp(&b.id));
-    for pref in refs {
-        let Some(rel) = pref.id.strip_prefix(&prefix) else {
-            continue;
-        };
-        let Some(kind) = app
-            .parameters
-            .get(&pref.ref_id)
-            .and_then(|p| p.parameter_type.as_deref())
-            .and_then(|t| app.parameter_types.get(t))
-            .map(|t| &t.kind)
-        else {
-            continue;
-        };
-        let (codes, range) = match kind {
-            bussard_prod::ParameterType::Enum { values, .. } => {
-                (values.iter().map(|v| v.value).collect(), None)
-            }
-            bussard_prod::ParameterType::Int { min, max, .. } => {
-                let lo = min.unwrap_or(0);
-                (
-                    Vec::new(),
-                    Some((lo, max.unwrap_or(lo.saturating_add(255)))),
-                )
-            }
-            _ => continue,
-        };
-        let keys: Vec<String> = match rel.split_once('_') {
-            Some((md, _)) if md.starts_with("MD-") => modules
-                .iter()
-                .filter(|(_, def)| def == md)
-                .map(|(instance, _)| bussard_prod::dynamic::selector_key(Some(instance), rel))
-                .collect(),
-            _ => vec![rel.to_string()],
-        };
-        if keys.is_empty() {
-            continue;
-        }
-        let (controls, tested) = match tested.get(rel) {
-            Some(values) => (true, values.iter().copied().collect()),
-            None => (false, Vec::new()),
-        };
-        out.push(Candidate {
-            keys,
-            codes,
-            range,
-            tested,
-            controls,
-        });
-    }
-    out
-}
-
-/// One random valid value set: each controlling ref (a `<choose>` or an
-/// `<Assign>` source) in each of its scopes with a chance of one in two,
-/// any other ref with one in sixteen; the value one of the enumeration's
-/// codes or within the integer range, a tested value half of the time.
-fn random_values(candidates: &[Candidate], rng: &mut Rng) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    for c in candidates {
-        for key in &c.keys {
-            if !rng.one_in(if c.controls { 2 } else { 16 }) {
-                continue;
-            }
-            let allowed = |v: &i64| match c.range {
-                Some((lo, hi)) => (lo..=hi).contains(v),
-                None => c.codes.contains(v),
-            };
-            let tested: Vec<i64> = c.tested.iter().copied().filter(allowed).collect();
-            let value = if !tested.is_empty() && rng.one_in(2) {
-                tested[rng.below(tested.len() as u64) as usize]
-            } else if let Some((lo, hi)) = c.range {
-                let span = hi.saturating_sub(lo).max(0) as u64;
-                lo.saturating_add(rng.below(span.saturating_add(1)) as i64)
-            } else if c.codes.is_empty() {
-                continue;
-            } else {
-                c.codes[rng.below(c.codes.len() as u64) as usize]
-            };
-            out.insert(key.clone(), value.to_string());
-        }
-    }
-    out
-}
 
 /// The first index at which two lists differ, as a message.
 fn first_difference<T: PartialEq + std::fmt::Debug>(
@@ -633,11 +413,7 @@ fn check_round_trip(
         .map_err(|diff| format!("vendor defaults: {diff}"))?
         .parameters;
     let candidates = candidates(app);
-    let seed = app
-        .id
-        .bytes()
-        .fold(0xC0FF_EE00_u64, |h, b| h.rotate_left(5) ^ u64::from(b));
-    let mut rng = Rng(seed);
+    let mut rng = Rng(seed(app));
     let mut other = 0;
     for set in 0..RANDOM_SETS {
         let values = random_values(&candidates, &mut rng);
@@ -672,38 +448,15 @@ fn test_product_model_round_trips_the_dynamic_tree_on_every_fixture() -> TestRes
     Ok(())
 }
 
-/// The `.knxprod` archives at or one level under `dir`, sorted.
-fn knxprod_files(dir: &Path) -> Vec<PathBuf> {
-    let is_knxprod = |p: &Path| p.extension().and_then(|e| e.to_str()) == Some("knxprod");
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            for sub in std::fs::read_dir(&path).into_iter().flatten().flatten() {
-                if is_knxprod(&sub.path()) {
-                    out.push(sub.path());
-                }
-            }
-        } else if is_knxprod(&path) {
-            out.push(path);
-        }
-    }
-    out.sort();
-    out
-}
-
 /// Corpus-gated (`BUSSARD_PRODUCT_CORPUS`, docs/testing.md): the round trip
 /// over every application program of every archive in the corpus.
 #[test]
 fn test_product_model_round_trips_the_dynamic_tree_on_the_corpus() -> TestResult {
-    let Some(dir) = std::env::var_os("BUSSARD_PRODUCT_CORPUS").map(PathBuf::from) else {
+    let Some(vendor) = corpus_vendor() else {
         eprintln!("BUSSARD_PRODUCT_CORPUS unset; skipping the Dynamic round trip sweep.");
         return Ok(());
     };
-    let vendor = [dir.join("cache/vendor"), dir.join("vendor"), dir]
-        .into_iter()
-        .find(|d| !knxprod_files(d).is_empty())
-        .ok_or("the corpus holds no .knxprod files")?;
+    let vendor = vendor?;
     let files = knxprod_files(&vendor);
     let started = std::time::Instant::now();
     let next = std::sync::atomic::AtomicUsize::new(0);

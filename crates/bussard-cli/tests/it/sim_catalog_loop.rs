@@ -594,20 +594,21 @@ fn object_shape(app: &ApplicationProgram, values: &BTreeMap<String, String>) -> 
         .collect()
 }
 
-/// The parameter refs a `<when>` on the way to an ETS page or channel tests
-/// (the product model's `blocks`, `bussard device` lists them as what enables
-/// an inactive page), plus those that gate a single ref inside a page: the
-/// enable switches. Pages inside a `<ModuleDef>` are not in `blocks`; their
-/// switches take their turn with the other parameters.
+/// The parameter refs a `<when>` in the application's own Dynamic section
+/// tests on the way to a parameter or object (the conditions `bussard
+/// device` lists as what enables an inactive page, and those that gate a
+/// single ref inside a page): the enable switches. Conditions inside a
+/// `<ModuleDef>` are not counted; their switches take their turn with the
+/// other parameters.
 fn switches(app: &ApplicationProgram) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for block in bussard_prod::blocks::blocks_for(app) {
-        out.extend(block.when.iter().map(|g| g.reference.clone()));
-        for gates in block.parameter_when.values() {
-            out.extend(gates.iter().map(|g| g.reference.clone()));
-        }
-    }
-    out
+    let index = bussard_model::dynamic::RefIndex::new(app);
+    index
+        .parameters()
+        .chain(index.com_objects())
+        .flat_map(|(_, occurrences)| occurrences)
+        .filter(|o| o.module_def.is_none())
+        .flat_map(|o| o.gates.iter().map(|g| g.param_ref_id.clone()))
+        .collect()
 }
 
 /// A random valid value for an app-relative parameter ref, `None` for one

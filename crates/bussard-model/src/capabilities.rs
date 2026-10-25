@@ -129,7 +129,7 @@ struct Hit<'a> {
 /// together, at least one in the parameter or choice text.
 fn product_hits<'a>(product: &'a ProductModel, words: &[String]) -> Vec<Hit<'a>> {
     let titles: HashMap<&str, (Option<&str>, String)> = product
-        .blocks
+        .blocks()
         .iter()
         .map(|b| {
             (
@@ -153,7 +153,7 @@ fn product_hits<'a>(product: &'a ProductModel, words: &[String]) -> Vec<Hit<'a>>
     };
     let mut candidates: Vec<(Option<&str>, &str, &ParamDef)> = Vec::new();
     let mut held: HashSet<&str> = HashSet::new();
-    for b in &product.blocks {
+    for b in product.blocks() {
         let mut own: HashSet<&str> = HashSet::new();
         for r in &b.parameters {
             let id = ref_param_id(r);
@@ -317,12 +317,12 @@ fn device_capabilities(
         }
     }
     let parent_of: HashMap<&str, Option<&str>> = product
-        .blocks
+        .blocks()
         .iter()
         .map(|b| (b.id.as_str(), b.parent.as_deref()))
         .collect();
     let title_of: HashMap<&str, Option<&str>> = product
-        .blocks
+        .blocks()
         .iter()
         .map(|b| (b.id.as_str(), b.text.as_deref()))
         .collect();
@@ -361,7 +361,14 @@ fn device_capabilities(
         };
         let current: Option<i64> = shown_entry
             .and_then(|(_, v)| v.clone())
-            .or_else(|| hit.def.default.clone())
+            .or_else(|| {
+                // A parameter no page holds stands for its one ref, if one.
+                let reference = match (hit.block, hit.def.refs.as_slice()) {
+                    (None, [only]) => only.as_str(),
+                    _ => hit.reference,
+                };
+                product.ref_default(reference).map(str::to_string)
+            })
             .and_then(|v| {
                 let v = v.trim();
                 v.parse::<i64>()

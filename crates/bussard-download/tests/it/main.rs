@@ -19,3 +19,8 @@ mod param_readback_roundtrip;
 mod sweep_fixtures;
 mod sys7_jung_m2_plan;
 mod sys7_theben_0701_plan;
+// The fixture applications and the random value sets of bussard-prod's
+// evaluator conformance test, shared with the view acceptance test.
+#[path = "../../../bussard-prod/tests/it/value_sets.rs"]
+mod value_sets;
+mod view_acceptance;

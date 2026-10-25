@@ -57,7 +57,7 @@ struct Unindexed {
     /// channel, if it has exactly one.
     channel: Option<String>,
     /// The ref's own `Value` when it overrides the parameter's default (the
-    /// product model's `ref_values`), recorded as the lock row's `default`
+    /// product model's `refs:` entry), recorded as the lock row's `default`
     /// the way the facts refresh records it (issue #326).
     default: Option<String>,
 }
@@ -104,7 +104,9 @@ impl KeyContext {
                 if let Some(text) = u.text {
                     texts.insert(reference.clone(), text);
                 }
-                let default = product.and_then(|m| m.ref_values.get(&reference).cloned());
+                let default = product
+                    .and_then(|m| m.parameter_refs.get(&reference))
+                    .and_then(|r| r.value.clone());
                 unindexed.insert(
                     reference,
                     Unindexed {
@@ -738,7 +740,6 @@ fn edit_distance(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
     use bussard_model::ProductModel;
-    use bussard_model::blocks::Gate;
     use bussard_model::dynamic::{DynamicNode, WhenTest};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -849,22 +850,7 @@ brightness.send = "4/1/5"
     /// the device runs, and with `ungated` `P-12_R-14` under none.
     fn branches(ungated: bool) -> impl Fn(&mut ProductModel) {
         move |product: &mut ProductModel| {
-            let Some(page) = product.blocks.iter_mut().find(|b| b.id == "PB-10") else {
-                return;
-            };
-            page.parameters.push("P-12_R-13".to_string());
-            page.parameter_when.insert(
-                "P-12_R-13".to_string(),
-                vec![Gate {
-                    reference: "P-11_R-11".to_string(),
-                    test: "2".to_string(),
-                    others: Vec::new(),
-                }],
-            );
-            if ungated {
-                page.parameters.push("P-12_R-14".to_string());
-            }
-            // The same refs in the Dynamic tree the evaluator walks.
+            // The pages derive from the Dynamic tree the evaluator walks.
             let mut added = vec!["P-12_R-13"];
             if ungated {
                 added.push("P-12_R-14");

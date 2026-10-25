@@ -1,22 +1,23 @@
 //! The ETS parameter pages of an application program (issue #298): the
-//! `<ParameterBlock>` and `<Channel>` containers of its Dynamic section, as the
-//! product model (`.bussard/models/<app>.yaml`, `blocks:`) records them, and
-//! which of them a device's configuration shows.
+//! `<ParameterBlock>` and `<Channel>` containers of its Dynamic section.
 //!
-//! The importer writes one [`BlockDef`] per container of the application's own
-//! Dynamic section, in document order (the order ETS lists the pages in): its
-//! title, the enclosing block, the `<choose>`/`<when>` conditions between that
-//! enclosing container and the block ([`Gate`]), the parameter refs it holds
-//! on any branch, and the com-objects it shows with the vendor defaults.
-//! Containers inside a `<ModuleDef>` are not recorded.
+//! [`pages_of`] derives one [`BlockDef`] per container of the application's
+//! own Dynamic section (the product model's `dynamic:` tree, issue #345), in
+//! document order (the order ETS lists the pages in): its title, the
+//! enclosing block, the `<choose>`/`<when>` conditions between that enclosing
+//! container and the block ([`Gate`]), and the parameter and com-object refs
+//! it holds on any branch. Containers inside a `<ModuleDef>` are not listed.
 //!
 //! Which of them a device's configuration shows is the Dynamic evaluator's
 //! answer ([`crate::dynamic::evaluate_dynamic`], issue #345), not this
 //! module's: [`Gate`] is only the words a page condition is written in.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+
+use crate::dynamic::{DynamicNode, WhenTest};
+use crate::param_model::ProductModel;
 
 /// What kind of Dynamic container a [`BlockDef`] is.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,19 +84,195 @@ pub struct BlockDef {
     /// branch, app-relative, in document order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<String>,
-    /// For each of [`Self::parameters`] that sits under a `<choose>` inside
-    /// this block on one branch only: the conditions between the block and
-    /// the ref, outermost first (issue #315). A ref outside any `<choose>`,
-    /// or on several branches, has no entry.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub parameter_when: BTreeMap<String, Vec<Gate>>,
-    /// The com-object refs directly inside that the vendor defaults show
-    /// (`O-22_R-7`).
+    /// The com-object refs directly inside (`O-22_R-7`), on any branch, in
+    /// document order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub objects: Vec<String>,
-    /// The com-object refs directly inside on other branches only.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub other_objects: Vec<String>,
+}
+
+/// The pages and channels of `product`'s own Dynamic section, in document
+/// order, derived from its tree. Containers inside a `<ModuleDef>` are not
+/// walked. Value-free: which of them a configuration shows is the
+/// evaluator's answer.
+pub fn pages_of(product: &ProductModel) -> Vec<BlockDef> {
+    let mut walk = PageWalk {
+        product,
+        out: Vec::new(),
+        seen_params: Vec::new(),
+        seen_objects: Vec::new(),
+    };
+    walk.nodes(&product.dynamic, None, None, &mut Vec::new());
+    walk.out
+}
+
+/// The [`pages_of`] walk state: the blocks so far, and per block the refs
+/// already recorded (to keep each list free of repeats).
+struct PageWalk<'a> {
+    product: &'a ProductModel,
+    out: Vec<BlockDef>,
+    seen_params: Vec<HashSet<String>>,
+    seen_objects: Vec<HashSet<String>>,
+}
+
+impl PageWalk<'_> {
+    /// Walks `nodes` inside block `current` (an index into `out`) of channel
+    /// `channel`; `gates` are the conditions since `current` began.
+    fn nodes(
+        &mut self,
+        nodes: &[DynamicNode],
+        current: Option<usize>,
+        channel: Option<&str>,
+        gates: &mut Vec<Gate>,
+    ) {
+        for node in nodes {
+            match node {
+                DynamicNode::Channel {
+                    id,
+                    name,
+                    text,
+                    number,
+                    children,
+                    ..
+                } => {
+                    let title = text
+                        .as_deref()
+                        .map(clean_text)
+                        .filter(|t| !t.is_empty())
+                        .or_else(|| name.clone());
+                    let index = self.push(BlockDef {
+                        id: id.clone(),
+                        kind: BlockKind::Channel,
+                        name: name.clone().filter(|n| Some(n) != title.as_ref()),
+                        text: title,
+                        number: *number,
+                        parent: current.map(|c| self.out[c].id.clone()),
+                        channel: None,
+                        when: gates.clone(),
+                        ..BlockDef::default()
+                    });
+                    self.nodes(children, Some(index), Some(id), &mut Vec::new());
+                }
+                DynamicNode::ParameterBlock {
+                    id,
+                    name,
+                    text,
+                    param_ref,
+                    children,
+                    ..
+                } => {
+                    let title = text
+                        .as_deref()
+                        .map(clean_text)
+                        .filter(|t| !t.is_empty())
+                        .or_else(|| param_ref.as_deref().and_then(|r| self.ref_text(r)))
+                        .or_else(|| name.clone());
+                    let index = self.push(BlockDef {
+                        id: id.clone(),
+                        kind: BlockKind::Block,
+                        name: name.clone().filter(|n| Some(n) != title.as_ref()),
+                        text: title,
+                        number: None,
+                        parent: current.map(|c| self.out[c].id.clone()),
+                        channel: channel.map(str::to_string),
+                        when: gates.clone(),
+                        ..BlockDef::default()
+                    });
+                    self.nodes(children, Some(index), channel, &mut Vec::new());
+                }
+                DynamicNode::ParameterRefRef(reference) => {
+                    let Some(c) = current else { continue };
+                    if self.seen_params[c].insert(reference.clone()) {
+                        self.out[c].parameters.push(reference.clone());
+                    }
+                }
+                DynamicNode::ComObjectRefRef(reference) => {
+                    let Some(c) = current else { continue };
+                    if self.seen_objects[c].insert(reference.clone()) {
+                        self.out[c].objects.push(reference.clone());
+                    }
+                }
+                DynamicNode::Choose {
+                    param_ref_id,
+                    whens,
+                } => {
+                    let explicit: Vec<&WhenTest> = whens
+                        .iter()
+                        .map(|w| &w.test)
+                        .filter(|t| **t != WhenTest::Default)
+                        .collect();
+                    for when in whens {
+                        let is_default = when.test == WhenTest::Default;
+                        gates.push(Gate {
+                            reference: param_ref_id.clone(),
+                            test: test_string(&when.test),
+                            others: if is_default {
+                                explicit.iter().map(|t| test_string(t)).collect()
+                            } else {
+                                Vec::new()
+                            },
+                        });
+                        self.nodes(&when.children, current, channel, gates);
+                        gates.pop();
+                    }
+                }
+                DynamicNode::Module { .. } | DynamicNode::Assign { .. } => {}
+            }
+        }
+    }
+
+    fn push(&mut self, block: BlockDef) -> usize {
+        self.out.push(block);
+        self.seen_params.push(HashSet::new());
+        self.seen_objects.push(HashSet::new());
+        self.out.len() - 1
+    }
+
+    /// The text of an app-relative parameter ref: the ref's own text, else
+    /// its parameter's text, else its name.
+    fn ref_text(&self, reference: &str) -> Option<String> {
+        let pref = self.product.parameter_refs.get(reference)?;
+        let param = self.product.parameters.get(&pref.parameter);
+        pref.text
+            .clone()
+            .or_else(|| param.and_then(|p| p.text.clone()))
+            .or_else(|| param.and_then(|p| p.name.clone()))
+            .map(|t| clean_text(&t))
+            .filter(|t| !t.is_empty())
+    }
+}
+
+/// A `<when>` test as [`Gate::test`] writes it.
+fn test_string(test: &WhenTest) -> String {
+    match test {
+        WhenTest::Default => "default".to_string(),
+        // Kept recognisable and matching nothing.
+        WhenTest::Unknown(raw) => format!("?{raw}"),
+        other => crate::dynamic_compact::test_text(other).unwrap_or_default(),
+    }
+}
+
+/// A title without its `{{…}}` placeholders: `{{0:default}}` becomes its
+/// default text, any other token goes, and the space or `()` it leaves too.
+pub fn clean_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            out.push_str(&rest[open..]);
+            rest = "";
+            break;
+        };
+        let token = &after[..close];
+        if let Some((_, default)) = token.split_once(':') {
+            out.push_str(default);
+        }
+        rest = &after[close + 2..];
+    }
+    out.push_str(rest);
+    let out = out.replace("()", "");
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The com-object number of a com-object ref (`O-22_R-7` → 22,
@@ -161,6 +338,27 @@ mod tests {
                 .collect(),
             parameters: params.iter().map(|p| p.to_string()).collect(),
             ..BlockDef::default()
+        }
+    }
+
+    #[test]
+    fn test_clean_text_drops_placeholders() {
+        assert_eq!(clean_text("Kanal {{ArgNr}} ({{0:...}})"), "Kanal (...)");
+        assert_eq!(clean_text("Kanal {{0}}"), "Kanal");
+        assert_eq!(clean_text("Plain"), "Plain");
+    }
+
+    #[test]
+    fn test_test_string_round_trips_through_when_test() {
+        use crate::dynamic::CompareOp;
+        for test in [
+            WhenTest::Values(vec![1, 2]),
+            WhenTest::Compare {
+                op: CompareOp::Ne,
+                value: 0,
+            },
+        ] {
+            assert_eq!(WhenTest::parse(Some(&test_string(&test)), None), test);
         }
     }
 

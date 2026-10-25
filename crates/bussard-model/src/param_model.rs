@@ -33,22 +33,12 @@ pub struct ProductModel {
     /// dropping its `_M-<m>_MI-<n>` module-instance selector and `_R-<r>`
     /// suffix; indexing app-relative lets the lookup ignore the app prefix.
     pub parameters: BTreeMap<String, ParamDef>,
-    /// The ETS parameter pages and channels of the application's Dynamic
-    /// section, in document order (issue #298). Empty for a model written
-    /// before [`MODEL_FORMAT`] 2.
-    pub blocks: Vec<crate::blocks::BlockDef>,
     /// The com-objects by number: the vendor's text, function and DPT.
     pub com_objects: BTreeMap<u16, ObjectDef>,
-    /// The com-object refs the blocks name that [`Self::com_objects`]
-    /// describes through another ref of the same number, keyed by
-    /// app-relative ref id (`O-32_R-454`).
+    /// The com-object refs of the application's Dynamic section that
+    /// [`Self::com_objects`] describes through another ref of the same
+    /// number, keyed by app-relative ref id (`O-32_R-454`).
     pub com_object_refs: BTreeMap<String, ObjectDef>,
-    /// The ETS `ParameterRef` `Value` overrides of the refs the blocks name
-    /// (in a page, or in a condition), keyed by app-relative ref id
-    /// (`UP-2248_R-2262`): the value a ref has when nothing is stored, where
-    /// it differs from its parameter's default (issue #326). Empty for a
-    /// model written before [`MODEL_FORMAT`] 4.
-    pub ref_values: BTreeMap<String, String>,
     /// The application program id (`M-0002_A-A0ED-10-9B4E`), the prefix the
     /// app-relative ids drop.
     pub program_id: String,
@@ -70,6 +60,10 @@ pub struct ProductModel {
     /// its parameter, its `Value` where it matters and whether it is internal
     /// (the `refs:` of each parameter, format 5).
     pub parameter_refs: BTreeMap<String, RefDef>,
+    /// The ETS parameter pages and channels, derived from [`Self::dynamic`]
+    /// on first use ([`Self::blocks`]).
+    #[serde(skip)]
+    pages: std::sync::OnceLock<Vec<crate::blocks::BlockDef>>,
 }
 
 /// One `ParameterRef` of a product model (an entry of a parameter's `refs:`).
@@ -83,6 +77,9 @@ pub struct RefDef {
     /// Whether the ref's effective `Access` is `None`: ETS keeps the value
     /// to itself and never shows it.
     pub internal: bool,
+    /// The ref's own `Text`, where it differs from its parameter's: what
+    /// titles a page whose `ParamRefId` names the ref.
+    pub text: Option<String>,
 }
 
 /// One com-object of a product model, reduced to what a view shows.
@@ -104,8 +101,10 @@ pub struct ObjectDef {
 /// block, `parameter_when:`, issue #315; format 4 the `ParameterRef` values,
 /// `ref_values:`, issue #326; format 5 the Dynamic tree, `dynamic:`,
 /// `module_dynamics:`, `unions:` and each parameter's `refs:`, `base_value`
-/// and integer width, issue #345).
-pub const MODEL_FORMAT: u32 = 5;
+/// and integer width, issue #345; format 6 drops `blocks:`,
+/// `parameter_when:` and `ref_values:`, which the tree gives, and writes a
+/// parameter's own default, issue #345).
+pub const MODEL_FORMAT: u32 = 6;
 
 /// Whether the model file at `path` is of the current [`MODEL_FORMAT`]. Reads
 /// only the head of the file, where the emitter puts the key.
@@ -197,13 +196,9 @@ struct RawModel {
     #[serde(default)]
     parameters: Vec<RawParam>,
     #[serde(default)]
-    blocks: Vec<crate::blocks::BlockDef>,
-    #[serde(default)]
     com_objects: BTreeMap<u16, RawComObject>,
     #[serde(default)]
     com_object_refs: BTreeMap<String, RawComObject>,
-    #[serde(default)]
-    ref_values: BTreeMap<String, String>,
     #[serde(default, with = "crate::dynamic_compact::nodes")]
     dynamic: Vec<crate::dynamic::DynamicNode>,
     #[serde(default, with = "crate::dynamic_compact::module_nodes")]
@@ -251,6 +246,8 @@ struct RawRef {
     value: Option<String>,
     #[serde(default)]
     internal: bool,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 // Some fields exist only to consume the YAML shape faithfully; the validator
@@ -356,6 +353,7 @@ impl ProductModel {
                         parameter: rel.clone(),
                         value: def.value,
                         internal: def.internal,
+                        text: def.text,
                     },
                 );
             }
@@ -393,31 +391,39 @@ impl ProductModel {
         Ok(ProductModel {
             bus_current_ma: raw.bus_current_ma,
             parameters,
-            blocks: raw.blocks,
             com_objects,
             com_object_refs,
-            ref_values: raw.ref_values,
             program_id: app_ref.to_string(),
             dynamic: raw.dynamic,
             module_dynamics: raw.module_dynamics,
             unions: raw.unions,
             parameter_refs,
+            pages: std::sync::OnceLock::new(),
         })
     }
 
+    /// The ETS parameter pages and channels of the application's own
+    /// Dynamic section, in document order, derived from the tree once
+    /// ([`crate::blocks::pages_of`]).
+    pub fn blocks(&self) -> &[crate::blocks::BlockDef] {
+        self.pages.get_or_init(|| crate::blocks::pages_of(self))
+    }
+
     /// The vendor default of app-relative parameter ref `reference`: the
-    /// ref's own `Value` ([`Self::ref_values`]) when it overrides its
-    /// parameter's, else the parameter's default. This is the value ETS
-    /// shows, and a download writes, when nothing is stored (issue #326).
+    /// ref's own `Value` when the model records one, else the parameter's
+    /// default. This is the value ETS shows, and a download writes, when
+    /// nothing is stored (issue #326).
     pub fn ref_default(&self, reference: &str) -> Option<&str> {
-        self.ref_values
-            .get(reference)
-            .map(String::as_str)
-            .or_else(|| {
-                self.parameters
-                    .get(crate::blocks::ref_param_id(reference))
-                    .and_then(|d| d.default.as_deref())
-            })
+        match self.parameter_refs.get(reference) {
+            Some(r) => r
+                .value
+                .as_deref()
+                .or_else(|| self.parameters.get(&r.parameter)?.default.as_deref()),
+            None => self
+                .parameters
+                .get(crate::blocks::ref_param_id(reference))
+                .and_then(|d| d.default.as_deref()),
+        }
     }
 
     /// Resolves a device-file parameter key the lock does not list, in the
@@ -955,6 +961,18 @@ pub fn key_to_param_id(key: &str) -> Option<String> {
     // Strip a `_M-<m>_MI-<n>` module-instance selector, if present. The
     // remaining id is `MD-<d>_<param>` or a plain `<param>`.
     Some(strip_module_instance(param_ref))
+}
+
+/// Maps a device-file parameter key to the app-relative ref id the product
+/// model lists in [`ProductModel::parameter_refs`]: the key's ref without
+/// its module-instance selector.
+///
+/// * `windalarm-1@MD-1_M-3_MI-1_P-3_R-45` → `MD-1_P-3_R-45`
+/// * `nachtabsenkung@P-1312_R-2140` → `P-1312_R-2140`
+pub fn key_to_model_ref(key: &str) -> Option<String> {
+    let ref_id = key.split_once('@').map(|(_, r)| r)?;
+    let (param_ref, r) = ref_id.rsplit_once("_R-")?;
+    Some(format!("{}_R-{r}", strip_module_instance(param_ref)))
 }
 
 /// Removes the `_M-<m>_MI-<n>` module-instance selector from an app-relative

@@ -343,25 +343,6 @@ load_procedure:
 - load_completed lsm=1
 - restart
 - disconnect
-blocks:
-- id: CH-0
-  kind: channel
-  text: Generic
-  number: 0
-- id: PB-10
-  text: 'Universal channel A: function'
-  name: ChannelA
-  parent: CH-0
-  channel: CH-0
-  when:
-  - ref: P-1_R-1
-    test: '1'
-  parameters:
-  - P-11_R-11
-  objects:
-  - O-1_R-1
-ref_values:
-  P-13_R-13: '4'
 unions:
 - size_bits: 8
   members:
@@ -397,30 +378,9 @@ Field notes:
 - `load_procedure`: the ordered op summary, a faithful view of the download script.
   `bussard flash` executes the supported subset
   ([reference.md](reference.md#bussard-flash-address)).
-- `blocks`: the ETS parameter pages (`<ParameterBlock>`) and `<Channel>`s of the
-  application's own Dynamic section, in the order ETS lists them (containers inside a
-  module definition are not recorded). `text` is the title ETS shows (the block's text,
-  else the text of the parameter that titles it), `name` its `Name` when that differs,
-  `parent` the enclosing block or channel. `when` lists the `<choose>`/`<when>`
-  conditions between the enclosing container and this one: the parameter ref and the
-  test as written (`1`, `1 2`, `!=0`, `<5`, or `default` with the sibling tests in
-  `others`). `parameters` are the refs directly inside on any branch, and
-  `parameter_when` the conditions inside the block for each of them that sits on one
-  branch of a `<choose>` only (format 3, issue #315): two refs of one parameter on two
-  branches of a function choice then tell apart which one the device shows; `objects` the
-  com-object refs the vendor defaults show once the block itself shows, `other_objects`
-  those on other branches only. `bussard device` and `knx_show_device` decide from them
-  which pages a device shows and what enables the others (issue #298).
-- `com_object_refs`: the com-object refs `blocks` names whose number `com_objects`
-  describes through another ref, with their own text, function and DPT (a "Switch"
-  object that becomes a "Value" object under another setting).
-- `ref_values`: the ETS `ParameterRef` `Value` of each ref `blocks` names (in a page or
-  in a condition) where it differs from its parameter's default, keyed by ref (format 4,
-  issue #326). It is the value a ref has when nothing is stored, the one ETS shows and a
-  download writes. A condition on such a ref, like the Theben Meteodata's "Wenn
-  Temperatur" = Windsensor (`UP-2248_R-2262`, parameter default 2, ref value 4), holds
-  through it. The device view resolves a ref's value in the download's order: the
-  stored value, the lock's `default`, the ref value, the parameter's default.
+- `com_object_refs`: the com-object refs of the Dynamic section whose number
+  `com_objects` describes through another ref, with their own text, function and DPT
+  (a "Switch" object that becomes a "Value" object under another setting).
 
 Format 5 (issue #345) adds what the Dynamic evaluator needs, so it can run over the
 model as it runs over the application XML (`bussard_model::dynamic::DynamicSource`):
@@ -428,8 +388,10 @@ model as it runs over the application XML (`bussard_model::dynamic::DynamicSourc
 - `refs` under each parameter: every `ParameterRef` of it, keyed by app-relative ref
   id. `value` is the ref's `Value` where it differs from the parameter's `Value` (or
   where the parameter's `default` above would not give it, an empty `Value` the model
-  leaves out); `internal: true` marks a ref whose effective `Access` is `None`, which
-  ETS never shows.
+  leaves out): the value a ref has when nothing is stored, the one ETS shows and a
+  download writes (issue #326). `internal: true` marks a ref whose effective `Access`
+  is `None`, which ETS never shows. `text` is the ref's own `Text` where it differs
+  from the parameter's (it titles a page whose `ParamRefId` names the ref).
 - `base_value` on a module parameter: the `BaseValue` argument whose per-instance
   value is added to its default (issue #126). `bits` (and `signed: true`) on an
   integer or plain enumeration parameter: the width a shared union memory is read
@@ -447,8 +409,15 @@ model as it runs over the application XML (`bussard_model::dynamic::DynamicSourc
   with its `id`, `def` and `args`; `assign` an `<Assign>` with `target` and `source`
   or `value`. All ids are app-relative; absent attributes are left out.
 
-For now `blocks`, `parameter_when` and `ref_values` are still written and still drive
-the device view; they go once the view reads the tree.
+Format 6 (issue #345) drops `blocks`, `parameter_when` and `ref_values`, and a
+parameter's `default` is its own `Value` (format 5 and older gave a parameter with one
+ref that ref's `Value`; the ref's `value` carries it now). The ETS pages `bussard
+device` and `knx_show_device` list are derived from `dynamic` when the model loads:
+one per `<ParameterBlock>` and `<Channel>` of the application's own section, in the
+order ETS lists them, titled by the block's text, else the text of the ref that titles
+it, else its `Name`, with `{{…}}` placeholders removed. Which of them a device shows,
+and every value, is the Dynamic evaluator's answer over the tree, the same one the
+download runs.
 
 The trees are written one top-level node per line in flow style (JSON, which YAML
 reads as is): in block style the indentation of the deep trees is three quarters of
@@ -457,8 +426,8 @@ from 37.3 MB (format 4) to 59.9 MB: 17.0 MB of trees, 1.6 MB of unions and 4.0 M
 refs, bits and base values. The largest, the ABB `M-0002_A-A0ED-10-9B4E`, goes from
 6.4 MB to 9.6 MB (tree 1.6 MB, unions 0.6 MB); the Jung `M-0004_A-D144-22-14F8-O000A`
 from 2.6 MB to 5.6 MB (tree 2.8 MB, most of it the argument maps of its 529 module
-instances). Once `blocks`, `parameter_when` and `ref_values` go (12.4 MB on the same
-models), the directory settles near 47 MB. The JSON cache under `.bussard/model-cache/`
+instances). Format 6 drops `blocks`, `parameter_when` and `ref_values` (12.4 MB on the
+same models), so the directory settles near 47 MB. The JSON cache under `.bussard/model-cache/`
 grows by about the same amount.
 
 ## The never-redistribute rule

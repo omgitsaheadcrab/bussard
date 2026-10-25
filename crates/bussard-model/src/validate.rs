@@ -248,7 +248,10 @@ fn check_parameters(
                 continue;
             }
 
-            if def.default.as_deref() == Some(value.as_str()) {
+            let vendor_default = crate::param_model::key_to_model_ref(key)
+                .and_then(|r| product_model.ref_default(&r))
+                .or(def.default.as_deref());
+            if vendor_default == Some(value.as_str()) {
                 diags.push(Diagnostic::new(
                     "I017",
                     Severity::Info,

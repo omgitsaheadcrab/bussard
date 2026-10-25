@@ -314,18 +314,11 @@ struct Model<'a> {
     parameters: Vec<ParameterModel>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     load_procedure: Vec<String>,
-    /// The ETS parameter pages and channels (issue #298).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    blocks: Vec<bussard_model::blocks::BlockDef>,
-    /// The com-object refs the blocks name that `com_objects` does not
-    /// describe (a number's other refs, with their own text, function and
-    /// DPT), keyed by app-relative ref id.
+    /// The com-object refs of the Dynamic section that `com_objects` does
+    /// not describe (a number's other refs, with their own text, function
+    /// and DPT), keyed by app-relative ref id.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     com_object_refs: BTreeMap<String, ComObjectModel>,
-    /// The `ParameterRef` values that override a parameter's default, of
-    /// the refs the blocks name, keyed by app-relative ref id (issue #326).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    ref_values: BTreeMap<String, String>,
     /// The `<Union>`s: size and member positions (issue #345).
     #[serde(
         skip_serializing_if = "Vec::is_empty",
@@ -417,6 +410,10 @@ struct RefModel {
     /// The effective `Access` is `None`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     internal: bool,
+    /// The ref's own `Text`, where it differs from the parameter's: the
+    /// title of a page the ref names (`ParamRefId`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
 }
 
 /// A parameter's type, tagged by shape.
@@ -477,9 +474,7 @@ struct MemoryModel {
 /// Builds the model for one application program.
 fn build_model<'a>(app: &'a ApplicationProgram, product: &ProductData) -> Model<'a> {
     let com_objects = com_objects_for(app);
-    let blocks = crate::blocks::blocks_for(app);
-    let com_object_refs = other_object_refs(app, &blocks, &com_objects);
-    let ref_values = crate::blocks::ref_values_for(app, &blocks);
+    let com_object_refs = other_object_refs(app, &com_objects);
     Model {
         model_format: bussard_model::param_model::MODEL_FORMAT,
         identity: Identity {
@@ -496,9 +491,7 @@ fn build_model<'a>(app: &'a ApplicationProgram, product: &ProductData) -> Model<
         com_objects,
         parameters: parameters_for(app),
         load_procedure: load_procedure_summary(&app.load_procedures),
-        blocks,
         com_object_refs,
-        ref_values,
         unions: unions_for(app),
         dynamic: &app.dynamic,
         module_dynamics: app
@@ -579,19 +572,16 @@ fn com_objects_for(app: &ApplicationProgram) -> BTreeMap<u16, ComObjectModel> {
     map
 }
 
-/// The com-object refs `blocks` name whose number `com_objects` describes
-/// through another ref, keyed by app-relative ref id.
+/// The com-object refs of the application's own Dynamic section whose
+/// number `com_objects` describes through another ref, keyed by
+/// app-relative ref id.
 fn other_object_refs(
     app: &ApplicationProgram,
-    blocks: &[bussard_model::blocks::BlockDef],
     com_objects: &BTreeMap<u16, ComObjectModel>,
 ) -> BTreeMap<String, ComObjectModel> {
     let mut out = BTreeMap::new();
     let prefix = format!("{}_", app.id);
-    for reference in blocks
-        .iter()
-        .flat_map(|b| b.objects.iter().chain(&b.other_objects))
-    {
+    for reference in &dynamic_object_refs(&app.dynamic) {
         if out.contains_key(reference) {
             continue;
         }
@@ -610,6 +600,29 @@ fn other_object_refs(
             continue;
         }
         out.insert(reference.clone(), com_object_model(&rc));
+    }
+    out
+}
+
+/// The `<ComObjectRefRef>`s of `nodes` and everything nested in them, on
+/// every branch (module bodies excluded: they are not walked from here).
+fn dynamic_object_refs(nodes: &[DynamicNode]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack: Vec<&[DynamicNode]> = vec![nodes];
+    while let Some(nodes) = stack.pop() {
+        for node in nodes {
+            match node {
+                DynamicNode::ComObjectRefRef(reference) => out.push(reference.clone()),
+                DynamicNode::Channel { children, .. }
+                | DynamicNode::ParameterBlock { children, .. } => stack.push(children),
+                DynamicNode::Choose { whens, .. } => {
+                    stack.extend(whens.iter().map(|w| w.children.as_slice()));
+                }
+                DynamicNode::ParameterRefRef(_)
+                | DynamicNode::Module { .. }
+                | DynamicNode::Assign { .. } => {}
+            }
+        }
     }
     out
 }
@@ -634,11 +647,10 @@ fn com_object_model(rc: &ResolvedComObject<'_>) -> ComObjectModel {
     }
 }
 
-/// The parameters, sorted by id, resolving each parameter's own default and
-/// applying any single owning parameter-ref override.
+/// The parameters, sorted by id, each with its own default and its refs
+/// (a ref's `Value` lives on the ref, issue #345).
 fn parameters_for(app: &ApplicationProgram) -> Vec<ParameterModel> {
-    // Index refs by the parameter they point at, so a parameter with exactly
-    // one ref inherits that ref's Value/Access override.
+    // Index refs by the parameter they point at.
     let mut refs_by_param: BTreeMap<&str, Vec<&crate::ParameterRef>> = BTreeMap::new();
     for pref in app.parameter_refs.values() {
         refs_by_param
@@ -652,15 +664,7 @@ fn parameters_for(app: &ApplicationProgram) -> Vec<ParameterModel> {
         .parameters
         .values()
         .map(|param| {
-            // Apply an override only when a single ref owns this parameter; with
-            // multiple refs the base default is kept (refs differ per instance).
-            let effective_default = match refs_by_param.get(param.id.as_str()) {
-                Some(refs) if refs.len() == 1 => {
-                    refs[0].value.clone().or_else(|| param.default.clone())
-                }
-                _ => param.default.clone(),
-            };
-            let default = effective_default.filter(|s| !s.is_empty());
+            let default = param.default.clone().filter(|s| !s.is_empty());
             let width = DynamicSource::integer_width(app, &param.id);
             let refs = refs_by_param
                 .get(param.id.as_str())
@@ -713,6 +717,7 @@ fn ref_model(
             .then(|| effective.map(str::to_string))
             .flatten(),
         internal: pref.access.as_deref().or(param.access.as_deref()) == Some("None"),
+        text: pref.text.clone().filter(|_| pref.text != param.text),
     }
 }
 
