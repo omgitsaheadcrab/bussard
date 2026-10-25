@@ -152,7 +152,7 @@ async fn test_model_edit_tools_snapshot_edit_and_describe() -> TestResult {
     assert_eq!(res["ok"], true, "{res}");
     assert_eq!(
         res["changes"][0],
-        "Living room blind actuator, channel B, now listens to Porch light (0/0/4).",
+        "Living room blind actuator (1.1.4), channel B, now listens to Porch light (0/0/4).",
         "{res}"
     );
 

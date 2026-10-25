@@ -204,7 +204,7 @@ impl BussardMcp {
     /// `knx_describe_change`.
     #[tool(
         description = "Describe a model change in plain sentences a homeowner can judge, e.g. \
-        \"Rocker 1 on Hallway push button now switches Porch light (0/0/4).\" With no arguments it \
+        \"Rocker 1 on Hallway push button (1.1.5) now switches Porch light (0/0/4).\" With no arguments it \
         describes the PENDING changes: the model files as they are now against the last history \
         snapshot, i.e. everything edited but not yet pushed to any device. Pass `from` and `to` \
         snapshot ids (from knx_history) to describe the change between two snapshots instead. \

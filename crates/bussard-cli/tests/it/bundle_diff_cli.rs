@@ -207,3 +207,105 @@ fn test_diff_rename_is_one_change_and_same_project_is_empty() -> TestResult {
     std::fs::remove_dir_all(&root)?;
     Ok(())
 }
+
+/// Issue #372: `diff --checklist` prints the ETS work list, group addresses
+/// first, then one section per device, then the notes; `--json` gives the
+/// same structure. Nothing is written.
+#[test]
+fn test_diff_checklist_groups_devices_and_notes() -> TestResult {
+    let root = temp_dir("checklist")?;
+    let json = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../bussard-project/tests/fixtures/tiny.xknxproject.json");
+    let model = root.join("knx");
+    run(
+        &[
+            "import",
+            "--from-json",
+            s(&json)?,
+            "--dir",
+            s(&model)?,
+            "--no-download",
+        ],
+        0,
+    )?;
+    let groups = std::fs::read_to_string(model.join("groups.toml"))?;
+    std::fs::write(
+        model.join("groups.toml"),
+        groups.replace(
+            "  { address = \"1/0/2\", name = \"Living room light status\", dpt = \"1\" },\n",
+            "  { address = \"1/0/2\", name = \"Living room light status\", dpt = \"1\" },\n  \
+             { address = \"1/0/3\", name = \"Hall light\", dpt = \"1.001\" },\n",
+        ),
+    )?;
+    let device = std::fs::read_to_string(model.join("devices/1.1.1.toml"))?;
+    std::fs::write(
+        model.join("devices/1.1.1.toml"),
+        device
+            .replace(
+                "0.listen = [\"1/0/1\"]",
+                "0.listen = [\"1/0/1\", \"1/0/3\"]",
+            )
+            .replace("1.send = \"1/0/2\"", "1.send = \"1/0/3\""),
+    )?;
+    let config = std::fs::read_to_string(model.join("bussard.toml"))?;
+    std::fs::write(
+        model.join("bussard.toml"),
+        format!("{config}gateway = \"127.0.0.1:3671\"\n"),
+    )?;
+    let before = model_bytes(&model)?;
+
+    let out = run(&["diff", s(&json)?, s(&model)?, "--checklist"], 0)?;
+    let at = |needle: &str| {
+        out.find(needle)
+            .ok_or_else(|| format!("no {needle:?} in\n{out}"))
+    };
+    let groups = at("## Group addresses")?;
+    let new_ga = at(
+        "- [ ] 1/0/3 \"Hall light\", DPT 1.001, new (main group 1 \"Ground floor\", \
+         middle group 1/0 \"Lighting\")",
+    )?;
+    let device = at("## 1.1.1 Test Switch Actuator")?;
+    let listen = at("- [ ] Objekt 0 \"Switch output A\": listens 1/0/1, 1/0/3 (was 1/0/1)")?;
+    let send = at("- [ ] Objekt 1 \"Status output A\": sends 1/0/3 (was 1/0/2)")?;
+    let notes = at("## Not in ETS by hand")?;
+    assert!(groups < new_ga && new_ga < device, "{out}");
+    assert!(device < listen && listen < send && send < notes, "{out}");
+    assert!(
+        out.contains("- The gateway changed from nothing to"),
+        "{out}"
+    );
+    let closing = format!(
+        "3 item(s), 1 note. Afterwards: export the project and run bussard diff <export> {}; \
+         it should report no changes.",
+        s(&model)?
+    );
+    assert!(out.contains(&closing), "{out}");
+
+    let out = run(&["diff", s(&json)?, s(&model)?, "--checklist", "--json"], 0)?;
+    let value: serde_json::Value = serde_json::from_str(&out)?;
+    assert_eq!(value["schema"], 1);
+    assert_eq!(value["items"], 3);
+    assert_eq!(value["groups"][0]["kind"], "group_added");
+    assert_eq!(value["groups"][0]["group"], "1/0/3");
+    let objects = value["devices"][0]["objects"].as_array().ok_or("objects")?;
+    assert_eq!(objects.len(), 2, "{out}");
+    assert_eq!(objects[1]["object"], 1);
+    assert_eq!(objects[1]["value"], "sends 1/0/3");
+    assert_eq!(objects[1]["old_value"], "sends 1/0/2");
+    assert_eq!(value["notes"][0]["kind"], "connection_changed");
+
+    // The plain `--json` keeps its shape, with the address in a link sentence.
+    let out = run(&["diff", s(&json)?, s(&model)?, "--json"], 0)?;
+    let value: serde_json::Value = serde_json::from_str(&out)?;
+    let changes = value["changes"].as_array().ok_or("changes")?;
+    assert!(
+        changes.iter().any(|c| c["sentence"]
+            .as_str()
+            .is_some_and(|t| t.contains("Test Switch Actuator (1.1.1)"))),
+        "{out}"
+    );
+
+    assert_eq!(model_bytes(&model)?, before, "diff wrote to the model");
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}
