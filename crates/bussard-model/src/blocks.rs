@@ -10,13 +10,11 @@
 //! on any branch, and the com-objects it shows with the vendor defaults.
 //! Containers inside a `<ModuleDef>` are not recorded.
 //!
-//! [`block_states`] decides per block whether a device shows it: a block is
-//! active when the lock lists a parameter or com-object only that block holds,
-//! or when its enclosing block is active and every condition holds for the
-//! device's values. An inactive block names the conditions that do not hold:
-//! the parameters to set to show it.
+//! Which of them a device's configuration shows is the Dynamic evaluator's
+//! answer ([`crate::dynamic::evaluate_dynamic`], issue #345), not this
+//! module's: [`Gate`] is only the words a page condition is written in.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -50,60 +48,6 @@ pub struct Gate {
     /// when none of them matches.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub others: Vec<String>,
-}
-
-/// Whether a `<when>` test (not `default`) matches `value`.
-fn test_matches(test: &str, value: f64) -> bool {
-    let t = test.trim();
-    for (prefix, cmp) in [
-        ("!=", (|v: f64, x: f64| v != x) as fn(f64, f64) -> bool),
-        ("<=", |v, x| v <= x),
-        (">=", |v, x| v >= x),
-        ("<", |v, x| v < x),
-        (">", |v, x| v > x),
-    ] {
-        if let Some(rest) = t.strip_prefix(prefix) {
-            return rest.trim().parse::<f64>().is_ok_and(|x| cmp(value, x));
-        }
-    }
-    value.fract() == 0.0
-        && t.split_whitespace()
-            .filter_map(|v| v.parse::<i64>().ok())
-            .any(|x| x as f64 == value)
-}
-
-impl Gate {
-    /// Whether the condition holds when its parameter has `value` (`None`:
-    /// unknown, which only a `default` branch without siblings passes).
-    pub fn holds(&self, value: Option<f64>) -> bool {
-        if self.test.trim() == "default" {
-            return match value {
-                Some(v) => !self.others.iter().any(|o| test_matches(o, v)),
-                None => self.others.is_empty(),
-            };
-        }
-        value.is_some_and(|v| test_matches(&self.test, v))
-    }
-
-    /// The enum codes (out of `codes`) that make the condition hold, in
-    /// order: what to set the parameter to.
-    pub fn satisfying(&self, codes: &[i64]) -> Vec<i64> {
-        codes
-            .iter()
-            .copied()
-            .filter(|c| self.holds(Some(*c as f64)))
-            .collect()
-    }
-
-    /// The first exact value the test names (for a parameter without enum
-    /// codes to choose from).
-    pub fn first_value(&self) -> Option<i64> {
-        let t = self.test.trim();
-        if t == "default" || t.starts_with(['!', '<', '>']) {
-            return None;
-        }
-        t.split_whitespace().find_map(|v| v.parse().ok())
-    }
 }
 
 /// One ETS parameter page (`<ParameterBlock>`) or `<Channel>` of an
@@ -173,18 +117,6 @@ pub fn ref_param_id(reference: &str) -> &str {
         .map_or(reference, |(head, _)| head)
 }
 
-/// Whether a device shows a block, and if not, why.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BlockState {
-    /// The configuration shows the block.
-    pub active: bool,
-    /// For an inactive block whose enclosing block is active: the indexes
-    /// into [`BlockDef::when`] of the conditions that do not hold.
-    pub failing: Vec<usize>,
-    /// The block is inactive because its enclosing block is.
-    pub parent_inactive: bool,
-}
-
 /// The index of each block's parent in `blocks` (the first block with that
 /// id that precedes it).
 pub fn parent_indexes(blocks: &[BlockDef]) -> Vec<Option<usize>> {
@@ -195,77 +127,6 @@ pub fn parent_indexes(blocks: &[BlockDef]) -> Vec<Option<usize>> {
         first.entry(b.id.as_str()).or_insert(i);
     }
     out
-}
-
-/// Decides for every block of `blocks` whether a device shows it.
-///
-/// `active_params` are the parameter refs the lock lists for the device,
-/// `active_objects` its com-object refs, and `value_of` the device's value
-/// of a parameter ref (stored, else the vendor default) as a number.
-pub fn block_states(
-    blocks: &[BlockDef],
-    active_params: &HashSet<&str>,
-    active_objects: &HashSet<&str>,
-    value_of: &dyn Fn(&str) -> Option<f64>,
-) -> Vec<BlockState> {
-    let parents = parent_indexes(blocks);
-    // A ref only one block holds is evidence for that block; one several
-    // blocks share (alternative pages showing the same parameter) is not.
-    let mut holders: HashMap<&str, usize> = HashMap::new();
-    for b in blocks {
-        let mut own: HashSet<&str> = HashSet::new();
-        for r in b
-            .parameters
-            .iter()
-            .chain(&b.objects)
-            .chain(&b.other_objects)
-        {
-            if own.insert(r) {
-                *holders.entry(r).or_default() += 1;
-            }
-        }
-    }
-    let mut evidence: Vec<bool> = blocks
-        .iter()
-        .map(|b| {
-            b.parameters
-                .iter()
-                .any(|r| holders.get(r.as_str()) == Some(&1) && active_params.contains(r.as_str()))
-                || b.objects.iter().chain(&b.other_objects).any(|r| {
-                    holders.get(r.as_str()) == Some(&1) && active_objects.contains(r.as_str())
-                })
-        })
-        .collect();
-    // Children come after their parent: propagate evidence upwards.
-    for i in (0..blocks.len()).rev() {
-        if evidence[i]
-            && let Some(p) = parents[i]
-        {
-            evidence[p] = true;
-        }
-    }
-    let mut states: Vec<BlockState> = Vec::with_capacity(blocks.len());
-    for (i, b) in blocks.iter().enumerate() {
-        let parent_active = parents[i].is_none_or(|p| states.get(p).is_none_or(|s| s.active));
-        let failing: Vec<usize> = b
-            .when
-            .iter()
-            .enumerate()
-            .filter(|(_, g)| !g.holds(value_of(&g.reference)))
-            .map(|(n, _)| n)
-            .collect();
-        let active = evidence[i] || (parent_active && failing.is_empty());
-        states.push(BlockState {
-            active,
-            failing: if active || !parent_active {
-                Vec::new()
-            } else {
-                failing
-            },
-            parent_inactive: !active && !parent_active,
-        });
-    }
-    states
 }
 
 /// The indexes of `index` and every block nested in it, in order.
@@ -301,54 +162,6 @@ mod tests {
             parameters: params.iter().map(|p| p.to_string()).collect(),
             ..BlockDef::default()
         }
-    }
-
-    #[test]
-    fn test_gate_holds_values_compare_and_default() {
-        let g = |t: &str, others: &[&str]| Gate {
-            reference: "P-1_R-1".into(),
-            test: t.into(),
-            others: others.iter().map(|o| o.to_string()).collect(),
-        };
-        assert!(g("1", &[]).holds(Some(1.0)));
-        assert!(!g("1", &[]).holds(Some(0.0)));
-        assert!(g("1 2", &[]).holds(Some(2.0)));
-        assert!(g("!=0", &[]).holds(Some(3.0)));
-        assert!(g("<5", &[]).holds(Some(4.0)));
-        assert!(!g("<5", &[]).holds(None));
-        assert!(g("default", &["1"]).holds(Some(0.0)));
-        assert!(!g("default", &["1"]).holds(Some(1.0)));
-        assert!(g("default", &[]).holds(None));
-        assert_eq!(g("1", &[]).satisfying(&[0, 1]), vec![1]);
-        assert_eq!(g("1 2", &[]).first_value(), Some(1));
-    }
-
-    #[test]
-    fn test_block_states_gates_evidence_and_parents() {
-        let blocks = vec![
-            block("PB-1", None, &[("P-1_R-1", "1")], &["P-2_R-2"]),
-            block("PB-2", Some("PB-1"), &[], &["P-3_R-3"]),
-            block("PB-3", None, &[("P-4_R-4", "1")], &["P-5_R-5"]),
-        ];
-        let params: HashSet<&str> = HashSet::new();
-        let objects: HashSet<&str> = HashSet::new();
-        let value = |r: &str| match r {
-            "P-1_R-1" => Some(0.0),
-            "P-4_R-4" => Some(1.0),
-            _ => None,
-        };
-        let s = block_states(&blocks, &params, &objects, &value);
-        assert!(!s[0].active);
-        assert_eq!(s[0].failing, vec![0]);
-        assert!(!s[1].active);
-        assert!(s[1].parent_inactive);
-        assert!(s[2].active);
-
-        // The lock listing a parameter only PB-2 holds makes PB-2 and PB-1
-        // active whatever the values say.
-        let params: HashSet<&str> = ["P-3_R-3"].into_iter().collect();
-        let s = block_states(&blocks, &params, &objects, &value);
-        assert!(s[0].active && s[1].active);
     }
 
     #[test]

@@ -488,6 +488,8 @@ fn test_parameter_pages_maps_refs_to_page_handles() -> TestResult {
     Ok(())
 }
 
+/// The internal "If temperature" refs (`P-13_R-13`, `P-13_R-15`,
+/// `Access="None"`) are reached but never listed (issue #345).
 #[test]
 fn test_unindexed_parameters_lists_what_the_pages_hold_beyond_the_lock() -> TestResult {
     let more = unindexed_parameters(&model()?, &products()?, ia()?)?;
@@ -501,16 +503,6 @@ fn test_unindexed_parameters_lists_what_the_pages_hold_beyond_the_lock() -> Test
             (
                 "P-12_R-12",
                 "dusk-threshold-in-lx",
-                Some("universal-channel-a-function")
-            ),
-            (
-                "P-13_R-13",
-                "if-temperature",
-                Some("universal-channel-a-function")
-            ),
-            (
-                "P-13_R-15",
-                "if-temperature",
                 Some("universal-channel-a-function")
             ),
             (

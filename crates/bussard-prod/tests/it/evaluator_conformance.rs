@@ -159,36 +159,37 @@ fn scenarios(app: &ApplicationProgram, product: &ProductModel) -> Vec<BTreeMap<S
             out.push(values);
         }
     };
-    for b in &product.blocks {
-        for g in b.when.iter().chain(b.parameter_when.values().flatten()) {
-            if let Some(v) = g.first_value() {
-                push(BTreeMap::from([(g.reference.clone(), v.to_string())]));
+    let first_value = |g: &bussard_model::dynamic::RefGate| match &g.test {
+        bussard_model::dynamic::WhenTest::Values(values) => values.first().copied(),
+        _ => None,
+    };
+    let index = bussard_model::dynamic::RefIndex::new(product);
+    let occurrences = || {
+        index
+            .parameters()
+            .flat_map(|(r, occ)| occ.iter().map(move |o| (r, o)))
+            .filter(|(_, o)| o.module_def.is_none())
+    };
+    for (_, o) in occurrences() {
+        for g in &o.gates {
+            if let Some(v) = first_value(g) {
+                push(BTreeMap::from([(g.param_ref_id.clone(), v.to_string())]));
             }
         }
     }
-    let parents = bussard_model::blocks::parent_indexes(&product.blocks);
-    for (i, b) in product.blocks.iter().enumerate() {
-        let mut enclosing: Vec<&bussard_model::blocks::Gate> = Vec::new();
-        let mut at = Some(i);
-        while let Some(j) = at {
-            enclosing.extend(product.blocks[j].when.iter());
-            at = parents[j];
-        }
-        for reference in &b.parameters {
-            let mut values = BTreeMap::new();
-            let own = b.parameter_when.get(reference).into_iter().flatten();
-            for g in enclosing.iter().copied().chain(own) {
-                if g.holds(vendor_default(app, &g.reference)) {
-                    continue;
-                }
-                if let Some(v) = g.first_value() {
-                    values
-                        .entry(g.reference.clone())
-                        .or_insert_with(|| v.to_string());
-                }
+    for (_, o) in occurrences() {
+        let mut values = BTreeMap::new();
+        for g in &o.gates {
+            if g.holds(vendor_default(app, &g.param_ref_id)) {
+                continue;
             }
-            push(values);
+            if let Some(v) = first_value(g) {
+                values
+                    .entry(g.param_ref_id.clone())
+                    .or_insert_with(|| v.to_string());
+            }
         }
+        push(values);
     }
     out
 }

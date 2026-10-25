@@ -55,12 +55,16 @@ parameters:
         - { value: 1, text: Rollladen }
         - { value: 2, text: Jalousie }
     default: "1"
+    refs:
+      MD-3_P-14_R-14: {}
   - id: M-0004_A-20DE-22-C7D8-O000A_MD-3_P-15
     text: Fahrzeit
     type: !int
       min: 1
       max: 600
     default: "60"
+    refs:
+      MD-3_P-15_R-15: {}
   - id: M-0004_A-20DE-22-C7D8-O000A_P-19
     text: Regenalarm
     type: !enum
@@ -68,6 +72,8 @@ parameters:
         - { value: 0, text: Nein }
         - { value: 1, text: Ja }
     default: "0"
+    refs:
+      P-19_R-38: {}
 "#;
 
 fn model() -> Result<Model, Box<dyn std::error::Error>> {
