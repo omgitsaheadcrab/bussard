@@ -329,7 +329,7 @@ pub(crate) fn apply_desired(
             .with_l4(target, &read_options, async |l4| {
                 // The facts and the identity verdict (issue #228, item 5).
                 let identified = crate::device_facts::identify(l4, &facts, model_device).await?;
-                let read = plan_cmd::read_live_tables(l4).await?;
+                let read = plan_cmd::read_live_tables(l4, write.product).await?;
                 let params = match (&read, write.product) {
                     (plan_cmd::LiveRead::Tables(live), Some(product)) => Some(
                         crate::param_readback::read_state(
@@ -555,6 +555,7 @@ pub(crate) fn apply_desired(
         } else {
             None
         },
+        table_bases: plan_cmd::table_bases(write.product),
     };
     let (code, read_back) = if tables_change {
         write_tables_then_parameters(

@@ -21,8 +21,9 @@ use crate::apply::{VerifyOutcome, discover_table_objects, negotiate_session_apdu
 use crate::apply_sys7::{Sys7ApplyError, Sys7TableImages, Sys7VerifyOutcome, apply_sys7_tables};
 use crate::backup::{BackupError, DeviceBackup, backups_root, write_device_backup};
 use crate::compute::{DesiredTables, compute_tables};
+use crate::flash::Sys7TableBases;
 use crate::plan::PlanReport;
-use crate::tables_sys7::{Sys7LiveTables, Sys7TablesError, read_sys7_tables};
+use crate::tables_sys7::{Sys7LiveTables, Sys7TablesError, read_sys7_tables_at};
 
 /// A device's live tables, whichever family served them.
 ///
@@ -99,6 +100,18 @@ pub enum LiveReadError {
 pub async fn read_live_tables<Ch: L4Channel>(
     l4: &mut Layer4Connection<Ch>,
 ) -> Result<LiveRead, LiveReadError> {
+    read_live_tables_at(l4, Sys7TableBases::default()).await
+}
+
+/// [`read_live_tables`] with the System 7 table bases the device's product
+/// allocates ([`crate::sys7_table_bases`]), the fallback the System 7 reader
+/// uses when the device does not answer `PID_TABLE_REFERENCE`. Every surface
+/// that has the product at hand reads (and so writes) the tables where the
+/// product put them; System B ignores `bases`.
+pub async fn read_live_tables_at<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    bases: Sys7TableBases,
+) -> Result<LiveRead, LiveReadError> {
     match read_tables(l4).await {
         Ok(tables) => Ok(LiveRead::Tables(LiveTables::SystemB(tables))),
         // The System B reader refused: route to the System 7 memory-mapped reader
@@ -106,7 +119,7 @@ pub async fn read_live_tables<Ch: L4Channel>(
         Err(TablesError::UnsupportedMask { address, mask })
             if MaskProfile::from_mask(mask).capabilities().plan_apply =>
         {
-            let live = read_sys7_tables(l4)
+            let live = read_sys7_tables_at(l4, bases)
                 .await
                 .map_err(|error| LiveReadError::Sys7 { address, error })?;
             Ok(LiveRead::Tables(LiveTables::Sys7(Box::new(live))))

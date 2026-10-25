@@ -133,6 +133,9 @@ pub struct Expected<'a> {
     pub parameters: Option<ExpectedParameters<'a>>,
     /// The security object.
     pub security: Option<ExpectedSecurity>,
+    /// Where the product puts a System 7 device's tables, the reader's
+    /// fallback when the device does not answer `PID_TABLE_REFERENCE`.
+    pub table_bases: bussard_download::Sys7TableBases,
 }
 
 impl<'a> Expected<'a> {
@@ -186,6 +189,7 @@ impl<'a> Expected<'a> {
                 device_mask,
             }),
             security: ExpectedSecurity::from_flash_plan(flash),
+            table_bases: bussard_download::sys7_table_bases(app),
         }
     }
 }
@@ -395,7 +399,7 @@ pub async fn read_back<Ch: L4Channel>(
 ) -> WriteReadback {
     let mut out = WriteReadback::default();
     if expected.tables.is_some() || expected.group_objects.is_some() {
-        match bussard_download::read_live_tables(l4).await {
+        match bussard_download::read_live_tables_at(l4, expected.table_bases).await {
             Ok(LiveRead::Tables(live)) => compare_tables(&mut out, live.tables(), expected),
             Ok(LiveRead::UnsupportedMask { mask, .. }) => out.notes.push(format!(
                 "tables not compared: mask {mask:04X} has no table reader"

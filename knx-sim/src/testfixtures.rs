@@ -88,6 +88,8 @@ pub fn synthetic_mdt_sys7_product() -> crate::prod::ProductData {
         hardware_type_marker: Some(vec![0, 0, 0, 0, 0x03, 0x0E, 0, 0, 0, 0]),
         device_compare_props: Vec::new(),
         written_props: Vec::new(),
+        task_segment_lsms: None,
+        compare_mems: Vec::new(),
     }
 }
 

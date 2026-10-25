@@ -1329,6 +1329,11 @@ impl BussardMcp {
             } else {
                 None
             },
+            table_bases: product
+                .as_ref()
+                .and_then(|p| p.app())
+                .map(bussard_download::sys7_table_bases)
+                .unwrap_or_default(),
         };
 
         // Whether a write stopped before it reached the device (no lease, a
@@ -2056,7 +2061,11 @@ async fn read_on<Ch: bussard_mgmt::L4Channel>(
     let identified = bussard_service::identify(l4, &facts, device)
         .await
         .map_err(|e| chain(&e))?;
-    let read = bussard_download::read_live_tables(l4)
+    let bases = product
+        .and_then(|p| p.app())
+        .map(bussard_download::sys7_table_bases)
+        .unwrap_or_default();
+    let read = bussard_download::read_live_tables_at(l4, bases)
         .await
         .map_err(|e| chain(&e))?;
     let params = match (&read, product) {

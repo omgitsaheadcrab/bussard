@@ -822,7 +822,7 @@ async fn read_device(
     };
     service
         .with_l4(target, &options, async |l4| {
-            Ok::<_, ServiceError>(plan_cmd::read_live_tables(l4).await)
+            Ok::<_, ServiceError>(plan_cmd::read_live_tables(l4, None).await)
         })
         .await
         .map_err(|err| session_open_error(err, || "connecting to the device".to_string()))?

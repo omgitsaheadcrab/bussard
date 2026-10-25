@@ -324,7 +324,7 @@ async fn read_one(dev: &mut Device, target: IndividualAddress) -> Capture {
         .filter(|s| !s.is_empty());
 
     let read_at = SystemTime::now();
-    let live = plan_cmd::read_live_tables(dev.l4_mut()).await;
+    let live = plan_cmd::read_live_tables(dev.l4_mut(), None).await;
     match live {
         Err(err) => Capture::failed(target, format!("reading the tables: {err:#}")),
         Ok(LiveRead::UnsupportedMask { mask, .. }) => Capture {

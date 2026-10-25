@@ -184,7 +184,7 @@ pub fn run_parameters(
         service
             .with_l4(target, &read_options, async |l4| {
                 let identified = crate::device_facts::identify(l4, &facts, device).await?;
-                let read = crate::plan_cmd::read_live_tables(l4).await?;
+                let read = crate::plan_cmd::read_live_tables(l4, None).await?;
                 let state = match &read {
                     crate::plan_cmd::LiveRead::Tables(live) => Some(
                         crate::param_readback::read_state(

@@ -206,6 +206,10 @@ pub struct Sys7LoadStateMachine {
     /// Whether a task-segment descriptor has been committed since the last
     /// `StartLoading`. `LoadCompleted` requires this.
     task_committed: bool,
+    /// Whether `LoadCompleted` requires a committed task-segment descriptor.
+    /// True unless the product's own load procedure finalises this LSM without
+    /// one (see [`Sys7LoadStateMachine::without_task_segment`]).
+    requires_task_segment: bool,
 }
 
 impl Default for Sys7LoadStateMachine {
@@ -213,6 +217,7 @@ impl Default for Sys7LoadStateMachine {
         Self {
             state: LoadState::Unloaded,
             task_committed: false,
+            requires_task_segment: true,
         }
     }
 }
@@ -271,6 +276,20 @@ impl Sys7LoadStateMachine {
         Self {
             state: initial,
             task_committed: false,
+            requires_task_segment: true,
+        }
+    }
+
+    /// An LSM whose `LoadCompleted` needs no committed task-segment
+    /// descriptor: the product's load procedure loads it without an
+    /// `LdCtrlTaskSegment`. ETS runs a vendor procedure verbatim, so the
+    /// hardware it was certified on completes such a load; the IRSC Open
+    /// actuators (`M-0071_A-2311-11`, mask 0701) load LSMs 1, 2 and 3 and
+    /// commit a task segment on LSM 5 only.
+    pub fn without_task_segment(initial: LoadState) -> Self {
+        Self {
+            requires_task_segment: false,
+            ..Self::new(initial)
         }
     }
 
@@ -373,7 +392,7 @@ impl Sys7LoadStateMachine {
             // LoadCompleted finalises to Loaded, but only after a committed task
             // descriptor (spec §4.3 precondition).
             (LoadState::Loading, E::LoadCompleted) => {
-                if !self.task_committed {
+                if self.requires_task_segment && !self.task_committed {
                     self.state = LoadState::Error;
                     return Err(Sys7TransitionError::MissingTaskSegment);
                 }
@@ -523,6 +542,29 @@ mod tests {
             assert_eq!(
                 lsm.apply(E::LoadCompleted),
                 Err(Sys7TransitionError::MissingTaskSegment)
+            );
+        }
+
+        #[test]
+        fn test_sys7_without_task_segment_completes_a_load() {
+            // The IRSC Open procedure (M-0071_A-1130-82): Load, AbsSegment,
+            // LoadCompleted on LSM 1, no TaskSegment.
+            let mut lsm = Sys7LoadStateMachine::without_task_segment(LoadState::Unloaded);
+            assert_eq!(
+                lsm.apply(E::StartLoading),
+                Ok(Sys7Step::State(LoadState::Loading))
+            );
+            assert!(
+                lsm.apply(E::AllocAbsSegment {
+                    start: 0x4000,
+                    length: 512,
+                    subtype: 0x00,
+                })
+                .is_ok()
+            );
+            assert_eq!(
+                lsm.apply(E::LoadCompleted),
+                Ok(Sys7Step::State(LoadState::Loaded))
             );
         }
 
