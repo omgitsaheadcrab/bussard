@@ -64,3 +64,10 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 [[profile.corpus.overrides]]
 filter = 'test(/^sim_catalog_loop::/)'
 slow-timeout = { period = "300s", terminate-after = 12 }
+
+# The Dynamic round trip (issue #345) evaluates every program of the corpus
+# 102 times (XML and model, defaults and 50 random value sets); the debug
+# evaluator needs about 33 minutes for the ~500 archives (1354 programs).
+[[profile.corpus.overrides]]
+filter = 'test(/round_trips_the_dynamic_tree_on_the_corpus/)'
+slow-timeout = { period = "300s", terminate-after = 12 }

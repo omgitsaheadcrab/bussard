@@ -24,6 +24,7 @@ pub mod doc;
 pub mod dotenv;
 pub mod dpt;
 pub mod dynamic;
+pub mod dynamic_compact;
 mod emit;
 pub mod ets_export;
 pub mod facts;

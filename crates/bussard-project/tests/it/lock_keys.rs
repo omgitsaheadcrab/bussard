@@ -255,12 +255,12 @@ const MODEL_WITH_REFS_YAML: &str = "parameters:
         - value: 1
           text: Heating
     default: '0'
-    refs: [M-00FA_A-00D1-10-0001_MD-1_P-2_R-2]
+    refs: {M-00FA_A-00D1-10-0001_MD-1_P-2_R-2: {}}
   - id: M-00FA_A-00D1-10-0001_P-3
     text: Mode
     type: !int
       min: 0
-    refs: [M-00FA_A-00D1-10-0001_P-3_R-4]
+    refs: {M-00FA_A-00D1-10-0001_P-3_R-4: {}}
 ";
 
 #[test]
