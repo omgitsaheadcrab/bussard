@@ -156,7 +156,7 @@ pub(crate) fn write_model(
             crate::lock_pin::pin_import(dir, project, &to_save);
         }
         fetch_product_data(dir, &to_save, fetch)?;
-        crate::product_store::complete_models(dir, None);
+        crate::product_store::complete_all_models(dir);
         crate::validate_cmd::print_summary(dir);
         return Ok(report_merge(merge, *kept, choice));
     }
@@ -195,7 +195,7 @@ pub(crate) fn write_model(
     fetch_product_data(dir, &to_save, fetch)?;
     // The product models of every pinned archive, in the lock's language, so
     // the first command after an import finds them written (issue #255).
-    crate::product_store::complete_models(dir, None);
+    crate::product_store::complete_all_models(dir);
     // Validation is part of import: the summary says what to fix next.
     crate::validate_cmd::print_summary(dir);
     if let Some((ours, merge, kept)) = merge_report {

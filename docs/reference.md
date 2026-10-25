@@ -979,7 +979,7 @@ knx/
 |---|---|
 | `init`, `import`, `import-product`, `adopt` | Create it and write `.bussard/models/` and the first history snapshot. `products/` is written next to it, never inside. |
 | `status`, `history`, `show`, `undo`, `export` | The history is empty: `status` says there is no snapshot yet, `history` lists nothing, `show` and `undo` find no snapshot, `export` writes the bundle without snapshots. |
-| `validate`, `groups`, `export-groups`, `doc`, `ha-config`, `device` | Regenerate `.bussard/models/` from the archives the lock pins, in the lock's `language`, then run as usual. The same happens when the directory exists but lacks the model of an application a stored archive carries (empty, partly deleted, or a device whose archive arrived later): every command checks one file per pinned application and writes only the missing ones. `device` also writes a single missing model on demand. `diff` and `keyring` read no model directory. |
+| `validate`, `groups`, `export-groups`, `doc`, `ha-config`, `device` | Regenerate `.bussard/models/` from the archives the lock pins, in the lock's `language`, then run as usual. The same happens when the directory exists but lacks the model of an application a device in the lock pins (empty, partly deleted, or a device whose archive arrived later): every command checks one file per pinned application and writes only the missing ones. Only the pinned applications get a model: an archive with 407 programs, of which one device runs one, is parsed for that one program (issue #356). `import` and `import-product` still write a model for every program of the archives they pin. `device` also writes a single missing model on demand. `diff` and `keyring` read no model directory. |
 | `scan`, `monitor`, `capture`, `read`, `write`, `learn`, `test` | Unaffected (the product models regenerate first, as above). |
 | `describe`, `plan`, `reconstruct`, `audit --live`, `backup` | Read the device facts from the device and write `.bussard/facts/<ia>.toml`; `plan` and `reconstruct` decode parameters when the archive is in `products/`. |
 | `flash`, `apply` (parameters), `commission --flash`, `replace` | Unaffected by `.bussard/`; they refuse before any bus write only when the archive the lock pins is missing from `products/` or changed. |
@@ -1049,7 +1049,7 @@ The facts live here, not in `devices/*.toml` or `bussard.lock`, because an ETS r
 
 The parsed-product cache (issue #214). A `.knxproj` carries the ApplicationProgram of every device in the project and a `.knxprod` often a whole product family, while `flash`, `plan`, `reconstruct` and `adopt` need one program. bussard reads the archive's table of contents first (the program ids from the entry names, the `Hardware.xml` order numbers, `knx_master.xml`) and then parses only the program the command selects: by `--application`, by the model's application reference or by the order number. When that does not settle the choice, every program is parsed, so a refusal reads as before. A lookup by order number reads the lock's `[[product]]` entries and parses nothing.
 
-What was parsed is stored here as JSON, one directory per archive:
+What was parsed is stored here as JSON, one directory per archive: the catalogue and each program a command parsed. Regenerating `.bussard/models/` parses only the pinned programs (with the programs their `Hardware2Program` lists next to them), so after it the cache holds those, not the whole archive:
 
 ```
 .bussard/products/<key>/catalog.json

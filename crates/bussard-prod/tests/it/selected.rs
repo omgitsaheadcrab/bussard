@@ -364,3 +364,109 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// A model directory holding the fixture archive under `products/`, with a
+/// lock entry that lists all three programs and one device per `pinned`
+/// application (issue #356).
+fn pinned_model(dir: &Path, pinned: &[&str]) -> TestResult {
+    std::fs::create_dir_all(dir.join("products"))?;
+    let archive = dir.join("products").join("fixture.knxprod");
+    build(&archive, "Fixture")?;
+    let (sha, size) = bussard_model::sha256_file(&archive)?;
+    let mut lock = format!(
+        "version = 3\n\n[[product]]\nsha256 = \"{sha}\"\nfile = \"products/fixture.knxprod\"\n\
+         filename = \"fixture.knxprod\"\nsize = {size}\n\
+         origin = {{ kind = \"file\", path = \"fixture.knxprod\" }}\n\
+         applications = [\"{APP_A}\", \"{PEI_A}\", \"{APP_B}\"]\n"
+    );
+    for (i, app) in pinned.iter().enumerate() {
+        lock.push_str(&format!(
+            "\n[[device]]\naddress = \"1.1.{}\"\napplication = \"{app}\"\nproduct_sha256 = \"{sha}\"\n",
+            i + 1
+        ));
+    }
+    std::fs::write(dir.join("bussard.lock"), lock)?;
+    Ok(())
+}
+
+/// The model files under `.bussard/models/`, sorted.
+fn model_files(dir: &Path) -> Result<Vec<String>, std::io::Error> {
+    let mut names: Vec<String> = std::fs::read_dir(dir.join(".bussard").join("models"))?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".yaml"))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// The program ids the parsed-product cache holds, over every archive entry.
+fn cached_programs(dir: &Path) -> Result<Vec<String>, std::io::Error> {
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(dir.join(".bussard").join("products"))?.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(entry.path())?.flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            if let Some((id, _)) = name.split_once('@') {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+#[test]
+fn test_complete_models_writes_only_the_pinned_application() -> TestResult {
+    use bussard_prod::product_model::{complete_models, models_incomplete};
+    let tmp = tempfile::tempdir()?;
+    pinned_model(tmp.path(), &[APP_B])?;
+    assert!(models_incomplete(tmp.path()));
+    assert!(complete_models(tmp.path(), None).is_empty());
+    assert_eq!(model_files(tmp.path())?, vec![format!("{APP_B}.yaml")]);
+    // Only the pinned program was parsed, so only it is in the cache.
+    assert_eq!(cached_programs(tmp.path())?, vec![APP_B.to_string()]);
+    assert!(
+        !models_incomplete(tmp.path()),
+        "the pinned model is written"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_complete_models_writes_each_pinned_application_of_one_archive() -> TestResult {
+    use bussard_prod::product_model::{complete_models, models_incomplete};
+    let tmp = tempfile::tempdir()?;
+    // Two devices pin A, one pins B: one read of the archive, each model once.
+    pinned_model(tmp.path(), &[APP_A, APP_B, APP_A])?;
+    assert!(complete_models(tmp.path(), None).is_empty());
+    // A's PEI companion is parsed to attach it to A, but no device pins it.
+    assert_eq!(
+        model_files(tmp.path())?,
+        vec![format!("{APP_A}.yaml"), format!("{APP_B}.yaml")]
+    );
+    assert!(!models_incomplete(tmp.path()));
+    // `only` writes an application the archive carries, pinned or not.
+    assert!(complete_models(tmp.path(), Some(PEI_A)).is_empty());
+    assert_eq!(model_files(tmp.path())?.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn test_complete_all_models_writes_every_application() -> TestResult {
+    use bussard_prod::product_model::complete_all_models;
+    let tmp = tempfile::tempdir()?;
+    pinned_model(tmp.path(), &[APP_B])?;
+    assert!(complete_all_models(tmp.path()).is_empty());
+    assert_eq!(
+        model_files(tmp.path())?,
+        vec![
+            format!("{APP_A}.yaml"),
+            format!("{PEI_A}.yaml"),
+            format!("{APP_B}.yaml")
+        ]
+    );
+    Ok(())
+}
