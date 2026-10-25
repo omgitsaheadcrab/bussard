@@ -257,14 +257,27 @@ pub fn seed(app: &ApplicationProgram) -> u64 {
 }
 
 /// The vendor directory of the corpus `BUSSARD_PRODUCT_CORPUS` names (the
-/// product-corpus directory, its `cache/`, or the vendor directory itself),
-/// `None` when it is unset.
-pub fn corpus_vendor() -> Option<Result<PathBuf, String>> {
-    let dir = std::env::var_os("BUSSARD_PRODUCT_CORPUS").map(PathBuf::from)?;
-    Some(
-        [dir.join("cache/vendor"), dir.join("vendor"), dir]
-            .into_iter()
-            .find(|d| !knxprod_files(d).is_empty())
-            .ok_or_else(|| "the corpus holds no .knxprod files".to_string()),
-    )
+/// product-corpus directory, its `cache/`, or the vendor directory itself).
+/// `None`, with the reason on stderr, when the variable is unset or empty
+/// (CI exports it empty on an ordinary run) or when no `.knxprod` is found:
+/// a corpus sweep then skips green, as `flash_corpus.rs` does.
+pub fn corpus_vendor() -> Option<PathBuf> {
+    let dir = std::env::var_os("BUSSARD_PRODUCT_CORPUS")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let Some(dir) = dir else {
+        eprintln!("BUSSARD_PRODUCT_CORPUS unset; skipping the corpus sweep.");
+        return None;
+    };
+    let found = [dir.join("cache/vendor"), dir.join("vendor"), dir.clone()]
+        .into_iter()
+        .find(|d| !knxprod_files(d).is_empty());
+    if found.is_none() {
+        eprintln!(
+            "BUSSARD_PRODUCT_CORPUS={} holds no .knxprod files; skipping (nothing to sweep). \
+             Run tests-support/product-corpus/fetch.sh first.",
+            dir.display()
+        );
+    }
+    found
 }

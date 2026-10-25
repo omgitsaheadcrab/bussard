@@ -301,10 +301,9 @@ fn test_view_shows_what_the_download_writes_on_every_fixture() -> TestResult {
 #[test]
 fn test_view_shows_what_the_download_writes_on_the_corpus() -> TestResult {
     let Some(vendor) = corpus_vendor() else {
-        eprintln!("BUSSARD_PRODUCT_CORPUS unset; skipping the view acceptance sweep.");
         return Ok(());
     };
-    let files = knxprod_files(&vendor?);
+    let files = knxprod_files(&vendor);
     let started = std::time::Instant::now();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(Vec::new());

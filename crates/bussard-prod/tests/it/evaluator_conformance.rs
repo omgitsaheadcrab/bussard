@@ -453,10 +453,8 @@ fn test_product_model_round_trips_the_dynamic_tree_on_every_fixture() -> TestRes
 #[test]
 fn test_product_model_round_trips_the_dynamic_tree_on_the_corpus() -> TestResult {
     let Some(vendor) = corpus_vendor() else {
-        eprintln!("BUSSARD_PRODUCT_CORPUS unset; skipping the Dynamic round trip sweep.");
         return Ok(());
     };
-    let vendor = vendor?;
     let files = knxprod_files(&vendor);
     let started = std::time::Instant::now();
     let next = std::sync::atomic::AtomicUsize::new(0);
