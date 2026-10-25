@@ -178,10 +178,11 @@ pub(crate) fn pinned_application(
 ///   (origin `index` when the pointer index knows its hash, else `file`),
 ///   linking the devices whose order number its catalogue carries; an empty
 ///   `vendor/` (apart from its old `.gitignore`) is removed.
-/// - When an application an archive in the lock pins has no
+/// - When an application a device in the lock pins has no
 ///   `.bussard/models/<app>.yaml` (the directory is absent, empty or partly
-///   deleted), the missing models are regenerated from those archives
-///   (issue #267). Checking costs one `stat` per pinned application.
+///   deleted), the missing models are regenerated from the archives that
+///   carry them (issues #267, #356). Checking costs one `stat` per pinned
+///   application.
 ///
 /// Failures are warnings: the command itself reports what it cannot do.
 pub(crate) fn prepare(dir: &Path) {
@@ -259,14 +260,27 @@ fn migrate_vendor(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Writes the product model of every application a pinned archive carries
+/// Writes the product model of every application a device in the lock pins
 /// that `.bussard/models/` lacks, or only of `only` when given (see
 /// [`bussard_prod::product_model::complete_models`], which the MCP and `viz`
 /// servers run on their model reload too).
 ///
 /// Failures are warnings: the command itself reports what it cannot do.
 pub(crate) fn complete_models(dir: &Path, only: Option<&str>) {
-    for warning in bussard_prod::product_model::complete_models(dir, only) {
+    warn(bussard_prod::product_model::complete_models(dir, only));
+}
+
+/// Writes the product model of every application of every archive the lock
+/// pins that `.bussard/models/` lacks, pinned by a device or not (see
+/// [`bussard_prod::product_model::complete_all_models`]): what `import` has
+/// always written.
+pub(crate) fn complete_all_models(dir: &Path) {
+    warn(bussard_prod::product_model::complete_all_models(dir));
+}
+
+/// Prints the warnings of a model completion.
+fn warn(warnings: Vec<String>) {
+    for warning in warnings {
         eprintln!("warning: regenerating the product models: {warning}");
     }
 }

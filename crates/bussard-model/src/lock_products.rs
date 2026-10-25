@@ -251,6 +251,56 @@ pub fn lock_entries(dir: &Path) -> Vec<ProductEntry> {
         .unwrap_or_default()
 }
 
+/// The application one `[[device]]` of the lock pins (see [`lock_pins`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevicePin {
+    /// The device's individual address.
+    pub address: IndividualAddress,
+    /// The application program id the device runs.
+    pub application: String,
+    /// The `sha256` of the `[[product]]` entry the device links to, lowercase.
+    pub product_sha256: Option<String>,
+}
+
+/// The `[[product]]` entries of `<dir>/bussard.lock` and the application
+/// every `[[device]]` pins, read in one parse.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LockPins {
+    /// Every `[[product]]` entry, as [`lock_entries`] returns them.
+    pub products: Vec<ProductEntry>,
+    /// One per device that names an `application`, in lock order.
+    pub devices: Vec<DevicePin>,
+}
+
+/// The lock's product entries and device pins (both empty when there is no
+/// lock or it does not parse). The product models a model directory needs
+/// are those of the pinned applications: the model load reads no other
+/// (issue #356).
+pub fn lock_pins(dir: &Path) -> LockPins {
+    let path = dir.join(LOCK_FILE);
+    let Some(lock) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| parse_lock(&path, &text).ok())
+    else {
+        return LockPins::default();
+    };
+    let devices = lock
+        .devices
+        .iter()
+        .filter_map(|d| {
+            Some(DevicePin {
+                address: d.address,
+                application: d.application.clone()?,
+                product_sha256: d.product_sha256.as_deref().map(str::to_ascii_lowercase),
+            })
+        })
+        .collect();
+    LockPins {
+        products: lock.products,
+        devices,
+    }
+}
+
 /// The archive file (relative to the model directory) the lock pins for the
 /// application `app`, out of `entries`: the first entry that names an
 /// archive in the model and lists `app` among its applications, or, for the

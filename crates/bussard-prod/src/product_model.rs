@@ -4,15 +4,16 @@
 //!
 //! [`write_product_models`] writes them from parsed product data (what
 //! `import-product` and `import` do). [`complete_models`] fills in the ones
-//! that are missing from the pinned archives. Every surface runs it before it
+//! the lock's devices pin that are missing, from the pinned archives. Every surface runs it before it
 //! reads the model: the CLI before each command, the MCP and `viz` servers at
 //! start and on every model reload (issue #267). An empty or partly deleted
 //! `.bussard/models/` therefore heals on its own; only an application no
 //! stored archive carries needs `bussard import-product`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use bussard_model::lock_products::{LockPins, lock_pins};
 use bussard_model::schema::ProductEntry;
 use serde::Serialize;
 
@@ -156,39 +157,73 @@ pub fn verified_archive(
     Ok(path)
 }
 
-/// Whether an application an archive in the lock pins lacks its model file,
-/// or has one of an older [`bussard_model::param_model::MODEL_FORMAT`]: the
-/// first 4 KiB of each pinned application's model are read, no archive.
-/// `false` when there is no lock.
+/// Whether an application a device in the lock pins lacks its model file, or
+/// has one of an older [`bussard_model::param_model::MODEL_FORMAT`]: the first
+/// 4 KiB of each pinned application's model are read, no archive. Only the
+/// applications [`complete_models`] writes count, so the two agree. `false`
+/// when there is no lock.
 pub fn models_incomplete(dir: &Path) -> bool {
     if !dir.join(bussard_model::loader::LOCK_FILE).is_file() {
         return false;
     }
     let models_dir = dir.join(bussard_model::param_model::MODELS_DIR);
-    if !models_dir.is_dir() {
-        return true;
-    }
-    bussard_model::lock_products::lock_entries(dir)
-        .iter()
-        .filter(|e| e.file.is_some())
-        .any(|e| {
-            e.applications.is_empty()
-                || e.applications.iter().any(|app| {
-                    !bussard_model::param_model::model_is_current(
-                        &models_dir.join(format!("{app}.yaml")),
-                    )
-                })
+    let pins = lock_pins(dir);
+    pins.products.iter().filter(|e| e.file.is_some()).any(|e| {
+        pinned_in(e, &pins).iter().any(|app| {
+            !bussard_model::param_model::model_is_current(&models_dir.join(format!("{app}.yaml")))
         })
+    })
 }
 
-/// Writes the product model of every application a pinned archive carries
+/// Whether the archive of `entry` carries `app` as far as the lock knows: an
+/// entry that lists its applications carries those, one that lists none
+/// carries what the devices linked to it pin.
+fn carries(entry: &ProductEntry, pins: &LockPins, app: &str) -> bool {
+    if entry.applications.is_empty() {
+        let sha = entry.sha256.to_ascii_lowercase();
+        pins.devices
+            .iter()
+            .any(|d| d.application == app && d.product_sha256.as_deref() == Some(sha.as_str()))
+    } else {
+        entry.applications.iter().any(|a| a == app)
+    }
+}
+
+/// The applications of `entry`'s archive a device in the lock pins: the
+/// product models the model directory needs from it (issue #356). The model
+/// load reads no other.
+fn pinned_in(entry: &ProductEntry, pins: &LockPins) -> BTreeSet<String> {
+    pins.devices
+        .iter()
+        .filter(|d| carries(entry, pins, &d.application))
+        .map(|d| d.application.clone())
+        .collect()
+}
+
+/// Which models [`complete`] writes.
+#[derive(Clone, Copy)]
+enum Wanted<'a> {
+    /// The pinned applications, or only this one.
+    Pinned(Option<&'a str>),
+    /// Every application of every pinned archive.
+    All,
+}
+
+/// Writes the product model of every application a device in the lock pins
 /// that `.bussard/models/` lacks or holds in an older format, or only of
-/// `only` when given. An archive whose applications all have a current model
-/// is not read. Returns one message per archive that could not be used
-/// (missing, changed, unreadable) for a model that is missing; an outdated
-/// model whose archive cannot be read stays as it is, silently. The caller
-/// reports them as warnings, since the command itself says what it cannot do
-/// without the model.
+/// `only` when given (an application a pinned archive carries, pinned by a
+/// device or not). Each archive is parsed once, and only for the programs it
+/// has to write (with their `Hardware2Program` companions, see
+/// [`AppSelection::Exact`]); an archive whose pinned applications all have a
+/// current model is not read. Applications no device pins get no model
+/// (issue #356): a 159 MB archive with 407 programs costs one program parse,
+/// not 407. [`complete_all_models`] writes every application.
+///
+/// Returns one message per archive that could not be used (missing, changed,
+/// unreadable) for a model that is missing; an outdated model whose archive
+/// cannot be read stays as it is, silently. The caller reports them as
+/// warnings, since the command itself says what it cannot do without the
+/// model.
 ///
 /// The archives are parsed in the language the model's device files carry
 /// their enum labels in ([`bussard_model::import_language`]: the lock's
@@ -196,6 +231,20 @@ pub fn models_incomplete(dir: &Path) -> bool {
 /// language would not know those labels (E017, issue #255). The
 /// parsed-product cache keys programs by that language.
 pub fn complete_models(dir: &Path, only: Option<&str>) -> Vec<String> {
+    complete(dir, Wanted::Pinned(only))
+}
+
+/// [`complete_models`] for every application program of every archive the
+/// lock pins that lacks a current model, pinned by a device or not: the
+/// behaviour before issue #356, for a caller that needs the whole product
+/// family. An archive whose listed applications all have a current model is
+/// not read.
+pub fn complete_all_models(dir: &Path) -> Vec<String> {
+    complete(dir, Wanted::All)
+}
+
+/// [`complete_models`] and [`complete_all_models`].
+fn complete(dir: &Path, wanted: Wanted<'_>) -> Vec<String> {
     let models_dir = dir.join(bussard_model::param_model::MODELS_DIR);
     let _ = std::fs::create_dir_all(&models_dir);
     let has_model = |app: &str| models_dir.join(format!("{app}.yaml")).is_file();
@@ -206,44 +255,84 @@ pub fn complete_models(dir: &Path, only: Option<&str>) -> Vec<String> {
     };
     let language = bussard_model::import_language(dir);
     let cache = cache_dir(dir);
+    let pins = lock_pins(dir);
+    // Applications written from an earlier entry: two archives that carry
+    // the same application write its model once.
+    let mut done: BTreeSet<String> = BTreeSet::new();
     let mut warnings = Vec::new();
-    for entry in bussard_model::lock_products::lock_entries(dir) {
-        if entry.file.is_none() {
-            continue;
-        }
-        let wanted = match only {
-            Some(app) => entry.applications.iter().any(|a| a == app) && !has_current(app),
-            None => {
-                entry.applications.is_empty() || !entry.applications.iter().all(|a| has_current(a))
+    for entry in pins.products.iter().filter(|e| e.file.is_some()) {
+        // `needed`: the models to write (`None`: every program the archive
+        // holds); `only_outdated`: each of them exists in an older format.
+        let (needed, only_outdated) = match wanted {
+            Wanted::Pinned(only) => {
+                let apps: BTreeSet<String> = match only {
+                    Some(app) if carries(entry, &pins, app) => BTreeSet::from([app.to_string()]),
+                    Some(_) => BTreeSet::new(),
+                    None => pinned_in(entry, &pins),
+                };
+                let needed: Vec<String> = apps
+                    .into_iter()
+                    .filter(|a| !done.contains(a) && !has_current(a))
+                    .collect();
+                if needed.is_empty() {
+                    continue;
+                }
+                let outdated = needed.iter().all(|a| has_model(a));
+                (Some(needed), outdated)
+            }
+            Wanted::All => {
+                let apps = &entry.applications;
+                if !apps.is_empty() && apps.iter().all(|a| has_current(a)) {
+                    continue;
+                }
+                (None, !apps.is_empty() && apps.iter().all(|a| has_model(a)))
             }
         };
-        let only_outdated =
-            !entry.applications.is_empty() && entry.applications.iter().all(|a| has_model(a));
-        if !wanted {
-            continue;
-        }
         let what = entry
             .filename
             .clone()
             .unwrap_or_else(|| entry.sha256.clone());
-        let written = verified_archive(dir, &what, &entry).and_then(|path| {
+        let written = verified_archive(dir, &what, entry).and_then(|path| {
+            let selection = match &needed {
+                Some(ids) => AppSelection::Exact(ids.clone()),
+                None => AppSelection::All,
+            };
             let product = crate::read_knxprod_selected_in(
                 &path,
                 None,
                 cache.as_deref(),
                 language.as_deref(),
-                |_| AppSelection::All,
+                |_| selection,
             )
             .map_err(|source| ModelError::Read {
                 path: path.clone(),
                 source,
             })?;
-            write_product_models(&product, dir)
+            match &needed {
+                // The companion programs the selection parsed along are
+                // attached to their application, not written as models.
+                Some(ids) => write_models(&product, dir, |id| ids.iter().any(|a| a == id)),
+                None => write_product_models(&product, dir),
+            }
         });
-        if let Err(err) = written
-            && !only_outdated
-        {
-            warnings.push(err.to_string());
+        match written {
+            Ok(files) => {
+                let ids: BTreeSet<String> = files
+                    .iter()
+                    .filter_map(|f| f.strip_suffix(".yaml"))
+                    .map(str::to_string)
+                    .collect();
+                // An application the lock says the archive carries, which it
+                // does not: no model, and the next command would try again.
+                for id in needed.iter().flatten() {
+                    if !ids.contains(id) && !has_model(id) {
+                        warnings.push(format!("{what} carries no application program {id}"));
+                    }
+                }
+                done.extend(ids);
+            }
+            Err(err) if !only_outdated => warnings.push(err.to_string()),
+            Err(_) => {}
         }
     }
     warnings
@@ -257,6 +346,15 @@ pub fn complete_models(dir: &Path, only: Option<&str>) -> Vec<String> {
 ///
 /// A model does not serialize, or a file cannot be written.
 pub fn write_product_models(product: &ProductData, dir: &Path) -> Result<Vec<String>, ModelError> {
+    write_models(product, dir, |_| true)
+}
+
+/// [`write_product_models`] for the programs whose id `keep` accepts.
+fn write_models(
+    product: &ProductData,
+    dir: &Path,
+    keep: impl Fn(&str) -> bool,
+) -> Result<Vec<String>, ModelError> {
     let models_dir = dir.join(bussard_model::param_model::MODELS_DIR);
     std::fs::create_dir_all(&models_dir).map_err(|source| ModelError::Io {
         what: "creating",
@@ -264,7 +362,7 @@ pub fn write_product_models(product: &ProductData, dir: &Path) -> Result<Vec<Str
         source,
     })?;
     let mut written: Vec<String> = Vec::new();
-    for app in &product.applications {
+    for app in product.applications.iter().filter(|a| keep(&a.id)) {
         let yaml = model_yaml(app, product)?;
         let file_name = format!("{}.yaml", app.id);
         let path = models_dir.join(&file_name);
@@ -1048,7 +1146,8 @@ mod tests {
         std::fs::write(
             dir.join(bussard_model::loader::LOCK_FILE),
             "version = 3\n\n[[product]]\nsha256 = \"00\"\nfile = \"products/a.knxprod\"\n\
-             origin = { kind = \"file\", path = \"a.knxprod\" }\napplications = [\"M-1\"]\n",
+             origin = { kind = \"file\", path = \"a.knxprod\" }\napplications = [\"M-1\"]\n\n\
+             [[device]]\naddress = \"1.1.1\"\napplication = \"M-1\"\n",
         )?;
         let models = dir.join(bussard_model::param_model::MODELS_DIR);
         std::fs::create_dir_all(&models)?;
@@ -1073,7 +1172,10 @@ mod tests {
         std::fs::write(
             dir.join(bussard_model::loader::LOCK_FILE),
             "version = 3\n\n[[product]]\nsha256 = \"00\"\nfile = \"products/a.knxprod\"\n\
-             origin = { kind = \"file\", path = \"a.knxprod\" }\napplications = [\"M-1\", \"M-2\"]\n",
+             origin = { kind = \"file\", path = \"a.knxprod\" }\n\
+             applications = [\"M-1\", \"M-2\", \"M-3\"]\n\n\
+             [[device]]\naddress = \"1.1.1\"\napplication = \"M-1\"\n\n\
+             [[device]]\naddress = \"1.1.2\"\napplication = \"M-2\"\n",
         )?;
         assert!(models_incomplete(&dir), "no models directory");
         let models = dir.join(bussard_model::param_model::MODELS_DIR);
@@ -1088,6 +1190,7 @@ mod tests {
         std::fs::write(models.join("M-2.yaml"), "identity:\n  id: M-2\n")?;
         assert!(models_incomplete(&dir), "a model of an older format");
         std::fs::write(models.join("M-2.yaml"), &current)?;
+        // M-3 is in the archive, but no device pins it (issue #356).
         assert!(
             !models_incomplete(&dir),
             "every pinned application has its model"

@@ -287,7 +287,8 @@ see [the corpus findings in DESIGN.md](DESIGN.md#the-flashability-corpus-and-swe
 A model file describes one application program. It is machine-generated and carries a
 banner saying so; do not hand-edit it. It lives under `<dir>/.bussard/models/`, which
 holds only data bussard regenerates: when the directory is missing, the next command
-rebuilds it from the archives in `products/`. Product models stay YAML: they are
+rebuilds it from the archives in `products/`, one model per application a device in the
+lock pins (issue #356). Product models stay YAML: they are
 generated files that nobody edits, so the reasons that moved the user's model files to
 TOML do not apply to them. Example (abridged):
 

@@ -205,8 +205,8 @@ impl ModelHandle {
     }
 }
 
-/// Regenerates the product models under `<dir>/.bussard/models/` that an
-/// archive the lock pins carries but the directory lacks (see
+/// Regenerates the product models under `<dir>/.bussard/models/` of the
+/// applications the lock's devices pin that the directory lacks (see
 /// [`bussard_prod::product_model::complete_models`]). Cheap when nothing is
 /// missing: one `stat` per pinned application, no archive read. A pinned
 /// archive that is missing or changed is logged as a warning; the tools that
