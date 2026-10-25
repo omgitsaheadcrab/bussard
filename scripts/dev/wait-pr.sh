@@ -24,8 +24,14 @@ state() {
 }
 
 # A freshly pushed head has no checks for a few seconds; `gh pr checks` would
-# exit with "no checks reported" instead of waiting.
-until gh pr checks "$pr" >/dev/null 2>&1; do
+# exit with "no checks reported" instead of waiting. Once checks exist it exits
+# 0 (all green) or 8 (some pending or failed); anything else means none yet.
+checks_present() {
+  gh pr checks "$pr" >/dev/null 2>&1
+  local rc=$?
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 8 ]
+}
+until checks_present; do
   read -r st _ _ < <(state)
   [ "$st" = MERGED ] && { echo "PR #$pr merged"; exit 0; }
   [ "$st" = CLOSED ] && { echo "PR #$pr closed without merging"; exit 2; }
