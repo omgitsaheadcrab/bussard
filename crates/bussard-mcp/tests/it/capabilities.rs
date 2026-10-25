@@ -266,123 +266,182 @@ const METEO_APP: &str = "M-0004_A-0304-10-0000";
 const METEO_CHANNELS: u32 = 12;
 const METEO_ON: u32 = 4;
 
-fn meteo_product() -> String {
-    let id = |s: String| format!("{METEO_APP}_{s}");
-    let enum_yes_no = "  type: !enum\n    values:\n    - value: 0\n      text: nein\n    - value: 1\n      text: ja\n  default: '0'\n";
-    let mut objects = String::from("com_objects:\n");
-    let mut params = String::from("parameters:\n");
-    let mut ref_values = String::from("ref_values:\n");
-    let mut blocks = String::from(
-        "blocks:\n- id: CH-0\n  kind: channel\n  text: Generic\n  number: 0\n- id: PB-1\n  text: Allgemein\n  parent: CH-0\n  channel: CH-0\n  parameters:\n",
-    );
-    let refs = |r: &[&str]| -> String {
-        let lines: String = r.iter().map(|r| format!("    {r}: {{}}\n")).collect();
-        format!("  refs:\n{lines}")
-    };
-    // The Dynamic tree the blocks come from (format 5): the evaluator's
-    // input, one flow line per node.
-    let mut general = Vec::new();
-    let mut channel = Vec::new();
-    for k in 1..=METEO_CHANNELS {
-        blocks.push_str(&format!("  - P-{k}_R-{k}\n"));
+/// The application XML of the Meteodata-like program (bussard's own
+/// fabrication, no vendor data): what the importer reads.
+fn meteo_xml() -> String {
+    let id = |s: &str| format!("{METEO_APP}_{s}");
+    let flags = r#"CommunicationFlag="Enabled" ReadFlag="Enabled" TransmitFlag="Enabled""#;
+    let mut params = String::new();
+    let mut refs = String::new();
+    let mut objects = String::new();
+    let mut object_refs = String::new();
+    let mut parameter = |pid: &str, name: &str, text: &str, kind: &str, value: &str| {
         params.push_str(&format!(
-            "- id: {}\n  name: Enable{k}\n  text: Universalkanal C{k} aktivieren\n{enum_yes_no}{}",
-            id(format!("P-{k}")),
-            refs(&[&format!("P-{k}_R-{k}")])
+            "<Parameter Id=\"{}\" Name=\"{name}\" Text=\"{text}\" ParameterType=\"{}\" Value=\"{value}\" />\n",
+            id(pid),
+            id(kind)
         ));
-        general.push(json!({"p": format!("P-{k}_R-{k}")}));
+    };
+    let mut general = String::new();
+    for k in 1..=METEO_CHANNELS {
+        parameter(
+            &format!("P-{k}"),
+            &format!("Enable{k}"),
+            &format!("Universalkanal C{k} aktivieren"),
+            "PT-YesNo",
+            "0",
+        );
+        general.push_str(&format!(
+            "<ParameterRefRef RefId=\"{}\" />\n",
+            id(&format!("P-{k}_R-{k}"))
+        ));
     }
-    channel.push(json!({"block": {"id": "PB-1", "text": "Allgemein", "nodes": general}}));
+    let mut channel = format!(
+        "<ParameterBlock Id=\"{}\" Text=\"Allgemein\">\n{general}</ParameterBlock>\n",
+        id("PB-1")
+    );
+    let mut add_ref = |r: String, p: String, value: Option<&str>| {
+        let value = value.map(|v| format!(" Value=\"{v}\"")).unwrap_or_default();
+        refs.push_str(&format!(
+            "<ParameterRef Id=\"{}\" RefId=\"{}\"{value} />\n",
+            id(&r),
+            id(&p)
+        ));
+    };
+    for k in 1..=METEO_CHANNELS {
+        add_ref(format!("P-{k}_R-{k}"), format!("P-{k}"), None);
+    }
+    let rr = |r: String| format!("<ParameterRefRef RefId=\"{}\" />", id(&r));
+    let or = |r: String| format!("<ComObjectRefRef RefId=\"{}\" />", id(&r));
     for k in 1..=METEO_CHANNELS {
         let first = if k >= 5 { 5 } else { k };
-        let when: String = (first..=k)
-            .map(|j| format!("  - ref: P-{j}_R-{j}\n    test: '1'\n"))
-            .collect();
         let (f, s, h) = (1000 + 10 * k, 1001 + 10 * k, 1002 + 10 * k);
-        let wind = 1005 + 10 * k;
-        params.push_str(&format!(
-            "- id: {}\n  name: Function{k}\n  text: Funktion des Kanals\n  type: !enum\n    values:\n    - value: 1\n      text: Helligkeit\n    - value: 2\n      text: Temperatur\n    - value: 3\n      text: Wind\n  default: '1'\n{}",
-            id(format!("P-{f}")),
-            refs(&[&format!("P-{f}_R-{f}")])
-        ));
-        params.push_str(&format!(
-            "- id: {}\n  name: Threshold{k}\n  text: Schwellwert in lx\n  type: !int\n    min: 1\n    max: 1000\n    size: 16\n  default: '100'\n{}",
-            id(format!("P-{s}")),
-            refs(&[&format!("P-{s}_R-{s}")])
-        ));
-        params.push_str(&format!(
-            "- id: {}\n  name: Brightness{k}\n  text: Helligkeitsschwelle C{k}\n  type: !int\n    min: 1\n    max: 1000\n    size: 16\n  default: '200'\n{}",
-            id(format!("P-{h}")),
-            refs(&[&format!("P-{h}_R-{h}"), &format!("P-{h}_R-{wind}")])
-        ));
-        for (n, text) in [(2 * k, "Schaltausgang"), (2 * k + 1, "Messwert")] {
-            objects.push_str(&format!(
-                "  {n}:\n    text: C{k} {text}\n    function_text: Ausgang\n    dpt: '1.001'\n    flags: CRT\n    ref_id: {}\n",
-                id(format!("O-{n}_R-{n}"))
-            ));
-        }
+        let (wind, u, w) = (1005 + 10 * k, 1006 + 10 * k, 1008 + 10 * k);
+        let v = u + 1;
+        parameter(
+            &format!("P-{f}"),
+            &format!("Function{k}"),
+            "Funktion des Kanals",
+            "PT-Function",
+            "1",
+        );
+        parameter(
+            &format!("P-{s}"),
+            &format!("Threshold{k}"),
+            "Schwellwert in lx",
+            "PT-Lux",
+            "100",
+        );
+        parameter(
+            &format!("P-{h}"),
+            &format!("Brightness{k}"),
+            &format!("Helligkeitsschwelle C{k}"),
+            "PT-Lux",
+            "200",
+        );
         // "Wenn Temperatur" (a union member in the real application) and
         // the wind threshold behind it.
-        let (u, w) = (1006 + 10 * k, 1008 + 10 * k);
-        params.push_str(&format!(
-            "- id: {}\n  name: Source{k}\n  text: Wenn Temperatur\n  type: !enum\n    values:\n    - value: 1\n      text: Helligkeitssensor\n    - value: 2\n      text: Temperatursensor\n    - value: 4\n      text: Windsensor\n  default: '2'\n  refs:\n    UP-{u}_R-{v}:\n      value: '4'\n",
-            id(format!("UP-{u}")),
-            v = u + 1
-        ));
-        params.push_str(&format!(
-            "- id: {}\n  name: Wind{k}\n  text: Windgeschwindigkeit\n  type: !int\n    min: 1\n    max: 40\n    size: 8\n  default: '4'\n{}",
-            id(format!("P-{w}")),
-            refs(&[&format!("P-{w}_R-{w}")])
-        ));
-        ref_values.push_str(&format!("  UP-{u}_R-{v}: '4'\n", v = u + 1));
-        // The two pages behind the enable switches C`first` .. C`k`.
-        let function = json!({"block": {
-            "id": format!("PB-{k}0"),
-            "text": format!("Universalkanal C{k}: Funktion"),
-            "nodes": [
-                {"p": format!("P-{f}_R-{f}")},
-                {"p": format!("P-{s}_R-{s}")},
-                {"choose": {"ref": format!("P-{f}_R-{f}"), "when": [
-                    {"test": "1", "nodes": [{"p": format!("P-{h}_R-{h}")}]},
-                    {"test": "3", "nodes": [
-                        {"p": format!("P-{h}_R-{wind}")},
-                        {"p": format!("UP-{u}_R-{v}", v = u + 1)},
-                        {"choose": {"ref": format!("UP-{u}_R-{v}", v = u + 1), "when": [
-                            {"test": "4", "nodes": [{"p": format!("P-{w}_R-{w}")}]},
-                        ]}},
-                    ]},
-                ]}},
-                {"o": format!("O-{n}_R-{n}", n = 2 * k)},
-            ],
-        }});
-        let objects_page = json!({"block": {
-            "id": format!("PB-{k}1"),
-            "text": format!("Objekte zu C{k}"),
-            "nodes": [{"o": format!("O-{n}_R-{n}", n = 2 * k + 1)}],
-        }});
-        let mut gated = vec![function, objects_page];
-        for j in (first..=k).rev() {
-            gated = vec![json!({"choose": {"ref": format!("P-{j}_R-{j}"), "when": [
-                {"test": "1", "nodes": gated},
-            ]}})];
+        parameter(
+            &format!("UP-{u}"),
+            &format!("Source{k}"),
+            "Wenn Temperatur",
+            "PT-Source",
+            "2",
+        );
+        parameter(
+            &format!("P-{w}"),
+            &format!("Wind{k}"),
+            "Windgeschwindigkeit",
+            "PT-Wind",
+            "4",
+        );
+        add_ref(format!("P-{f}_R-{f}"), format!("P-{f}"), None);
+        add_ref(format!("P-{s}_R-{s}"), format!("P-{s}"), None);
+        add_ref(format!("P-{h}_R-{h}"), format!("P-{h}"), None);
+        add_ref(format!("P-{h}_R-{wind}"), format!("P-{h}"), None);
+        add_ref(format!("UP-{u}_R-{v}"), format!("UP-{u}"), Some("4"));
+        add_ref(format!("P-{w}_R-{w}"), format!("P-{w}"), None);
+        for (n, text) in [(2 * k, "Schaltausgang"), (2 * k + 1, "Messwert")] {
+            objects.push_str(&format!(
+                "<ComObject Id=\"{}\" Number=\"{n}\" Text=\"C{k} {text}\" FunctionText=\"Ausgang\" ObjectSize=\"1 Bit\" DatapointType=\"DPST-1-1\" {flags} />\n",
+                id(&format!("O-{n}"))
+            ));
+            object_refs.push_str(&format!(
+                "<ComObjectRef Id=\"{}\" RefId=\"{}\" />\n",
+                id(&format!("O-{n}_R-{n}")),
+                id(&format!("O-{n}"))
+            ));
         }
-        channel.extend(gated);
-        blocks.push_str(&format!(
-            "- id: PB-{k}0\n  text: 'Universalkanal C{k}: Funktion'\n  parent: CH-0\n  channel: CH-0\n  when:\n{when}  parameters:\n  - P-{f}_R-{f}\n  - P-{s}_R-{s}\n  - P-{h}_R-{h}\n  - P-{h}_R-{wind}\n  - UP-{u}_R-{v}\n  - P-{w}_R-{w}\n  parameter_when:\n    P-{h}_R-{h}:\n    - ref: P-{f}_R-{f}\n      test: '1'\n    P-{h}_R-{wind}:\n    - ref: P-{f}_R-{f}\n      test: '3'\n    UP-{u}_R-{v}:\n    - ref: P-{f}_R-{f}\n      test: '3'\n    P-{w}_R-{w}:\n    - ref: P-{f}_R-{f}\n      test: '3'\n    - ref: UP-{u}_R-{v}\n      test: '4'\n  objects:\n  - O-{n}_R-{n}\n",
-            n = 2 * k,
-            v = u + 1
-        ));
-        blocks.push_str(&format!(
-            "- id: PB-{k}1\n  text: Objekte zu C{k}\n  parent: CH-0\n  channel: CH-0\n  when:\n{when}  objects:\n  - O-{n}_R-{n}\n",
-            n = 2 * k + 1
-        ));
+        // The two pages behind the enable switches C`first` .. C`k`.
+        let mut gated = format!(
+            "<ParameterBlock Id=\"{}\" Text=\"Universalkanal C{k}: Funktion\">\n{}\n{}\n\
+             <choose ParamRefId=\"{}\">\n<when test=\"1\">{}</when>\n<when test=\"3\">{}{}\
+             <choose ParamRefId=\"{}\"><when test=\"4\">{}</when></choose></when>\n</choose>\n{}\n\
+             </ParameterBlock>\n<ParameterBlock Id=\"{}\" Text=\"Objekte zu C{k}\">{}</ParameterBlock>\n",
+            id(&format!("PB-{k}0")),
+            rr(format!("P-{f}_R-{f}")),
+            rr(format!("P-{s}_R-{s}")),
+            id(&format!("P-{f}_R-{f}")),
+            rr(format!("P-{h}_R-{h}")),
+            rr(format!("P-{h}_R-{wind}")),
+            rr(format!("UP-{u}_R-{v}")),
+            id(&format!("UP-{u}_R-{v}")),
+            rr(format!("P-{w}_R-{w}")),
+            or(format!("O-{n}_R-{n}", n = 2 * k)),
+            id(&format!("PB-{k}1")),
+            or(format!("O-{n}_R-{n}", n = 2 * k + 1)),
+        );
+        for j in (first..=k).rev() {
+            gated = format!(
+                "<choose ParamRefId=\"{}\"><when test=\"1\">\n{gated}</when></choose>\n",
+                id(&format!("P-{j}_R-{j}"))
+            );
+        }
+        channel.push_str(&gated);
     }
-    let dynamic =
-        json!({"channel": {"id": "CH-0", "name": "Generic", "number": 0, "nodes": channel}});
-    let format = bussard_model::param_model::MODEL_FORMAT;
+    let types = format!(
+        "<ParameterType Id=\"{yes}\" Name=\"yesno\"><TypeRestriction Base=\"Value\" SizeInBit=\"1\">\
+         <Enumeration Text=\"nein\" Value=\"0\" Id=\"{yes}_EN-0\" /><Enumeration Text=\"ja\" Value=\"1\" Id=\"{yes}_EN-1\" />\
+         </TypeRestriction></ParameterType>\n\
+         <ParameterType Id=\"{fun}\" Name=\"function\"><TypeRestriction Base=\"Value\" SizeInBit=\"4\">\
+         <Enumeration Text=\"Helligkeit\" Value=\"1\" Id=\"{fun}_EN-1\" /><Enumeration Text=\"Temperatur\" Value=\"2\" Id=\"{fun}_EN-2\" />\
+         <Enumeration Text=\"Wind\" Value=\"3\" Id=\"{fun}_EN-3\" /></TypeRestriction></ParameterType>\n\
+         <ParameterType Id=\"{src}\" Name=\"source\"><TypeRestriction Base=\"Value\" SizeInBit=\"4\">\
+         <Enumeration Text=\"Helligkeitssensor\" Value=\"1\" Id=\"{src}_EN-1\" /><Enumeration Text=\"Temperatursensor\" Value=\"2\" Id=\"{src}_EN-2\" />\
+         <Enumeration Text=\"Windsensor\" Value=\"4\" Id=\"{src}_EN-4\" /></TypeRestriction></ParameterType>\n\
+         <ParameterType Id=\"{lux}\" Name=\"lux\"><TypeNumber SizeInBit=\"16\" Type=\"unsignedInt\" minInclusive=\"1\" maxInclusive=\"1000\" /></ParameterType>\n\
+         <ParameterType Id=\"{wind}\" Name=\"wind\"><TypeNumber SizeInBit=\"8\" Type=\"unsignedInt\" minInclusive=\"1\" maxInclusive=\"40\" /></ParameterType>\n",
+        yes = id("PT-YesNo"),
+        fun = id("PT-Function"),
+        src = id("PT-Source"),
+        lux = id("PT-Lux"),
+        wind = id("PT-Wind"),
+    );
     format!(
-        "model_format: {format}\nidentity:\n  id: {METEO_APP}\n  name: meteo test app\n  application_number: 304\n  application_version: 16\n  mask_version: '0701'\n  load_procedure_style: ProductProcedure\n  schema_version: '23'\n{objects}{params}load_procedure:\n- connect\n- restart\n- disconnect\n{blocks}{ref_values}dynamic:\n- {dynamic}\n"
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<KNX xmlns=\"http://knx.org/xml/project/23\">\
+         <ManufacturerData><Manufacturer RefId=\"M-0004\"><ApplicationPrograms>\n\
+         <ApplicationProgram Id=\"{METEO_APP}\" ApplicationNumber=\"304\" ApplicationVersion=\"16\" \
+         MaskVersion=\"MV-0701\" Name=\"meteo test app\" LoadProcedureStyle=\"ProductProcedure\">\n<Static>\n\
+         <ParameterTypes>\n{types}</ParameterTypes>\n<Parameters>\n{params}</Parameters>\n\
+         <ParameterRefs>\n{refs}</ParameterRefs>\n<ComObjects>\n{objects}</ComObjects>\n\
+         <ComObjectRefs>\n{object_refs}</ComObjectRefs>\n<LoadProcedures><LoadProcedure>\
+         <LdCtrlConnect /><LdCtrlRestart /><LdCtrlDisconnect /></LoadProcedure></LoadProcedures>\n\
+         </Static>\n<Dynamic>\n<Channel Id=\"{}\" Name=\"Generic\" Text=\"\" Number=\"0\">\n{channel}</Channel>\n\
+         </Dynamic>\n</ApplicationProgram>\n</ApplicationPrograms></Manufacturer></ManufacturerData></KNX>\n",
+        id("CH-0")
     )
+}
+
+/// The product model of the Meteodata-like program, written by the
+/// importer from [`meteo_xml`] (issue #345: one source of pages in tests
+/// as in production).
+fn meteo_product() -> anyhow::Result<String> {
+    let app = bussard_prod::parse_application_program(METEO_APP, meteo_xml().as_bytes())?;
+    let product = bussard_prod::ProductData {
+        applications: vec![app.clone()],
+        ..bussard_prod::ProductData::default()
+    };
+    Ok(bussard_prod::product_model::model_yaml(&app, &product)?)
 }
 
 fn write_meteo(dir: &Path) -> anyhow::Result<()> {
@@ -419,7 +478,7 @@ fn write_meteo(dir: &Path) -> anyhow::Result<()> {
     std::fs::write(dir.join("bussard.lock"), lock)?;
     std::fs::write(
         dir.join(format!(".bussard/models/{METEO_APP}.yaml")),
-        meteo_product(),
+        meteo_product()?,
     )?;
     Ok(())
 }

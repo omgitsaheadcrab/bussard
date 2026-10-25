@@ -36,7 +36,7 @@
 //! what it could set.
 
 use std::cell::{OnceCell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use serde::Serialize;
@@ -641,7 +641,7 @@ impl<'a> Pages<'a> {
     ) -> Self {
         let product = evaluated.product;
         let config = &evaluated.config;
-        let blocks = product.blocks.as_slice();
+        let blocks = product.blocks();
         let parents = parent_indexes(blocks);
         let mut by_id: HashMap<&str, Vec<usize>> = HashMap::new();
         for (i, b) in blocks.iter().enumerate() {
@@ -1212,7 +1212,6 @@ impl<'a> Pages<'a> {
         subtree(self.blocks, &self.parents, i).into_iter().any(|j| {
             let b = &self.blocks[j];
             !b.objects.is_empty()
-                || !b.other_objects.is_empty()
                 || b.parameters.iter().any(|r| {
                     self.product
                         .parameters
@@ -1542,7 +1541,7 @@ fn block_scope(
 /// Whether `product` carries ETS parameter pages to evaluate: its `blocks`
 /// and the Dynamic tree they come from.
 fn has_pages(product: &ProductModel) -> bool {
-    !product.blocks.is_empty() && !product.dynamic.is_empty()
+    !product.blocks().is_empty() && !product.dynamic.is_empty()
 }
 
 /// Builds the view of `address`, with `channel` (a handle, a channel id, the
@@ -2083,6 +2082,52 @@ pub fn parameter_visibility(
     Ok(pg.visibility())
 }
 
+/// The application-level com-object refs the configuration of device
+/// `address` shows under its current values: reached by the evaluation, on
+/// an active page or outside every page. Empty without a product model with
+/// pages.
+///
+/// # Errors
+///
+/// [`ViewError::NoDevice`] when the model has no device `address`.
+pub fn shown_objects(
+    model: &Model,
+    products: &ProductModels,
+    address: IndividualAddress,
+) -> Result<BTreeSet<String>, ViewError> {
+    let device = &model
+        .devices
+        .get(&address)
+        .ok_or(ViewError::NoDevice(address))?
+        .device;
+    let product = device
+        .product
+        .as_ref()
+        .and_then(|p| p.application_ref.as_deref())
+        .and_then(|a| products.get(a))
+        .filter(|p| has_pages(p));
+    let Some(product) = product else {
+        return Ok(BTreeSet::new());
+    };
+    let params = parameter_entries(device);
+    let (overrides, _) = device_overrides(device);
+    let evaluated = Evaluated::new(product, &overrides);
+    let pg = Pages::new(device, &evaluated, &overrides, &params);
+    let config = &evaluated.config;
+    Ok(config
+        .com_objects
+        .iter()
+        .zip(&config.com_object_placements)
+        .filter(|(c, place)| c.module.is_none() && place.module.is_none() && place.shown)
+        .filter(|(_, place)| {
+            container_of(&place.blocks, place.channel.as_ref())
+                .and_then(|id| pg.block_of(&id))
+                .is_none_or(|i| pg.states[i].active)
+        })
+        .map(|(c, _)| c.com_object_ref_id.clone())
+        .collect())
+}
+
 impl Pages<'_> {
     /// [`parameter_visibility`] of every ref the pages hold.
     fn visibility(&self) -> BTreeMap<String, RefVisibility> {
@@ -2172,6 +2217,17 @@ pub fn ignored_overrides(
 /// [`ignored_overrides`] on the pages `pg` of `device`.
 fn ignored_in(device: &Device, pg: &Pages<'_>) -> Vec<IgnoredOverride> {
     let visibility = pg.visibility();
+    let config = &pg.evaluated.config;
+    // The application-level refs whose stored value the evaluation uses
+    // without showing them: the source of a reached `<Assign>`, which the
+    // image writes and which steers the target. An `<Assign>` target's own
+    // value is replaced, so a stored one stays ignored.
+    let in_effect: HashSet<&str> = config
+        .parameters
+        .iter()
+        .filter(|p| p.module.is_none() && !config.is_assigned(None, &p.param_ref_id))
+        .map(|p| p.param_ref_id.as_str())
+        .collect();
     let mut out = Vec::new();
     for (mem_key, value) in &device.parameters {
         if crate::files::is_hidden_mem_key(mem_key) {
@@ -2186,6 +2242,9 @@ fn ignored_in(device: &Device, pg: &Pages<'_>) -> Vec<IgnoredOverride> {
         let Some(needs) = visibility.get(reference).and_then(|v| v.needs.clone()) else {
             continue;
         };
+        if in_effect.contains(reference) {
+            continue;
+        }
         let def = pg.product.parameters.get(ref_param_id(reference));
         let locked = device.lock.parameters.get(reference);
         let default = pg.evaluated.vendor_default(reference);

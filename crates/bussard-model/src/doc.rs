@@ -644,8 +644,8 @@ fn device_doc(
                 .split_once('@')
                 .map_or(key.clone(), |(slug, _)| slug.replace('-', " ")),
             default: product_model.and_then(|m| {
-                crate::param_model::key_to_param_id(key)
-                    .and_then(|id| m.parameters.get(&id).and_then(|p| p.default.clone()))
+                crate::param_model::key_to_model_ref(key)
+                    .and_then(|r| m.ref_default(&r).map(str::to_string))
             }),
             key: key.clone(),
             value: value.clone(),

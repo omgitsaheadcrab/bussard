@@ -1027,27 +1027,44 @@ async fn test_knx_last_apply_recovers_a_lost_reply_across_a_restart() -> anyhow:
 async fn test_knx_plan_device_lists_a_value_on_an_unshown_ref_as_ignored() -> anyhow::Result<()> {
     let h = Harness::start(Duration::from_secs(600)).await?;
     let app = "M-00FA_A-0321-10-0000";
-    let format = bussard_model::param_model::MODEL_FORMAT;
     let dir = h.dir.path();
     std::fs::create_dir_all(dir.join(".bussard/models"))?;
+    // The product model, written by the importer from this application XML
+    // (issue #345): the threshold's `P-2_R-2` under "Helligkeit", its
+    // `P-2_R-5` under "Wind".
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<KNX xmlns=\"http://knx.org/xml/project/23\">\
+         <ManufacturerData><Manufacturer RefId=\"M-00FA\"><ApplicationPrograms>\
+         <ApplicationProgram Id=\"{app}\" ApplicationNumber=\"321\" ApplicationVersion=\"16\" \
+         MaskVersion=\"MV-07B0\" Name=\"branch test app\" LoadProcedureStyle=\"ProductProcedure\">\
+         <Static><ParameterTypes>\
+         <ParameterType Id=\"{app}_PT-F\" Name=\"function\"><TypeRestriction Base=\"Value\" SizeInBit=\"4\">\
+         <Enumeration Text=\"Helligkeit\" Value=\"1\" Id=\"{app}_PT-F_EN-1\" />\
+         <Enumeration Text=\"Wind\" Value=\"3\" Id=\"{app}_PT-F_EN-3\" /></TypeRestriction></ParameterType>\
+         <ParameterType Id=\"{app}_PT-L\" Name=\"lux\"><TypeNumber SizeInBit=\"16\" Type=\"unsignedInt\" \
+         minInclusive=\"1\" maxInclusive=\"1000\" /></ParameterType></ParameterTypes><Parameters>\
+         <Parameter Id=\"{app}_P-1\" Name=\"Function\" Text=\"Funktion des Kanals\" ParameterType=\"{app}_PT-F\" Value=\"1\" />\
+         <Parameter Id=\"{app}_P-2\" Name=\"Threshold\" Text=\"Schwelle\" ParameterType=\"{app}_PT-L\" Value=\"200\" />\
+         </Parameters><ParameterRefs>\
+         <ParameterRef Id=\"{app}_P-1_R-1\" RefId=\"{app}_P-1\" />\
+         <ParameterRef Id=\"{app}_P-2_R-2\" RefId=\"{app}_P-2\" />\
+         <ParameterRef Id=\"{app}_P-2_R-5\" RefId=\"{app}_P-2\" /></ParameterRefs>\
+         <LoadProcedures><LoadProcedure><LdCtrlConnect /><LdCtrlDisconnect /></LoadProcedure></LoadProcedures>\
+         </Static><Dynamic><ParameterBlock Id=\"{app}_PB-1\" Text=\"Funktion\">\
+         <ParameterRefRef RefId=\"{app}_P-1_R-1\" /><choose ParamRefId=\"{app}_P-1_R-1\">\
+         <when test=\"1\"><ParameterRefRef RefId=\"{app}_P-2_R-2\" /></when>\
+         <when test=\"3\"><ParameterRefRef RefId=\"{app}_P-2_R-5\" /></when></choose>\
+         </ParameterBlock></Dynamic></ApplicationProgram></ApplicationPrograms></Manufacturer>\
+         </ManufacturerData></KNX>\n"
+    );
+    let program = bussard_prod::parse_application_program(app, xml.as_bytes())?;
+    let product = bussard_prod::ProductData {
+        applications: vec![program.clone()],
+        ..bussard_prod::ProductData::default()
+    };
     std::fs::write(
         dir.join(format!(".bussard/models/{app}.yaml")),
-        format!(
-            "model_format: {format}\nidentity:\n  id: {app}\n  name: branch test app\n  \
-             application_number: 321\n  application_version: 16\n  mask_version: '07B0'\n  \
-             load_procedure_style: ProductProcedure\n  schema_version: '23'\nparameters:\n\
-             - id: {app}_P-1\n  name: Function\n  text: Funktion des Kanals\n  type: !enum\n    \
-             values:\n    - value: 1\n      text: Helligkeit\n    - value: 3\n      text: Wind\n  \
-             default: '1'\n  refs:\n    P-1_R-1: {{}}\n- id: {app}_P-2\n  name: Threshold\n  \
-             text: Schwelle\n  type: !int\n    min: 1\n    max: 1000\n    size: 16\n  \
-             default: '200'\n  refs:\n    P-2_R-2: {{}}\n    P-2_R-5: {{}}\nload_procedure:\n- connect\n\
-             - disconnect\nblocks:\n- id: PB-1\n  text: Funktion\n  parameters:\n  - P-1_R-1\n  \
-             - P-2_R-2\n  - P-2_R-5\n  parameter_when:\n    P-2_R-2:\n    - ref: P-1_R-1\n      \
-             test: '1'\n    P-2_R-5:\n    - ref: P-1_R-1\n      test: '3'\ndynamic:\n\
-             - {{\"block\":{{\"id\":\"PB-1\",\"text\":\"Funktion\",\"nodes\":[{{\"p\":\"P-1_R-1\"}},\
-             {{\"choose\":{{\"ref\":\"P-1_R-1\",\"when\":[{{\"test\":\"1\",\"nodes\":\
-             [{{\"p\":\"P-2_R-2\"}}]}},{{\"test\":\"3\",\"nodes\":[{{\"p\":\"P-2_R-5\"}}]}}]}}}}]}}}}\n"
-        ),
+        bussard_prod::product_model::model_yaml(&program, &product)?,
     )?;
     std::fs::write(
         dir.join("bussard.lock"),

@@ -1,4 +1,4 @@
-//! The `blocks:` section of a product model (issue #298), from the fabricated
+//! The ETS pages of a product model (issue #298), from the fabricated
 //! System 7 application `fixtures/blocks_app.xml`: three universal channels
 //! as ETS parameter pages behind "enable" parameters, C behind B, and B's
 //! objects on a page of their own.
@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use bussard_model::blocks::BlockKind;
+use bussard_model::dynamic::{RefIndex, WhenTest};
 use bussard_model::param_model::{
     MODEL_FORMAT, cached_product_model, model_cache_path, model_is_current,
 };
@@ -28,9 +29,42 @@ fn app() -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
     )?)
 }
 
+/// The product model the importer writes for the fixture.
+fn written_model() -> Result<bussard_model::ProductModel, Box<dyn std::error::Error>> {
+    let product = ProductData {
+        applications: vec![app()?],
+        ..ProductData::default()
+    };
+    let yaml = bussard_prod::product_model::model_yaml(&product.applications[0], &product)?;
+    Ok(bussard_model::ProductModel::from_yaml(&yaml, APP)?)
+}
+
+/// The conditions in front of the one app-level occurrence of `reference`
+/// inside its innermost container, as (controlling ref, test).
+fn gates_inside(index: &RefIndex, reference: &str) -> Vec<(String, String)> {
+    index
+        .parameter(reference)
+        .iter()
+        .chain(index.com_object(reference))
+        .filter(|o| o.module_def.is_none())
+        .flat_map(|o| o.gates[o.container_gates..].iter())
+        .map(|g| {
+            let test = match &g.test {
+                WhenTest::Values(v) => v.iter().map(i64::to_string).collect::<Vec<_>>().join(" "),
+                WhenTest::Default => "default".to_string(),
+                other => format!("{other:?}"),
+            };
+            (g.param_ref_id.clone(), test)
+        })
+        .collect()
+}
+
+/// The pages derived from the written model's Dynamic tree (issue #345;
+/// before format 6 the importer wrote them as `blocks:`).
 #[test]
-fn test_blocks_for_records_pages_gates_and_objects() -> TestResult {
-    let blocks = bussard_prod::blocks::blocks_for(&app()?);
+fn test_model_blocks_records_pages_gates_and_objects() -> TestResult {
+    let model = written_model()?;
+    let blocks = model.blocks();
     let ids: Vec<&str> = blocks.iter().map(|b| b.id.as_str()).collect();
     assert_eq!(ids, ["CH-0", "PB-1", "PB-10", "PB-20", "PB-21", "PB-30"]);
 
@@ -45,7 +79,7 @@ fn test_blocks_for_records_pages_gates_and_objects() -> TestResult {
     assert_eq!(general.parameters, ["P-1_R-1", "P-2_R-2", "P-3_R-3"]);
 
     // A page titled by a parameter ref takes that parameter's text; its
-    // condition is the enable parameter, its objects those the defaults show.
+    // condition is the enable parameter.
     let a = &blocks[2];
     assert_eq!(a.text.as_deref(), Some("Universal channel A: function"));
     assert_eq!(a.name.as_deref(), Some("ChannelA"));
@@ -67,38 +101,27 @@ fn test_blocks_for_records_pages_gates_and_objects() -> TestResult {
     );
     // The dusk threshold sits under the channel function's choice inside
     // the page (issue #315); the function itself under none.
-    let dusk: Vec<(&str, &str)> = a
-        .parameter_when
-        .get("P-12_R-12")
-        .map(|gates| {
-            gates
-                .iter()
-                .map(|g| (g.reference.as_str(), g.test.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    assert_eq!(dusk, [("P-11_R-11", "1")]);
-    assert!(!a.parameter_when.contains_key("P-11_R-11"));
+    let index = RefIndex::new(&model);
+    let pair = |r: &str, t: &str| (r.to_string(), t.to_string());
+    assert_eq!(gates_inside(&index, "P-12_R-12"), [pair("P-11_R-11", "1")]);
+    assert!(gates_inside(&index, "P-11_R-11").is_empty());
     // The wind threshold sits behind the wind function and "If temperature"
     // = Wind (issue #326).
-    let wind: Vec<(&str, &str)> = a
-        .parameter_when
-        .get("P-14_R-14")
-        .map(|gates| {
-            gates
-                .iter()
-                .map(|g| (g.reference.as_str(), g.test.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    assert_eq!(wind, [("P-11_R-11", "3"), ("P-13_R-13", "4")]);
+    assert_eq!(
+        gates_inside(&index, "P-14_R-14"),
+        [pair("P-11_R-11", "3"), pair("P-13_R-13", "4")]
+    );
     assert_eq!(a.objects, ["O-1_R-1"]);
 
-    // The objects page: the default function shows O-2_R-2; the default
-    // branch's ref is recorded as another branch's.
+    // The objects page holds both branches' objects: the default function
+    // shows O-2_R-2, the default branch holds O-2_R-3.
     let objects_b = &blocks[4];
-    assert_eq!(objects_b.objects, ["O-2_R-2"]);
-    assert_eq!(objects_b.other_objects, ["O-2_R-3"]);
+    assert_eq!(objects_b.objects, ["O-2_R-2", "O-2_R-3"]);
+    assert_eq!(gates_inside(&index, "O-2_R-2"), [pair("P-21_R-21", "1")]);
+    assert_eq!(
+        gates_inside(&index, "O-2_R-3"),
+        [pair("P-21_R-21", "default")]
+    );
 
     // Channel C sits behind both B's and C's switches.
     let c = &blocks[5];
@@ -112,18 +135,18 @@ fn test_blocks_for_records_pages_gates_and_objects() -> TestResult {
 }
 
 /// Issue #326: a `ParameterRef` `Value` that differs from its parameter's
-/// default is carried into the model, so the page evaluator resolves a
-/// condition on it as the download side does. A ref without one, or whose
-/// parameter has no ref of the kind, is not listed.
+/// default is carried into the model (on the ref, format 6), so the
+/// evaluator resolves a condition on it as the download side does. A ref
+/// without one takes its parameter's default.
 #[test]
-fn test_ref_values_for_carries_ref_level_values() -> TestResult {
-    let app = app()?;
-    let blocks = bussard_prod::blocks::blocks_for(&app);
-    let values = bussard_prod::blocks::ref_values_for(&app, &blocks);
-    assert_eq!(
-        values.into_iter().collect::<Vec<_>>(),
-        [("P-13_R-13".to_string(), "4".to_string())]
-    );
+fn test_model_carries_ref_level_values() -> TestResult {
+    let model = written_model()?;
+    let values: Vec<(&str, &str)> = model
+        .parameter_refs
+        .iter()
+        .filter_map(|(r, d)| Some((r.as_str(), d.value.as_deref()?)))
+        .collect();
+    assert_eq!(values, [("P-13_R-13", "4")]);
     Ok(())
 }
 
@@ -176,7 +199,7 @@ fn test_written_model_matches_the_fixture() -> TestResult {
     );
 
     let model = bussard_model::ProductModel::from_yaml(&written, APP)?;
-    assert_eq!(model.blocks.len(), 6);
+    assert_eq!(model.blocks().len(), 6);
     assert_eq!(model.ref_default("P-13_R-13"), Some("4"));
     assert_eq!(model.ref_default("P-13_R-15"), Some("2"));
     assert_eq!(model.ref_default("P-11_R-11"), Some("1"));

@@ -657,3 +657,18 @@ fn test_device_view_marks_a_value_at_the_ref_value_as_default() -> TestResult {
     assert_eq!(row.at_default, Some(true));
     Ok(())
 }
+
+/// Issue #345: the view has no value-resolution code of its own. Every
+/// value and every page state comes from the one Dynamic evaluator, so the
+/// names of the lookups it replaced must not come back.
+#[test]
+fn test_device_view_source_has_no_value_resolution_of_its_own() -> TestResult {
+    const SOURCE: &str = include_str!("../../src/device_view.rs");
+    for word in ["ref_values", "default_value", "raw_value", "block_states"] {
+        assert!(
+            !SOURCE.contains(word),
+            "device_view.rs mentions `{word}`: values and page states come from the evaluator"
+        );
+    }
+    Ok(())
+}
