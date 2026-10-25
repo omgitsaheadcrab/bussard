@@ -6,7 +6,7 @@
 # procedure used to download it. Regenerated data under .bussard/: derived from
 # the archive under products/, rebuilt whenever it is missing.
 # Docs: https://github.com/tmbo/bussard/blob/main/docs/product-data.md
-model_format: 4
+model_format: 5
 identity:
   id: M-00FA_A-0298-10-0000
   name: bussard capability test app
@@ -55,10 +55,15 @@ parameters:
     segment: M-00FA_A-0298-10-0000_AS-4400
     offset: 0
     bit_offset: 0
+  bits: 1
+  refs:
+    P-1_R-1: {}
 - id: M-00FA_A-0298-10-0000_P-10
   name: TitleA
   text: 'Universal channel A: function'
   type: none
+  refs:
+    P-10_R-10: {}
 - id: M-00FA_A-0298-10-0000_P-11
   name: FunctionA
   text: Channel function
@@ -75,6 +80,9 @@ parameters:
     segment: M-00FA_A-0298-10-0000_AS-4400
     offset: 1
     bit_offset: 0
+  bits: 4
+  refs:
+    P-11_R-11: {}
 - id: M-00FA_A-0298-10-0000_P-12
   name: DuskA
   text: Dusk threshold in lx
@@ -87,6 +95,9 @@ parameters:
     segment: M-00FA_A-0298-10-0000_AS-4400
     offset: 2
     bit_offset: 0
+  bits: 8
+  refs:
+    P-12_R-12: {}
 - id: M-00FA_A-0298-10-0000_P-13
   name: SourceA
   text: If temperature
@@ -103,6 +114,13 @@ parameters:
     segment: M-00FA_A-0298-10-0000_AS-4400
     offset: 6
     bit_offset: 4
+  bits: 4
+  refs:
+    P-13_R-13:
+      value: '4'
+      internal: true
+    P-13_R-15:
+      internal: true
 - id: M-00FA_A-0298-10-0000_P-14
   name: WindA
   text: Wind threshold
@@ -115,6 +133,9 @@ parameters:
     segment: M-00FA_A-0298-10-0000_AS-4400
     offset: 7
     bit_offset: 0
+  bits: 8
+  refs:
+    P-14_R-14: {}
 - id: M-00FA_A-0298-10-0000_P-2
   name: EnableB
   text: Universal channel B enable
@@ -129,10 +150,15 @@ parameters:
     segment: M-00FA_A-0298-10-0000_AS-4400
     offset: 0
     bit_offset: 1
+  bits: 1
+  refs:
+    P-2_R-2: {}
 - id: M-00FA_A-0298-10-0000_P-20
   name: TitleB
   text: 'Universal channel B: function'
   type: none
+  refs:
+    P-20_R-20: {}
 - id: M-00FA_A-0298-10-0000_P-21
   name: FunctionB
   text: Channel function
@@ -149,6 +175,9 @@ parameters:
     segment: M-00FA_A-0298-10-0000_AS-4400
     offset: 3
     bit_offset: 0
+  bits: 4
+  refs:
+    P-21_R-21: {}
 - id: M-00FA_A-0298-10-0000_P-22
   name: DuskB
   text: Dusk threshold in lx
@@ -161,10 +190,15 @@ parameters:
     segment: M-00FA_A-0298-10-0000_AS-4400
     offset: 4
     bit_offset: 0
+  bits: 8
+  refs:
+    P-22_R-22: {}
 - id: M-00FA_A-0298-10-0000_P-23
   name: ObjectsB
   text: Objects
   type: none
+  refs:
+    P-23_R-23: {}
 - id: M-00FA_A-0298-10-0000_P-3
   name: EnableC
   text: Universal channel C enable
@@ -179,10 +213,15 @@ parameters:
     segment: M-00FA_A-0298-10-0000_AS-4400
     offset: 0
     bit_offset: 2
+  bits: 1
+  refs:
+    P-3_R-3: {}
 - id: M-00FA_A-0298-10-0000_P-30
   name: TitleC
   text: 'Universal channel C: function'
   type: none
+  refs:
+    P-30_R-30: {}
 - id: M-00FA_A-0298-10-0000_P-31
   name: FunctionC
   text: Channel function
@@ -199,6 +238,9 @@ parameters:
     segment: M-00FA_A-0298-10-0000_AS-4400
     offset: 5
     bit_offset: 0
+  bits: 4
+  refs:
+    P-31_R-31: {}
 load_procedure:
 - connect
 - restart
@@ -303,3 +345,5 @@ com_object_refs:
     ref_id: M-00FA_A-0298-10-0000_O-2_R-3
 ref_values:
   P-13_R-13: '4'
+dynamic:
+- {"channel":{"id":"CH-0","name":"Generic","number":0,"nodes":[{"o":"O-0_R-0"},{"block":{"id":"PB-1","name":"General","text":"General","nodes":[{"p":"P-1_R-1"},{"p":"P-2_R-2"},{"choose":{"ref":"P-2_R-2","when":[{"test":"1","nodes":[{"p":"P-3_R-3"}]}]}}]}},{"choose":{"ref":"P-1_R-1","when":[{"test":"1","nodes":[{"block":{"id":"PB-10","name":"ChannelA","param_ref":"P-10_R-10","nodes":[{"p":"P-11_R-11"},{"choose":{"ref":"P-11_R-11","when":[{"test":"1","nodes":[{"p":"P-12_R-12"},{"o":"O-1_R-1"}]},{"test":"2","nodes":[{"p":"P-13_R-15"}]},{"test":"3","nodes":[{"p":"P-13_R-13"},{"choose":{"ref":"P-13_R-13","when":[{"test":"4","nodes":[{"p":"P-14_R-14"}]}]}}]}]}}]}}]}]}},{"choose":{"ref":"P-2_R-2","when":[{"test":"1","nodes":[{"block":{"id":"PB-20","name":"ChannelB","param_ref":"P-20_R-20","nodes":[{"p":"P-21_R-21"},{"choose":{"ref":"P-21_R-21","when":[{"test":"1","nodes":[{"p":"P-22_R-22"}]}]}}]}},{"block":{"id":"PB-21","name":"ObjectsB","param_ref":"P-23_R-23","nodes":[{"choose":{"ref":"P-21_R-21","when":[{"test":"1","nodes":[{"o":"O-2_R-2"}]},{"default":true,"nodes":[{"o":"O-2_R-3"}]}]}}]}},{"choose":{"ref":"P-3_R-3","when":[{"test":"1","nodes":[{"block":{"id":"PB-30","name":"ChannelC","param_ref":"P-30_R-30","nodes":[{"p":"P-31_R-31"},{"o":"O-3_R-4"}]}}]}]}}]}]}}]}}

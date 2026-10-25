@@ -35,7 +35,7 @@ directory itself. Every gated test resolves all three to the vendor directory.
 $ export BUSSARD_PRODUCT_CORPUS="$PWD/tests-support/product-corpus"
 $ cargo nextest run --profile corpus \
     -p bussard-download -p bussard-prod -p bussard-cli \
-    -E 'binary(it) & test(/^(flash_corpus|flash_dryrun_system7|ets_golden|sys7_jung_m2_plan|param_readback_roundtrip|parameter_image|sys7_visible_parameters|selected|flash_dry_run|offline_oracle)::/)'
+    -E 'binary(it) & test(/^(flash_corpus|flash_dryrun_system7|ets_golden|sys7_jung_m2_plan|param_readback_roundtrip|parameter_image|sys7_visible_parameters|selected|evaluator_conformance|flash_dry_run|offline_oracle)::/)'
 ```
 
 The `corpus` nextest profile (`.config/nextest.toml`) allows a test 20 minutes:
@@ -56,6 +56,7 @@ The gated tests:
 | bussard-prod | `parameter_image.rs` | the Zennio FIX2 union default byte, the ABB IEEE-754 single width |
 | bussard-prod | `sys7_visible_parameters.rs` | Jung System 7 parameter images (3361, 2116, 3181) against ETS |
 | bussard-prod | `selected.rs` | a selective archive read equals the full read, on the first archives of the corpus (`BUSSARD_SELECTED_CORPUS_LIMIT`, default 6) |
+| bussard-prod | `evaluator_conformance.rs` | the Dynamic evaluator over each program's product model gives the same modules, placements, containers and values as over its XML, at the vendor defaults and under 50 seeded random value sets (#345) |
 | bussard-cli | `flash_dry_run.rs` | `flash --dry-run --dump-images` of the Jung 3361-1M |
 | bussard-cli | `offline_oracle.rs` | the offline-oracle rows pass `--check` (needs `BUSSARD_ORACLE_ROWS`, see below) |
 

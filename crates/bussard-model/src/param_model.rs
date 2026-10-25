@@ -49,6 +49,40 @@ pub struct ProductModel {
     /// it differs from its parameter's default (issue #326). Empty for a
     /// model written before [`MODEL_FORMAT`] 4.
     pub ref_values: BTreeMap<String, String>,
+    /// The application program id (`M-0002_A-A0ED-10-9B4E`), the prefix the
+    /// app-relative ids drop.
+    pub program_id: String,
+    /// The application's own Dynamic section (`dynamic:`, format 5, issue
+    /// #345), app-relative ids throughout: what [`crate::dynamic::evaluate_dynamic`]
+    /// walks through this model's [`crate::dynamic::DynamicSource`] impl.
+    #[serde(with = "crate::dynamic_compact::nodes")]
+    pub dynamic: Vec<crate::dynamic::DynamicNode>,
+    /// The Dynamic section of every module definition, keyed by app-relative
+    /// module definition id (`MD-1`) (`module_dynamics:`, format 5).
+    #[serde(with = "crate::dynamic_compact::module_nodes")]
+    pub module_dynamics: BTreeMap<String, Vec<crate::dynamic::DynamicNode>>,
+    /// The application's `<Union>`s, in document order, each with its size
+    /// and its members' app-relative parameter ids and positions (`unions:`,
+    /// format 5).
+    #[serde(with = "crate::dynamic_compact::unions")]
+    pub unions: Vec<crate::dynamic::Union>,
+    /// Every parameter ref of the application, keyed by app-relative ref id:
+    /// its parameter, its `Value` where it matters and whether it is internal
+    /// (the `refs:` of each parameter, format 5).
+    pub parameter_refs: BTreeMap<String, RefDef>,
+}
+
+/// One `ParameterRef` of a product model (an entry of a parameter's `refs:`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct RefDef {
+    /// The app-relative id of the parameter it points at.
+    pub parameter: String,
+    /// The ref's `Value`, where the model's parameter `default` does not give
+    /// it already: the value the ref has when nothing is stored.
+    pub value: Option<String>,
+    /// Whether the ref's effective `Access` is `None`: ETS keeps the value
+    /// to itself and never shows it.
+    pub internal: bool,
 }
 
 /// One com-object of a product model, reduced to what a view shows.
@@ -68,8 +102,10 @@ pub struct ObjectDef {
 /// the file. A model of an older format regenerates from its archive
 /// (format 2 adds `blocks:`, issue #298; format 3 the conditions inside a
 /// block, `parameter_when:`, issue #315; format 4 the `ParameterRef` values,
-/// `ref_values:`, issue #326).
-pub const MODEL_FORMAT: u32 = 4;
+/// `ref_values:`, issue #326; format 5 the Dynamic tree, `dynamic:`,
+/// `module_dynamics:`, `unions:` and each parameter's `refs:`, `base_value`
+/// and integer width, issue #345).
+pub const MODEL_FORMAT: u32 = 5;
 
 /// Whether the model file at `path` is of the current [`MODEL_FORMAT`]. Reads
 /// only the head of the file, where the emitter puts the key.
@@ -108,6 +144,16 @@ pub struct ParamDef {
     /// product model lists them (`refs:`). A device-file key the lock does not
     /// list resolves through them (see [`ProductModel::resolve_key`]).
     pub refs: Vec<String>,
+    /// The `BaseValue` argument id: a module parameter whose default has the
+    /// instance's value of this argument added to it (issue #126).
+    pub base_value: Option<String>,
+    /// Width in bits and signedness of an integer or plain enumeration
+    /// parameter (`bits:`, `signed:`), `None` for any other type: what a
+    /// shared `<Union>` memory is read back with.
+    pub integer_width: Option<(u32, bool)>,
+    /// For an enumeration, its members (code and label): what an override
+    /// written as a label is matched against. Empty for other kinds.
+    pub enum_values: Vec<crate::dynamic::EnumValue>,
 }
 
 /// A parameter's type, mirroring the `type:` tag in the model YAML.
@@ -158,6 +204,12 @@ struct RawModel {
     com_object_refs: BTreeMap<String, RawComObject>,
     #[serde(default)]
     ref_values: BTreeMap<String, String>,
+    #[serde(default, with = "crate::dynamic_compact::nodes")]
+    dynamic: Vec<crate::dynamic::DynamicNode>,
+    #[serde(default, with = "crate::dynamic_compact::module_nodes")]
+    module_dynamics: BTreeMap<String, Vec<crate::dynamic::DynamicNode>>,
+    #[serde(default, with = "crate::dynamic_compact::unions")]
+    unions: Vec<crate::dynamic::Union>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,7 +236,21 @@ struct RawParam {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    refs: Vec<String>,
+    refs: BTreeMap<String, Option<RawRef>>,
+    #[serde(default)]
+    base_value: Option<String>,
+    #[serde(default)]
+    bits: Option<u32>,
+    #[serde(default)]
+    signed: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawRef {
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    internal: bool,
 }
 
 // Some fields exist only to consume the YAML shape faithfully; the validator
@@ -251,16 +317,48 @@ impl ProductModel {
     pub fn from_yaml(text: &str, app_ref: &str) -> Result<Self, serde_norway::Error> {
         let raw: RawModel = serde_norway::from_str(text)?;
         let mut parameters = BTreeMap::new();
+        let mut parameter_refs = BTreeMap::new();
         let prefix = format!("{app_ref}_");
+        let relative = |id: &str| id.strip_prefix(&prefix).unwrap_or(id).to_string();
         for p in raw.parameters {
-            let rel = p.id.strip_prefix(&prefix).unwrap_or(&p.id).to_string();
-            let labels = match &p.param_type {
-                RawType::Enum { values } => values
-                    .iter()
-                    .filter_map(|v| v.text.clone().map(|t| (v.value, t)))
-                    .collect(),
-                _ => Vec::new(),
+            let rel = relative(&p.id);
+            let (labels, enum_values) = match &p.param_type {
+                RawType::Enum { values } => (
+                    values
+                        .iter()
+                        .filter_map(|v| v.text.clone().map(|t| (v.value, t)))
+                        .collect(),
+                    values
+                        .iter()
+                        .map(|v| {
+                            let text = v.text.clone().unwrap_or_default();
+                            crate::dynamic::EnumValue {
+                                value: v.value,
+                                default_text: text.clone(),
+                                text,
+                                translations: BTreeMap::new(),
+                                id: None,
+                                binary_value: None,
+                            }
+                        })
+                        .collect(),
+                ),
+                _ => (Vec::new(), Vec::new()),
             };
+            let mut refs = Vec::with_capacity(p.refs.len());
+            for (reference, def) in p.refs {
+                let def = def.unwrap_or_default();
+                let reference = relative(&reference);
+                refs.push(reference.clone());
+                parameter_refs.insert(
+                    reference,
+                    RefDef {
+                        parameter: rel.clone(),
+                        value: def.value,
+                        internal: def.internal,
+                    },
+                );
+            }
             parameters.insert(
                 rel,
                 ParamDef {
@@ -269,11 +367,10 @@ impl ProductModel {
                     default: p.default,
                     text: p.text.filter(|t| !t.trim().is_empty()),
                     name: p.name.filter(|n| !n.trim().is_empty()),
-                    refs: p
-                        .refs
-                        .iter()
-                        .map(|r| r.strip_prefix(&prefix).unwrap_or(r).to_string())
-                        .collect(),
+                    refs,
+                    base_value: p.base_value,
+                    integer_width: p.bits.map(|bits| (bits, p.signed)),
+                    enum_values,
                 },
             );
         }
@@ -300,6 +397,11 @@ impl ProductModel {
             com_objects,
             com_object_refs,
             ref_values: raw.ref_values,
+            program_id: app_ref.to_string(),
+            dynamic: raw.dynamic,
+            module_dynamics: raw.module_dynamics,
+            unions: raw.unions,
+            parameter_refs,
         })
     }
 
@@ -357,6 +459,69 @@ impl ProductModel {
             }
             _ => Some(reference.clone()),
         }
+    }
+}
+
+/// The product model as the Dynamic evaluator's input (issue #345): the same
+/// walk as over the application XML, from the tree, refs and unions the
+/// model carries. Parameter ids are app-relative.
+impl crate::dynamic::DynamicSource for ProductModel {
+    fn program_id(&self) -> &str {
+        &self.program_id
+    }
+
+    fn dynamic(&self) -> &[crate::dynamic::DynamicNode] {
+        &self.dynamic
+    }
+
+    fn module_dynamic(&self, module_def: &str) -> Option<&[crate::dynamic::DynamicNode]> {
+        self.module_dynamics.get(module_def).map(Vec::as_slice)
+    }
+
+    fn module_dynamics(
+        &self,
+    ) -> Box<dyn Iterator<Item = (&str, &[crate::dynamic::DynamicNode])> + '_> {
+        Box::new(
+            self.module_dynamics
+                .iter()
+                .map(|(def, body)| (def.as_str(), body.as_slice())),
+        )
+    }
+
+    fn parameter_ref(&self, ref_id: &str) -> Option<(&str, Option<&str>)> {
+        self.parameter_refs
+            .get(ref_id)
+            .map(|r| (r.parameter.as_str(), r.value.as_deref()))
+    }
+
+    fn parameter_refs(&self) -> Box<dyn Iterator<Item = (&str, &str)> + '_> {
+        Box::new(
+            self.parameter_refs
+                .iter()
+                .map(|(r, def)| (r.as_str(), def.parameter.as_str())),
+        )
+    }
+
+    fn parameter(&self, param_id: &str) -> Option<(Option<&str>, Option<&str>)> {
+        self.parameters
+            .get(param_id)
+            .map(|p| (p.default.as_deref(), p.base_value.as_deref()))
+    }
+
+    fn integer_width(&self, param_id: &str) -> Option<(u32, bool)> {
+        self.parameters.get(param_id)?.integer_width
+    }
+
+    fn enum_members(&self, param_id: &str) -> Option<&[crate::dynamic::EnumValue]> {
+        let def = self.parameters.get(param_id)?;
+        match def.kind {
+            ParamKind::Enum { .. } => Some(def.enum_values.as_slice()),
+            _ => None,
+        }
+    }
+
+    fn unions(&self) -> &[crate::dynamic::Union] {
+        &self.unions
     }
 }
 
@@ -841,17 +1006,17 @@ parameters:
     text: Betriebsart
     type: !int
       min: 0
-    refs: [M-1_A-1_MD-3_P-14_R-14]
+    refs: {M-1_A-1_MD-3_P-14_R-14: {}}
   - id: M-1_A-1_P-19
     text: Regenalarm
     type: !int
       min: 0
-    refs: [M-1_A-1_P-19_R-38]
+    refs: {M-1_A-1_P-19_R-38: {}}
   - id: M-1_A-1_P-20
     text: Zwei Refs
     type: !int
       min: 0
-    refs: [M-1_A-1_P-20_R-1, M-1_A-1_P-20_R-2]
+    refs: {M-1_A-1_P-20_R-1: {}, M-1_A-1_P-20_R-2: {}}
   - id: M-1_A-1_P-21
     name: OhneRefs
     type: !int

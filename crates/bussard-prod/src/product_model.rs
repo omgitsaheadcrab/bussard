@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use bussard_model::schema::ProductEntry;
 use serde::Serialize;
 
+use crate::dynamic::{DynamicNode, DynamicSource, Union, UnionMember};
 use crate::{
     AppSelection, ApplicationProgram, LoadOp, LoadProcedure, ParameterType, ProductData,
     ResolvedComObject,
@@ -264,8 +265,7 @@ pub fn write_product_models(product: &ProductData, dir: &Path) -> Result<Vec<Str
     })?;
     let mut written: Vec<String> = Vec::new();
     for app in &product.applications {
-        let model = build_model(app, product);
-        let yaml = serialize_model(&model)?;
+        let yaml = model_yaml(app, product)?;
         let file_name = format!("{}.yaml", app.id);
         let path = models_dir.join(&file_name);
         std::fs::write(&path, &yaml).map_err(|source| ModelError::Io {
@@ -285,9 +285,19 @@ pub fn write_product_models(product: &ProductData, dir: &Path) -> Result<Vec<Str
 // The model YAML shape
 // ---------------------------------------------------------------------------
 
+/// The product model YAML of `app` (one of `product`'s applications), as
+/// [`write_product_models`] writes it, banner included.
+///
+/// # Errors
+///
+/// The model does not serialize.
+pub fn model_yaml(app: &ApplicationProgram, product: &ProductData) -> Result<String, ModelError> {
+    serialize_model(&build_model(app, product))
+}
+
 /// The top-level model file for one application program.
 #[derive(Debug, Serialize)]
-struct Model {
+struct Model<'a> {
     /// [`bussard_model::param_model::MODEL_FORMAT`]: a model of an older
     /// format regenerates.
     model_format: u32,
@@ -316,6 +326,20 @@ struct Model {
     /// the refs the blocks name, keyed by app-relative ref id (issue #326).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     ref_values: BTreeMap<String, String>,
+    /// The `<Union>`s: size and member positions (issue #345).
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "bussard_model::dynamic_compact::unions::serialize"
+    )]
+    unions: Vec<Union>,
+    /// The application's Dynamic section (issue #345), appended by
+    /// [`serialize_model`] one flow-style node per line.
+    #[serde(skip)]
+    dynamic: &'a [DynamicNode],
+    /// The module definitions' Dynamic sections by app-relative id, written
+    /// the same way.
+    #[serde(skip)]
+    module_dynamics: BTreeMap<&'a str, &'a [DynamicNode]>,
 }
 
 /// The identity block.
@@ -368,6 +392,31 @@ struct ParameterModel {
     default: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     memory: Option<MemoryModel>,
+    /// The `BaseValue` argument, app-relative (issue #126).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_value: Option<String>,
+    /// Width in bits of an integer or plain enumeration parameter: what a
+    /// shared union memory is read back with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bits: Option<u32>,
+    /// Whether that integer is signed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    signed: bool,
+    /// The refs that point at this parameter, app-relative.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    refs: BTreeMap<String, RefModel>,
+}
+
+/// One `ParameterRef` of a parameter.
+#[derive(Debug, Default, Serialize)]
+struct RefModel {
+    /// The ref's `Value`, where it differs from the parameter's `Value`, or
+    /// where the model's `default` would not give it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    /// The effective `Access` is `None`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    internal: bool,
 }
 
 /// A parameter's type, tagged by shape.
@@ -426,7 +475,7 @@ struct MemoryModel {
 }
 
 /// Builds the model for one application program.
-fn build_model(app: &ApplicationProgram, product: &ProductData) -> Model {
+fn build_model<'a>(app: &'a ApplicationProgram, product: &ProductData) -> Model<'a> {
     let com_objects = com_objects_for(app);
     let blocks = crate::blocks::blocks_for(app);
     let com_object_refs = other_object_refs(app, &blocks, &com_objects);
@@ -450,7 +499,40 @@ fn build_model(app: &ApplicationProgram, product: &ProductData) -> Model {
         blocks,
         com_object_refs,
         ref_values,
+        unions: unions_for(app),
+        dynamic: &app.dynamic,
+        module_dynamics: app
+            .module_dynamics
+            .iter()
+            .map(|(def, body)| (def.as_str(), body.as_slice()))
+            .collect(),
     }
+}
+
+/// The application's unions with app-relative member ids.
+fn unions_for(app: &ApplicationProgram) -> Vec<Union> {
+    let prefix = format!("{}_", app.id);
+    app.unions
+        .iter()
+        .map(|u| Union {
+            size_bits: u.size_bits,
+            memory: None,
+            members: u
+                .members
+                .iter()
+                .map(|m| UnionMember {
+                    parameter: m
+                        .parameter
+                        .strip_prefix(&prefix)
+                        .unwrap_or(&m.parameter)
+                        .to_string(),
+                    offset: m.offset,
+                    bit_offset: m.bit_offset,
+                    is_default: m.is_default,
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// The order numbers that map to this application program, sorted.
@@ -565,6 +647,7 @@ fn parameters_for(app: &ApplicationProgram) -> Vec<ParameterModel> {
             .push(pref);
     }
 
+    let prefix = format!("{}_", app.id);
     let mut out: Vec<ParameterModel> = app
         .parameters
         .values()
@@ -577,22 +660,60 @@ fn parameters_for(app: &ApplicationProgram) -> Vec<ParameterModel> {
                 }
                 _ => param.default.clone(),
             };
+            let default = effective_default.filter(|s| !s.is_empty());
+            let width = DynamicSource::integer_width(app, &param.id);
+            let refs = refs_by_param
+                .get(param.id.as_str())
+                .into_iter()
+                .flatten()
+                .map(|pref| {
+                    let id = pref.id.strip_prefix(&prefix).unwrap_or(&pref.id);
+                    (id.to_string(), ref_model(param, pref, default.as_deref()))
+                })
+                .collect();
             ParameterModel {
                 id: param.id.clone(),
                 name: param.name.clone().filter(|s| !s.is_empty()),
                 text: param.text.clone().filter(|s| !s.is_empty()),
                 param_type: param_type_model(app, param.parameter_type.as_deref()),
-                default: effective_default.filter(|s| !s.is_empty()),
+                default,
                 memory: param.memory.as_ref().map(|m| MemoryModel {
                     segment: m.code_segment.clone(),
                     offset: m.offset,
                     bit_offset: m.bit_offset,
                 }),
+                base_value: param
+                    .base_value
+                    .as_deref()
+                    .map(|b| b.strip_prefix(&prefix).unwrap_or(b).to_string()),
+                bits: width.map(|(bits, _)| bits),
+                signed: width.is_some_and(|(_, signed)| signed),
+                refs,
             }
         })
         .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
+}
+
+/// The model entry of `pref`, a ref of `param`, where the model writes
+/// `default` as the parameter's default: the ref's `Value` where it differs
+/// from the parameter's own, and wherever the model's `default` would not
+/// give the value the ref has (an empty `Value` the model leaves out), so
+/// the evaluator reads every ref's value as the XML gives it (issue #345).
+fn ref_model(
+    param: &crate::Parameter,
+    pref: &crate::ParameterRef,
+    default: Option<&str>,
+) -> RefModel {
+    let effective = pref.value.as_deref().or(param.default.as_deref());
+    let differs = pref.value.is_some() && pref.value != param.default;
+    RefModel {
+        value: (differs || effective != default)
+            .then(|| effective.map(str::to_string))
+            .flatten(),
+        internal: pref.access.as_deref().or(param.access.as_deref()) == Some("None"),
+    }
 }
 
 /// Resolves a parameter's `ParameterType` ref to its model shape.
@@ -827,10 +948,31 @@ fn opt<T: std::fmt::Display>(v: &Option<T>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-/// Serializes a model to YAML, prefixed with the generated-file banner.
+/// Serializes a model to YAML, prefixed with the generated-file banner. The
+/// Dynamic trees come last, each node of their top level on a line of its
+/// own in flow style (see
+/// [`bussard_model::dynamic_compact::write_flow_lines`]).
 fn serialize_model(model: &Model) -> Result<String, ModelError> {
     let body = serde_norway::to_string(model).map_err(|e| ModelError::Serialize(e.to_string()))?;
-    Ok(format!("{MODEL_BANNER}{body}"))
+    let mut out = format!("{MODEL_BANNER}{body}");
+    let flow = |e: serde_json::Error| ModelError::Serialize(e.to_string());
+    if !model.dynamic.is_empty() {
+        out.push_str("dynamic:\n");
+        bussard_model::dynamic_compact::write_flow_lines(model.dynamic, "", &mut out)
+            .map_err(flow)?;
+    }
+    if !model.module_dynamics.is_empty() {
+        out.push_str("module_dynamics:\n");
+        for (def, body) in &model.module_dynamics {
+            if body.is_empty() {
+                out.push_str(&format!("  {def}: []\n"));
+                continue;
+            }
+            out.push_str(&format!("  {def}:\n"));
+            bussard_model::dynamic_compact::write_flow_lines(body, "  ", &mut out).map_err(flow)?;
+        }
+    }
+    Ok(out)
 }
 
 /// The banner prefixed to each generated model file (same voice as the
