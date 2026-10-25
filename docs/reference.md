@@ -179,10 +179,20 @@ Explain what changes from `A` to `B`, as the plain sentences `bussard status` pr
 | `<A>`, `<B>` | | The two sides. |
 | `--json` | off | Emit `{"a", "b", "summary", "touches_protected", "changes": [...]}`, the same change objects as `status --json`. |
 | `--raw` | off | Print a file-level TOML diff instead of the sentences. |
+| `--checklist` | off | Print a per-device Markdown checklist of the changes to redo by hand in ETS. With `--json`, emit the same structure as JSON. |
 | `--password <PASSWORD>` | | Password for both `.knxproj` sides. Falls back to `BUSSARD_PROJECT_PASSWORD`. |
 | `--password-b <PASSWORD>` | | Password for the second side, when it differs. |
 
-Group addresses are matched by address and devices by individual address, so a GA renamed in a newer export is one rename, not a removal and an addition. Two exports of the same project give an empty diff. A parameter change is named by the parameter's text from the product model (`.bussard/models/*.yaml`) when a model-directory side has one, and by its key otherwise.
+Group addresses are matched by address and devices by individual address, so a GA renamed in a newer export is one rename, not a removal and an addition. Two exports of the same project give an empty diff. A parameter change is named by the parameter's text from the product model (`.bussard/models/*.yaml`) when a model-directory side has one, and by its key otherwise. A link sentence names the device with its address (`Meteodata 140 S (1.1.202), channel CH-0, now switches …`).
+
+**`--checklist` (issue #372).** ETS signs its project files, so bussard cannot write its changes back into a `.knxproj`; ETS stays in step only when someone redoes them by hand. `bussard diff <export> knx --checklist` prints that work in the order it is done in ETS:
+
+1. *Group addresses*: new, renamed, DPT, description, security, removed, with the model's range names (`- [ ] 4/1/20 "Aussen dunkel", DPT 1.001, new (main group 4 "Zentral", middle group 4/1 "Wetterdaten")`).
+2. One `## <address> <name> (<room>)` section per device, with *Device* (name, location, product, channel names), *Parameters* (`- [ ] Universalkanal C4: Funktion › Helligkeitsschwelle: unter 20 lx (was über 10000 lx)`: the ETS page the device view puts it on, the ETS label, the new value as ETS shows it and the old one, which is the vendor default when the old side stores none; pages in ETS order, and a parameter that enables another one's page or branch comes first), *Objects and links* (`- [ ] Objekt 105 "C18.1 Logikmodul" (Schalten): sends 1/0/4 (was nothing)`, only the roles that changed) and *Security*.
+3. *Not in ETS by hand*: plain notes for what ETS does not take (gateway, transport, admission, the `protected` flag), a value the model stores at its vendor default, and a parameter ETS does not show under the new values.
+4. The count of items and `Afterwards: export the project and run bussard diff <export> <B>; it should report no changes.`
+
+The pages and old values come from the product models of a model-directory side. A cached model of an older format carries no pages; the checklist then says so, and `bussard device <address>` regenerates it. `--checklist --json` emits `{"schema", "a", "b", "changes", "items", "groups": [...], "devices": [{"address", "name", "room", "device", "parameters", "objects", "security"}], "notes": [...]}`; each item has `kind`, `text` and, where they apply, `device`, `group`, `object`, `page`, `label`, `value`, `old_value`.
 
 ### `bussard scan [LINE]`
 
@@ -512,7 +522,7 @@ The summary table lists each device as `commissioned`, `present` or `failed: <re
 
 ### `bussard status`
 
-Show what has changed in the model since the last history snapshot, as plain sentences ("Rocker 1 on Hallway push button now switches Porch light (0/0/4)."). Nothing here has reached a device: `status` reads files only. Always exits 0. With no snapshot yet it says so and stops.
+Show what has changed in the model since the last history snapshot, as plain sentences ("Rocker 1 on Hallway push button (1.1.5) now switches Porch light (0/0/4)."). Nothing here has reached a device: `status` reads files only. Always exits 0. With no snapshot yet it says so and stops.
 
 | Flag | Default | Meaning |
 |---|---|---|

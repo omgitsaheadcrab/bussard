@@ -9,6 +9,9 @@
 //! as one rename, not a removal and an addition. Parameter changes use the
 //! parameter's text from a model directory's cached `models/*.yaml` when there
 //! is one, and the key otherwise.
+//!
+//! `--checklist` prints the same changes as a per-device Markdown checklist
+//! to redo by hand in ETS ([`bussard_model::checklist`], issue #372).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -18,6 +21,7 @@ use anyhow::Context;
 use bussard_model::Model;
 use bussard_model::bundle::{self, Bundle};
 use bussard_model::change::{ChangeSet, describe, name_parameters, render_text};
+use bussard_model::checklist::checklist;
 use bussard_model::param_model::ProductModels;
 
 /// One side of a diff, loaded into memory.
@@ -30,13 +34,23 @@ pub struct Side {
     pub files: BTreeMap<String, String>,
 }
 
-/// Runs `bussard diff <a> <b> [--json] [--raw]`. Always exits 0: "no
-/// differences" is an answer.
+/// How `bussard diff` prints its answer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Format {
+    /// `--json`: machine-readable.
+    pub json: bool,
+    /// `--raw`: the file-level diff of the model files.
+    pub raw: bool,
+    /// `--checklist`: the ETS checklist.
+    pub checklist: bool,
+}
+
+/// Runs `bussard diff <a> <b> [--json] [--raw] [--checklist]`. Always exits
+/// 0: "no differences" is an answer.
 pub fn run(
     a: &Path,
     b: &Path,
-    json: bool,
-    raw: bool,
+    format: Format,
     password: Option<String>,
     password_b: Option<String>,
 ) -> anyhow::Result<ExitCode> {
@@ -48,12 +62,39 @@ pub fn run(
     let side_a = load_side(a, pw_a.as_deref())?;
     let side_b = load_side(b, pw_b.as_deref())?;
 
+    let Format {
+        json,
+        raw,
+        checklist: as_checklist,
+    } = format;
     if raw {
         print_raw(a, b, &side_a.files, &side_b.files);
         return Ok(ExitCode::SUCCESS);
     }
 
     let changes = diff(&side_a, &side_b);
+    if as_checklist {
+        let list = checklist(
+            &changes,
+            &side_a.model,
+            &side_b.model,
+            &products(&side_a, &side_b),
+        );
+        if json {
+            let mut value = serde_json::to_value(&list)?;
+            if let Some(map) = value.as_object_mut() {
+                map.insert("a".to_string(), a.display().to_string().into());
+                map.insert("b".to_string(), b.display().to_string().into());
+            }
+            crate::output::print(crate::output::schema::DIFF_CHECKLIST, &value)?;
+        } else {
+            print!(
+                "{}",
+                list.render_markdown(&a.display().to_string(), &b.display().to_string())
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     if json {
         let value = serde_json::json!({
             "a": a.display().to_string(),
@@ -89,10 +130,15 @@ pub fn run(
 /// product models.
 pub fn diff(a: &Side, b: &Side) -> ChangeSet {
     let mut changes = describe(&a.model, &b.model);
+    name_parameters(&mut changes, [&b.model, &a.model], &products(a, b));
+    changes
+}
+
+/// Both sides' product models, the second side's winning.
+fn products(a: &Side, b: &Side) -> ProductModels {
     let mut products = a.products.clone();
     products.by_app_ref.extend(b.products.by_app_ref.clone());
-    name_parameters(&mut changes, [&b.model, &a.model], &products);
-    changes
+    products
 }
 
 /// Loads one side from whatever `path` names.

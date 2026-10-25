@@ -27,6 +27,8 @@ pub mod schema {
     pub const DEVICE: u32 = 1;
     /// `bussard diff --json`.
     pub const DIFF: u32 = 1;
+    /// `bussard diff --checklist --json`.
+    pub const DIFF_CHECKLIST: u32 = 1;
     /// `bussard doc --json` (the documentation model).
     pub const DOC: u32 = 1;
     /// `bussard export --json`.

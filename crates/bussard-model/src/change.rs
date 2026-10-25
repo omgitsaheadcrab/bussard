@@ -433,20 +433,6 @@ fn ga_label(models: [&Model; 2], ga: GroupAddress) -> String {
     ga.to_string()
 }
 
-/// A device's short name for mid-sentence use: its name, or its individual
-/// address when it has none.
-fn device_name(models: [&Model; 2], ia: IndividualAddress) -> String {
-    for model in models {
-        if let Some(loaded) = model.devices.get(&ia) {
-            let name = loaded.device.name.trim();
-            if !name.is_empty() {
-                return name.to_string();
-            }
-        }
-    }
-    ia.to_string()
-}
-
 /// A device's full label: `Hallway push button (1.1.5)`, or the bare address.
 fn device_label(models: [&Model; 2], ia: IndividualAddress) -> String {
     for model in models {
@@ -531,7 +517,7 @@ fn product_label(product: Option<&Product>) -> String {
 /// A parameter key rendered for a human: the slug before the `@`, with dashes
 /// turned into spaces and the first letter capitalized. Falls back to the whole
 /// key when it carries no slug.
-fn parameter_label(key: &str) -> String {
+pub(crate) fn parameter_label(key: &str) -> String {
     let slug = key.split('@').next().unwrap_or(key).trim();
     if slug.is_empty() {
         return key.to_string();
@@ -1118,7 +1104,7 @@ fn describe_links(old: &Model, new: &Model, out: &mut Vec<Change>) {
 ///
 /// The subject is the com-object name (when the model has one) on the device,
 /// with the channel appended when the com object belongs to a named channel:
-/// "Living room blind actuator, channel B, no longer listens to Central down
+/// "Living room blind actuator (1.1.4), channel B, no longer listens to Central down
 /// (3/0/1)."
 #[allow(clippy::too_many_arguments)] // all of it is one sentence's worth of context
 fn link_sentence(
@@ -1131,7 +1117,9 @@ fn link_sentence(
     ga: GroupAddress,
     added: bool,
 ) -> String {
-    let device_label = device_name(models, ia);
+    // The address goes with the name, so a sentence naming only a channel
+    // still says which device it is (issue #372).
+    let device_label = device_label(models, ia);
     let mut subject = match object_name {
         Some(name) => format!("{name} on {device_label}"),
         None => device_label,
@@ -1319,7 +1307,7 @@ mod tests {
         let set = describe(&old, &new);
         assert_eq!(
             set.changes[0].sentence,
-            "Living room blind actuator, channel B, \
+            "Living room blind actuator (1.1.4), channel B, \
              no longer listens to Central down (3/0/1)."
         );
     }

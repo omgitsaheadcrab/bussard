@@ -719,6 +719,10 @@ enum Command {
         /// Print a file-level TOML diff instead of sentences.
         #[arg(long, conflicts_with = "json")]
         raw: bool,
+        /// Print a per-device Markdown checklist of the changes to redo by
+        /// hand in ETS (with `--json`, the same structure as JSON).
+        #[arg(long, conflicts_with = "raw")]
+        checklist: bool,
         /// Project password for both sides (else `BUSSARD_PROJECT_PASSWORD`).
         #[arg(long)]
         password: Option<String>,
@@ -1969,9 +1973,20 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
             a,
             b,
             raw,
+            checklist,
             password,
             password_b,
-        } => diff_cmd::run(&a, &b, json, raw, password, password_b),
+        } => diff_cmd::run(
+            &a,
+            &b,
+            diff_cmd::Format {
+                json,
+                raw,
+                checklist,
+            },
+            password,
+            password_b,
+        ),
         Command::Monitor { filter } => monitor_cmd::run(
             dir,
             json,
