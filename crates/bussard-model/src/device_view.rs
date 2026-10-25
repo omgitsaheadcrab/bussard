@@ -500,7 +500,10 @@ fn param_row(
         reference: entry.reference.clone(),
         text: def.and_then(|d| d.text.clone()),
         value,
-        default: default.map(|d| display_value(def, &d)),
+        // An empty text default has nothing to show.
+        default: default
+            .filter(|d| !d.is_empty())
+            .map(|d| display_value(def, &d)),
         at_default,
         choices,
         range,
