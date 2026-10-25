@@ -805,6 +805,15 @@ pub struct Sys7Context {
     /// the plan placed a parameter in is `0xFF` too, whatever the product's
     /// `<Mask>` says there (issue #320).
     pub segment_masks: BTreeMap<String, Vec<u8>>,
+    /// The segments that hold the application's code: the ones the plan
+    /// streams verbatim from the product's `<Data>`. A checksummed EEPROM
+    /// segment of the application's load-state machine qualifies when no
+    /// parameter is placed in it and it is neither a link table nor the
+    /// group-object descriptor table (whose CONFIG octets the planner
+    /// rewrites from the model). The System 7 identity check samples only
+    /// these (issue #355); a product with none is judged by its load-state
+    /// machines alone.
+    pub code_segments: std::collections::BTreeSet<String>,
 }
 
 impl FlashPlan {
@@ -1003,6 +1012,15 @@ impl FlashPlan {
             .as_ref()
             .and_then(|s| s.segment_masks.get(segment_id))
             .map(Vec::as_slice)
+    }
+
+    /// The System 7 segments that hold the application's code (see
+    /// [`Sys7Context::code_segments`]), the only ones the identity check
+    /// samples (issue #355). Empty for a System B plan.
+    pub fn sys7_code_segments(&self) -> impl Iterator<Item = &str> {
+        self.sys7
+            .iter()
+            .flat_map(|s| s.code_segments.iter().map(String::as_str))
     }
 
     /// The resident octets a parameter-only download diffs `segment_id`'s image

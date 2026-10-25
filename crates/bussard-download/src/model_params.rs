@@ -529,36 +529,36 @@ enum CodeSample {
     Matches { segments: usize },
     /// A segment differs: the reason names it and the first differing offset.
     Differs(String),
+    /// The product has no code segment to sample: its segments hold tables
+    /// and parameters only (the Theben Meteodata 140 S).
+    NoCode,
     /// No segment could be compared; the reason says why.
     Unread(String),
 }
 
-/// Reads the leading octets of every System 7 code segment (a data-bearing
-/// segment no parameter targets) and compares them with the product's bytes,
-/// octet by octet where the segment mask marks the octet as written.
+/// Reads the leading octets of every System 7 code segment and compares them
+/// with the product's bytes, octet by octet where the segment mask marks the
+/// octet as written. The code segments are the plan's
+/// [`FlashPlan::sys7_code_segments`]: never a link table, the group-object
+/// descriptor table or parameter memory, whose octets change with the
+/// configuration (issue #355).
 async fn sample_code<Ch: bussard_mgmt::L4Channel>(
     l4: &mut bussard_mgmt::Layer4Connection<Ch>,
     plan: &FlashPlan,
 ) -> CodeSample {
+    let code: std::collections::BTreeSet<&str> = plan.sys7_code_segments().collect();
     let mut compared = 0;
     let mut unread = Vec::new();
     for step in &plan.steps {
         let FlashStep::Sys7AbsSegment {
             address,
             image: Some(image),
-            checksum_ctrl,
             ..
         } = step
         else {
             continue;
         };
-        // Parameter segments are what changes; runtime-writable segments are
-        // rewritten by the running application; table segments are the links.
-        let carries_params = plan
-            .param_images
-            .get(&image.segment_id)
-            .is_some_and(|b| !b.is_empty());
-        if carries_params || *checksum_ctrl == 0 || image.kind == crate::ImageKind::Table {
+        if !code.contains(image.segment_id.as_str()) {
             continue;
         }
         let Some(expected) = plan.image_bytes(&image.segment_id) else {
@@ -595,10 +595,7 @@ async fn sample_code<Ch: bussard_mgmt::L4Channel>(
     if compared > 0 {
         CodeSample::Matches { segments: compared }
     } else if unread.is_empty() {
-        CodeSample::Unread(format!(
-            "{} has no code segment to compare against the device",
-            plan.identity.id
-        ))
+        CodeSample::NoCode
     } else {
         CodeSample::Unread(format!(
             "no code segment could be read ({})",
@@ -621,7 +618,7 @@ pub async fn sys7_code_mismatch<Ch: bussard_mgmt::L4Channel>(
         CodeSample::Differs(reason) => Some(format!(
             "{reason}. Run `bussard flash --force` to replace it."
         )),
-        CodeSample::Matches { .. } | CodeSample::Unread(_) => None,
+        CodeSample::Matches { .. } | CodeSample::NoCode | CodeSample::Unread(_) => None,
     }
 }
 
@@ -631,6 +628,8 @@ pub async fn sys7_code_mismatch<Ch: bussard_mgmt::L4Channel>(
 pub enum Sys7Identity {
     /// Every load-state machine the procedure drives is `Loaded` and the
     /// sampled code matches the product: the device runs this application.
+    /// With `segments: 0` the product has no code segment to sample, and the
+    /// load state alone is the evidence (issue #355).
     SameApplication {
         /// How many code segments were compared.
         segments: usize,
@@ -653,6 +652,12 @@ impl Sys7Identity {
     /// One sentence for a plan or a pre-flight: what the check concluded.
     pub fn describe(&self, plan: &FlashPlan) -> String {
         match self {
+            Sys7Identity::SameApplication { segments: 0 } => format!(
+                "System 7: every load-state machine is Loaded; {} has no code segment to sample \
+                 (its segments hold tables and parameters), so the load state alone identifies \
+                 the application",
+                plan.identity.id
+            ),
             Sys7Identity::SameApplication { segments } => format!(
                 "System 7: every load-state machine is Loaded and the code matches {} ({segments} \
                  segment(s) compared)",
@@ -722,6 +727,8 @@ pub async fn sys7_identity<Ch: bussard_mgmt::L4Channel>(
     }
     match sample_code(l4, plan).await {
         CodeSample::Matches { segments } => Sys7Identity::SameApplication { segments },
+        // Nothing to sample: the load state alone stands in for the id.
+        CodeSample::NoCode => Sys7Identity::SameApplication { segments: 0 },
         CodeSample::Differs(reason) => Sys7Identity::Resident { reason },
         CodeSample::Unread(reason) => Sys7Identity::Unknown { reason },
     }

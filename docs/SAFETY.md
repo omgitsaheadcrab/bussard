@@ -449,7 +449,11 @@ It refuses before any write when:
 
 System 7 exposes no application id, so there the identity check is every
 load-state machine `Loaded` plus the first octets of each code segment matching
-the product. On System 7 the download opens LSM 3 and writes the parameter octets in
+the product. A code segment is one streamed verbatim from the product: never a
+link table, the group-object descriptor table, RAM or parameter memory, whose
+octets change with the configuration (issue #355). A product with no code
+segment (the Theben Meteodata 140 S) is judged by its load-state machines
+alone, and the pre-flight says so. On System 7 the download opens LSM 3 and writes the parameter octets in
 place, with no allocation record, and the executor re-reads LSM 3 right before
 and writes nothing unless it is `Loaded` (issue #146). If a parameter download
 fails midway and the application still reads `Loaded`, re-run it (it writes

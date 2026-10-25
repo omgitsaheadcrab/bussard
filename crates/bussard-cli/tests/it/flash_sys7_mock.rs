@@ -3,8 +3,11 @@
 //! judges the device by its load-state machines and a sample of its code
 //! (the verdict `knx_plan_device` decides on too): the product's code
 //! proceeds, code that differs by one octet is refused with the segment
-//! named. Against an in-process mock KNXnet/IP gateway on loopback; the
-//! `bussard` binary always runs with an explicit loopback `--gateway`.
+//! named. Issue #355: the sample covers the code alone, so a configuration
+//! flashed over another one (the group-object descriptor table follows the
+//! links) is the same application. Against an in-process mock KNXnet/IP
+//! gateway on loopback; the `bussard` binary always runs with an explicit
+//! loopback `--gateway`.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -272,5 +275,132 @@ fn test_flash_system7_links_lost_on_the_device_fail_with_the_link() -> TestResul
         "the error names the link: {stderr}"
     );
     assert!(!stdout.contains("flash verified"), "{stdout}");
+    Ok(())
+}
+
+/// Where the #355 fixture's group-object descriptor table (`AS-6`) sits.
+const OBJECT_TABLE_BASE: u32 = 0x4700;
+
+/// The fixture application with the group-object descriptor table in an
+/// LSM 3 EEPROM segment and the RAM its pointers address, as the Theben
+/// Meteodata 140 S and the MDT 0705 programs lay it out (issue #355): `[CNT=3]
+/// [RAM flags 0x0700]` and three descriptors `[ptr][CONFIG 0xDF][TYPE 0]`.
+/// The planner rewrites the CONFIG octets from the links, so they differ
+/// between two configurations of the same application. `with_code` keeps the
+/// code segment `AS-4`; without it the product has no code to sample.
+fn object_table_app(with_code: bool) -> Result<String, Box<dyn std::error::Error>> {
+    let segments = r#"<AbsoluteSegment Id="M-00FA_A-0007_AS-4" Size="4" Address="17920"><Data>CgsMDQ==</Data></AbsoluteSegment>"#;
+    let ops = r#"<LdCtrlAbsSegment LsmIdx="3" Address="17920" Size="4" />"#;
+    let table = "AwcABwHfAAcC3wAHA98A"; // 03 0700 0701DF00 0702DF00 0703DF00
+    let code = if with_code {
+        r#"<Data>CgsMDQ==</Data>"#
+    } else {
+        ""
+    };
+    let xml = SYS7_APP_XML
+        .replace(
+            segments,
+            &format!(
+                r#"<AbsoluteSegment Id="M-00FA_A-0007_AS-4" Size="4" Address="17920">{code}</AbsoluteSegment>
+              <AbsoluteSegment Id="M-00FA_A-0007_AS-5" Size="64" Address="1792" />
+              <AbsoluteSegment Id="M-00FA_A-0007_AS-6" Size="15" Address="18176"><Data>{table}</Data></AbsoluteSegment>"#
+            ),
+        )
+        .replace(
+            ops,
+            r#"<LdCtrlAbsSegment LsmIdx="3" Address="1792" Size="64" MemType="2" />
+                <LdCtrlAbsSegment LsmIdx="3" Address="17920" Size="4" />
+                <LdCtrlAbsSegment LsmIdx="3" Address="18176" Size="15" />"#,
+        );
+    if !xml.contains("AS-6") || !xml.contains(r#"Address="18176" Size="15""#) {
+        return Err("the fixture's code segment moved".into());
+    }
+    Ok(xml)
+}
+
+/// Rewrites the model's device file with `links` as its `[links]` body.
+fn set_links(bench: &Bench, links: &str) -> TestResult {
+    std::fs::write(
+        bench.dir.join("knx").join("devices").join("1.1.7.toml"),
+        format!(
+            "address = \"1.1.7\"\nname = \"Weather station\"\n\n[parameters]\n\
+             \"thr@P-0_R-1\" = \"9\"\n\"obj2@P-1_R-2\" = \"1\"\n\n[links]\n{links}"
+        ),
+    )?;
+    Ok(())
+}
+
+/// The CONFIG octet of descriptor `asap` in the device's object table.
+fn object_config(bench: &Bench, asap: u32) -> Result<u8, Box<dyn std::error::Error>> {
+    let config = bench.gateway.with_device(device_ia()?, |dev| {
+        dev.read_mem(OBJECT_TABLE_BASE + 3 + 4 * asap + 2, 1)
+    })?;
+    config
+        .first()
+        .copied()
+        .ok_or_else(|| "no CONFIG octet".into())
+}
+
+/// Issue #355: configuration A (object 1 linked), then configuration B (no
+/// link) over it, without `--force`. The descriptor table's CONFIG octets
+/// differ between the two, and the identity sample compares the code segment
+/// alone, so B is accepted as the same application.
+#[test]
+fn test_flash_system7_configuration_over_another_proceeds_without_force() -> TestResult {
+    let bench = Bench::start_with(
+        system7_device(device_ia()?, &SYS7_CODE),
+        &object_table_app(true)?,
+    )?;
+    // Configuration A goes on as the sim loop's first flash does.
+    let out = bench.flash(&["--force"])?;
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let linked = object_config(&bench, 1)?;
+    assert_eq!(
+        linked & 0x04,
+        0x04,
+        "object 1 linked: C set ({linked:#04X})"
+    );
+
+    set_links(&bench, "")?;
+    let out = bench.flash(&[])?;
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stderr.contains("already runs this application"), "{stderr}");
+    assert!(
+        stderr.contains("the code matches") && stderr.contains("1 segment(s) compared"),
+        "only the code segment is sampled: {stderr}"
+    );
+    assert!(!stderr.contains("AS-6"), "{stderr}");
+    let unlinked = object_config(&bench, 1)?;
+    assert_eq!(
+        unlinked & 0x04,
+        0,
+        "object 1 unlinked: C clear ({unlinked:#04X})"
+    );
+    Ok(())
+}
+
+/// Issue #355: a product whose segments hold tables and parameters only (the
+/// Meteodata 140 S) has no code to sample; the gate judges it by its
+/// load-state machines and says so.
+#[test]
+fn test_flash_system7_without_code_segment_falls_back_to_the_load_state() -> TestResult {
+    let bench = Bench::start_with(
+        system7_device(device_ia()?, &SYS7_CODE),
+        &object_table_app(false)?,
+    )?;
+    let out = bench.flash(&[])?;
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    set_links(&bench, "")?;
+    let out = bench.flash(&[])?;
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("no code segment to sample")
+            && stderr.contains("the load state alone identifies the application"),
+        "{stderr}"
+    );
     Ok(())
 }

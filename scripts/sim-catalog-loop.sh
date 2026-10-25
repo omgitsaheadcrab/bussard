@@ -47,9 +47,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUBSET=(
   "2CDG 110 283 R0011|A-A0ED-10"       # ABB i-bus (159 MB archive, 07B0, big object 5)
   "52921ST|A-D142-21"                  # Jung F50 push-button (07B0, the house's)
-  "1409207|A-140C-14-A512"             # Theben Meteodata 140 S (0701, known #355)
-  "SCN-P360D3.03|A-0072-44-49AB"       # MDT 0705 (known #355)
-  "SCN-P360D3.03|A-0076-44-685A"       # MDT 0705 (known #355)
+  "1409207|A-140C-14-A512"             # Theben Meteodata 140 S (0701)
+  "SCN-P360D3.03|A-0072-44-49AB"       # MDT 0705
+  "SCN-P360D3.03|A-0076-44-685A"       # MDT 0705
 )
 
 update_baseline=0
