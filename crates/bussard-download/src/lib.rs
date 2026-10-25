@@ -74,9 +74,9 @@ pub use device_plan::{
 pub use flash::{
     AppIdentity, Connector, DeviceFacts, FlashOptions, FlashOutcome, FlashPlan, FlashStep,
     ImageKind, ImageRef, PartialPlanError, PlanError, Progress, RebootReadiness, RestartKind,
-    Session, SingleConnector, Sys7Context, discover_application_object, flash, plan_flash,
-    plan_flash_sys7_with_hawk, plan_flash_with_object_flags, same_program, select_application,
-    sys7_profile_from_hawk, trace,
+    Session, SingleConnector, Sys7Context, Sys7TableBases, discover_application_object, flash,
+    plan_flash, plan_flash_sys7_with_hawk, plan_flash_with_object_flags, same_program,
+    select_application, sys7_profile_from_hawk, sys7_table_bases, trace,
 };
 pub use model_params::{
     OrderNumberError, Sys7Identity, build_module_obj3_descriptors, build_table_images,
@@ -104,9 +104,9 @@ pub use preflight::{
 };
 pub use program::{
     LiveRead, LiveReadError, LiveTables, NoLinks, TableWriteSummary, desired_tables_for,
-    read_live_tables, render_full_image_plan_text, render_plan_text, write_pre_write_backup,
-    write_sys7, write_system_b, write_system_b_secured, write_system_b_seeded, write_tables,
-    write_tables_secured, write_tables_seeded,
+    read_live_tables, read_live_tables_at, render_full_image_plan_text, render_plan_text,
+    write_pre_write_backup, write_sys7, write_system_b, write_system_b_secured,
+    write_system_b_seeded, write_tables, write_tables_secured, write_tables_seeded,
 };
 pub use security::{
     DeviceSecurityView, GO_FLAGS_SECURE, GroupKeyEntry, MAX_SEQUENCE, SecureSenderEntry,
@@ -120,4 +120,4 @@ pub use sweep::{
     SweepManifest, SweepTotals, classify_application, family_label, manifest_from_products,
     sweep_corpus, sweep_file,
 };
-pub use tables_sys7::{Sys7LiveTables, Sys7TablesError, read_sys7_tables};
+pub use tables_sys7::{Sys7LiveTables, Sys7TablesError, read_sys7_tables, read_sys7_tables_at};

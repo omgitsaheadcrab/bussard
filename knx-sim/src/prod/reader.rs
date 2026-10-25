@@ -73,17 +73,123 @@ pub fn read_knxprod_bytes(
     }
 
     for name in &names {
-        let mut file = zip.by_name(name)?;
         let mut content = String::new();
-        file.read_to_string(&mut content)?;
+        zip.by_name(name)?.read_to_string(&mut content)?;
         if !content.contains("<ApplicationProgram") {
             continue;
         }
-        if let Some(pd) = parse_application_program(&content, application_id)? {
+        if let Some(mut pd) = parse_application_program(&content, application_id)? {
+            attach_pei_programs(&mut zip, &names, &mut pd)?;
             return Ok(pd);
         }
     }
     Err(ProdError::NoApplicationProgram)
+}
+
+/// The application ids a `Hardware2Program` of the archive lists next to
+/// `app_id`, read from every `Hardware.xml`.
+fn hardware_partners<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    names: &[String],
+    app_id: &str,
+) -> Result<Vec<String>, ProdError> {
+    let needle = format!("RefId=\"{app_id}\"");
+    let mut partners: Vec<String> = Vec::new();
+    for name in names.iter().filter(|n| n.ends_with("Hardware.xml")) {
+        let mut content = String::new();
+        zip.by_name(name)?.read_to_string(&mut content)?;
+        if !content.contains(&needle) {
+            continue;
+        }
+        let mut reader = Reader::from_str(&content);
+        let mut group: Option<Vec<String>> = None;
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf)? {
+                Event::Eof => break,
+                Event::Start(e) if e.name().as_ref() == b"Hardware2Program" => {
+                    group = Some(Vec::new());
+                }
+                Event::Start(e) | Event::Empty(e)
+                    if e.name().as_ref() == b"ApplicationProgramRef" =>
+                {
+                    if let (Some(g), Some(id)) = (group.as_mut(), attr(&e, "RefId")) {
+                        g.push(id);
+                    }
+                }
+                Event::End(e) if e.name().as_ref() == b"Hardware2Program" => {
+                    if let Some(g) = group.take()
+                        && g.iter().any(|id| id == app_id)
+                    {
+                        for id in g {
+                            if id != app_id && !partners.contains(&id) {
+                                partners.push(id);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            buf.clear();
+        }
+    }
+    Ok(partners)
+}
+
+/// Folds into `pd` what the `PeiProgram`s paired with the application
+/// (`Hardware2Program`) bring to the device: ETS downloads such a companion in
+/// the same session (an ABB i-bus control element pairs `A-488A-11` with the
+/// PEI program `A-488A-21`, which allocates object 5 and writes its PID 16 and
+/// PID 13). The real hardware serves those properties and that segment, so the
+/// simulated device must too; without them a write to object 5 PID 16 went
+/// unanswered and timed the flash out.
+fn attach_pei_programs<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    names: &[String],
+    pd: &mut ProductData,
+) -> Result<(), ProdError> {
+    let partners = hardware_partners(zip, names, &pd.application_id)?;
+    for id in partners {
+        let Some(name) = names.iter().find(|n| n.ends_with(&format!("{id}.xml"))) else {
+            continue;
+        };
+        let mut content = String::new();
+        zip.by_name(name)?.read_to_string(&mut content)?;
+        let is_pei = content
+            .find("<ApplicationProgram ")
+            .and_then(|start| {
+                let tag = &content[start..];
+                tag.find('>').map(|end| &tag[..end])
+            })
+            .is_some_and(|tag| tag.contains("ProgramType=\"PeiProgram\""));
+        if !is_pei {
+            continue;
+        }
+        let Some(pei) = parse_application_program(&content, Some(&id))? else {
+            continue;
+        };
+        for prop in pei.written_props {
+            if !pd
+                .written_props
+                .iter()
+                .any(|&(o, p, _)| o == prop.0 && p == prop.1)
+            {
+                pd.written_props.push(prop);
+            }
+        }
+        for object in pei.objects {
+            if pd.object(object.lsm_index).is_none() {
+                pd.objects.push(object);
+            }
+        }
+        for segment in pei.segments {
+            if pd.segment(segment.lsm_index).is_none() {
+                pd.segments.push(segment);
+            }
+        }
+    }
+    pd.objects.sort_by_key(|o| o.lsm_index);
+    Ok(())
 }
 
 /// Decode an even-length hex string (as used by `InlineData`); `None` on any
@@ -168,6 +274,9 @@ fn parse_application_program(
     let mut hardware_type_marker: Option<Vec<u8>> = None;
     let mut device_compare_props: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut written_props: Vec<(u8, u8, usize)> = Vec::new();
+    let mut task_segment_lsms: Vec<u8> = Vec::new();
+    let mut completes_loads = false;
+    let mut compare_mems: Vec<(u16, Vec<u8>)> = Vec::new();
 
     // Transient state while parsing a RelativeSegment (which has a child <Data>).
     let mut cur_segment: Option<RelativeSegment> = None;
@@ -271,6 +380,31 @@ fn parse_application_program(
                             .any(|&(o, p, _)| o == object && p == pid)
                     {
                         written_props.push((object, pid, len));
+                    }
+                }
+                b"LdCtrlLoadCompleted" if in_app => completes_loads = true,
+                b"LdCtrlTaskSegment" if in_app => {
+                    if let Some(lsm) = parse_u32(&e, "LsmIdx")?.and_then(|v| u8::try_from(v).ok())
+                        && !task_segment_lsms.contains(&lsm)
+                    {
+                        task_segment_lsms.push(lsm);
+                    }
+                }
+                b"LdCtrlCompareMem" if in_app => {
+                    let address = parse_u32(&e, "Address")?.and_then(|v| u16::try_from(v).ok());
+                    let value = attr(&e, "InlineData").and_then(|hex| decode_hex(&hex));
+                    if let (Some(address), Some(mut value)) = (address, value) {
+                        // `Size` octets are compared; `InlineData` may carry
+                        // more (Zennio pads it to 11 octets with zeros).
+                        if let Some(size) = parse_u32(&e, "Size")?
+                            && let Ok(size) = usize::try_from(size)
+                            && size < value.len()
+                        {
+                            value.truncate(size);
+                        }
+                        if !compare_mems.iter().any(|(a, _)| *a == address) {
+                            compare_mems.push((address, value));
+                        }
                     }
                 }
                 b"LdCtrlCompareProp" => {
@@ -381,6 +515,8 @@ fn parse_application_program(
         hardware_type_marker,
         device_compare_props,
         written_props,
+        task_segment_lsms: completes_loads.then_some(task_segment_lsms),
+        compare_mems,
     }))
 }
 
@@ -405,6 +541,73 @@ mod tests {
         for s in ["ä", "ää", "0ä", "ä0", "€€", "\u{10348}"] {
             assert_eq!(decode_hex(s), None, "{s:?} must be refused, not panic");
         }
+    }
+
+    /// A System 7 application program with a CompareMem preflight and a
+    /// TaskSegment on LSM 5 only (the Zennio / IRSC 0701 shapes).
+    const SYS7_APP: &str = r#"<KNX><ManufacturerData><Manufacturer RefId="M-0071"><ApplicationPrograms>
+      <ApplicationProgram Id="M-0071_A-1231-22-E232" ApplicationNumber="4657" ApplicationVersion="34"
+          ProgramType="ApplicationProgram" MaskVersion="MV-0701">
+        <Static><LoadProcedures><LoadProcedure>
+          <LdCtrlCompareMem Address="46608" Size="3" InlineData="5212300000000000000000" />
+          <LdCtrlLoad LsmIdx="1" />
+          <LdCtrlAbsSegment LsmIdx="1" Address="16384" Size="512" />
+          <LdCtrlLoadCompleted LsmIdx="1" />
+          <LdCtrlTaskSegment LsmIdx="5" Address="17408" />
+        </LoadProcedure></LoadProcedures></Static>
+      </ApplicationProgram></ApplicationPrograms></Manufacturer></ManufacturerData></KNX>"#;
+
+    #[test]
+    fn test_parse_application_program_reads_task_segments_and_compare_mem() -> Result<(), ProdError>
+    {
+        let pd =
+            parse_application_program(SYS7_APP, None)?.ok_or(ProdError::NoApplicationProgram)?;
+        assert_eq!(pd.task_segment_lsms, Some(vec![5]));
+        // Size octets of the padded InlineData.
+        assert_eq!(pd.compare_mems, vec![(0xB610, vec![0x52, 0x12, 0x30])]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_knxprod_bytes_pairs_the_pei_program() -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write as _;
+        let app = r#"<KNX><ApplicationProgram Id="M-0002_A-488A-11-4A38" ProgramType="ApplicationProgram" MaskVersion="MV-07B0">
+          <Static><LoadProcedures><LoadProcedure MergeId="2">
+            <LdCtrlWriteProp ObjIdx="4" PropId="16" InlineData="0A" />
+          </LoadProcedure></LoadProcedures></Static></ApplicationProgram></KNX>"#;
+        let pei = r#"<KNX><ApplicationProgram Id="M-0002_A-488A-21-D09B" ProgramType="PeiProgram" MaskVersion="MV-07B0">
+          <Static><Code><RelativeSegment Id="RS-05" Offset="0" Size="34" LoadStateMachine="5" /></Code>
+          <LoadProcedures><LoadProcedure MergeId="3">
+            <LdCtrlWriteProp ObjIdx="5" PropId="16" InlineData="0A" />
+            <LdCtrlWriteProp ObjIdx="5" PropId="13" InlineData="0002488A20" />
+          </LoadProcedure></LoadProcedures></Static></ApplicationProgram></KNX>"#;
+        let hardware = r#"<KNX><Hardware><Hardware2Programs>
+          <Hardware2Program Id="HP-1">
+            <ApplicationProgramRef RefId="M-0002_A-488A-11-4A38" />
+            <ApplicationProgramRef RefId="M-0002_A-488A-21-D09B" />
+          </Hardware2Program></Hardware2Programs></Hardware></KNX>"#;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, body) in [
+                ("M-0002/M-0002_A-488A-11-4A38.xml", app),
+                ("M-0002/M-0002_A-488A-21-D09B.xml", pei),
+                ("M-0002/Hardware.xml", hardware),
+            ] {
+                zip.start_file(name, options)?;
+                zip.write_all(body.as_bytes())?;
+            }
+            zip.finish()?;
+        }
+        let pd = read_knxprod_bytes(buf.get_ref(), Some("M-0002_A-488A-11-4A38"))?;
+        assert_eq!(pd.application_id, "M-0002_A-488A-11-4A38");
+        assert!(pd.written_props.contains(&(4, 16, 1)));
+        assert!(pd.written_props.contains(&(5, 16, 1)));
+        assert!(pd.written_props.contains(&(5, 13, 5)));
+        assert!(pd.object(5).is_some(), "the PEI program's object 5");
+        Ok(())
     }
 
     #[test]

@@ -73,12 +73,27 @@ struct PlanJson {
 // `bussard_download::program`; the CLI keeps its anyhow-returning wrappers.
 pub(crate) use bussard_download::LiveRead;
 
+/// Where the device's product puts a System 7 device's tables (see
+/// [`bussard_download::sys7_table_bases`]); the corpus defaults without a
+/// product.
+pub(crate) fn table_bases(
+    product: Option<&crate::param_readback::ProductSource>,
+) -> bussard_download::Sys7TableBases {
+    product
+        .and_then(|p| p.app())
+        .map(bussard_download::sys7_table_bases)
+        .unwrap_or_default()
+}
+
 /// Reads a device's live tables on an open (and authorized) connection, picking
-/// the reader by mask family (see [`bussard_download::read_live_tables`]).
+/// the reader by mask family (see [`bussard_download::read_live_tables_at`]).
+/// With the device's `product`, a System 7 device that does not answer
+/// `PID_TABLE_REFERENCE` is read where the product puts its tables.
 pub(crate) async fn read_live_tables<Ch: L4Channel>(
     l4: &mut Layer4Connection<Ch>,
+    product: Option<&crate::param_readback::ProductSource>,
 ) -> anyhow::Result<LiveRead> {
-    Ok(bussard_download::read_live_tables(l4).await?)
+    Ok(bussard_download::read_live_tables_at(l4, table_bases(product)).await?)
 }
 
 /// Reads the device's security individual address table (PID 54) when
@@ -253,7 +268,7 @@ pub(crate) fn read_device(
                         .await?
                         .check
                         .map(|check| check.device);
-                    let read = read_live_tables(l4).await?;
+                    let read = read_live_tables(l4, product).await?;
                     let params = match (&read, product) {
                         (LiveRead::Tables(live), Some(product)) => Some(
                             crate::param_readback::read_state(

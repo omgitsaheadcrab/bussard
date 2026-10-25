@@ -116,6 +116,16 @@ pub struct ProductData {
     /// object 4 or 5 PID 16, others object 0 PID 52 or 86), so the simulated
     /// device seeds each one writable where it lacks it.
     pub written_props: Vec<(u8, u8, usize)>,
+    /// The LSM indices the application's load procedures finalise with an
+    /// `LdCtrlTaskSegment` (System 7), or `None` when the product carries no
+    /// procedure that completes a load (a synthetic product): then every LSM
+    /// requires one.
+    pub task_segment_lsms: Option<Vec<u8>>,
+    /// The memory the application's `LdCtrlCompareMem` preflights expect, as
+    /// `(address, the first Size octets of InlineData)`: a Zennio 0701 program
+    /// compares its hardware id at `0xB610`. A factory device of that hardware
+    /// holds exactly these octets, so the simulated device serves them.
+    pub compare_mems: Vec<(u16, Vec<u8>)>,
 }
 
 impl ProductData {

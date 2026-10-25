@@ -2339,6 +2339,40 @@ async fn run_table_apply(mode: LsmMode) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+/// A product that places its association table at `0x41FF` (the Jung and
+/// Siemens 0705 programs, issue #369): a device that does not answer
+/// `PID_TABLE_REFERENCE` is read there with the product's bases, and two
+/// octets into the table without them.
+#[tokio::test]
+async fn test_read_sys7_tables_at_reads_the_product_association_base()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut bus, state, handle) = setup(LsmMode::Property, Fault::None).await?;
+    let target: bussard_model::IndividualAddress = "1.1.99".parse()?;
+    seed_tables(&state, target.raw(), &[0x0801, 0x0802], &[], &[0x00]);
+    {
+        let mut s = lock(&state);
+        // [CNT=2][1,1][2,1] at 0x41FF; 0x4201 holds the first ASAP.
+        for (i, b) in [0x02u8, 0x01, 0x01, 0x02, 0x01].iter().enumerate() {
+            s.memory.insert(0x41FF + i as u16, *b);
+        }
+    }
+    let mut l4 = authed_connection(&mut bus, target).await?;
+    let bases = bussard_download::Sys7TableBases {
+        address: Some(0x4000),
+        association: Some(0x41FF),
+    };
+    let live = bussard_download::read_sys7_tables_at(&mut l4, bases).await?;
+    assert_eq!(live.association_base, 0x41FF);
+    assert_eq!(live.tables.associations, vec![(1, 1), (2, 1)]);
+    assert_eq!(live.tables.resolved.len(), 2);
+    let fallback = read_sys7_tables(&mut l4).await?;
+    assert_eq!(fallback.association_base, 0x4201);
+    assert_ne!(fallback.tables.associations, live.tables.associations);
+    drop(l4);
+    drop(handle);
+    Ok(())
+}
+
 #[tokio::test]
 async fn apply_system7_tables_property_lsm() -> Result<(), Box<dyn std::error::Error>> {
     run_table_apply(LsmMode::Property).await

@@ -341,7 +341,21 @@ impl Device {
             );
             io.set_property(0x0E, Property::writable(vec![0x00]));
             objects.insert(lsm_index, io);
-            lsms.insert(lsm_index, Sys7LoadStateMachine::new(initial_state));
+            // The TaskSegment precondition holds for an LSM the product's own
+            // procedure finalises with one (the corpus norm, 47/49), or for
+            // every LSM when the product carries no such procedure: a vendor
+            // procedure that completes an LSM without one is what its
+            // hardware accepts (ETS runs it verbatim).
+            let lsm = if product
+                .task_segment_lsms
+                .as_ref()
+                .is_none_or(|lsms| lsms.contains(&lsm_index))
+            {
+                Sys7LoadStateMachine::new(initial_state)
+            } else {
+                Sys7LoadStateMachine::without_task_segment(initial_state)
+            };
+            lsms.insert(lsm_index, lsm);
             // Keep a loadable-object descriptor so PID_MCB_TABLE reads and
             // memory bookkeeping have a home (base is the S7 table anchor).
             let descriptor = product
@@ -364,13 +378,18 @@ impl Device {
         }
 
         seed_written_props(&mut objects, product);
+        // The factory memory the product's CompareMem preflights check.
+        let mut memory = Memory::new();
+        for (address, value) in &product.compare_mems {
+            memory.seed(u32::from(*address), value);
+        }
         let mut device = Self {
             address,
             profile,
             sys7: Some(Sys7Runtime { profile: s7, lsms }),
             objects,
             loadables,
-            memory: Memory::new(),
+            memory,
             access_level: 15,
             connected: false,
             tx_seq: 0,

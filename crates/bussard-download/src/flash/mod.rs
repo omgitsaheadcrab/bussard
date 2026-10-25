@@ -117,8 +117,8 @@ use plan::{MAX_MEMORY_END, insert_factory_reset, manufacturer_from_app_id};
 pub use plan::{plan_flash, plan_flash_with_object_flags, same_program, select_application};
 pub(crate) use plan_sys7::sys7_lsm_override;
 pub use plan_sys7::{
-    Sys7PlanTables, Sys7TableImage, linked_flags_from_system_b, plan_flash_sys7_with_hawk,
-    sys7_profile_from_hawk, sys7_tables_from_system_b,
+    Sys7PlanTables, Sys7TableBases, Sys7TableImage, linked_flags_from_system_b,
+    plan_flash_sys7_with_hawk, sys7_profile_from_hawk, sys7_table_bases, sys7_tables_from_system_b,
 };
 pub use session::{Connector, DeviceFacts, RebootReadiness, RestartKind, Session, SingleConnector};
 

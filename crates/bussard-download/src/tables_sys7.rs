@@ -24,19 +24,20 @@
 //! [`crate::compute_sys7`] for the span it implies **bounded by the region's own
 //! size**, and refuse an absurd count before a single further octet is read.
 //!
-//! # The addresses are the corpus defaults, not product data
+//! # Where the tables are
 //!
-//! `plan` / `apply` / `reconstruct` run without a `.knxprod`: there is no
-//! `HawkConfigurationData` and no segment `Address` attribute to resolve the
-//! table bases from, so this reader uses the corpus-wide defaults `0x4000` and
-//! `0x4201` (`[corpus: 49/49]`, `[system7-spec §2.3]`). Every MDT / Theben /
-//! Zennio app in the corpus places its tables there, but a device whose product
-//! puts them elsewhere reads back as an empty table set rather than as links —
-//! it is never mis-decoded, because a count that does not fit the region is
-//! refused and an unwritten region reads back as `CNT = 0`. Pointing the reader
-//! at a product-resolved base is the follow-up (`S7-CAL:` / issue #49 M1.5);
-//! until then a device with no readable tables at these bases must be programmed
-//! with `bussard flash`.
+//! The device's own `PID_TABLE_REFERENCE` (objects 1 and 2) wins: the Jung 0705
+//! devices answer it. A device that does not answer is read where its product's
+//! load procedure allocates LSM 1 and LSM 2 ([`crate::sys7_table_bases`], passed
+//! to [`read_sys7_tables_at`]), as ETS takes them from the product: most MDT /
+//! Theben / Zennio programs use `0x4000` / `0x4201`, but the Jung and Siemens
+//! 0705 programs put the association table at `0x41FF` and the MDT
+//! `M-0083_A-0041-14` (0701) at `0x4041`. Without a product (`reconstruct`, a
+//! backup) the corpus defaults `0x4000` and `0x4201` are the last resort
+//! (`[corpus: 49/49]` of the first sample, `[system7-spec §2.3]`). A wrong base is
+//! never mis-decoded as a link set past the region, because a count that does
+//! not fit the region is refused and an unwritten region reads back as
+//! `CNT = 0`, but it does read the wrong octets as the table (#369).
 //!
 //! The result is a [`bussard_mgmt::tables::DeviceTables`] — the same shape the
 //! System B reader produces — so `plan`, the `reconstruct` report and the
@@ -49,6 +50,8 @@ use bussard_mgmt::load::{WriteError, read_memory, read_table_reference};
 use bussard_mgmt::tables::{DeviceTables, ResolvedLink, TableSource};
 use bussard_mgmt::{MaskProfile, apci};
 use bussard_model::IndividualAddress;
+
+use crate::flash::Sys7TableBases;
 
 use crate::compute_sys7::{
     SYS7_ADDRESS_REGION_LEN, SYS7_ADDRESS_TABLE_ADDR, SYS7_ASSOCIATION_REGION_LEN,
@@ -126,6 +129,18 @@ pub struct Sys7LiveTables {
 pub async fn read_sys7_tables<Ch: L4Channel>(
     l4: &mut Layer4Connection<Ch>,
 ) -> Result<Sys7LiveTables, Sys7TablesError> {
+    read_sys7_tables_at(l4, Sys7TableBases::default()).await
+}
+
+/// [`read_sys7_tables`] with the table bases the device's product allocates
+/// ([`crate::sys7_table_bases`]) as the fallback when the device does not
+/// answer `PID_TABLE_REFERENCE`, in place of the corpus defaults. A product
+/// that puts its association table at `0x41FF` otherwise reads back from
+/// `0x4201`, two octets into the table, and a write would land there too.
+pub async fn read_sys7_tables_at<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    bases: Sys7TableBases,
+) -> Result<Sys7LiveTables, Sys7TablesError> {
     let address = l4.target();
     let mask = device_descriptor(l4).await?;
     if !MaskProfile::from_mask(mask).is_system_7() {
@@ -138,8 +153,20 @@ pub async fn read_sys7_tables<Ch: L4Channel>(
     // `PID_TABLE_REFERENCE` names its segment start (the Jung 0705 devices expose
     // PID 7 on objects 1 and 2). The spec constants are only the fallback for a
     // device that does not answer.
-    let address_base = table_base(l4, 1, SYS7_ADDRESS_TABLE_ADDR, &mut notes).await;
-    let association_base = table_base(l4, 2, SYS7_ASSOCIATION_TABLE_ADDR, &mut notes).await;
+    let address_base = table_base(
+        l4,
+        1,
+        bases.address.unwrap_or(SYS7_ADDRESS_TABLE_ADDR),
+        &mut notes,
+    )
+    .await;
+    let association_base = table_base(
+        l4,
+        2,
+        bases.association.unwrap_or(SYS7_ASSOCIATION_TABLE_ADDR),
+        &mut notes,
+    )
+    .await;
 
     // --- LSM 1 region: address table, then the group-object table ---
     let addr_image = read_counted_table(

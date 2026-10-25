@@ -188,6 +188,16 @@ impl Memory {
         Ok(())
     }
 
+    /// Place factory content at `addr` outside every segment: memory the
+    /// device holds from the factory (a hardware id a vendor procedure's
+    /// `LdCtrlCompareMem` checks) rather than memory a download writes. No
+    /// tool write can reach it, since a write must land in a segment.
+    pub fn seed(&mut self, addr: u32, data: &[u8]) {
+        for (i, b) in data.iter().enumerate() {
+            self.cells.insert(addr.wrapping_add(i as u32), *b);
+        }
+    }
+
     /// Read `len` bytes starting at `addr`; unwritten cells read back as `0x00`.
     /// This models verify-on-read for the tool.
     pub fn read(&self, addr: u32, len: usize) -> Vec<u8> {

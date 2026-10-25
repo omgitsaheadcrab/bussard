@@ -1117,19 +1117,70 @@ pub(super) fn sys7_op_label(op: &LoadOp) -> String {
     }
 }
 
-/// Parses an `LdCtrlCompareMem` raw op's `Address` and `InlineData` attributes
-/// (`[system7-spec §4.5]`). Returns `(address, expected_bytes)`.
+/// Where a System 7 product places its link tables: the address the
+/// application's own procedure allocates for LSM 1 (address table, followed by
+/// the group-object table) and LSM 2 (association table). `None` where the
+/// procedure allocates no absolute segment on that LSM.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sys7TableBases {
+    /// The LSM 1 region (the address table).
+    pub address: Option<u16>,
+    /// The LSM 2 region (the association table).
+    pub association: Option<u16>,
+}
+
+/// The table bases `app`'s System 7 load procedure allocates
+/// (`LdCtrlAbsSegment` on LSM 1 and 2, the first of each). The corpus default
+/// `0x4000` / `0x4201` is common but not universal: the Jung and Siemens 0705
+/// programs put the association table at `0x41FF`, the Elsner
+/// `M-00B6_A-4548-01` at `0x41D5`, the MDT `M-0083_A-0041-14` (0701) at
+/// `0x4041`, the Zennio 0701 programs at `0x4200`. The table reader falls back
+/// to these when the device does not answer `PID_TABLE_REFERENCE`, as ETS
+/// takes them from the product.
+pub fn sys7_table_bases(app: &ApplicationProgram) -> Sys7TableBases {
+    let (ops, _) = assemble_ops(app, None);
+    let base = |lsm: u32| {
+        ops.iter().find_map(|op| match op {
+            LoadOp::AbsSegment {
+                lsm_idx: Some(l),
+                address: Some(a),
+                ..
+            } if *l == lsm => u16::try_from(*a).ok(),
+            _ => None,
+        })
+    };
+    Sys7TableBases {
+        address: base(1),
+        association: base(2),
+    }
+}
+
+/// Parses an `LdCtrlCompareMem` raw op's `Address`, `InlineData` and `Size`
+/// attributes (`[system7-spec §4.5]`). Returns `(address, expected_bytes)`.
+///
+/// `Size` is the number of octets compared: the Zennio 0701 programs
+/// (`M-0071_A-1231-22`, `M-0071_A-3222-11`) pad `InlineData` to 11 octets with
+/// zeros behind a `Size` of 3 or 2, and the device holds other data past the
+/// compared octets. A `Size` larger than `InlineData` is not shortened.
 pub(super) fn parse_compare_mem(attrs: &[(String, String)]) -> Option<(u32, Vec<u8>)> {
     let mut address: Option<u32> = None;
     let mut inline: Option<Vec<u8>> = None;
+    let mut size: Option<usize> = None;
     for (k, v) in attrs {
         match k.as_str() {
             "Address" => address = v.trim().parse().ok(),
             "InlineData" => inline = decode_hex(v),
+            "Size" => size = v.trim().parse().ok(),
             _ => {}
         }
     }
-    Some((address?, inline?))
+    let mut expected = inline?;
+    if let Some(size) = size
+        && size < expected.len()
+    {
+        expected.truncate(size);
+    }
+    Some((address?, expected))
 }
 
 /// Decodes an even-length hex string (e.g. an `InlineData` attribute) into bytes;
@@ -1149,6 +1200,27 @@ pub(super) fn decode_hex(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::flash::plan::plan_flash;
+
+    #[test]
+    fn test_parse_compare_mem_compares_size_octets() -> Result<(), Box<dyn std::error::Error>> {
+        let attrs = |size: &str| {
+            vec![
+                ("Address".to_string(), "46608".to_string()),
+                ("Size".to_string(), size.to_string()),
+                (
+                    "InlineData".to_string(),
+                    "5212300000000000000000".to_string(),
+                ),
+            ]
+        };
+        let (address, expected) = parse_compare_mem(&attrs("3")).ok_or("not parsed")?;
+        assert_eq!(address, 0xB610);
+        assert_eq!(expected, vec![0x52, 0x12, 0x30]);
+        // A Size past the inline data keeps what is there.
+        let (_, expected) = parse_compare_mem(&attrs("20")).ok_or("not parsed")?;
+        assert_eq!(expected.len(), 11);
+        Ok(())
+    }
     use crate::flash::test_support::no_overrides;
     use bussard_prod::application::parse_application_program;
     use std::collections::BTreeMap;
@@ -1967,6 +2039,38 @@ mod tests {
             s,
             FlashStep::Sys7CompareMem { address: 46609, expected } if expected == &[0x32, 0x10]
         )));
+        Ok(())
+    }
+
+    #[test]
+    fn test_sys7_table_bases_reads_the_procedure_allocations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The Jung 0705 shape: the association table at 0x41FF, not 0x4201.
+        let xml = r#"<KNX xmlns="http://knx.org/xml/project/23">
+         <ApplicationProgram Id="M-0004_A-7066" ApplicationNumber="28774" ApplicationVersion="17"
+            MaskVersion="MV-0705" Name="Eingang" LoadProcedureStyle="ProductProcedure">
+          <Static>
+           <LoadProcedures>
+            <LoadProcedure>
+             <LdCtrlUnload LsmIdx="1" />
+             <LdCtrlLoad LsmIdx="1" />
+             <LdCtrlAbsSegment LsmIdx="1" SegType="0" Address="16384" Size="511" />
+             <LdCtrlLoadCompleted LsmIdx="1" />
+             <LdCtrlLoad LsmIdx="2" />
+             <LdCtrlAbsSegment LsmIdx="2" SegType="0" Address="16895" Size="255" />
+             <LdCtrlLoadCompleted LsmIdx="2" />
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+         </ApplicationProgram></KNX>"#;
+        let app = parse_application_program("M-0004_A-7066", xml.as_bytes())?;
+        assert_eq!(
+            sys7_table_bases(&app),
+            Sys7TableBases {
+                address: Some(0x4000),
+                association: Some(0x41FF),
+            }
+        );
         Ok(())
     }
 
