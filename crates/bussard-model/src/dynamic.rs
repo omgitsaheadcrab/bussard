@@ -1742,6 +1742,19 @@ pub struct RefGate {
     pub siblings: Vec<WhenTest>,
 }
 
+impl RefGate {
+    /// Whether the walk takes this branch when the controlling parameter has
+    /// `value` (a number, or `None` when it has none): the test matches, or,
+    /// for a [`WhenTest::Default`] branch, no sibling matches. Whether the
+    /// controlling parameter is active (issue #159) is the caller's to check.
+    pub fn holds(&self, value: Option<f64>) -> bool {
+        if self.test == WhenTest::Default {
+            return !self.siblings.iter().any(|t| when_matches(t, value));
+        }
+        when_matches(&self.test, value)
+    }
+}
+
 /// One place a `<ParameterRefRef>` or `<ComObjectRefRef>` occurs in the
 /// Dynamic section, independent of any value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1755,6 +1768,11 @@ pub struct RefOccurrence {
     pub blocks: Vec<BlockRef>,
     /// The `<when>` branches in front of it, outermost first.
     pub gates: Vec<RefGate>,
+    /// How many of [`Self::gates`] stand in front of its innermost
+    /// container (the last of [`Self::blocks`], else [`Self::channel`]):
+    /// `gates[container_gates..]` are the conditions inside that container,
+    /// between the container and the ref.
+    pub container_gates: usize,
 }
 
 /// Every occurrence of every parameter ref and com-object ref in the Dynamic
@@ -1776,6 +1794,7 @@ impl RefIndex {
             channel: None,
             blocks: Vec::new(),
             gates: Vec::new(),
+            container_gates: 0,
             index: &mut index,
         };
         walker.visit(src.dynamic());
@@ -1819,6 +1838,8 @@ struct IndexWalk<'a> {
     channel: Option<ChannelRef>,
     blocks: Vec<BlockRef>,
     gates: Vec<RefGate>,
+    /// `gates.len()` when the innermost container began.
+    container_gates: usize,
     index: &'a mut RefIndex,
 }
 
@@ -1829,6 +1850,7 @@ impl IndexWalk<'_> {
             channel: self.channel.clone(),
             blocks: self.blocks.clone(),
             gates: self.gates.clone(),
+            container_gates: self.container_gates,
         }
     }
 
@@ -1853,14 +1875,18 @@ impl IndexWalk<'_> {
                 }
                 DynamicNode::Channel { children, .. } => {
                     let outer = std::mem::replace(&mut self.channel, node.channel_ref());
+                    let gates = std::mem::replace(&mut self.container_gates, self.gates.len());
                     self.visit(children);
                     self.channel = outer;
+                    self.container_gates = gates;
                 }
                 DynamicNode::ParameterBlock { children, .. } => {
                     let depth = self.blocks.len();
                     self.blocks.extend(node.block_ref());
+                    let gates = std::mem::replace(&mut self.container_gates, self.gates.len());
                     self.visit(children);
                     self.blocks.truncate(depth);
+                    self.container_gates = gates;
                 }
                 DynamicNode::Choose {
                     param_ref_id,
@@ -2161,5 +2187,30 @@ mod tests {
             }
         );
         assert_eq!(occs[1].blocks.len(), 1);
+        // The first sits behind its gate outside any container, the second
+        // behind it outside PB-7: nothing inside its container gates it.
+        assert_eq!(occs[0].container_gates, 0);
+        assert_eq!(occs[1].container_gates, 1);
+    }
+
+    #[test]
+    fn test_ref_gate_holds_values_compare_and_default() {
+        let gate = |test: WhenTest, siblings: Vec<WhenTest>| RefGate {
+            param_ref_id: "P-1_R-1".to_string(),
+            test,
+            siblings,
+        };
+        assert!(gate(WhenTest::Values(vec![1, 2]), vec![]).holds(Some(2.0)));
+        assert!(!gate(WhenTest::Values(vec![1]), vec![]).holds(Some(0.0)));
+        assert!(!gate(WhenTest::Values(vec![1]), vec![]).holds(None));
+        let ne = WhenTest::Compare {
+            op: CompareOp::Ne,
+            value: 0,
+        };
+        assert!(gate(ne.clone(), vec![]).holds(Some(3.0)));
+        assert!(!gate(ne, vec![]).holds(Some(0.0)));
+        let default = gate(WhenTest::Default, vec![WhenTest::Values(vec![1])]);
+        assert!(default.holds(Some(0.0)));
+        assert!(!default.holds(Some(1.0)));
     }
 }

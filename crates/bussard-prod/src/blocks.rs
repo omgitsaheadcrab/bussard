@@ -309,21 +309,15 @@ mod tests {
     }
 
     #[test]
-    fn test_test_string_round_trips_through_gate() {
-        let gate = Gate {
-            reference: "P-1_R-1".into(),
-            test: test_string(&WhenTest::Values(vec![1, 2])),
-            others: Vec::new(),
-        };
-        assert!(gate.holds(Some(2.0)));
-        let gate = Gate {
-            reference: "P-1_R-1".into(),
-            test: test_string(&WhenTest::Compare {
+    fn test_test_string_round_trips_through_when_test() {
+        for test in [
+            WhenTest::Values(vec![1, 2]),
+            WhenTest::Compare {
                 op: CompareOp::Ne,
                 value: 0,
-            }),
-            others: Vec::new(),
-        };
-        assert!(gate.holds(Some(5.0)) && !gate.holds(Some(0.0)));
+            },
+        ] {
+            assert_eq!(WhenTest::parse(Some(&test_string(&test)), None), test);
+        }
     }
 }

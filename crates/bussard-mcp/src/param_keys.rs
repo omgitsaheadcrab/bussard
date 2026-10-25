@@ -739,6 +739,7 @@ mod tests {
     use super::*;
     use bussard_model::ProductModel;
     use bussard_model::blocks::Gate;
+    use bussard_model::dynamic::{DynamicNode, WhenTest};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -862,6 +863,58 @@ brightness.send = "4/1/5"
             );
             if ungated {
                 page.parameters.push("P-12_R-14".to_string());
+            }
+            // The same refs in the Dynamic tree the evaluator walks.
+            let mut added = vec!["P-12_R-13"];
+            if ungated {
+                added.push("P-12_R-14");
+            }
+            for r in added {
+                product.parameter_refs.insert(
+                    r.to_string(),
+                    bussard_model::param_model::RefDef {
+                        parameter: "P-12".to_string(),
+                        ..Default::default()
+                    },
+                );
+            }
+            add_to_page(&mut product.dynamic, ungated);
+        }
+    }
+
+    /// Puts `P-12_R-13` on the temperature sensor branch of channel A's
+    /// function page, and with `ungated` `P-12_R-14` on the page itself.
+    fn add_to_page(nodes: &mut [DynamicNode], ungated: bool) {
+        for node in nodes {
+            match node {
+                DynamicNode::ParameterBlock { id, children, .. } if id == "PB-10" => {
+                    for child in children.iter_mut() {
+                        if let DynamicNode::Choose {
+                            param_ref_id,
+                            whens,
+                        } = child
+                            && param_ref_id == "P-11_R-11"
+                        {
+                            for w in whens.iter_mut() {
+                                if w.test == WhenTest::Values(vec![2]) {
+                                    w.children
+                                        .push(DynamicNode::ParameterRefRef("P-12_R-13".into()));
+                                }
+                            }
+                        }
+                    }
+                    if ungated {
+                        children.push(DynamicNode::ParameterRefRef("P-12_R-14".into()));
+                    }
+                }
+                DynamicNode::Channel { children, .. }
+                | DynamicNode::ParameterBlock { children, .. } => add_to_page(children, ungated),
+                DynamicNode::Choose { whens, .. } => {
+                    for w in whens.iter_mut() {
+                        add_to_page(&mut w.children, ungated);
+                    }
+                }
+                _ => {}
             }
         }
     }

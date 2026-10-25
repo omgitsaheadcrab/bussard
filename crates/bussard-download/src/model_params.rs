@@ -100,23 +100,16 @@ pub fn parameter_overrides(
     model: Option<&bussard_model::Model>,
     target: IndividualAddress,
 ) -> (BTreeMap<String, String>, Vec<String>) {
-    let mut out = BTreeMap::new();
-    let mut malformed = Vec::new();
-    let Some(model) = model else {
-        return (out, malformed);
+    let Some(loaded) = model.and_then(|m| m.devices.get(&target)) else {
+        return (BTreeMap::new(), Vec::new());
     };
-    let Some(loaded) = model.devices.get(&target) else {
-        return (out, malformed);
-    };
-    for (key, value) in &loaded.device.parameters {
-        match key.split_once('@') {
-            Some((_slug, ref_id)) if !ref_id.is_empty() => {
-                out.insert(ref_id.to_string(), value.clone());
-            }
-            _ => malformed.push(malformed_parameter_warning(key, target)),
-        }
-    }
-    (out, malformed)
+    // The one helper the device view evaluates with too (issue #345).
+    let (out, malformed) = bussard_model::device_view::device_overrides(&loaded.device);
+    let warnings = malformed
+        .iter()
+        .map(|key| malformed_parameter_warning(key, target))
+        .collect();
+    (out, warnings)
 }
 
 /// The warning for a parameter key without the `<slug>@<ref-id>` form.

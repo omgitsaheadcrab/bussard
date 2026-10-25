@@ -1038,11 +1038,15 @@ async fn test_knx_plan_device_lists_a_value_on_an_unshown_ref_as_ignored() -> an
              load_procedure_style: ProductProcedure\n  schema_version: '23'\nparameters:\n\
              - id: {app}_P-1\n  name: Function\n  text: Funktion des Kanals\n  type: !enum\n    \
              values:\n    - value: 1\n      text: Helligkeit\n    - value: 3\n      text: Wind\n  \
-             default: '1'\n- id: {app}_P-2\n  name: Threshold\n  text: Schwelle\n  type: !int\n    \
-             min: 1\n    max: 1000\n    size: 16\n  default: '200'\nload_procedure:\n- connect\n\
+             default: '1'\n  refs:\n    P-1_R-1: {{}}\n- id: {app}_P-2\n  name: Threshold\n  \
+             text: Schwelle\n  type: !int\n    min: 1\n    max: 1000\n    size: 16\n  \
+             default: '200'\n  refs:\n    P-2_R-2: {{}}\n    P-2_R-5: {{}}\nload_procedure:\n- connect\n\
              - disconnect\nblocks:\n- id: PB-1\n  text: Funktion\n  parameters:\n  - P-1_R-1\n  \
              - P-2_R-2\n  - P-2_R-5\n  parameter_when:\n    P-2_R-2:\n    - ref: P-1_R-1\n      \
-             test: '1'\n    P-2_R-5:\n    - ref: P-1_R-1\n      test: '3'\n"
+             test: '1'\n    P-2_R-5:\n    - ref: P-1_R-1\n      test: '3'\ndynamic:\n\
+             - {{\"block\":{{\"id\":\"PB-1\",\"text\":\"Funktion\",\"nodes\":[{{\"p\":\"P-1_R-1\"}},\
+             {{\"choose\":{{\"ref\":\"P-1_R-1\",\"when\":[{{\"test\":\"1\",\"nodes\":\
+             [{{\"p\":\"P-2_R-2\"}}]}},{{\"test\":\"3\",\"nodes\":[{{\"p\":\"P-2_R-5\"}}]}}]}}}}]}}}}\n"
         ),
     )?;
     std::fs::write(

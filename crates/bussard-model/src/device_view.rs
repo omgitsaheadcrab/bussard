@@ -19,19 +19,35 @@
 //! device; `summary` counts them. A page handle selects one page as the
 //! scope.
 //!
+//! What the configuration shows, and every value the view prints or tests,
+//! comes from one [`evaluate_dynamic`] of the product model with the device's
+//! values ([`device_overrides`], the map the flash evaluates with too, issue
+//! #345): a page or channel is active when the walk enters it, a parameter or
+//! object sits where the walk reached it, and an inactive page shows what the
+//! walk reaches with its enabling values applied. The value-free
+//! [`RefIndex`] gives the conditions in front of a ref, in words. Pages stay
+//! those of the application's own Dynamic section; module instances are
+//! evaluated but not listed as pages. Internal refs (`Access="None"`) are
+//! reached but never listed.
+//!
 //! [`DeviceView::render_table`] is the terminal rendering, and
 //! [`DeviceView::render_toml`] the paste-ready device-file snippet: what the
 //! file sets, plus commented lines `# key = "value"   # choice | choice` for
 //! what it could set.
 
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 
 use serde::Serialize;
 
 use crate::address::IndividualAddress;
 use crate::blocks::{
-    BlockDef, BlockKind, BlockState, Gate, block_states, object_number, parent_indexes,
-    ref_param_id, subtree,
+    BlockDef, BlockKind, Gate, object_number, parent_indexes, ref_param_id, subtree,
+};
+use crate::dynamic::{
+    ChannelRef, CompareOp, DynamicConfig, RefGate, RefIndex, RefOccurrence, WhenTest,
+    evaluate_dynamic, split_selector,
 };
 use crate::flags::Flags;
 use crate::loader::Model;
@@ -313,9 +329,6 @@ struct ParamEntry {
     channel: Option<String>,
     param: Option<String>,
     stored: Option<String>,
-    /// The ref's own default when it overrides the parameter's (the lock's
-    /// `default`), else `None` and the product model's default applies.
-    ref_default: Option<String>,
 }
 
 /// Every parameter of `device`: the lock's index plus what the file stores.
@@ -330,7 +343,6 @@ fn parameter_entries(device: &Device) -> Vec<ParamEntry> {
                 channel: p.channel.clone(),
                 param: p.param.clone(),
                 stored: None,
-                ref_default: p.default.clone(),
             },
         );
     }
@@ -346,11 +358,74 @@ fn parameter_entries(device: &Device) -> Vec<ParamEntry> {
                 channel: None,
                 param: crate::param_model::key_to_param_id(mem_key),
                 stored: None,
-                ref_default: None,
             });
         entry.stored = Some(value.clone());
     }
     by_ref.into_values().collect()
+}
+
+/// The parameter values of `device` keyed by ref, as the Dynamic evaluator
+/// and the flash take them: every stored value, `hidden@…` ones too (a
+/// download writes them), keyed by the part of the in-memory key after `@`
+/// (an app-relative `ParameterRef` id, with its module-instance selector
+/// when it has one). The second half lists the keys without that form,
+/// which are left out.
+pub fn device_overrides(device: &Device) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut out = BTreeMap::new();
+    let mut malformed = Vec::new();
+    for (key, value) in &device.parameters {
+        match key.split_once('@') {
+            Some((_, reference)) if !reference.is_empty() => {
+                out.insert(reference.to_string(), value.clone());
+            }
+            _ => malformed.push(key.clone()),
+        }
+    }
+    (out, malformed)
+}
+
+/// A device's configuration as the Dynamic evaluator sees it: one
+/// [`evaluate_dynamic`] of the product model with the device's values.
+/// Every value the view prints or tests comes from here.
+struct Evaluated<'a> {
+    product: &'a ProductModel,
+    config: DynamicConfig,
+}
+
+impl<'a> Evaluated<'a> {
+    /// Evaluates `product` with `overrides` (see [`device_overrides`]).
+    fn new(product: &'a ProductModel, overrides: &BTreeMap<String, String>) -> Self {
+        Evaluated {
+            product,
+            config: evaluate_dynamic(product, overrides),
+        }
+    }
+
+    /// The reached module instance and the app-relative ref of a device-file
+    /// ref key (`MD-3_M-18_MI-1_P-14_R-14`, or a plain `P-1_R-1`).
+    fn locate(&self, key: &str) -> (Option<usize>, String) {
+        let (instance, reference) = split_selector(key);
+        let module = instance.and_then(|id| self.config.modules.iter().position(|m| m.id == id));
+        (module, reference)
+    }
+
+    /// The device's value of a ref: stored, assigned, else the vendor
+    /// default ([`DynamicConfig::value`]).
+    fn value(&self, key: &str) -> Option<String> {
+        let (module, reference) = self.locate(key);
+        self.config.value(self.product, module, &reference)
+    }
+
+    /// The vendor default of a ref ([`DynamicConfig::vendor_default`]).
+    fn vendor_default(&self, key: &str) -> Option<String> {
+        let (module, reference) = self.locate(key);
+        self.config.vendor_default(self.product, module, &reference)
+    }
+
+    /// [`Self::value`] as a number, what a `<when>` test reads.
+    fn number(&self, key: &str) -> Option<f64> {
+        self.value(key)?.trim().parse().ok()
+    }
 }
 
 /// Renders a stored or default code as the file writes it: the enum label
@@ -380,14 +455,18 @@ fn same_value(def: Option<&ParamDef>, a: &str, b: &str) -> bool {
     matches!((code(a), code(b)), (Some(x), Some(y)) if x == y)
 }
 
-fn param_row(entry: &ParamEntry, product: Option<&ProductModel>) -> ParamRow {
+fn param_row(
+    entry: &ParamEntry,
+    product: Option<&ProductModel>,
+    evaluated: Option<&Evaluated<'_>>,
+) -> ParamRow {
     let def = entry
         .param
         .as_deref()
         .and_then(|id| product.and_then(|p| p.parameters.get(id)));
-    let default = default_value(product, entry.ref_default.as_deref(), &entry.reference, def);
+    let default = evaluated.and_then(|e| e.vendor_default(&entry.reference));
     let value = entry.stored.as_deref().map(|v| display_value(def, v));
-    let at_default = def.map(|_| match (entry.stored.as_deref(), default) {
+    let at_default = def.map(|_| match (entry.stored.as_deref(), default.as_deref()) {
         (None, _) => true,
         (Some(v), Some(d)) => same_value(def, v, d),
         (Some(_), None) => false,
@@ -421,22 +500,15 @@ fn param_row(entry: &ParamEntry, product: Option<&ProductModel>) -> ParamRow {
         reference: entry.reference.clone(),
         text: def.and_then(|d| d.text.clone()),
         value,
-        default: default.map(|d| display_value(def, d)),
+        // An empty text default has nothing to show.
+        default: default
+            .filter(|d| !d.is_empty())
+            .map(|d| display_value(def, &d)),
         at_default,
         choices,
         range,
         ignored: None,
     }
-}
-
-/// The numeric value of a stored or default parameter value: the number,
-/// or the code of an enum label.
-fn value_number(def: Option<&ParamDef>, value: &str) -> Option<f64> {
-    let v = value.trim();
-    v.parse::<f64>().ok().or_else(|| {
-        def.and_then(|d| crate::param_model::enum_code(&d.labels, v))
-            .map(|c| c as f64)
-    })
 }
 
 /// The enum codes of a parameter, in order (empty for other kinds).
@@ -447,121 +519,320 @@ fn enum_codes(def: &ParamDef) -> Vec<i64> {
     }
 }
 
-/// The default of parameter ref `reference` (definition `def`) when nothing
-/// is stored, in the order the download side resolves it (issue #326): the
-/// lock's `default` (`locked`, the ref's own value as the lock indexes it),
-/// else the product model's `ParameterRef` value, else the parameter's
-/// default.
-fn default_value<'b>(
-    product: Option<&'b ProductModel>,
-    locked: Option<&'b str>,
-    reference: &str,
-    def: Option<&'b ParamDef>,
-) -> Option<&'b str> {
-    locked
-        .or_else(|| {
-            product
-                .and_then(|p| p.ref_values.get(reference))
-                .map(String::as_str)
-        })
-        .or_else(|| def.and_then(|d| d.default.as_deref()))
+/// A page condition as the evaluator's [`RefGate`], to test it.
+fn ref_gate(gate: &Gate) -> RefGate {
+    let parse = |t: &str| {
+        if t.trim() == "default" {
+            WhenTest::Default
+        } else {
+            WhenTest::parse(Some(t), None)
+        }
+    };
+    RefGate {
+        param_ref_id: gate.reference.clone(),
+        test: parse(&gate.test),
+        siblings: gate.others.iter().map(|o| parse(o)).collect(),
+    }
 }
 
-/// The device's value of parameter ref `reference`, as written: the stored
-/// value (a hidden one too: a download writes it), else
-/// [`default_value`]. The one lookup the page states, the conditions and
-/// the rendered values share, so they agree with the image a download
-/// writes.
-fn raw_value<'b>(
-    product: &'b ProductModel,
-    values: &HashMap<&str, &'b ParamEntry>,
-    reference: &str,
-) -> Option<&'b str> {
-    let def = product.parameters.get(ref_param_id(reference));
-    let entry = values.get(reference);
-    entry.and_then(|e| e.stored.as_deref()).or_else(|| {
-        default_value(
-            Some(product),
-            entry.and_then(|e| e.ref_default.as_deref()),
-            reference,
-            def,
-        )
-    })
+/// An evaluator [`RefGate`] as the page condition words take it.
+fn words_gate(gate: &RefGate) -> Gate {
+    let is_default = gate.test == WhenTest::Default;
+    Gate {
+        reference: gate.param_ref_id.clone(),
+        test: crate::dynamic_compact::test_text(&gate.test)
+            .unwrap_or_else(|| "default".to_string()),
+        others: if is_default {
+            gate.siblings
+                .iter()
+                .filter_map(crate::dynamic_compact::test_text)
+                .collect()
+        } else {
+            Vec::new()
+        },
+    }
 }
+
+/// The value to set the controlling parameter of `gate` to so its branch is
+/// taken, out of the parameter's enum `codes`; else the first exact value
+/// the test names. `None` when neither gives one.
+fn enabling_code(gate: &RefGate, codes: &[i64]) -> Option<i64> {
+    codes
+        .iter()
+        .copied()
+        .find(|c| gate.holds(Some(*c as f64)))
+        .or_else(|| match &gate.test {
+            WhenTest::Values(values) => values.first().copied(),
+            _ => None,
+        })
+}
+
+/// Whether a device shows a page or channel, and if not, why.
+#[derive(Debug, Clone, Default)]
+struct PageState {
+    /// The configuration shows it: the evaluator reached it.
+    active: bool,
+    /// For an inactive one whose enclosing page is active: the indexes into
+    /// [`BlockDef::when`] of the conditions that do not hold.
+    failing: Vec<usize>,
+    /// It is inactive because its enclosing page is.
+    parent_inactive: bool,
+}
+
+/// The values an inactive page is enabled with: (ref, value) pairs.
+type EnablingValues = Vec<(String, String)>;
 
 /// The ETS parameter pages of one device: which it shows, and where its
-/// parameters and objects sit.
+/// parameters and objects sit. Activity and placement come from one
+/// [`evaluate_dynamic`] with the device's values ([`Evaluated`]); the
+/// static [`RefIndex`] gives the conditions in front of each ref.
 struct Pages<'a> {
     product: &'a ProductModel,
+    evaluated: &'a Evaluated<'a>,
+    overrides: &'a BTreeMap<String, String>,
     blocks: &'a [BlockDef],
     parents: Vec<Option<usize>>,
-    states: Vec<BlockState>,
+    states: Vec<PageState>,
+    index: RefIndex,
+    /// The block indexes of each container id (several for an id the
+    /// Dynamic section repeats).
+    by_id: HashMap<&'a str, Vec<usize>>,
+    /// The application-level parameter refs the configuration shows.
+    reached: HashSet<String>,
+    /// The block a reached parameter ref sits on (its first reach).
+    reached_at: HashMap<String, usize>,
+    /// The parameters with a reached ref (by parameter id), and those the
+    /// Dynamic section shows anywhere: a `<choose>` on a parameter of the
+    /// second set but not of the first selects nothing (issue #159).
+    active_params: HashSet<String>,
+    placed_params: HashSet<String>,
     /// The device's parameters by ref, without the hidden ones.
     entries: HashMap<&'a str, &'a ParamEntry>,
-    /// The device's parameters by ref, the hidden ones too: what the value
-    /// lookup reads.
-    values: HashMap<&'a str, &'a ParamEntry>,
     /// The block each of the device's parameter refs sits on.
     param_block: HashMap<&'a str, usize>,
     /// The block each of the device's object refs sits on.
     object_block: HashMap<String, usize>,
+    /// Per inactive block: the configuration with its enabling values
+    /// applied, evaluated on first use.
+    enabled: Vec<OnceCell<Rc<DynamicConfig>>>,
+    /// Those configurations by their enabling values: inactive channels of
+    /// one switch share one evaluation.
+    by_values: RefCell<HashMap<EnablingValues, Rc<DynamicConfig>>>,
+}
+
+/// The innermost container id of a placement: its last block, else its
+/// channel.
+fn container_of(
+    blocks: &[crate::dynamic::BlockRef],
+    channel: Option<&ChannelRef>,
+) -> Option<String> {
+    blocks
+        .last()
+        .map(|b| b.id.clone())
+        .or_else(|| channel.map(|c| c.id.clone()))
 }
 
 impl<'a> Pages<'a> {
-    fn new(device: &'a Device, product: &'a ProductModel, params: &'a [ParamEntry]) -> Self {
+    fn new(
+        device: &'a Device,
+        evaluated: &'a Evaluated<'a>,
+        overrides: &'a BTreeMap<String, String>,
+        params: &'a [ParamEntry],
+    ) -> Self {
+        let product = evaluated.product;
+        let config = &evaluated.config;
         let blocks = product.blocks.as_slice();
+        let parents = parent_indexes(blocks);
+        let mut by_id: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, b) in blocks.iter().enumerate() {
+            by_id.entry(b.id.as_str()).or_default().push(i);
+        }
+        let index = RefIndex::new(product);
+        let reached_containers: HashSet<&str> = config
+            .containers
+            .iter()
+            .filter(|c| c.placement.module.is_none())
+            .map(|c| c.container.id())
+            .collect();
+        let mut active_params: HashSet<String> = HashSet::new();
+        let mut reached: HashSet<String> = HashSet::new();
+        let mut reached_place: HashMap<String, String> = HashMap::new();
+        for (p, place) in config.parameters.iter().zip(&config.parameter_placements) {
+            if p.module.is_some() {
+                continue;
+            }
+            if let Some(r) = product.parameter_refs.get(&p.param_ref_id) {
+                active_params.insert(r.parameter.clone());
+            }
+            if place.module.is_some() || !place.shown {
+                continue;
+            }
+            reached.insert(p.param_ref_id.clone());
+            if let Some(id) = container_of(&place.blocks, place.channel.as_ref()) {
+                reached_place.entry(p.param_ref_id.clone()).or_insert(id);
+            }
+        }
+        let placed_params: HashSet<String> = index
+            .parameters()
+            .filter_map(|(r, _)| product.parameter_refs.get(r))
+            .map(|r| r.parameter.clone())
+            .collect();
+        let mut states: Vec<PageState> = Vec::with_capacity(blocks.len());
+        for (i, b) in blocks.iter().enumerate() {
+            let parent_active = parents[i].is_none_or(|p| states.get(p).is_none_or(|s| s.active));
+            let active = parent_active && reached_containers.contains(b.id.as_str());
+            states.push(PageState {
+                active,
+                failing: Vec::new(),
+                parent_inactive: !parent_active,
+            });
+        }
+        let mut pages = Pages {
+            product,
+            evaluated,
+            overrides,
+            blocks,
+            parents,
+            states,
+            index,
+            by_id,
+            reached,
+            reached_at: HashMap::new(),
+            active_params,
+            placed_params,
+            entries: HashMap::new(),
+            param_block: HashMap::new(),
+            object_block: HashMap::new(),
+            enabled: (0..blocks.len()).map(|_| OnceCell::new()).collect(),
+            by_values: RefCell::new(HashMap::new()),
+        };
+        for (i, b) in blocks.iter().enumerate() {
+            if !pages.states[i].active && !pages.states[i].parent_inactive {
+                let gates: Vec<RefGate> = b.when.iter().map(ref_gate).collect();
+                pages.states[i].failing = pages.failing_gates(&gates);
+            }
+        }
+        pages.reached_at = reached_place
+            .into_iter()
+            .filter_map(|(r, id)| pages.block_of(&id).map(|i| (r, i)))
+            .collect();
         // A stored value of a parameter the configuration hides (`hidden@…`)
-        // is no evidence that its page is shown.
-        let entries: HashMap<&str, &ParamEntry> = params
+        // is not one of the device's parameters to list.
+        pages.entries = params
             .iter()
             .filter(|p| !crate::files::is_hidden_mem_key(&p.key))
             .map(|p| (p.reference.as_str(), p))
             .collect();
-        let values: HashMap<&str, &ParamEntry> =
-            params.iter().map(|p| (p.reference.as_str(), p)).collect();
-        let active_params: HashSet<&str> = entries.keys().copied().collect();
-        let object_refs: Vec<&str> = device
+        // A reached ref sits where the evaluator reached it; any other on the
+        // first page holding it, a shown page before a hidden one.
+        let mut param_block: HashMap<&str, usize> = HashMap::new();
+        for reference in pages.entries.keys() {
+            let at = pages.reached_at.get(*reference).copied().or_else(|| {
+                pages.first_holder(
+                    pages
+                        .index
+                        .parameter(reference)
+                        .iter()
+                        .filter(|o| o.module_def.is_none()),
+                )
+            });
+            if let Some(i) = at {
+                param_block.insert(*reference, i);
+            }
+        }
+        let mut reached_objects: HashMap<&str, usize> = HashMap::new();
+        for (c, place) in config.com_objects.iter().zip(&config.com_object_placements) {
+            if c.module.is_some() || place.module.is_some() {
+                continue;
+            }
+            if let Some(i) = container_of(&place.blocks, place.channel.as_ref())
+                .and_then(|id| pages.block_of(&id))
+            {
+                reached_objects
+                    .entry(c.com_object_ref_id.as_str())
+                    .or_insert(i);
+            }
+        }
+        let mut object_block: HashMap<String, usize> = HashMap::new();
+        for reference in device
             .com_objects
             .values()
             .filter_map(|o| o.reference.as_deref())
-            .collect();
-        let active_objects: HashSet<&str> = object_refs.iter().copied().collect();
-        let value_of = |reference: &str| -> Option<f64> {
-            let def = product.parameters.get(ref_param_id(reference));
-            value_number(def, raw_value(product, &values, reference)?)
-        };
-        let states = block_states(blocks, &active_params, &active_objects, &value_of);
-        let parents = parent_indexes(blocks);
-        // Active blocks claim a ref first, so a parameter that alternative
-        // pages share sits on the one the device shows.
-        let order: Vec<usize> = (0..blocks.len())
-            .filter(|i| states[*i].active)
-            .chain((0..blocks.len()).filter(|i| !states[*i].active))
-            .collect();
-        let mut param_block: HashMap<&str, usize> = HashMap::new();
-        let mut object_block: HashMap<String, usize> = HashMap::new();
-        for &i in &order {
-            for r in &blocks[i].parameters {
-                if let Some((key, _)) = entries.get_key_value(r.as_str()) {
-                    param_block.entry(*key).or_insert(i);
-                }
-            }
-            for r in blocks[i].objects.iter().chain(&blocks[i].other_objects) {
-                if active_objects.contains(r.as_str()) {
-                    object_block.entry(r.clone()).or_insert(i);
-                }
+        {
+            let at = reached_objects.get(reference).copied().or_else(|| {
+                pages.first_holder(
+                    pages
+                        .index
+                        .com_object(reference)
+                        .iter()
+                        .filter(|o| o.module_def.is_none()),
+                )
+            });
+            if let Some(i) = at {
+                object_block.insert(reference.to_string(), i);
             }
         }
-        Pages {
-            product,
-            blocks,
-            parents,
-            states,
-            entries,
-            values,
-            param_block,
-            object_block,
+        pages.param_block = param_block;
+        pages.object_block = object_block;
+        pages
+    }
+
+    /// The block of container id `id`: the shown one when the id repeats.
+    fn block_of(&self, id: &str) -> Option<usize> {
+        let all = self.by_id.get(id)?;
+        all.iter()
+            .copied()
+            .find(|i| self.states[*i].active)
+            .or_else(|| all.first().copied())
+    }
+
+    /// The block of the first of `occurrences` on a shown page, else of the
+    /// first.
+    fn first_holder<'o>(
+        &self,
+        occurrences: impl Iterator<Item = &'o RefOccurrence>,
+    ) -> Option<usize> {
+        let holders: Vec<usize> = occurrences
+            .filter_map(|o| container_of(&o.blocks, o.channel.as_ref()))
+            .filter_map(|id| self.by_id.get(id.as_str()))
+            .flatten()
+            .copied()
+            .collect();
+        holders
+            .iter()
+            .copied()
+            .find(|i| self.states[*i].active)
+            .or_else(|| holders.first().copied())
+    }
+
+    /// The indexes of the `gates` that keep the configuration from what
+    /// they guard: those whose test the device's values fail, else (all
+    /// tests pass) those whose controlling parameter is inactive (issue
+    /// #159).
+    fn failing_gates(&self, gates: &[RefGate]) -> Vec<usize> {
+        let by_value: Vec<usize> = (0..gates.len())
+            .filter(|n| !gates[*n].holds(self.evaluated.number(&gates[*n].param_ref_id)))
+            .collect();
+        if !by_value.is_empty() {
+            return by_value;
         }
+        (0..gates.len())
+            .filter(|n| !self.gate_holds(&gates[*n]))
+            .collect()
+    }
+
+    /// Whether the device's configuration takes the branch of `gate`: its
+    /// controlling parameter is active (issue #159) and its value passes
+    /// the test.
+    fn gate_holds(&self, gate: &RefGate) -> bool {
+        let param = self
+            .product
+            .parameter_refs
+            .get(&gate.param_ref_id)
+            .map(|r| r.parameter.as_str());
+        let active =
+            param.is_none_or(|p| !self.placed_params.contains(p) || self.active_params.contains(p));
+        active && gate.holds(self.evaluated.number(&gate.param_ref_id))
     }
 
     /// How many `<ParameterBlock>` ancestors block `i` has.
@@ -580,32 +851,115 @@ impl<'a> Pages<'a> {
     /// The device's value of a parameter ref, rendered as the file writes it.
     fn current(&self, reference: &str) -> Option<String> {
         let def = self.product.parameters.get(ref_param_id(reference));
-        let raw = raw_value(self.product, &self.values, reference)?;
-        Some(display_value(def, raw))
+        let raw = self.evaluated.value(reference)?;
+        Some(display_value(def, &raw))
+    }
+
+    /// The failing conditions of inactive block `i` with the values that
+    /// make them hold: (gate, value to show, value to evaluate).
+    fn enable_values(&self, i: usize) -> Vec<(&'a Gate, String, Option<i64>)> {
+        let blocks: &'a [BlockDef] = self.blocks;
+        self.states[i]
+            .failing
+            .iter()
+            .filter_map(|n| blocks[i].when.get(*n))
+            .map(|g| {
+                let def = self.product.parameters.get(ref_param_id(&g.reference));
+                let codes = def.map(enum_codes).unwrap_or_default();
+                let code = enabling_code(&ref_gate(g), &codes);
+                let set_to = code
+                    .map(|c| display_value(def, &c.to_string()))
+                    .unwrap_or_else(|| g.test.clone());
+                (g, set_to, code)
+            })
+            .collect()
+    }
+
+    /// The configuration once inactive block `i` is enabled: the device's
+    /// values with its failing conditions set to values that hold.
+    fn enabled(&self, i: usize) -> &DynamicConfig {
+        self.enabled[i].get_or_init(|| {
+            let mut values: EnablingValues = Vec::new();
+            for (g, _, code) in self.enable_values(i) {
+                let test = ref_gate(g);
+                let value = code.or_else(|| match test.test {
+                    WhenTest::Compare { op, value } => Some(match op {
+                        CompareOp::Ne | CompareOp::Gt => value.saturating_add(1),
+                        CompareOp::Lt => value.saturating_sub(1),
+                        CompareOp::Le | CompareOp::Ge => value,
+                    }),
+                    _ => None,
+                });
+                if let Some(v) = value {
+                    values.push((g.reference.clone(), v.to_string()));
+                }
+            }
+            if let Some(done) = self.by_values.borrow().get(&values) {
+                return Rc::clone(done);
+            }
+            let mut overrides = self.overrides.clone();
+            overrides.extend(values.iter().cloned());
+            let config = Rc::new(evaluate_dynamic(self.product, &overrides));
+            self.by_values
+                .borrow_mut()
+                .insert(values, Rc::clone(&config));
+            config
+        })
+    }
+
+    /// The blocks `members` and the blocks nested in them.
+    fn tree(&self, members: &[usize]) -> HashSet<usize> {
+        members
+            .iter()
+            .flat_map(|i| subtree(self.blocks, &self.parents, *i))
+            .collect()
+    }
+
+    /// Whether the placement `blocks`/`channel` of `config` sits in `tree`.
+    fn placed_in(
+        &self,
+        tree: &HashSet<usize>,
+        blocks: &[crate::dynamic::BlockRef],
+        channel: Option<&ChannelRef>,
+    ) -> bool {
+        container_of(blocks, channel)
+            .and_then(|id| self.by_id.get(id.as_str()))
+            .is_some_and(|all| all.iter().any(|i| tree.contains(i)))
     }
 
     /// The parameter definitions blocks `members` and their nested blocks
-    /// hold, one per parameter, without headings (`type: none`). Of several
-    /// refs of one parameter, the first whose conditions inside its block
-    /// hold, else the first.
+    /// hold, one per parameter, without headings (`type: none`) and internal
+    /// refs (`Access="None"`). Of several refs of one parameter, the first
+    /// that enabling `members` reaches, else the first.
     fn held_params(&self, members: &[usize]) -> Vec<(&'a str, &'a ParamDef)> {
-        // Per parameter id: its index in `out` and whether that ref's
-        // branch holds.
+        let product: &'a ProductModel = self.product;
+        let blocks: &'a [BlockDef] = self.blocks;
+        let config = self.enabled(members[0]);
+        let reached: HashSet<&str> = config
+            .parameters
+            .iter()
+            .zip(&config.parameter_placements)
+            .filter(|(p, place)| p.module.is_none() && place.module.is_none() && place.shown)
+            .map(|(p, _)| p.param_ref_id.as_str())
+            .collect();
         let mut seen: HashMap<&str, (usize, bool)> = HashMap::new();
         let mut out = Vec::new();
         let all = members
             .iter()
-            .flat_map(|i| subtree(self.blocks, &self.parents, *i));
+            .flat_map(|i| subtree(blocks, &self.parents, *i));
         for j in all {
-            for r in &self.blocks[j].parameters {
+            for r in &blocks[j].parameters {
+                if product.parameter_refs.get(r).is_some_and(|d| d.internal) {
+                    continue;
+                }
                 let id = ref_param_id(r);
-                let Some(def) = self.product.parameters.get(id) else {
+                let Some(def) = product.parameters.get(id) else {
                     continue;
                 };
                 if matches!(def.kind, ParamKind::None) {
                     continue;
                 }
-                let holds = self.on_branch(j, r);
+                let holds = reached.contains(r.as_str());
                 match seen.get_mut(id) {
                     Some((at, taken)) => {
                         if holds && !*taken {
@@ -623,29 +977,20 @@ impl<'a> Pages<'a> {
         out
     }
 
-    /// The objects blocks `members` show with the vendor defaults once
-    /// enabled: their own, and those of nested blocks whose conditions hold.
+    /// The objects blocks `members` show once enabled: what the evaluator
+    /// reaches in them and their nested blocks with the enabling values.
     fn would_show(&self, members: &[usize]) -> Vec<ShownObject> {
-        let mut shown: HashSet<usize> = HashSet::new();
-        let mut refs: Vec<&str> = Vec::new();
-        let all = members
-            .iter()
-            .flat_map(|i| subtree(self.blocks, &self.parents, *i));
-        for j in all {
-            let reached = members.contains(&j)
-                || (self.parents[j].is_some_and(|p| shown.contains(&p))
-                    && self.blocks[j]
-                        .when
-                        .iter()
-                        .all(|g| g.holds(self.value_number(&g.reference))));
-            if !reached {
+        let tree = self.tree(members);
+        let config = self.enabled(members[0]);
+        let mut out: Vec<ShownObject> = Vec::new();
+        for (c, place) in config.com_objects.iter().zip(&config.com_object_placements) {
+            if c.module.is_some()
+                || place.module.is_some()
+                || !self.placed_in(&tree, &place.blocks, place.channel.as_ref())
+            {
                 continue;
             }
-            shown.insert(j);
-            refs.extend(self.blocks[j].objects.iter().map(String::as_str));
-        }
-        let mut out: Vec<ShownObject> = Vec::new();
-        for r in refs {
+            let r = c.com_object_ref_id.as_str();
             let Some(number) = object_number(r) else {
                 continue;
             };
@@ -665,37 +1010,47 @@ impl<'a> Pages<'a> {
         out
     }
 
-    fn value_number(&self, reference: &str) -> Option<f64> {
-        let def = self.product.parameters.get(ref_param_id(reference));
-        value_number(def, raw_value(self.product, &self.values, reference)?)
-    }
-
-    /// Whether the configuration shows parameter ref `reference` of block
-    /// `i`: the block is active and every condition inside it between the
-    /// block and the ref holds for the device's values.
-    fn shows_ref(&self, i: usize, reference: &str) -> bool {
-        self.states[i].active && self.on_branch(i, reference)
-    }
-
-    /// Whether every condition inside block `i` between the block and
-    /// parameter ref `reference` holds for the device's values: the block
-    /// shows the ref once it shows itself.
-    fn on_branch(&self, i: usize, reference: &str) -> bool {
-        self.blocks[i]
-            .parameter_when
-            .get(reference)
-            .is_none_or(|gates| {
-                gates
-                    .iter()
-                    .all(|g| g.holds(self.value_number(&g.reference)))
+    /// The application-level occurrences of parameter ref `reference`
+    /// directly in block `i`.
+    fn occurrences_in(&self, i: usize, reference: &str) -> Vec<&RefOccurrence> {
+        let id = self.blocks[i].id.as_str();
+        self.index
+            .parameter(reference)
+            .iter()
+            .filter(|o| {
+                o.module_def.is_none()
+                    && container_of(&o.blocks, o.channel.as_ref()).as_deref() == Some(id)
             })
+            .collect()
     }
 
     /// Whether the configuration shows parameter ref `reference` of block
     /// `i`, and what it needs when it does not (issue #321).
     fn ref_visibility(&self, i: usize, reference: &str) -> RefVisibility {
-        let gates = self.blocks[i].parameter_when.get(reference);
-        let shown = self.shows_ref(i, reference);
+        let occurrences = self.occurrences_in(i, reference);
+        // The conditions inside the block, when every occurrence has the
+        // same ones (a ref on two branches has no one condition).
+        let inner: Option<&[RefGate]> = match occurrences.as_slice() {
+            [first, rest @ ..] => {
+                let gates = &first.gates[first.container_gates.min(first.gates.len())..];
+                rest.iter()
+                    .all(|o| &o.gates[o.container_gates.min(o.gates.len())..] == gates)
+                    .then_some(gates)
+            }
+            [] => None,
+        };
+        let shown = self.reached.contains(reference)
+            && self
+                .reached_at
+                .get(reference)
+                .is_some_and(|j| self.blocks[*j].id == self.blocks[i].id);
+        let on_branch = shown
+            || occurrences.is_empty()
+            || occurrences.iter().any(|o| {
+                o.gates[o.container_gates.min(o.gates.len())..]
+                    .iter()
+                    .all(|g| g.holds(self.evaluated.number(&g.param_ref_id)))
+            });
         let (needs, now) = if shown {
             (None, None)
         } else {
@@ -707,24 +1062,25 @@ impl<'a> Pages<'a> {
             {
                 page = p;
             }
-            let mut failing: Vec<&Gate> = if self.states[page].active {
+            let mut failing: Vec<Gate> = if self.states[page].active {
                 Vec::new()
             } else {
                 self.states[page]
                     .failing
                     .iter()
                     .filter_map(|n| self.blocks[page].when.get(*n))
+                    .cloned()
                     .collect()
             };
+            let inner = inner.unwrap_or_default();
             failing.extend(
-                gates
+                self.failing_gates(inner)
                     .into_iter()
-                    .flatten()
-                    .filter(|g| !g.holds(self.value_number(&g.reference))),
+                    .map(|n| words_gate(&inner[n])),
             );
             let mut needs: Vec<String> = Vec::new();
             let mut now: Vec<String> = Vec::new();
-            for g in failing {
+            for g in &failing {
                 let words = self.gate_words(g);
                 if !needs.contains(&words) {
                     needs.push(words);
@@ -756,11 +1112,11 @@ impl<'a> Pages<'a> {
         };
         RefVisibility {
             shown,
-            on_branch: self.on_branch(i, reference),
-            condition: gates.filter(|gates| !gates.is_empty()).map(|gates| {
+            on_branch,
+            condition: inner.filter(|gates| !gates.is_empty()).map(|gates| {
                 gates
                     .iter()
-                    .map(|g| self.gate_words(g))
+                    .map(|g| self.gate_words(&words_gate(g)))
                     .collect::<Vec<_>>()
                     .join(" and ")
             }),
@@ -806,20 +1162,11 @@ impl<'a> Pages<'a> {
 
     /// What enables inactive block `i` (shown together with `members`).
     fn inactive(&self, i: usize, members: &[usize]) -> Inactive {
-        let enable = self.states[i]
-            .failing
-            .iter()
-            .filter_map(|n| self.blocks[i].when.get(*n))
-            .map(|g| {
+        let enable = self
+            .enable_values(i)
+            .into_iter()
+            .map(|(g, set_to, _)| {
                 let def = self.product.parameters.get(ref_param_id(&g.reference));
-                let codes = def.map(enum_codes).unwrap_or_default();
-                let set_to = g
-                    .satisfying(&codes)
-                    .first()
-                    .copied()
-                    .or_else(|| g.first_value())
-                    .map(|c| display_value(def, &c.to_string()))
-                    .unwrap_or_else(|| g.test.clone());
                 EnableStep {
                     key: self
                         .entries
@@ -828,15 +1175,10 @@ impl<'a> Pages<'a> {
                     reference: g.reference.clone(),
                     text: def.and_then(|d| d.text.clone().or_else(|| d.name.clone())),
                     set_to,
-                    default: default_value(
-                        Some(self.product),
-                        self.values
-                            .get(g.reference.as_str())
-                            .and_then(|e| e.ref_default.as_deref()),
-                        &g.reference,
-                        def,
-                    )
-                    .map(|d| display_value(def, d)),
+                    default: self
+                        .evaluated
+                        .vendor_default(&g.reference)
+                        .map(|d| display_value(def, &d)),
                     current: self.current(&g.reference),
                 }
             })
@@ -1128,7 +1470,7 @@ fn block_scope(
             .entries
             .iter()
             .filter(|(r, _)| pg.param_block.get(*r).is_some_and(|b| tree.contains(b)))
-            .map(|(_, e)| param_row(e, Some(pg.product)))
+            .map(|(_, e)| param_row(e, Some(pg.product), Some(pg.evaluated)))
             .collect();
         parameters.sort_by(|a, b| a.key.cmp(&b.key));
         let objects: Vec<ObjectRow> = device
@@ -1159,7 +1501,7 @@ fn block_scope(
             // A ref the lock indexes (or the file stores) keeps its key and
             // value, so the key printed here is the one the edit tools take.
             if let Some(e) = pg.entries.get(reference) {
-                return param_row(e, Some(pg.product));
+                return param_row(e, Some(pg.product), Some(pg.evaluated));
             }
             let entry = ParamEntry {
                 reference: reference.to_string(),
@@ -1167,9 +1509,8 @@ fn block_scope(
                 channel: None,
                 param: Some(ref_param_id(reference).to_string()),
                 stored: None,
-                ref_default: None,
             };
-            param_row(&entry, Some(pg.product))
+            param_row(&entry, Some(pg.product), Some(pg.evaluated))
         })
         .collect();
     let inactive = pg.inactive(i, &listed.members);
@@ -1198,6 +1539,12 @@ fn block_scope(
     }
 }
 
+/// Whether `product` carries ETS parameter pages to evaluate: its `blocks`
+/// and the Dynamic tree they come from.
+fn has_pages(product: &ProductModel) -> bool {
+    !product.blocks.is_empty() && !product.dynamic.is_empty()
+}
+
 /// Builds the view of `address`, with `channel` (a handle, a channel id, the
 /// vendor number, or [`DEVICE_SCOPE`]) in detail when given.
 pub fn device_view(
@@ -1218,6 +1565,8 @@ pub fn device_view(
     let product = application.as_deref().and_then(|a| products.get(a));
     let params = parameter_entries(device);
     let links = model.links.links.get(&address);
+    let (overrides, _) = device_overrides(device);
+    let evaluated = product.map(|p| Evaluated::new(p, &overrides));
 
     let user_name = |id: &str| {
         let ch = device.channels.get(id)?;
@@ -1255,9 +1604,10 @@ pub fn device_view(
 
     // The ETS parameter pages: listed for a device without channels of its
     // own, and the inactive channels of one with channels (issue #298).
-    let pages = product
-        .filter(|p| !p.blocks.is_empty())
-        .map(|p| Pages::new(device, p, &params));
+    let pages = evaluated
+        .as_ref()
+        .filter(|e| has_pages(e.product))
+        .map(|e| Pages::new(device, e, &overrides, &params));
     let channel_less = device.channels.len() <= 1;
     let listed: Vec<Listed> = match &pages {
         Some(pg) if channel_less => pg.listed(
@@ -1353,7 +1703,7 @@ pub fn device_view(
             let parameters: Vec<ParamRow> = params
                 .iter()
                 .filter(|p| p.channel == id)
-                .map(|p| param_row(p, product))
+                .map(|p| param_row(p, product, evaluated.as_ref()))
                 .collect();
             let objects: Vec<ObjectRow> = device
                 .com_objects
@@ -1498,7 +1848,7 @@ pub fn parameter_pages(
         .as_ref()
         .and_then(|p| p.application_ref.as_deref())
         .and_then(|a| products.get(a))
-        .filter(|p| !p.blocks.is_empty());
+        .filter(|p| has_pages(p));
     let Some(product) = product else {
         return Ok(out);
     };
@@ -1506,7 +1856,9 @@ pub fn parameter_pages(
         return Ok(out);
     }
     let params = parameter_entries(device);
-    let pg = Pages::new(device, product, &params);
+    let (overrides, _) = device_overrides(device);
+    let evaluated = Evaluated::new(product, &overrides);
+    let pg = Pages::new(device, &evaluated, &overrides, &params);
     let taken: Vec<String> = device
         .channels
         .keys()
@@ -1583,13 +1935,15 @@ pub fn unindexed_parameters(
         .as_ref()
         .and_then(|p| p.application_ref.as_deref())
         .and_then(|a| products.get(a))
-        .filter(|p| !p.blocks.is_empty());
+        .filter(|p| has_pages(p));
     let Some(product) = product else {
         return Ok(out);
     };
     let params = parameter_entries(device);
     let known: HashSet<&str> = params.iter().map(|p| p.reference.as_str()).collect();
-    let pg = Pages::new(device, product, &params);
+    let (overrides, _) = device_overrides(device);
+    let evaluated = Evaluated::new(product, &overrides);
+    let pg = Pages::new(device, &evaluated, &overrides, &params);
     let mut handle_of: HashMap<usize, &str> = HashMap::new();
     let listed = if device.channels.len() > 1 {
         Vec::new()
@@ -1616,6 +1970,14 @@ pub fn unindexed_parameters(
     for i in order {
         for reference in &pg.blocks[i].parameters {
             if known.contains(reference.as_str()) || out.contains_key(reference) {
+                continue;
+            }
+            // An internal ref (`Access="None"`) is reached but never shown.
+            if product
+                .parameter_refs
+                .get(reference)
+                .is_some_and(|r| r.internal)
+            {
                 continue;
             }
             let id = ref_param_id(reference);
@@ -1710,12 +2072,14 @@ pub fn parameter_visibility(
         .as_ref()
         .and_then(|p| p.application_ref.as_deref())
         .and_then(|a| products.get(a))
-        .filter(|p| !p.blocks.is_empty());
+        .filter(|p| has_pages(p));
     let Some(product) = product else {
         return Ok(BTreeMap::new());
     };
     let params = parameter_entries(device);
-    let pg = Pages::new(device, product, &params);
+    let (overrides, _) = device_overrides(device);
+    let evaluated = Evaluated::new(product, &overrides);
+    let pg = Pages::new(device, &evaluated, &overrides, &params);
     Ok(pg.visibility())
 }
 
@@ -1794,12 +2158,14 @@ pub fn ignored_overrides(
         .as_ref()
         .and_then(|p| p.application_ref.as_deref())
         .and_then(|a| products.get(a))
-        .filter(|p| !p.blocks.is_empty());
+        .filter(|p| has_pages(p));
     let Some(product) = product else {
         return Ok(Vec::new());
     };
     let params = parameter_entries(device);
-    let pg = Pages::new(device, product, &params);
+    let (overrides, _) = device_overrides(device);
+    let evaluated = Evaluated::new(product, &overrides);
+    let pg = Pages::new(device, &evaluated, &overrides, &params);
     Ok(ignored_in(device, &pg))
 }
 
@@ -1822,13 +2188,8 @@ fn ignored_in(device: &Device, pg: &Pages<'_>) -> Vec<IgnoredOverride> {
         };
         let def = pg.product.parameters.get(ref_param_id(reference));
         let locked = device.lock.parameters.get(reference);
-        let default = default_value(
-            Some(pg.product),
-            locked.and_then(|p| p.default.as_deref()),
-            reference,
-            def,
-        );
-        if default.is_some_and(|d| same_value(def, value, d)) {
+        let default = pg.evaluated.vendor_default(reference);
+        if default.is_some_and(|d| same_value(def, value, &d)) {
             continue;
         }
         out.push(IgnoredOverride {

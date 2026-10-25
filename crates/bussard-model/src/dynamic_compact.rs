@@ -136,7 +136,7 @@ struct AssignOut<'a> {
 }
 
 /// The `test` text of a branch, `None` for the default branch.
-fn test_text(test: &WhenTest) -> Option<String> {
+pub(crate) fn test_text(test: &WhenTest) -> Option<String> {
     match test {
         WhenTest::Values(values) => Some(
             values

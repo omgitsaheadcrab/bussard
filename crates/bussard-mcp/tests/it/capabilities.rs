@@ -275,30 +275,45 @@ fn meteo_product() -> String {
     let mut blocks = String::from(
         "blocks:\n- id: CH-0\n  kind: channel\n  text: Generic\n  number: 0\n- id: PB-1\n  text: Allgemein\n  parent: CH-0\n  channel: CH-0\n  parameters:\n",
     );
+    let refs = |r: &[&str]| -> String {
+        let lines: String = r.iter().map(|r| format!("    {r}: {{}}\n")).collect();
+        format!("  refs:\n{lines}")
+    };
+    // The Dynamic tree the blocks come from (format 5): the evaluator's
+    // input, one flow line per node.
+    let mut general = Vec::new();
+    let mut channel = Vec::new();
     for k in 1..=METEO_CHANNELS {
         blocks.push_str(&format!("  - P-{k}_R-{k}\n"));
         params.push_str(&format!(
-            "- id: {}\n  name: Enable{k}\n  text: Universalkanal C{k} aktivieren\n{enum_yes_no}",
-            id(format!("P-{k}"))
+            "- id: {}\n  name: Enable{k}\n  text: Universalkanal C{k} aktivieren\n{enum_yes_no}{}",
+            id(format!("P-{k}")),
+            refs(&[&format!("P-{k}_R-{k}")])
         ));
+        general.push(json!({"p": format!("P-{k}_R-{k}")}));
     }
+    channel.push(json!({"block": {"id": "PB-1", "text": "Allgemein", "nodes": general}}));
     for k in 1..=METEO_CHANNELS {
         let first = if k >= 5 { 5 } else { k };
         let when: String = (first..=k)
             .map(|j| format!("  - ref: P-{j}_R-{j}\n    test: '1'\n"))
             .collect();
         let (f, s, h) = (1000 + 10 * k, 1001 + 10 * k, 1002 + 10 * k);
+        let wind = 1005 + 10 * k;
         params.push_str(&format!(
-            "- id: {}\n  name: Function{k}\n  text: Funktion des Kanals\n  type: !enum\n    values:\n    - value: 1\n      text: Helligkeit\n    - value: 2\n      text: Temperatur\n    - value: 3\n      text: Wind\n  default: '1'\n",
-            id(format!("P-{f}"))
+            "- id: {}\n  name: Function{k}\n  text: Funktion des Kanals\n  type: !enum\n    values:\n    - value: 1\n      text: Helligkeit\n    - value: 2\n      text: Temperatur\n    - value: 3\n      text: Wind\n  default: '1'\n{}",
+            id(format!("P-{f}")),
+            refs(&[&format!("P-{f}_R-{f}")])
         ));
         params.push_str(&format!(
-            "- id: {}\n  name: Threshold{k}\n  text: Schwellwert in lx\n  type: !int\n    min: 1\n    max: 1000\n    size: 16\n  default: '100'\n",
-            id(format!("P-{s}"))
+            "- id: {}\n  name: Threshold{k}\n  text: Schwellwert in lx\n  type: !int\n    min: 1\n    max: 1000\n    size: 16\n  default: '100'\n{}",
+            id(format!("P-{s}")),
+            refs(&[&format!("P-{s}_R-{s}")])
         ));
         params.push_str(&format!(
-            "- id: {}\n  name: Brightness{k}\n  text: Helligkeitsschwelle C{k}\n  type: !int\n    min: 1\n    max: 1000\n    size: 16\n  default: '200'\n",
-            id(format!("P-{h}"))
+            "- id: {}\n  name: Brightness{k}\n  text: Helligkeitsschwelle C{k}\n  type: !int\n    min: 1\n    max: 1000\n    size: 16\n  default: '200'\n{}",
+            id(format!("P-{h}")),
+            refs(&[&format!("P-{h}_R-{h}"), &format!("P-{h}_R-{wind}")])
         ));
         for (n, text) in [(2 * k, "Schaltausgang"), (2 * k + 1, "Messwert")] {
             objects.push_str(&format!(
@@ -310,15 +325,48 @@ fn meteo_product() -> String {
         // the wind threshold behind it.
         let (u, w) = (1006 + 10 * k, 1008 + 10 * k);
         params.push_str(&format!(
-            "- id: {}\n  name: Source{k}\n  text: Wenn Temperatur\n  type: !enum\n    values:\n    - value: 1\n      text: Helligkeitssensor\n    - value: 2\n      text: Temperatursensor\n    - value: 4\n      text: Windsensor\n  default: '2'\n",
-            id(format!("UP-{u}"))
+            "- id: {}\n  name: Source{k}\n  text: Wenn Temperatur\n  type: !enum\n    values:\n    - value: 1\n      text: Helligkeitssensor\n    - value: 2\n      text: Temperatursensor\n    - value: 4\n      text: Windsensor\n  default: '2'\n  refs:\n    UP-{u}_R-{v}:\n      value: '4'\n",
+            id(format!("UP-{u}")),
+            v = u + 1
         ));
         params.push_str(&format!(
-            "- id: {}\n  name: Wind{k}\n  text: Windgeschwindigkeit\n  type: !int\n    min: 1\n    max: 40\n    size: 8\n  default: '4'\n",
-            id(format!("P-{w}"))
+            "- id: {}\n  name: Wind{k}\n  text: Windgeschwindigkeit\n  type: !int\n    min: 1\n    max: 40\n    size: 8\n  default: '4'\n{}",
+            id(format!("P-{w}")),
+            refs(&[&format!("P-{w}_R-{w}")])
         ));
         ref_values.push_str(&format!("  UP-{u}_R-{v}: '4'\n", v = u + 1));
-        let wind = 1005 + 10 * k;
+        // The two pages behind the enable switches C`first` .. C`k`.
+        let function = json!({"block": {
+            "id": format!("PB-{k}0"),
+            "text": format!("Universalkanal C{k}: Funktion"),
+            "nodes": [
+                {"p": format!("P-{f}_R-{f}")},
+                {"p": format!("P-{s}_R-{s}")},
+                {"choose": {"ref": format!("P-{f}_R-{f}"), "when": [
+                    {"test": "1", "nodes": [{"p": format!("P-{h}_R-{h}")}]},
+                    {"test": "3", "nodes": [
+                        {"p": format!("P-{h}_R-{wind}")},
+                        {"p": format!("UP-{u}_R-{v}", v = u + 1)},
+                        {"choose": {"ref": format!("UP-{u}_R-{v}", v = u + 1), "when": [
+                            {"test": "4", "nodes": [{"p": format!("P-{w}_R-{w}")}]},
+                        ]}},
+                    ]},
+                ]}},
+                {"o": format!("O-{n}_R-{n}", n = 2 * k)},
+            ],
+        }});
+        let objects_page = json!({"block": {
+            "id": format!("PB-{k}1"),
+            "text": format!("Objekte zu C{k}"),
+            "nodes": [{"o": format!("O-{n}_R-{n}", n = 2 * k + 1)}],
+        }});
+        let mut gated = vec![function, objects_page];
+        for j in (first..=k).rev() {
+            gated = vec![json!({"choose": {"ref": format!("P-{j}_R-{j}"), "when": [
+                {"test": "1", "nodes": gated},
+            ]}})];
+        }
+        channel.extend(gated);
         blocks.push_str(&format!(
             "- id: PB-{k}0\n  text: 'Universalkanal C{k}: Funktion'\n  parent: CH-0\n  channel: CH-0\n  when:\n{when}  parameters:\n  - P-{f}_R-{f}\n  - P-{s}_R-{s}\n  - P-{h}_R-{h}\n  - P-{h}_R-{wind}\n  - UP-{u}_R-{v}\n  - P-{w}_R-{w}\n  parameter_when:\n    P-{h}_R-{h}:\n    - ref: P-{f}_R-{f}\n      test: '1'\n    P-{h}_R-{wind}:\n    - ref: P-{f}_R-{f}\n      test: '3'\n    UP-{u}_R-{v}:\n    - ref: P-{f}_R-{f}\n      test: '3'\n    P-{w}_R-{w}:\n    - ref: P-{f}_R-{f}\n      test: '3'\n    - ref: UP-{u}_R-{v}\n      test: '4'\n  objects:\n  - O-{n}_R-{n}\n",
             n = 2 * k,
@@ -329,9 +377,11 @@ fn meteo_product() -> String {
             n = 2 * k + 1
         ));
     }
+    let dynamic =
+        json!({"channel": {"id": "CH-0", "name": "Generic", "number": 0, "nodes": channel}});
     let format = bussard_model::param_model::MODEL_FORMAT;
     format!(
-        "model_format: {format}\nidentity:\n  id: {METEO_APP}\n  name: meteo test app\n  application_number: 304\n  application_version: 16\n  mask_version: '0701'\n  load_procedure_style: ProductProcedure\n  schema_version: '23'\n{objects}{params}load_procedure:\n- connect\n- restart\n- disconnect\n{blocks}{ref_values}"
+        "model_format: {format}\nidentity:\n  id: {METEO_APP}\n  name: meteo test app\n  application_number: 304\n  application_version: 16\n  mask_version: '0701'\n  load_procedure_style: ProductProcedure\n  schema_version: '23'\n{objects}{params}load_procedure:\n- connect\n- restart\n- disconnect\n{blocks}{ref_values}dynamic:\n- {dynamic}\n"
     )
 }
 
