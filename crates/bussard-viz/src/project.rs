@@ -854,6 +854,8 @@ fahren.listen = ["0/1/0"]
       min: 0
       max: 255
     default: "10"
+    refs:
+      P-1_R-1: {{}}
   - id: {PARAM_APP}_P-2
     text: "Betriebsart"
     type: !enum
@@ -861,6 +863,8 @@ fahren.listen = ["0/1/0"]
         - {{ value: 1, text: "Rollladen" }}
         - {{ value: 2, text: "Jalousie mit Lamellenverstellung" }}
     default: "1"
+    refs:
+      P-2_R-2: {{}}
 "#
         );
         let mut products = ProductModels::default();
