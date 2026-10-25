@@ -524,6 +524,7 @@ pub(super) fn plan_flash_sys7(
         &default_flags,
         last_object,
     );
+    let code_segments = sys7_code_segments(&steps, &images, &param_images, &placed);
 
     Ok(FlashPlan {
         identity: AppIdentity {
@@ -541,12 +542,50 @@ pub(super) fn plan_flash_sys7(
         sys7: Some(Sys7Context {
             profile: s7_profile,
             segment_masks,
+            code_segments,
         }),
         confirmed_restart: false,
         baseline: BTreeMap::new(),
         placed,
         unwritten: BTreeMap::new(),
     })
+}
+
+/// The segments of a System 7 plan that hold the application's code, which
+/// the identity check samples (issue #355): the segments streamed verbatim
+/// from the product's `<Data>`. Left out are a table load-state machine's
+/// segment (its image is computed from the model), a RAM segment (the
+/// running application rewrites it), one with no checksum control (the
+/// product does not treat it as fixed content), one a parameter is placed in
+/// (parameter memory), and the group-object descriptor table (the planner
+/// rewrites its CONFIG and TYPE octets from the model: the Theben Meteodata's
+/// `AS-4400` and the MDT `A-00xx` programs').
+fn sys7_code_segments(
+    steps: &[FlashStep],
+    images: &BTreeMap<String, Vec<u8>>,
+    param_images: &BTreeMap<String, Vec<u8>>,
+    placed: &bussard_prod::PlacedOctets,
+) -> BTreeSet<String> {
+    let object_table = sys7_group_object_table(steps, images);
+    steps
+        .iter()
+        .filter_map(|step| match step {
+            FlashStep::Sys7AbsSegment {
+                image: Some(image),
+                mem_type,
+                checksum_ctrl,
+                ..
+            } if image.kind == ImageKind::Code && *mem_type != 2 && *checksum_ctrl != 0 => {
+                Some(&image.segment_id)
+            }
+            _ => None,
+        })
+        .filter(|id| !param_images.get(*id).is_some_and(|b| !b.is_empty()))
+        .filter(|id| !placed.get(*id).is_some_and(|o| !o.is_empty()))
+        .filter(|id| object_table.as_ref() != Some(*id))
+        .filter(|id| images.contains_key(*id))
+        .cloned()
+        .collect()
 }
 
 /// The write mask of a parameter segment (issue #320): an octet is written
@@ -713,6 +752,56 @@ pub(super) fn apply_sys7_group_object_links(
     default_flags: &BTreeMap<u16, Sys7ObjectDefault>,
     last_object: Option<u16>,
 ) {
+    let Some(segment) = sys7_group_object_table(steps, images) else {
+        return;
+    };
+    let Some(bytes) = images.get_mut(&segment) else {
+        return;
+    };
+    let count = bytes.first().map_or(0, |&c| usize::from(c));
+    // The finder checked the image holds `count` descriptors.
+    let Some(descriptors) = bytes.get_mut(3..3 + 4 * count) else {
+        return;
+    };
+    use bussard_model::Flags;
+    for (asap, d) in descriptors.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let asap = asap as u16;
+        if last_object.is_some_and(|last| asap > last) {
+            break;
+        }
+        let default = default_flags.get(&asap);
+        if linked.contains(&asap) {
+            match linked_flags
+                .get(&asap)
+                .copied()
+                .or_else(|| default.map(|o| o.flags | Flags::COMMUNICATION))
+            {
+                Some(flags) => d[2] = sys7_config_from_flags(d[2], flags),
+                None => d[2] |= 0x04,
+            }
+        } else {
+            match default {
+                Some(o) => d[2] = sys7_config_from_flags(d[2], o.flags - Flags::COMMUNICATION),
+                None => d[2] &= !0x04,
+            }
+        }
+        if let Some(t) = default.and_then(|o| o.type_code) {
+            d[3] = t;
+        }
+    }
+}
+
+/// The LSM 3 EEPROM segment whose image carries the group-object descriptor
+/// table, found by shape (see [`apply_sys7_group_object_links`]):
+/// `[CNT:1][RAM-flags ptr:2]` followed by `CNT` 4-octet descriptors
+/// `[data ptr:2 BE][CONFIG][TYPE]`, every pointer inside a RAM (`mem_type` 2)
+/// segment the plan allocates. The planner rewrites its CONFIG and TYPE
+/// octets from the model, so it is configuration, not code (issue #355).
+/// `None` when no segment has that shape.
+pub(super) fn sys7_group_object_table(
+    steps: &[FlashStep],
+    images: &BTreeMap<String, Vec<u8>>,
+) -> Option<String> {
     let ram: Vec<(u32, u32)> = steps
         .iter()
         .filter_map(|s| match s {
@@ -726,7 +815,7 @@ pub(super) fn apply_sys7_group_object_links(
         })
         .collect();
     if ram.is_empty() {
-        return;
+        return None;
     }
     // An unused descriptor slot carries a zero data pointer (the 3361 image
     // declares 200 slots and uses 125), so zero passes the shape check.
@@ -746,7 +835,7 @@ pub(super) fn apply_sys7_group_object_links(
         else {
             continue;
         };
-        let Some(bytes) = images.get_mut(&img.segment_id) else {
+        let Some(bytes) = images.get(&img.segment_id) else {
             continue;
         };
         let Some((&count, rest)) = bytes.split_first() else {
@@ -764,42 +853,11 @@ pub(super) fn apply_sys7_group_object_links(
                 .0
                 .iter()
                 .all(|d| in_ram(u16::from_be_bytes([d[0], d[1]])));
-        if !shaped {
-            continue;
+        if shaped {
+            return Some(img.segment_id.clone());
         }
-        use bussard_model::Flags;
-        for (asap, d) in bytes[3..3 + 4 * count]
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .enumerate()
-        {
-            let asap = asap as u16;
-            if last_object.is_some_and(|last| asap > last) {
-                break;
-            }
-            let default = default_flags.get(&asap);
-            if linked.contains(&asap) {
-                match linked_flags
-                    .get(&asap)
-                    .copied()
-                    .or_else(|| default.map(|o| o.flags | Flags::COMMUNICATION))
-                {
-                    Some(flags) => d[2] = sys7_config_from_flags(d[2], flags),
-                    None => d[2] |= 0x04,
-                }
-            } else {
-                match default {
-                    Some(o) => d[2] = sys7_config_from_flags(d[2], o.flags - Flags::COMMUNICATION),
-                    None => d[2] &= !0x04,
-                }
-            }
-            if let Some(t) = default.and_then(|o| o.type_code) {
-                d[3] = t;
-            }
-        }
-        return;
     }
+    None
 }
 
 /// Plans a System 7 flash using a `.knxprod`'s parsed `HawkConfigurationData` to
@@ -1212,6 +1270,65 @@ mod tests {
     /// project's T W R C (`47` became `5f`), and the template slots past the
     /// highest declared object keep their `17` (ETS only rewrites descriptors up
     /// to the last com-object `Number`).
+    /// Issue #355: the identity sample's segments are the code alone, never a
+    /// link table, RAM, parameter memory or the group-object descriptor
+    /// table (the Meteodata's `AS-4400`, whose CONFIG octets follow the
+    /// configuration).
+    #[test]
+    fn test_sys7_code_segments_never_picks_a_table_or_parameter_segment() {
+        let seg = |lsm: u32, address: u32, mem_type: u8, checksum_ctrl: u8, id: &str, kind| {
+            FlashStep::Sys7AbsSegment {
+                lsm,
+                address,
+                size: 16,
+                mem_type,
+                seg_flags: 0xF2,
+                checksum_ctrl,
+                image: Some(ImageRef {
+                    segment_id: id.to_string(),
+                    kind,
+                    len: 16,
+                }),
+            }
+        };
+        let steps = vec![
+            seg(1, 0x4000, 3, 0x80, "AS-4000", ImageKind::Table),
+            seg(2, 0x4201, 3, 0x80, "AS-4201", ImageKind::Table),
+            // The RAM the descriptors point into (the Meteodata's AS-1C00).
+            seg(3, 0x1C00, 2, 0x00, "AS-1C00", ImageKind::Code),
+            seg(3, 0x4400, 3, 0x80, "AS-4400", ImageKind::Code),
+            seg(3, 0x4800, 3, 0x00, "AS-4800", ImageKind::Code),
+            seg(3, 0x4C00, 3, 0x80, "AS-4C00", ImageKind::Code),
+            seg(3, 0x5000, 3, 0x80, "AS-5000", ImageKind::Code),
+            seg(3, 0x5400, 3, 0x80, "AS-5400", ImageKind::Code),
+        ];
+        // [CNT=2][RAM flags 0x1C00] and two descriptors pointing into RAM.
+        let object_table = vec![
+            0x02, 0x1C, 0x00, 0x1C, 0x01, 0x4F, 0x00, 0x1C, 0x02, 0x4B, 0x00,
+        ];
+        let images: BTreeMap<String, Vec<u8>> = [
+            "AS-4000", "AS-4201", "AS-1C00", "AS-4800", "AS-4C00", "AS-5000", "AS-5400",
+        ]
+        .iter()
+        .map(|id| ((*id).to_string(), vec![0xAA; 16]))
+        .chain([("AS-4400".to_string(), object_table)])
+        .collect();
+        assert_eq!(
+            sys7_group_object_table(&steps, &images).as_deref(),
+            Some("AS-4400")
+        );
+        // AS-4C00 carries a parameter image, AS-5000 a placed parameter only.
+        let param_images = BTreeMap::from([("AS-4C00".to_string(), vec![1u8; 16])]);
+        let placed = BTreeMap::from([("AS-5000".to_string(), BTreeSet::from([3usize]))]);
+        let code = sys7_code_segments(&steps, &images, &param_images, &placed);
+        assert_eq!(code, BTreeSet::from(["AS-5400".to_string()]));
+
+        // Without AS-5400 nothing is code: the gate falls back to the load
+        // state (the Meteodata 140 S).
+        let code = sys7_code_segments(&steps[..7], &images, &param_images, &placed);
+        assert!(code.is_empty(), "{code:?}");
+    }
+
     #[test]
     fn test_apply_sys7_group_object_links_object_zero_and_trailing_slots() {
         use bussard_model::Flags;

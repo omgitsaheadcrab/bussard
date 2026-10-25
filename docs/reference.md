@@ -388,7 +388,7 @@ Before planning it reads the parameter memory back, and every write goes out as 
 
 It refuses, before any write, when:
 
-- the device runs another application: on System B its `PID_PROGRAM_VERSION` differs from the product's, or cannot be read; System 7 has no readable application id, so every load-state machine must be `Loaded` and the first octets of each application code segment must read back as the product's bytes;
+- the device runs another application: on System B its `PID_PROGRAM_VERSION` differs from the product's, or cannot be read; System 7 has no readable application id, so every load-state machine must be `Loaded` and the first octets of each application code segment must read back as the product's bytes (a code segment is streamed verbatim from the product, never a link table, the group-object descriptor table or parameter memory; a product with none is judged by the load-state machines alone);
 - the application is not `Loaded`, or the load state cannot be read;
 - a parameter segment cannot be read back (its base or content is unknown);
 - on System 7, the model's links differ from the device's group-address or association table: the table load-state machines are not reloaded, so run `apply` first;
