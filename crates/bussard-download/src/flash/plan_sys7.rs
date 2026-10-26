@@ -9,7 +9,7 @@
 
 use super::plan::assemble_ops;
 use super::{AppIdentity, FlashPlan, FlashStep, ImageKind, ImageRef, PlanError, Sys7Context};
-use bussard_prod::application::{ApplicationProgram, LoadOp, SegmentKind};
+use bussard_prod::application::{ApplicationProgram, LoadOp, SegmentKind, TableLocation};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The largest System 7 memory address (and segment size) the 2-octet fields of
@@ -539,15 +539,17 @@ pub(super) fn plan_flash_sys7(
         .chain(default_flags.keys().copied())
         .chain(linked.iter().copied())
         .max();
+    let declared = app.com_object_table.as_ref();
     apply_sys7_group_object_links(
         &steps,
         &mut images,
+        declared,
         &linked,
         linked_flags,
         &default_flags,
         last_object,
     );
-    let code_segments = sys7_code_segments(&steps, &images, &param_images, &placed);
+    let code_segments = sys7_code_segments(&steps, &images, declared, &param_images, &placed);
 
     Ok(FlashPlan {
         identity: AppIdentity {
@@ -586,10 +588,11 @@ pub(super) fn plan_flash_sys7(
 fn sys7_code_segments(
     steps: &[FlashStep],
     images: &BTreeMap<String, Vec<u8>>,
+    declared: Option<&TableLocation>,
     param_images: &BTreeMap<String, Vec<u8>>,
     placed: &bussard_prod::PlacedOctets,
 ) -> BTreeSet<String> {
-    let object_table = sys7_group_object_table(steps, images);
+    let object_table = sys7_object_table_location(steps, images, declared).map(|(id, _)| id);
     steps
         .iter()
         .filter_map(|step| match step {
@@ -760,30 +763,36 @@ pub(super) fn sys7_linked_asaps(assoc_image: &[u8]) -> BTreeSet<u16> {
 /// T C), 1.1.1 (`47` became `5f`); objects no `<when>` branch shows keep the
 /// template (`db`) on the 3361-1MWW and 3181 captures (issue #117).
 ///
-/// The table is found by shape, since the mask declares no address for it:
+/// The table is where the program's `<ComObjectTable CodeSegment Offset>`
+/// declares it, else found by shape (see [`sys7_object_table_location`]):
 /// `[CNT:1][RAM-flags ptr:2]` followed by `CNT` 4-octet descriptors
-/// `[data ptr:2 BE][CONFIG][TYPE]`, where every data pointer and the RAM-flags
-/// pointer fall inside a RAM (`mem_type` 2) segment the same plan allocates.
-/// Descriptor `i` is ASAP `i` (the 1.1.46 capture: association ASAPs 1, 5, 7,
-/// 13 are exactly the descriptors ETS enabled). A plan without such a segment
-/// is left untouched.
+/// `[data ptr:2][CONFIG][TYPE]`. Descriptor `i` is ASAP `i` (the 1.1.46
+/// capture: association ASAPs 1, 5, 7, 13 are exactly the descriptors ETS
+/// enabled). A plan without such a segment is left untouched.
+///
+/// Issue #386, 1.1.44 (ABB 6119/20, `A-A002`, no links): the declared table
+/// at `AS-43FE` holds 30 descriptors whose little-endian pointers name the
+/// controller's own RAM, which the plan does not allocate. ETS wrote `13`
+/// and `53` (the visible refs' W / T W, C cleared) to objects 0 and 1 and
+/// `db` (template `df`, C cleared) to the other 28.
 pub(super) fn apply_sys7_group_object_links(
     steps: &[FlashStep],
     images: &mut BTreeMap<String, Vec<u8>>,
+    declared: Option<&TableLocation>,
     linked: &BTreeSet<u16>,
     linked_flags: &BTreeMap<u16, bussard_model::Flags>,
     default_flags: &BTreeMap<u16, Sys7ObjectDefault>,
     last_object: Option<u16>,
 ) {
-    let Some(segment) = sys7_group_object_table(steps, images) else {
+    let Some((segment, at)) = sys7_object_table_location(steps, images, declared) else {
         return;
     };
     let Some(bytes) = images.get_mut(&segment) else {
         return;
     };
-    let count = bytes.first().map_or(0, |&c| usize::from(c));
+    let count = bytes.get(at).map_or(0, |&c| usize::from(c));
     // The finder checked the image holds `count` descriptors.
-    let Some(descriptors) = bytes.get_mut(3..3 + 4 * count) else {
+    let Some(descriptors) = bytes.get_mut(at + 3..at + 3 + 4 * count) else {
         return;
     };
     use bussard_model::Flags;
@@ -812,6 +821,45 @@ pub(super) fn apply_sys7_group_object_links(
             d[3] = t;
         }
     }
+}
+
+/// Where the group-object descriptor table sits in a System 7 plan: the
+/// segment id and the table's offset in its image.
+///
+/// The program's `<ComObjectTable CodeSegment Offset>` declaration wins when
+/// it names an LSM 3 EEPROM segment of the plan whose image holds the
+/// `[CNT:1][RAM-flags ptr:2]` header and `CNT` 4-octet descriptors there.
+/// Every System 7 program of the product corpus declares it (336
+/// applications); the declaration is what finds the table of a program whose
+/// descriptors point into controller RAM the plan does not allocate, or
+/// whose pointers are little-endian (101 corpus applications declare
+/// `ParameterByteOrder="LittleEndian"`, the ABB 6119/20 among them, issue
+/// #386). Without a usable declaration the table is found by shape
+/// ([`sys7_group_object_table`]) at offset 0.
+pub(super) fn sys7_object_table_location(
+    steps: &[FlashStep],
+    images: &BTreeMap<String, Vec<u8>>,
+    declared: Option<&TableLocation>,
+) -> Option<(String, usize)> {
+    let from_declaration = declared.and_then(|table| {
+        let lsm3_eeprom = steps.iter().any(|step| {
+            matches!(
+                step,
+                FlashStep::Sys7AbsSegment {
+                    lsm: 3,
+                    mem_type: 3,
+                    image: Some(img),
+                    ..
+                } if img.segment_id == table.code_segment
+            )
+        });
+        let at = usize::try_from(table.offset).ok()?;
+        let bytes = images.get(&table.code_segment)?;
+        let count = usize::from(*bytes.get(at)?);
+        (lsm3_eeprom && count > 0 && bytes.len() >= at + 3 + 4 * count)
+            .then(|| (table.code_segment.clone(), at))
+    });
+    from_declaration.or_else(|| sys7_group_object_table(steps, images).map(|id| (id, 0)))
 }
 
 /// The LSM 3 EEPROM segment whose image carries the group-object descriptor
@@ -1343,6 +1391,85 @@ mod tests {
 
     use bussard_prod::application::ApplicationProgram;
 
+    /// Issue #386, 1.1.44 (ABB 6119/20, `A-A002`, mask 0701): the program
+    /// declares its descriptor table at `AS-43FE` + 0, the pointers are
+    /// little-endian and name controller RAM the plan does not allocate, so
+    /// only the declaration finds it. With no links, ETS wrote the visible
+    /// objects 0 and 1 with their refs' flags and C cleared (`13`, `53`) and
+    /// cleared C on the template of the rest (`df` became `db`).
+    #[test]
+    fn test_apply_sys7_group_object_links_uses_the_declared_table() {
+        use bussard_model::Flags;
+        let seg_id = "M-0007_A-A002-13-73C8-O0002_AS-43FE".to_string();
+        let steps = vec![FlashStep::Sys7AbsSegment {
+            lsm: 3,
+            address: 0x43FE,
+            size: 123,
+            mem_type: 3,
+            seg_flags: 0x80,
+            checksum_ctrl: 0x00,
+            image: Some(ImageRef {
+                segment_id: seg_id.clone(),
+                kind: ImageKind::Code,
+                len: 15,
+            }),
+        }];
+        // The product's first three descriptors, CNT cut to 3.
+        let template = vec![
+            0x03, 0x60, 0x04, 0x7E, 0x04, 0xDF, 0x00, 0x7F, 0x04, 0xDF, 0x00, 0x83, 0x04, 0xDF,
+            0x00,
+        ];
+        let defaults = BTreeMap::from([
+            (
+                0,
+                Sys7ObjectDefault {
+                    flags: Flags::WRITE | Flags::COMMUNICATION,
+                    type_code: None,
+                },
+            ),
+            (
+                1,
+                Sys7ObjectDefault {
+                    flags: Flags::TRANSMIT | Flags::WRITE | Flags::COMMUNICATION,
+                    type_code: None,
+                },
+            ),
+        ]);
+        let run = |declared: Option<&TableLocation>| {
+            let mut images = BTreeMap::from([(seg_id.clone(), template.clone())]);
+            apply_sys7_group_object_links(
+                &steps,
+                &mut images,
+                declared,
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                &defaults,
+                None,
+            );
+            images.remove(&seg_id).unwrap_or_default()
+        };
+        // The shape finder alone does not see it: no RAM segment in the plan.
+        assert_eq!(sys7_group_object_table(&steps, &BTreeMap::new()), None);
+        assert_eq!(run(None), template);
+        let declared = TableLocation {
+            code_segment: seg_id.clone(),
+            offset: 0,
+        };
+        assert_eq!(
+            run(Some(&declared)),
+            vec![
+                0x03, 0x60, 0x04, 0x7E, 0x04, 0x13, 0x00, 0x7F, 0x04, 0x53, 0x00, 0x83, 0x04, 0xDB,
+                0x00
+            ]
+        );
+        // A declaration the image cannot hold falls back to the shape finder.
+        let past_end = TableLocation {
+            code_segment: seg_id.clone(),
+            offset: 4,
+        };
+        assert_eq!(run(Some(&past_end)), template);
+    }
+
     /// The System 7 group-object post-pass: the communication flag follows the
     /// association table (1.1.31: no links, none set; 1.1.46: exactly the
     /// linked ASAPs), everything else in the descriptor is left alone.
@@ -1385,6 +1512,7 @@ mod tests {
         apply_sys7_group_object_links(
             &steps,
             &mut images,
+            None,
             &BTreeSet::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -1405,6 +1533,7 @@ mod tests {
         apply_sys7_group_object_links(
             &steps,
             &mut images,
+            None,
             &linked,
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -1430,13 +1559,22 @@ mod tests {
         apply_sys7_group_object_links(
             &steps,
             &mut images_df,
+            None,
             &linked,
             &flags,
             &BTreeMap::new(),
             None,
         );
         assert_eq!(images_df[&seg_id][9], 0x4F);
-        apply_sys7_group_object_links(&steps, &mut images, &linked, &flags, &BTreeMap::new(), None);
+        apply_sys7_group_object_links(
+            &steps,
+            &mut images,
+            None,
+            &linked,
+            &flags,
+            &BTreeMap::new(),
+            None,
+        );
         assert_eq!(images[&seg_id][9], 0x4F);
 
         // A segment that does not look like the descriptor table is untouched.
@@ -1445,6 +1583,7 @@ mod tests {
         apply_sys7_group_object_links(
             &steps,
             &mut images,
+            None,
             &BTreeSet::from([1]),
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -1507,12 +1646,12 @@ mod tests {
         // AS-4C00 carries a parameter image, AS-5000 a placed parameter only.
         let param_images = BTreeMap::from([("AS-4C00".to_string(), vec![1u8; 16])]);
         let placed = BTreeMap::from([("AS-5000".to_string(), BTreeSet::from([3usize]))]);
-        let code = sys7_code_segments(&steps, &images, &param_images, &placed);
+        let code = sys7_code_segments(&steps, &images, None, &param_images, &placed);
         assert_eq!(code, BTreeSet::from(["AS-5400".to_string()]));
 
         // Without AS-5400 nothing is code: the gate falls back to the load
         // state (the Meteodata 140 S).
-        let code = sys7_code_segments(&steps[..7], &images, &param_images, &placed);
+        let code = sys7_code_segments(&steps[..7], &images, None, &param_images, &placed);
         assert!(code.is_empty(), "{code:?}");
     }
 
@@ -1558,6 +1697,7 @@ mod tests {
         apply_sys7_group_object_links(
             &steps,
             &mut images,
+            None,
             &BTreeSet::from([0]),
             &flags,
             &BTreeMap::new(),
@@ -1651,6 +1791,7 @@ mod tests {
             apply_sys7_group_object_links(
                 &steps,
                 &mut images,
+                None,
                 &BTreeSet::new(),
                 &BTreeMap::new(),
                 &defaults,

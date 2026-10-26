@@ -28,7 +28,10 @@
 //!   default 3 at `BitOffset 6` sat in byte `0b0000_0111`).
 //!
 //! Multi-byte integers are stored **big-endian** (default 500 appeared as
-//! `01 F4`, 2000 as `07 D0`, 10 as `00 0A`).
+//! `01 F4`, 2000 as `07 D0`, 10 as `00 0A`), unless the program declares
+//! `<Options ParameterByteOrder="LittleEndian">`: then a byte-aligned integer
+//! field of two or more octets is stored least significant octet first (the
+//! ABB 6119/20's debounce 5633 as `01 16`, issue #386).
 //!
 //! # Base image
 //!
@@ -132,8 +135,9 @@ fn apply_erased_fill(
 ///    `P-1312_R-2140`) — **not** the parameter name, which is provably
 ///    non-unique (module repetition and multi-ref parameters).
 ///
-/// The resolved value is encoded MSB-first big-endian into the byte image keyed
-/// by the memory's `CodeSegment`. Returns a map from segment id to its image.
+/// The resolved value is encoded MSB-first big-endian (little-endian for a
+/// multi-octet integer of a `ParameterByteOrder="LittleEndian"` program) into
+/// the byte image keyed by the memory's `CodeSegment`. Returns a map from segment id to its image.
 ///
 /// # Module-instance offsets
 ///
@@ -1672,6 +1676,8 @@ fn place_checked(
     placement: &Placement,
     seg_size: Option<u32>,
 ) -> Result<Range<usize>> {
+    let ordered = little_endian_field(app, bit_offset, placement);
+    let placement = ordered.as_ref().unwrap_or(placement);
     // The exclusive byte end this placement writes up to (bit fields round up).
     let end: u64 = match placement {
         Placement::Empty => offset as u64,
@@ -1710,6 +1716,57 @@ fn place_checked(
         _ => offset,
     };
     Ok(first..usize::try_from(end).unwrap_or(first).max(first))
+}
+
+/// A byte-aligned integer field of a program that declares
+/// `ParameterByteOrder="LittleEndian"`, as the octets it stores: least
+/// significant first. `None` when the placement keeps the default MSB-first
+/// order: a big-endian program, a field of one octet or less, one that is not
+/// a whole number of octets or does not start on an octet boundary, and any
+/// [`Placement::Bytes`] payload (text, raw data, floats, `BinaryValue`
+/// members, packed times and integers wider than 64 bits).
+///
+/// Issue #386: the ABB 6119/20 (`M-0007_A-A002-13`, little-endian) holds its
+/// 16-bit debounce enumeration value 5633 (`0x1601`) as `01 16` at `0x6D01`
+/// in the ETS download of 1.1.44.
+fn little_endian_field(
+    app: &ApplicationProgram,
+    bit_offset: u8,
+    placement: &Placement,
+) -> Option<Placement> {
+    match placement {
+        Placement::Field { bits, value }
+            if app.parameters_little_endian
+                && bit_offset == 0
+                && *bits > 8
+                && bits.is_multiple_of(8) =>
+        {
+            let len = (*bits / 8) as usize;
+            Some(Placement::Bytes(value.to_le_bytes()[..len].to_vec()))
+        }
+        _ => None,
+    }
+}
+
+/// Reads an integer field the way [`little_endian_field`] and [`place`]
+/// write it: least significant octet first when `little_endian` applies to
+/// the field, else MSB-first ([`read_field`]).
+fn read_int_field(
+    image: &[u8],
+    offset: usize,
+    bit_offset: u8,
+    bits: u32,
+    little_endian: bool,
+) -> Option<u64> {
+    if little_endian && bit_offset == 0 && bits > 8 && bits <= 64 && bits.is_multiple_of(8) {
+        let held = image.get(offset..offset.checked_add((bits / 8) as usize)?)?;
+        return Some(
+            held.iter()
+                .rev()
+                .fold(0u64, |acc, b| (acc << 8) | u64::from(*b)),
+        );
+    }
+    read_field(image, offset, bit_offset, bits)
 }
 
 /// Places an encoded value into `image` at the byte offset (and bit offset for
@@ -1775,7 +1832,13 @@ pub fn decode_parameter_value(
     offset: usize,
     bit_offset: u8,
 ) -> Option<String> {
-    decode_value(parameter_type_of(app, param), image, offset, bit_offset)
+    decode_value(
+        parameter_type_of(app, param),
+        image,
+        offset,
+        bit_offset,
+        app.parameters_little_endian,
+    )
 }
 
 /// What `value` reads back as once written for `param`: the value encoded the
@@ -1803,8 +1866,10 @@ pub fn canonical_parameter_value(
         };
     }
     let mut scratch = Vec::new();
+    // Placed MSB-first and read back the same way: the canonical form does
+    // not depend on the program's byte order.
     place(&mut scratch, 0, 0, &placement);
-    decode_value(ptype, &scratch, 0, 0)
+    decode_value(ptype, &scratch, 0, 0, false)
 }
 
 /// Encodes `value` for `param` and writes it into `image` at the byte
@@ -1835,12 +1900,14 @@ pub fn write_parameter_value(
     place_checked(app, pname, image, offset, bit_offset, &placement, None).map(|_| ())
 }
 
-/// [`decode_parameter_value`] on a resolved type.
+/// [`decode_parameter_value`] on a resolved type; `little_endian` is the
+/// program's `ParameterByteOrder` (see [`little_endian_field`]).
 fn decode_value(
     ptype: Option<&ParameterType>,
     image: &[u8],
     offset: usize,
     bit_offset: u8,
+    little_endian: bool,
 ) -> Option<String> {
     let bytes = |len: usize| image.get(offset..offset.checked_add(len)?);
     match ptype? {
@@ -1852,7 +1919,7 @@ fn decode_value(
                 return decode_wide_int(bytes((bits / 8) as usize)?, bits, *signed)
                     .map(|n| n.to_string());
             }
-            let raw = read_field(image, offset, bit_offset, bits)?;
+            let raw = read_int_field(image, offset, bit_offset, bits, little_endian)?;
             Some(if *signed {
                 sign_extend(raw, bits).to_string()
             } else {
@@ -1869,7 +1936,8 @@ fn decode_value(
                 })?;
                 return Some(member.value.to_string());
             }
-            read_field(image, offset, bit_offset, bits).map(|raw| raw.to_string())
+            read_int_field(image, offset, bit_offset, bits, little_endian)
+                .map(|raw| raw.to_string())
         }
         ParameterType::Text { size_bits } => {
             let slice = bytes((size_bits.unwrap_or(0) / 8) as usize)?;
@@ -1920,7 +1988,8 @@ fn decode_value(
         }
         ParameterType::Other { size_bits, .. } => {
             let bits = (*size_bits).filter(|b| *b > 0 && *b <= 64 && b % 8 == 0)?;
-            read_field(image, offset, bit_offset, bits).map(|raw| raw.to_string())
+            read_int_field(image, offset, bit_offset, bits, little_endian)
+                .map(|raw| raw.to_string())
         }
     }
 }
@@ -3257,6 +3326,86 @@ mod tests {
        </choose>
       </Dynamic>
      </ApplicationProgram></KNX>"#;
+
+    /// The ABB 6119/20 shape (issue #386): `ParameterByteOrder` set by
+    /// `{order}`, a 16-bit enumeration in a union at `0x6D01` (default 5633),
+    /// a 16-bit number and a two-octet text after it.
+    fn byte_order_xml(order: &str) -> String {
+        format!(
+            r#"<KNX xmlns="http://knx.org/xml/project/20">
+     <ApplicationProgram Id="A" MaskVersion="MV-0701" Name="le">
+      <Static>
+       <Code><AbsoluteSegment Id="A_AS-6D00" Size="8" Address="27904"><Data>AAEUAAAAAAA=</Data></AbsoluteSegment></Code>
+       <ParameterTypes>
+        <ParameterType Id="A_PT-1" Name="e"><TypeRestriction Base="Value" SizeInBit="16"><Enumeration Text="a" Value="5633" Id="A_PT-1_EN-1" /><Enumeration Text="b" Value="5634" Id="A_PT-1_EN-2" /></TypeRestriction></ParameterType>
+        <ParameterType Id="A_PT-2" Name="n"><TypeNumber SizeInBit="16" Type="unsignedInt" minInclusive="0" maxInclusive="65535" /></ParameterType>
+        <ParameterType Id="A_PT-3" Name="t"><TypeText SizeInBit="16" /></ParameterType>
+       </ParameterTypes>
+       <Parameters>
+        <Union SizeInBit="16">
+         <Memory CodeSegment="A_AS-6D00" Offset="1" BitOffset="0" />
+         <Parameter Id="A_UP-1" Name="debounce" ParameterType="A_PT-1" Value="5633" Offset="0" BitOffset="0" DefaultUnionParameter="true" />
+        </Union>
+        <Parameter Id="A_P-2" Name="count" ParameterType="A_PT-2" Value="258"><Memory CodeSegment="A_AS-6D00" Offset="3" BitOffset="0" /></Parameter>
+        <Parameter Id="A_P-3" Name="text" ParameterType="A_PT-3" Value="ab"><Memory CodeSegment="A_AS-6D00" Offset="5" BitOffset="0" /></Parameter>
+       </Parameters>
+       <ParameterRefs>
+        <ParameterRef Id="A_UP-1_R-1" RefId="A_UP-1" />
+        <ParameterRef Id="A_P-2_R-2" RefId="A_P-2" />
+        <ParameterRef Id="A_P-3_R-3" RefId="A_P-3" />
+       </ParameterRefs>
+       <Options {order} />
+      </Static>
+      <Dynamic><ChannelIndependentBlock><ParameterBlock Id="A_PB-1">
+       <ParameterRefRef RefId="A_UP-1_R-1" />
+       <ParameterRefRef RefId="A_P-2_R-2" />
+       <ParameterRefRef RefId="A_P-3_R-3" />
+      </ParameterBlock></ChannelIndependentBlock></Dynamic>
+     </ApplicationProgram></KNX>"#
+        )
+    }
+
+    /// Issue #386: a little-endian program stores a multi-octet integer
+    /// least significant octet first (ETS wrote the ABB's debounce 5633 as
+    /// `01 16`), a text keeps its order, and the decoder reads the value back.
+    /// A big-endian or undeclared order stays MSB-first.
+    #[test]
+    fn test_compute_parameter_image_little_endian_parameters() -> Result<()> {
+        let le = parse_application_program(
+            "A",
+            byte_order_xml(r#"ParameterByteOrder="LittleEndian""#).as_bytes(),
+        )?;
+        assert!(le.parameters_little_endian);
+        let images = compute_parameter_image(&le, &no_overrides(), &BTreeMap::new())?;
+        assert_eq!(
+            images["A_AS-6D00"],
+            [0x00, 0x01, 0x16, 0x02, 0x01, b'a', b'b', 0]
+        );
+        let mut overrides = BTreeMap::new();
+        overrides.insert("UP-1_R-1".to_string(), "5634".to_string());
+        overrides.insert("P-2_R-2".to_string(), "4660".to_string());
+        let image = &compute_parameter_image(&le, &overrides, &BTreeMap::new())?["A_AS-6D00"];
+        assert_eq!(image[1..5], [0x02, 0x16, 0x34, 0x12]);
+        let decode = |id: &str, offset: usize| {
+            le.parameters
+                .get(id)
+                .and_then(|p| decode_parameter_value(&le, p, image, offset, 0))
+        };
+        assert_eq!(decode("A_UP-1", 1).as_deref(), Some("5634"));
+        assert_eq!(decode("A_P-2", 3).as_deref(), Some("4660"));
+        assert_eq!(decode("A_P-3", 5).as_deref(), Some("ab"));
+
+        for order in [r#"ParameterByteOrder="BigEndian""#, ""] {
+            let be = parse_application_program("A", byte_order_xml(order).as_bytes())?;
+            let images = compute_parameter_image(&be, &no_overrides(), &BTreeMap::new())?;
+            assert_eq!(
+                images["A_AS-6D00"],
+                [0x00, 0x16, 0x01, 0x01, 0x02, b'a', b'b', 0],
+                "{order}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_compute_parameter_image_dynamic_writes_only_shown_parameters() -> Result<()> {

@@ -654,6 +654,16 @@ pub struct LoadProcedure {
     pub ops: Vec<LoadOp>,
 }
 
+/// A table's place inside a code segment, as `<Static>` declares it
+/// (`<ComObjectTable CodeSegment=… Offset=…>`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TableLocation {
+    /// The full `Id` of the code segment holding the table.
+    pub code_segment: String,
+    /// The table's byte offset inside that segment.
+    pub offset: u32,
+}
+
 /// One parsed ApplicationProgram.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ApplicationProgram {
@@ -702,6 +712,17 @@ pub struct ApplicationProgram {
     /// of at the product's static LSM 2 address (issue #383).
     #[serde(default)]
     pub dynamic_table_management: bool,
+    /// Whether `<Options>` declares `ParameterByteOrder="LittleEndian"`: a
+    /// multi-octet integer parameter is stored least significant octet first
+    /// (the ABB 6119/20 `A-A002` writes debounce 5633 as `01 16`, issue #386).
+    /// `false` for `BigEndian` or no declaration, the KNX default.
+    #[serde(default)]
+    pub parameters_little_endian: bool,
+    /// Where `<Static><ComObjectTable CodeSegment Offset>` places the
+    /// group-object table inside a code segment, when the program declares
+    /// it. A System 7 (mask 07xx) program keeps its descriptor table there.
+    #[serde(default)]
+    pub com_object_table: Option<TableLocation>,
     /// Base com-objects, keyed by full `Id`.
     pub com_objects: HashMap<String, ComObject>,
     /// Com-object refs, keyed by full `Id`.
@@ -1185,7 +1206,10 @@ fn handle_start(
                 get(m, b"DownloadInvisibleParameters").map(str::to_string);
             app.prefer_partial_download = get(m, b"PreferPartialDownloadIfApplicationLoaded")
                 .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
+            app.parameters_little_endian = get(m, b"ParameterByteOrder")
+                .is_some_and(|v| v.eq_ignore_ascii_case("LittleEndian"));
         }
+        b"ComObjectTable" => insert_com_object_table(app, m),
         b"Language" => translations.enter_language(get(m, b"Identifier")),
         b"TranslationElement" => translations.enter_element(get(m, b"RefId")),
         b"ComObject" => insert_com_object(app, m),
@@ -1311,7 +1335,10 @@ fn handle_empty(
                 get(m, b"DownloadInvisibleParameters").map(str::to_string);
             app.prefer_partial_download = get(m, b"PreferPartialDownloadIfApplicationLoaded")
                 .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
+            app.parameters_little_endian = get(m, b"ParameterByteOrder")
+                .is_some_and(|v| v.eq_ignore_ascii_case("LittleEndian"));
         }
+        b"ComObjectTable" => insert_com_object_table(app, m),
         b"NumericArg" => {
             // A `<NumericArg RefId=arg-id Value=n>` of the current `<Module>`.
             if let Some(module) = state.dynamic.cur_module.as_mut()
@@ -1529,6 +1556,18 @@ fn apply_translations(app: &mut ApplicationProgram, translations: &TranslationCo
     translate_tree(&mut app.dynamic, &full, translations);
     for body in app.module_dynamics.values_mut() {
         translate_tree(body, &full, translations);
+    }
+}
+
+/// Records where `<ComObjectTable>` places the group-object table.
+fn insert_com_object_table(app: &mut ApplicationProgram, m: &Attrs) {
+    if let Some(code_segment) = get(m, b"CodeSegment") {
+        app.com_object_table = Some(TableLocation {
+            code_segment: code_segment.to_string(),
+            offset: get(m, b"Offset")
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0),
+        });
     }
 }
 
@@ -2400,6 +2439,39 @@ mod tests {
             );
             let app = parse_application_program_str("M-1_A-1", &xml)?;
             assert_eq!(app.dynamic_table_management, expected, "{attr}");
+        }
+        Ok(())
+    }
+
+    /// Issue #386: `ParameterByteOrder` and the `<ComObjectTable>` placement
+    /// (the ABB 6119/20 `A-A002`: little-endian, table at `AS-43FE` + 0).
+    #[test]
+    fn test_parse_application_program_byte_order_and_object_table() -> Result<()> {
+        let xml = |options: &str, table: &str| {
+            format!(
+                r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t"><Static>{table}{options}</Static></ApplicationProgram></KNX>"#
+            )
+        };
+        let app = parse_application_program_str(
+            "M-1_A-1",
+            &xml(
+                r#"<Options ParameterByteOrder="LittleEndian" />"#,
+                r#"<ComObjectTable CodeSegment="M-1_A-1_AS-43FE" Offset="2"><ComObject Id="M-1_A-1_O-0" Number="0" /></ComObjectTable>"#,
+            ),
+        )?;
+        assert!(app.parameters_little_endian);
+        assert_eq!(
+            app.com_object_table,
+            Some(TableLocation {
+                code_segment: "M-1_A-1_AS-43FE".to_string(),
+                offset: 2,
+            })
+        );
+        for options in [r#"<Options ParameterByteOrder="BigEndian" />"#, ""] {
+            let app =
+                parse_application_program_str("M-1_A-1", &xml(options, "<ComObjectTable />"))?;
+            assert!(!app.parameters_little_endian, "{options}");
+            assert_eq!(app.com_object_table, None);
         }
         Ok(())
     }
