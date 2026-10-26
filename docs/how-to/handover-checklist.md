@@ -1,6 +1,6 @@
-# KNX handover checklist
+# Handover checklist
 
-Attach this page to a purchase contract or an acceptance protocol. The owner uses it as the list of what to demand; the integrator uses it as the delivery list. It follows the handover and security checklists in the KNX Association's [KNX Project Preparation](https://www.knx.es/_data/docsfiles/5_KNX-Project-Preparation_en.pdf).
+Attach this page to a purchase contract or an acceptance protocol. The owner uses it as the list of what to demand, the integrator as the delivery list. It follows the handover and security checklists in the KNX Association's [KNX Project Preparation](https://www.knx.es/_data/docsfiles/5_KNX-Project-Preparation_en.pdf).
 
 Installation: ______________________  Integrator: ______________________  Date: __________
 
@@ -40,10 +40,18 @@ Installation: ______________________  Integrator: ______________________  Date: 
 - [ ] Acceptance test report from `bussard test`, with the `tests.toml` it ran
 - [ ] Backup from `bussard backup`, taken after the last `apply`
 
-The bundle and its checksum are the delivered state. `bussard diff` against this bundle shows, in sentences, anything changed since.
+The bundle and its checksum are the delivered state. `bussard diff` against this bundle later shows, in sentences, everything changed since.
 
 ## Who owns the project file
 
-The KNX Project Design Guidelines say the integrator "is obliged to hand over the very latest version of the project data", and the Swiss KNX guidelines of 2024 say it must be handed over. Guidelines are not law: the contract decides, and court rulings point both ways. Put the handover of the project data and its passwords into the contract. An integrator who worries about warranty can hand over a password-protected project with the password in a sealed envelope; an opened envelope then marks the point where the owner took over.
+The KNX Project Design Guidelines say the integrator "is obliged to hand over the very latest version of the project data", and the Swiss KNX guidelines say it must be handed over. Guidelines are not law: the contract decides, and court rulings point both ways. Put the handover of the project data and its passwords into the contract.
+
+An integrator who worries about warranty can hand over a password-protected project with the password in a sealed envelope. An opened envelope then marks the point where the owner took over.
 
 Received complete: ______________________ (owner)  Delivered: ______________________ (integrator)
+
+## Next steps
+
+- [Commission a line](commission-a-line.md): produce the acceptance test report and the house manual.
+- [Work with an integrator](work-with-an-integrator.md): exchange changes after handover.
+- [Back up and replace](back-up-and-replace.md): take the backup the list asks for.

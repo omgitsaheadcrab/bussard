@@ -59,7 +59,7 @@ pub struct ImportOptions {
     /// The language to derive texts in (an ETS identifier such as `de-DE`).
     /// `None` lets the import choose: the project's stated language, else the
     /// language every program offers (see "Text language" in
-    /// `docs/reference/model-format.md`).
+    /// `docs/reference/files/`).
     pub language: Option<String>,
 }
 

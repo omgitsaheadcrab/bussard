@@ -95,7 +95,7 @@ Field notes:
   what the parameter phase needs to place the value into the device's parameter memory.
 - `load_procedure`: the ordered op summary, a faithful view of the download script.
   `bussard flash` executes the supported subset
-  ([reference](../docs/reference/cli.md#bussard-flash-address)).
+  ([reference](../docs/reference/commands/programming.md)).
 - `com_object_refs`: the com-object refs of the Dynamic section whose number
   `com_objects` describes through another ref, with their own text, function and DPT
   (a "Switch" object that becomes a "Value" object under another setting).

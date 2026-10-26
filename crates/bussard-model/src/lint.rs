@@ -19,7 +19,7 @@
 //!     name_pattern: "* * *"
 //! ```
 //!
-//! Every finding is a warning with an `L0xx` code (see `docs/reference/cli.md`).
+//! Every finding is a warning with an `L0xx` code (see `docs/reference/diagnostics.md`).
 //! The convention lints read the same block and role tables the scaffolder
 //! writes ([`crate::scaffold`]), so `bussard scaffold` output is clean by
 //! construction.

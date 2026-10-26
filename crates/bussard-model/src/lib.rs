@@ -1,7 +1,7 @@
 //! Core KNX domain model for bussard.
 //!
 //! This crate defines the address, DPT and flag types; DPT value codecs; the
-//! in-memory model; the TOML loader/saver (`docs/reference/model-format.md`); and the
+//! in-memory model; the TOML loader/saver (`docs/reference/files/`); and the
 //! validation rules. Everything downstream (transport, monitor, MCP, CLI)
 //! builds on these types.
 //!

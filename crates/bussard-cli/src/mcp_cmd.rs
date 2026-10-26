@@ -126,7 +126,7 @@ pub fn run(
 }
 
 /// The server name the registration uses; matches the docs
-/// (`docs/tutorials/first-weekend.md`), which register the server as `knx`.
+/// (`docs/getting-started/first-weekend.md`), which register the server as `knx`.
 const SERVER_NAME: &str = "knx";
 
 /// The placeholder printed in place of a secret the client must supply.

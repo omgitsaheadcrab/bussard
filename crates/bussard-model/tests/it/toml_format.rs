@@ -1,4 +1,4 @@
-//! The TOML model format (docs/reference/model-format.md): load/save round trips through
+//! The TOML model format (docs/reference/files/): load/save round trips through
 //! the lock, format-preserving saves, key resolution, and the E020–E026 rules.
 
 use std::collections::BTreeMap;

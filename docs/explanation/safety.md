@@ -1,1267 +1,189 @@
 # Safety
 
-`bussard` writes to physical building infrastructure. A bad write can move a
-blind onto a plant, trip a wind alarm, or leave a device half-programmed. This
-page is the one thing to read before your first write. The write path is built
-to make the dangerous cases loud, but the guard-rails only help if you know
-which bus you are pointed at.
+bussard writes to physical building infrastructure, and the guard-rails only
+help if you know which bus you are pointed at. Read this page before your
+first write; it takes five minutes.
 
-Read commands (`monitor`, `read`, `scan`, `plan`, `reconstruct`) never transmit
-device programming and are never gated. Everything below is about the write
-commands: `write`, `apply`, `flash`, `assign`, `adopt`, `commission`,
-`restore`, `replace` and `test`.
+A bad write can move a blind onto a plant, trip a wind alarm, or leave a
+device half-programmed. The write path is built to make those cases loud.
 
-Two long-running servers can also write, and they pass the same gate at
-startup rather than per command:
+## Only a few commands write
 
-- `bussard mcp --allow-writes`, which registers the `knx_write_group` tool and
-  hands an LLM the bus for the session.
-- `bussard mcp --allow-programming`, which registers `knx_plan_device` and
-  `knx_apply_device` so an LLM can write one device's link tables after the
-  human approves the plan (see [MCP programming tier](#mcp-programming-tier)).
-- `bussard viz --allow-writes` (arms `POST /api/group-write`) and
-  `bussard viz --watch-prog` (puts broadcast reads on the bus on a timer).
+Read commands (`monitor`, `read`, `scan`, `plan`, `reconstruct`) never
+transmit device programming and are never gated. These commands write:
+`write`, `apply`, `flash`, `assign`, `adopt`, `commission`, `restore`,
+`replace` and `test`. [What each write command does](write-commands.md)
+covers each one.
+
+Two long-running servers can also write. They pass the same gate once, at
+startup, rather than per command:
+
+- `bussard mcp --allow-writes` hands an LLM the bus for group writes for the
+  session, and `bussard mcp --allow-programming` lets it write one device's
+  tables after you approve the plan.
+- `bussard viz --allow-writes` arms the page's group-write endpoint, and
+  `bussard viz --watch-prog` puts broadcast reads on the bus on a timer.
 
 Both default to off. A bare `bussard viz` is a viewer whose write endpoint
 answers `403`, and a bare `bussard mcp` has no write tool, so neither can
 transmit and neither is gated.
 
-## The one rule: know which bus you are hitting
-
-The single most dangerous mistake is running a write against your live house
-when you meant a test bus. `bussard.toml` can carry a `connection.gateway`
-pointing at the real gateway, and that value is used by default, so a bare
-`bussard write ...` can reach the real bus without you naming it.
-
-Two things protect you:
-
-1. **Every write names its gateway.** The confirmation prompt echoes the
-   resolved gateway as `host:port` (for example
-   `write 3/0/4 <- down (1.008) via 192.0.2.10:3671? [y/N]`). Read it before
-   you type `y`. If the address is not the one you expect, abort.
-
-2. **Non-loopback gateways are refused by default.** A write whose resolved
-   gateway is *not* loopback (not `127.0.0.0/8`, not `::1`) refuses to run.
-   For the write commands the check happens per invocation; for the two
-   servers it happens once, at startup, so a write-enabled server pointed at a
-   real gateway refuses to start at all:
-
-   ```
-   refusing to write to non-loopback gateway 192.0.2.10:3671: this looks
-   like a real KNX bus. If you really mean to write to it, re-run with
-   --allow-remote-gateway or set BUSSARD_ALLOW_REAL_GATEWAY=1.
-   ```
-
-   Loopback gateways (the simulator, the test suite) are always allowed. To
-   write to a real gateway you opt in explicitly, per command with
-   `--allow-remote-gateway` or for a session with `BUSSARD_ALLOW_REAL_GATEWAY=1`.
-   Treat setting the env var as arming the tool: unset it when you are done.
-   `BUSSARD_GATEWAY` and `BUSSARD_DIR` only choose which bus and model a
-   command uses; no environment variable other than
-   `BUSSARD_ALLOW_REAL_GATEWAY` can permit a write.
-
-Point at a test bus by giving a loopback gateway explicitly, either
-`--gateway 127.0.0.1` on the command or `gateway = "127.0.0.1:3671"` under `[connection]`
-in `bussard.toml`. The [`knx-sim`](../../knx-sim/README.md) simulator is the
-easiest safe target: from the `knx-sim/` directory run
-`cargo run -- examples/da_tp.yaml`, which listens on `127.0.0.1:3671`, then
-point `bussard` at it. Because it is loopback, no opt-in flag is needed.
-
-## Your first writes
-
-Do your first real writes against a spare device or the simulator, never a
-live installation. Two safe practice targets:
-
-- **The simulator.** `knx-sim` is a strict, independent device model. It
-  accepts the same programming a real System B or System 7 device does and
-  rejects out-of-order or out-of-bounds operations, so a mistake fails on the
-  sim instead of on your wall. See the [flash walk-through](../how-to/recipes.md#-flash-a-factory-fresh-device)
-  and the [`bussard flash` reference](../reference/cli.md#bussard-flash-address).
-- **A spare device on the bench**, powered and reachable but not wired into
-  anything that moves.
-
-Once a command behaves the way you expect against the sim, the only change for
-the real bus is the gateway and the `--allow-remote-gateway` opt-in.
-
-## What each write command does, and its rails
-
-Every device write is plan-before-apply: `bussard` reads the live state, shows
-a diff, asks for confirmation on the terminal (`y/N`), writes, then verifies by
-reading back. A refusal exits non-zero *before* anything is written.
-
-### The confirmation rules
+## Every write asks once
 
 - `--yes` means one thing on every command: skip the confirmation prompt. It
   never consents to anything else.
-- Without a terminal and without `--yes`, every write command is refused with
-  one sentence: `refusing to <action> without a terminal to confirm on; pass
-  --yes to confirm non-interactively`. This covers `assign`, `adopt`, `flash`,
-  `apply`, `commission`, `restore`, `replace`, `write`, `test` and `learn`.
-- `assign`, `adopt`, `replace` and `commission` act on whatever device is in
-  programming mode as their first bus step, so they refuse before loading the
-  model or opening a connection. `learn` does the same. `flash`, `apply`,
-  `restore`, `write` and `test` first read and show what they would change,
-  then refuse at the prompt.
+- Without a terminal and without `--yes`, a write command is refused with
+  `refusing to <action> without a terminal to confirm on; pass --yes to
+  confirm non-interactively`. `learn` follows the same rule.
 - An explicit address or value is not consent. `bussard assign 1.1.47` in a
   script still needs `--yes`.
-- Downloading vendor product data is a separate consent with its own flag,
-  `--yes-download` (`init`, `import`, `import-product`, `adopt`). Without a
-  terminal and without it, nothing is downloaded (`import-product` refuses).
-- `--yes` never lifts the real-gateway gate: a non-loopback gateway still needs
-  `--allow-remote-gateway` or `BUSSARD_ALLOW_REAL_GATEWAY=1`, and the gate is
-  checked before the prompt.
+- Downloading vendor product data is a separate consent, `--yes-download`
+  (`init`, `import`, `import-product`, `adopt`). Without a terminal and
+  without it, nothing is downloaded, and `import-product` refuses.
+- `--yes` never lifts the real-gateway gate below. The gate is checked before
+  the prompt.
 
-**`write <GA> <VALUE>`** sends a single group value (`on`/`off`, `up`/`down`, a
-number, a percentage). It is a runtime command, not device programming: nothing
-is stored on a device, but actuators move. The confirmation names the GA, the
-decoded value, and the gateway.
+## The one rule: know which bus you are hitting
 
-**Secured group addresses (KNX Data Secure).** A device with a
-secured group object ignores a plain telegram on its GA. `write`, `read` (and
-MCP `knx_write_group` / `knx_read_group`, and viz) send such a GA as an
-`A_SecureData` group telegram when it has a group key in `--keyring` or is
-marked `secure = true` in `groups.toml`; a secured GA without a key is refused
-before anything is sent, and a plain GA goes out byte for byte as before. A
-secured `read` accepts only a response whose MAC verifies under the group key.
-The sequence number is milliseconds since 2018-01-05, and never below the last
-one the same process sent. A receiver accepts a secured group telegram only
-from a sender it knows: ETS lists the senders of each secured GA in the
-device's security individual address table (PID 54), so the tunnel address
-bussard sends from must be in it, or the device drops the telegram without a
-word (`write` then reports success, `read` times out). `flash --keyring` and
-`apply --keyring` write that table like ETS (the devices that send on a secured
-GA the device listens to) and leave bussard out of it unless you pass
-`--secure-sender <tunnel IA>` or set `[connection] admit_tunnel_senders =
-true`: those add bussard's tunnel addresses with sequence 0, so the device
-accepts `write --keyring` from them. Both are off by default because they
-widen who the device trusts; the next ETS download of the device removes them
-again. Before a secured write or read bussard checks whether the devices on
-the GA admit its tunnel address and refuses when the recorded evidence says
-they do not. `monitor --keyring` is read-only on the bus. See [Secured group
-writes from bussard](#secured-group-writes-from-bussard) for the workflow.
+The most dangerous mistake is running a write against your live house when you
+meant a test bus. `bussard.toml` can carry a `connection.gateway` pointing at
+the real gateway, and that value is the default, so a bare `bussard write`
+can reach the real bus without you naming it. Two things protect you.
 
-**`apply <ADDRESS>`** writes the model to a device: its link tables (group
-address and association tables) and, when `bussard.lock` pins the product
-data (or `--product` is given), the parameter octets that differ. It validates
-the model first and refuses on an error, before the bus is touched; a pinned
-archive that is missing or changed, and a `--product` / `--application` that
-contradicts the lock without `--force`, are refused there too. A device whose
-application id or mask differs from what the lock pins is refused before any
-write, naming the `bussard flash` it needs. It shows the plan in
-the device file's words and asks once (`apply these N changes to <ia> through
-<gateway>? [y/N]`); a device that already matches is not asked about and not
-written. With `--plan <hash>` it refuses when the device state no longer
-hashes to the `state_hash` of the plan a human approved (`plan --json`). It
-backs up first: the device's pre-apply tables are written to
-`<dir>/captures/backups/<ia>-<timestamp>.json`, and the parameter memory to
-`<dir>/captures/backups/parameters/` when parameters change, before any write;
-the apply refuses if a backup cannot be written. The parameter half is the
-parameter-only download below, with its rails; a parameter change that shows or
-hides a com-object is refused and needs a full `flash`. Tables are rewritten
-wholesale, so re-running `apply` is idempotent. To go back, re-apply from the
-model, or `bussard restore <dir>/captures/backups <ADDRESS>` to write the
-backed-up tables through the same path.
+**Every write names its gateway.** The confirmation prompt shows the resolved
+gateway as `host:port`, for example:
 
-**Installation-wide backup (`backup`, `restore`).** The per-device backup above
-covers only the device `apply` is about to touch. Take a snapshot of the whole
-installation before the first write: `bussard backup` reads every model device
-into `<dir>/captures/backups/<UTC timestamp>/`, one JSON file per device plus a
-`manifest.json`. It is read-only on the bus: it sends descriptor, authorize,
-property-read and memory-read APDUs and nothing else, and a mock-gateway test
-fails if a single write reaches a device. The manifest lists every device,
-including the ones it could not cover: `skipped` for a mask bussard cannot read,
-`unreachable` for a device that did not answer, `failed` for a read that broke
-(which makes the run exit 1). On System B the snapshot includes the
-application segment, where the parameters live; on System 7 it does not,
-because the device does not report that segment's length. `apply` prints a
-hint while no such snapshot exists.
-
-`bussard restore <backup-dir> <ADDRESS>` writes one device's tables back. It is
-the `apply` command with the backup as the desired state: same plan, same
-confirmation naming the gateway, same pre-write backup, same verify, same
-non-loopback gate. Restoring a fresh backup onto an unchanged device plans empty
-and writes nothing. `restore` writes link tables only.
-
-`bussard restore --parameters <backup.json> <ADDRESS>` replays a parameter
-backup (`captures/backups/parameters/`, written before every parameter write)
-with the parameter-only download below. It refuses a backup of
-another device, application or mask before planning, writes only the octets a
-parameter is placed in under the model's configuration, keeps device-managed
-octets (`Access="None"` values the application owns at runtime) as the device
-holds them, backs up the memory it overwrites, confirms naming the gateway, and
-verifies by read-back. It keeps every rail of `--parameters-only`: a device that
-does not run the application (a factory-fresh or unloaded one) is refused. At
-the programming tier the same restore is `knx_restore_parameters`, with a plan,
-a single-use digest and the human's explicit yes.
-
-**`replace <ADDRESS>`** swaps a dead device for a new one of the same
-product, flashing it from the archive `bussard.lock` pins (or `--product`).
-It refuses when the old device still answers, when the pressed device's order
-number or mask differs from the model's device file, and with `--no-flash`
-when the pressed device runs another application than the lock pins, unless
-`--force`. A missing pinned archive refuses the run before the bus is
-touched. After one confirmation naming the gateway it runs the
-`assign`, `flash` and `apply` write paths in turn (no write of its own), then
-records `replaced: <date>` in the device file.
-
-**`flash <ADDRESS>`** downloads an application program from vendor product
-data (the archive `bussard.lock` pins for the device under `products/`,
-verified by its SHA-256, or `--product`; the ETS-free application download).
-A pinned archive that is missing or changed refuses the flash before any bus
-access, with the recovery step (see product-data.md).
-A `--product` or `--application` that contradicts the lock is refused unless
-`--force`, which also pins the archive for the device. The pre-flight prints
-the device's identity line against the lock; drift is not refused here (a
-flash is how it is fixed), the factory-freshness gate below decides. It runs a pre-flight
-plan, then writes, then verifies the application reads back as `Loaded` and
-spot-checks written segments. After the terminal restart it re-reads the
-application object's type and load state; the other objects' `Loaded` comes
-from their own `LoadCompleted` before the restart, and a segment whose MCB CRC
-check already passed before the restart is not sampled again. If the
-application is not `Loaded` after the reboot, every object's state and every
-sample is read, as before. Each load-state change (unload, open, segment
-allocation, completion) is confirmed by the state the device returns in its
-answer to the write, as ETS does; when that answer carries no state octet or
-not the expected state, `flash` reads the state back instead. A flash takes **no backup**, because a
-factory-fresh device has no prior application to save. The command states this
-plainly before it writes:
-
-```
-NOTE: a first flash assumes the device is factory-fresh; no backup is
-possible (there is no prior application to save). Recovery from a failed
-flash is re-running `bussard flash`.
+```console
+write 3/0/4 <- down (1.008) via 192.0.2.10:3671? [y/N]
 ```
 
-**The factory-freshness check.** Because there is no backup, `flash` verifies
-that assumption before it writes anything. In its read-only pre-flight it reads
-the load states that decide: on System B the `PID_LOAD_STATE_CONTROL` of the
-application objects (interface-object types 3 and 4) plus the resident
-application id in `PID_PROGRAM_VERSION`, on System 7 each load-state machine.
-The other System B objects never change the verdict, so they are read only when
-no application object reports a load state; the verdict is then the one a read
-of every object gives. Then:
+Read it before you type `y`. If the address is not the one you expect, abort.
 
-| What the device reports | What `flash` does |
-| --- | --- |
-| No application loaded | Proceeds (the device is factory-fresh). |
-| An object left `Loading` or in `Error` by an interrupted flash | Proceeds; re-flashing is the recovery path. |
-| The **same** application already loaded | Proceeds without `--force`, with a notice. |
-| A **different** application loaded | **Refuses**; `--force` overrides. |
-| An application loaded that it cannot identify | **Refuses**; `--force` overrides. |
-| A load state it cannot read at all | **Refuses** as unknown; `--force` overrides. |
+**Real gateways are refused by default.** A write whose gateway is not
+loopback (not `127.0.0.0/8`, not `::1`) refuses to run. A write command checks
+on every invocation; a write-enabled server checks at startup and refuses to
+start:
 
-A refusal names the device, the resident application and the two ways forward:
-capture what is on the device first (`reconstruct` reads its links into the
-model, and `apply` backs the tables up to `captures/backups/` before writing),
-or re-run with `--force` to overwrite it anyway. `--force` prints a single loud
-line naming the device, the gateway and what is being destroyed, and the
-confirmation prompt repeats it, so a `y` is typed against the real consequence.
-
-Two details worth knowing. **Unreadable is not fresh**: if the device refuses
-the state reads, `flash` refuses too, and says the state was unreadable rather
-than `Loaded`, because a write with no backup must not be what finds out. And
-**re-flashing the same application is deliberately allowed**, because the
-failure messages tell you to re-run `flash` after an interrupted one. It is
-still a full rewrite: the parameters are reset to the vendor defaults plus the
-device file's parameter values, and the address, association and
-group-object tables are rewritten from the model's links. On System 7 there is
-no application-id property, so a loaded device can never be recognised as "the
-same application": any loaded System 7 device needs `--force`.
-
-**The factory reset before the download (System B).** Many System B
-applications allocate their segment with a fill byte and bussard, like ETS,
-then writes only the octets that differ from it. The device's fill is
-bookkeeping, not an erase: on a re-flash, every octet the new image leaves out
-keeps whatever the previous image put there. On the test campaign a Jung F50
-re-flashed this way kept a blinking status LED until ETS ran "reset device" and
-a full download. So `flash` opens such a download the way ETS opens an initial
-one: a confirmed master reset with erase code 7 ("factory reset without
-individual address"). The device erases its application program, its
-parameters and its group addresses and links, keeps its individual address,
-answers with the time it needs to reboot, and reboots. `flash` waits that long
-(at most a minute), reconnects and runs the download on the blank device. The
-same reset is added when `--force` replaces an application `flash` did not
-recognise or could not read. A device that refuses the reset, or does not
-answer it, fails the flash before anything is written.
-
-The reset erases everything the download rewrites, so the plan shows it as its
-first step and the differential download (skipping objects whose resident image
-already matches) does not apply: every object is streamed in full. Pass
-`--no-factory-reset` to leave it out, but only when you know the device holds no
-stale image, for example a device fresh from the box. System 7 downloads write
-every region in full and never reset.
-
-**Data Secure devices: the security object is part of the download.** A
-security-activated device keeps its group keys and the per-group-object
-security flags in its security interface object, not in the link tables. With
-`--keyring` (or `--tool-key`), `flash` programs that object the way the ETS
-secured download does: it unloads it right after the other
-objects, and after the tables and parameters it reloads it with the security
-individual address table (cleared, then one `[IA][sequence]` entry per device
-that sends on a secured group address this device listens to, with the
-sender's keyring `SequenceNumber` when the model marks the sender `activated`,
-else 0), the group key table (one
-entry per keyed group address the device links, from the keyring) and the
-group-object security flags, then completes it. `apply --keyring` (and
-`restore`, and `apply --line` with a keyring) rewrites the security object next
-to the tables, because the key table indexes the address table. The dry run lists each of
-these steps; key bytes are never printed. Use the project's current keyring: a
-group address the model marks `secure` without a key in the keyring refuses
-the plan before anything is written. `--tool-key` carries no group keys, so it
-only suits a device without secured group addresses.
-
-The factory reset stays in secured downloads. ETS does not send one in its
-secured download, but it does send one (erase code 7) while activating Data
-Secure, and the decrypted capture shows the device keeps its tool key across
-it: every frame before and after verifies under the same key. The reset clears
-what the download rewrites anyway, the security object included, and the
-download then programs the object again. Nothing in the capture or the
-specification shows harm, so the rule above applies unchanged: the reset runs
-when the device carries an image `flash` did not recognise or when the
-download is sparse. `--no-factory-reset` still leaves it out.
-
-After any restart `flash` itself triggers on a Data Secure device (the
-factory reset, a load procedure's master reset, the terminal restart before the
-post-restart check), the device can answer at the transport layer before its
-security layer is ready, and then drops the first S-A_Sync_Req without an
-answer (seen on 1.1.12). `flash` waits like ETS instead: it probes
-the rebooted device with a plain `A_DeviceDescriptor_Read` every 500 ms for up
-to 30 s (ETS's capture shows the device back about 14 s after the reset; a
-probe that answers earlier ends the wait), keeps that connection and sends the
-Sync_Req on it. A Sync_Req the device
-acknowledges but does not answer is repeated on the same connection, up to
-five attempts with a 1, 2, 4, 8 s backoff after a restart and three attempts
-(1, 2 s) on any other secured connection, before the flash stops with "did not
-answer the Data Secure sync request". Plain devices keep the shorter reboot
-poll and see no extra frames.
-
-How long `flash` waits after a restart: after a restart the
-device confirmed (the factory reset, the terminal confirmed restart) it waits
-the process time the device reported, never less, and probes from 0.5 s after
-that; after a bare `A_Restart` it stays quiet for 1.5 s first. A probe waits
-500 ms for the device's acknowledgement and then up to 2 s for its answer,
-because 1.1.5 answered 1.3 to 1.9 s late while it sent its power-up
-telegrams. A probe the interface confirms negatively (`L_Data.con` with the
-error bit) counts as "not up yet", never as absent: the same device answered
-such a probe 1.3 s later. After the factory reset `flash` also probes from
-+3 s, only to measure when the device answers; `flash -v` prints that
-readiness per restart on its timing line. If the flash still stops right after the factory
-reset, the device is left unloaded: re-run the same `flash`.
-
-Activation itself (turning Data Secure on, writing the tool key and the
-sending sequence number) is ETS's job: bussard operates devices ETS has
-activated and never activates or deactivates one.
-
-**Resume on connection loss.** A flash survives two kinds of connection loss
-without starting over:
-
-- *Device connection death.* The device drops its Layer-4 connection (an idle
-  timeout, a per-connection exchange budget, a reboot). The flash reconnects,
-  re-authorizes (including the Data Secure sync, and after a restart bussard
-  triggered, the readiness probe), and resumes the current step. A chunked
-  memory write continues from the last confirmed chunk; a chunk is never split
-  across the reconnect.
-- *Gateway tunnel loss, up to 60 s.* The KNXnet/IP link to the IP interface
-  drops (a pulled LAN cable, a switch or Wi-Fi outage). When a frame stays
-  unacknowledged after its retransmit, or the heartbeat fails, bussard logs
-  `gateway connection lost`, sends a best-effort DISCONNECT for the old tunnel,
-  and opens a new one, retrying after 1, 2, 4, 8, 8 ... s. Once the tunnel is
-  back it logs `gateway connection re-established`, re-sends the pending frame,
-  and the flash resumes as after a device connection death. The read-only
-  pre-flight simply runs again. `BUSSARD_TUNNEL_RECONNECT_SECS` changes the
-  60 s budget (`0` turns the re-establish off).
-
-A KNXnet/IP Secure tunnel over TCP has no ACK to time out: a pulled
-cable used to go unnoticed until the kernel gave up on the connection, about
-37 s later. The tunnel now probes the link with a CONNECTIONSTATE_REQUEST once
-it has received nothing for 5 s and treats an answer missing for 2 more seconds
-as a lost link, so a loss is noticed after about 7 s.
-`BUSSARD_TCP_READ_DEADLINE_MS` changes the 5 s (`0` turns the probe off). A
-secure session over UDP keeps its TUNNELING_ACKs, so its ACK timeout detects a
-loss as on a plain tunnel.
-
-Both kinds of loss are also covered while bussard waits for a device it
-restarted: the factory reset that opens a System B download, an
-`LdCtrlMasterReset`, the final restart and its verify, and the System 7
-pre-download and final restarts. The reconnect after the restart (readiness
-probe, Data Secure sync, authorize) starts again once the tunnel is back, and
-the flash continues with the same step. The restart itself is not sent again
-unless the link dropped before the device could have received it. An
-authorize that went unanswered because the link was down is not taken to mean
-"this device has no authorize", so later connections still present the key.
-The retries stop 90 s after the first failure (the 60 s tunnel budget plus the
-30 s readiness poll); the error then is the same as without the retry.
-
-What is not covered: a gateway that stays unreachable longer than the budget.
-If that happens during the wait after the factory reset, the device is left
-reset and unloaded; a plain re-run of the same `flash` recovers it.
-The flash then stops with the original error plus a hint naming the gateway
-(`timed out waiting for TUNNELING_ACK; the tunnel to gateway … could not be
-re-established within 60 s`), leaving the device partially written. The same
-re-establish protects every other command (`apply`, `describe`, `reconstruct`,
-`plan`, `write`), but only `flash` resumes its own steps: another command whose
-device connection dropped during the outage fails with a connection error and
-can simply be run again. A group write that was pending when the link dropped
-is sent once the tunnel is back, up to a minute late.
-
-**Recovery from a failed or interrupted flash.** The download is idempotent: it
-re-unloads and rewrites the whole application, so the fix for a partial flash is
-to re-run `bussard flash <ADDRESS>`. If re-flashing does not recover the device,
-fall back to downloading it with ETS. Do not assume a device is functional until
-a flash reports the application `Loaded` and verified.
-
-**`flash --parameters-only <ADDRESS>`** rewrites only the parameter memory of
-a device that already runs the application; `apply` runs the same
-download for the parameters that differ, after the tables. Unlike a full flash
-it has something to lose, the parameters the device holds, so it works like
-`apply`: it reads the parameter memory first, shows the parameters that change,
-confirms (or needs `--yes`), backs the memory up to
-`<dir>/captures/backups/parameters/<ia>-<unix time>.json`, writes only the
-octets that differ, completes the load, restarts the device and verifies by
-reading the memory back. It never unloads, never allocates a segment, never
-factory-resets and never touches the link tables.
-
-**What a partial write touches (ETS parity).** Only the octets a
-parameter is placed in under the current configuration: a parameter the
-Dynamic section reaches, a hidden parameter the application downloads at its
-default, and the device-managed octets alongside another write. An octet the
-configuration places no parameter in keeps the device's value, because ETS's
-download does not write it either: the 1.1.18 capture shows ETS skipping
-offsets 165, 168 and 171 (the extension-module selectors `_AppInstanz 51/52`,
-gated by `P-388`). When such an octet differs from the model's image, the plan
-lists it as not written with the sentence "ETS does not write this octet in a
-download" and does not count it. A full `flash` still allocates the segment
-with its fill and writes every octet, as an ETS full download does, so a
-device that needs those octets cleared gets a full flash. This holds for
-`apply`, `flash --parameters-only`, `knx_apply_device` and `restore
---parameters` alike.
-
-It refuses before any write when:
-
-| What the device reports | What `--parameters-only` does |
-|---|---|
-| Another application (System B `PID_PROGRAM_VERSION` differs or cannot be read; System 7 code that does not match the product) | Refuses: its memory has another layout. Use a full `flash`. |
-| No loaded application, or an object/LSM not `Loaded` | Refuses: there is nothing to patch. Use a full `flash`. |
-| An unreadable load state or parameter segment | Refuses: the base address or the current content is unknown. |
-| New values that show or hide a com-object | Refuses: the group-object table would change, and only a full `flash` rewrites it. The message names the objects. |
-| System 7 links that differ from the device's tables | Refuses: the table load-state machines are not reloaded. Run `apply` first. |
-| Values that already match | Prints `nothing to do`, exits 0, touches no load state. |
-
-System 7 exposes no application id, so there the identity check is every
-load-state machine `Loaded` plus the first octets of each code segment matching
-the product. A code segment is one streamed verbatim from the product: never a
-link table, the group-object descriptor table, RAM or parameter memory, whose
-octets change with the configuration. A product with no code
-segment (the Theben Meteodata 140 S) is judged by its load-state machines
-alone, and the pre-flight says so. On System 7 the download opens LSM 3 and writes the parameter octets in
-place, with no allocation record, and the executor re-reads LSM 3 right before
-and writes nothing unless it is `Loaded`. If a parameter download
-fails midway and the application still reads `Loaded`, re-run it (it writes
-only the octets that still differ); if it does not, recover with a full
-`flash --force`. The backup file holds the memory as it was.
-
-**`assign`** sets a device's individual address; **`adopt`** is the guided
-wizard that assigns a new device and writes its device file (it prints the
-`flash` command, it does not flash). Both follow the confirmation rules above:
-they confirm on a terminal, and without one they need `--yes`. The target
-address is the optional `ADDRESS` argument of either; without it they take the
-next free address on the line.
-
-**Changing the address of a Data Secure device.** After the address write,
-`assign` verifies by reading the device at its new address. A Data
-Secure-activated device answers a plain descriptor read with mask `FFFF`, so
-`assign` verifies it over `A_SecureData` with its tool key. The
-keyring lists tool keys by individual address, so it finds the key under the
-new address only after ETS re-exports it. Until then `assign` takes the key
-from the old address's entry and prints a note to re-export the keyring;
-`--tool-key` overrides the keyring for this one verification. Re-export the
-keyring from ETS after every address change of a Secure device: every later
-command (`describe`, `flash`, `apply`, `scan`, `audit --live`) looks the key up
-under the new address and treats the device as having none until the keyring
-lists it there. Without any key, `assign` still verifies that the device
-answers at the new address, reports "Data Secure activated (mask hidden), no
-tool key in the keyring", and records no mask in the stub device file.
-
-**Adopting a Data Secure device reads only.** When the keyring
-(`--keyring`, `BUSSARD_KEYRING` or `connection.keyring`) lists the device in programming mode, `adopt` treats it
-as a device ETS has commissioned. It refuses a target address other than the
-device's own before anything is sent (the keyring's tool key is keyed by that
-address), sends no address write, no `PID_PROGMODE` write and nothing to the
-security object, and reads the device over `A_SecureData`: the descriptor and
-identity, the link tables, the parameter memory, and the security object's
-group-object security flags (PID 61) and security individual address table
-(PID 54). The key tables (PID 53, PID 56) are write-only and never read. The
-only bus traffic is the programming-mode broadcast, the free-access
-`A_Authorize_Request` every read-only session sends, and these reads; the
-device stays in programming mode until its button is pressed. An activated device
-the keyring does not list (mask `FFFF` in the clear) fails before any device
-file is written, with a hint to re-export the keyring. Activating a Secure
-device, re-keying it or turning Data Secure off stays with ETS; tier 2 of
-Activation from the FDSK certificate is not implemented.
-
-The PID 54 table read back is kept in the lock (`secure_senders`). A later
-secured `flash` or `apply` of that device writes those senders back next to
-the ones the links imply, so the download does not silently drop a sender the
-model does not describe (a device outside the model, for example). Without
-that record, a download from a model that lacks the device's peers would clear
-them from PID 54 and the device would drop their secured telegrams.
-
-**Whole-line runs** (`apply --line`, `commission --line`) ask one confirmation
-for the run instead of one per device. The prompt names the resolved gateway
-and the number of devices it will touch, and the same `--yes` and non-loopback
-gates apply. Each device still gets the full single-device rails: `apply
---line` backs up and verifies every device, and `commission` refuses to address
-a device whose order number does not match the model. A device that fails is
-reported and the run moves on. `apply --line` records every outcome in
-`<dir>/captures/apply-line-<line>.json` as it goes, so after an interruption
-`--resume` continues without rewriting finished devices; a clean run deletes
-the file.
-
-### Secured group writes from bussard
-
-A secured group write from bussard reaches a receiver only if the receiver
-admits bussard's tunnel address as a sender: its security individual address
-table (PID 54) must list that address. ETS lists the devices that send on a
-secured GA the receiver listens to, and a tunnelling address only when group
-addresses are assigned to that tunnelling address in ETS (the keyring then
-carries the assignment as the interface's `<Group Address=… Senders=…>`). The
-reference installation assigns none, so its S3 captures show no
-tunnel address in any PID 54. A receiver that does not admit the sender drops
-the telegram without a word.
-
-**What bussard checks before sending.** `write`, `read`,
-`knx_write_group` and `knx_read_group` on a secured GA look up the tunnel
-address the gateway assigned and the devices the model links to the GA, then
-weigh the evidence:
-
-- a device's recorded table (`secure_senders` in `bussard.lock`, read back by
-  `bussard adopt` or written by a verified secured `apply`, `apply --line` or
-  `flash`) admits exactly the addresses it lists;
-- without one, an ETS assignment of the GA to that tunnelling address in the
-  keyring or key store admits it;
-- otherwise bussard cannot tell.
-
-If every linked device has a recorded table and none lists the tunnel
-address, the write or read is refused before anything is sent:
-
-```
-1.1.5 does not list the tunnel address 1.1.25 as a secure sender of 1/0/4; the actuator would discard the telegram. Admit the tunnel addresses (see below) or send plain only if the GA is not secured on the device.
+```console
+refusing to write to non-loopback gateway 192.0.2.10:3671: this looks
+like a real KNX bus. If you really mean to write to it, re-run with
+--allow-remote-gateway or set BUSSARD_ALLOW_REAL_GATEWAY=1.
 ```
 
-If the evidence is unknown (no read-back yet, no assignment), the telegram is
-sent and the result says so:
+You opt in per command with `--allow-remote-gateway`, or for a shell session
+with an exported `BUSSARD_ALLOW_REAL_GATEWAY=1`. Treat setting the variable as
+arming the tool and unset it when you are done. `BUSSARD_GATEWAY` and
+`BUSSARD_DIR` only choose which bus and model a command uses; no other
+variable can permit a write.
 
-```
-sent secured from 1.1.25; delivery to 1.1.5 is not confirmed by KNX; if nothing happens, 1.1.5 probably does not admit 1.1.25
-```
+**The simulator is the safe target.** Loopback gateways are always allowed.
+Give one explicitly, with `--gateway 127.0.0.1` on the command or
+`gateway = "127.0.0.1:3671"` under `[connection]` in `bussard.toml`. The
+`knx-sim` simulator in the repository listens on `127.0.0.1:3671`: from the
+`knx-sim/` directory run `cargo run -- examples/da_tp.yaml`, then point
+bussard at it. No opt-in flag is needed.
 
-Whatever the verdict, a write result says only what KNX confirms: "the
-interface acknowledged the telegram (L_Data.con); KNX reports no
-application-level result". A group write has no reply from the device, so
-neither bussard nor an assistant over MCP may report that the device executed
-it. A secured read that times out says that the usual cause is a responder
-that does not admit the sender.
+## Your first writes
 
-**Admitting the tunnel addresses.** In order of preference:
+Do your first real writes against the simulator or a spare device, never a
+live installation:
 
-1. **`admit_tunnel_senders`.** Set `admit_tunnel_senders = true` under
-   `[connection]` in `bussard.toml`. Then `plan`/`apply` (and
-   `knx_plan_device`/`knx_apply_device`) on a KNX Data Secure device read its
-   PID 54 and, when a tunnelling address of the key store is missing, list one
-   change (`+ the security individual address table (PID 54) admits the
-   tunnelling addresses …`); applying it rewrites the tables and the security
-   object with every tunnelling address of the key store at sequence 0 (the
-   device learns the clock-seeded sequence from the first telegram). Every
-   tunnel user is admitted, not just one, because bussard picks the
-   tunnelling user per connection and host. This is what ETS
-   does when group addresses are assigned to the interface's tunnelling
-   addresses. The verified write records the table it wrote in the lock
-   (`secure_senders`, the shape `adopt` writes), so the check above reports
-   the next secured write as admitted.
-2. **`--secure-sender <tunnel IA>`** on `flash` or `apply` adds one address
-   for one run, without the option.
-3. **Assign the group addresses to the tunnelling addresses in ETS** and
-   download the receivers from ETS; re-import the keyring afterwards so the
-   key store carries the assignment.
-4. **Send through a secured device.** Write to a plain GA that a secured
-   device (a logic module, a push button with a logic function) forwards to
-   the secured GA. The receivers keep their ETS sender list and bussard sends
-   in the clear.
+- **The simulator** accepts the same programming a real System B or System 7
+  device does, and rejects out-of-order or out-of-bounds operations, so a
+  mistake fails on the simulator instead of on your wall.
+- **A spare device on the bench**, powered and reachable but not wired into
+  anything that moves.
 
-The option widens who the device trusts, so it is off by default; off, the
-security object is written exactly as before, byte for byte. An ETS download
-of a receiver without the assignment in ETS rewrites PID 54 without the
-tunnel addresses, and the next `plan` with the option on lists the change
-again.
-
-### Switching Data Secure off for one group address
-
-`bussard groups secure <GA> off` (or `knx_set_group` with `secure: false`)
-lets a Secure device run one group address plain, for example so a
-non-Secure sender can switch it:
-
-1. The key store loses the group key, `groups.toml` and the lock lose the
-   `secure` flags of the group and of every linked com-object. One snapshot
-   covers all three, with a copy of the encrypted key store, so `bussard
-   undo` (or `knx_undo`) restores them, the very key included. It needs
-   `BUSSARD_KEYRING_PASSWORD`, and it is refused while a linked object also
-   links another secured group address.
-2. `bussard plan <ia>` on each linked Secure device reads its group-object
-   security flags (PID 61) and lists one change: `- security object: Data
-   Secure off for 1/0/4 (…): its group key leaves the group key table (PID
-   53) and object 12 loses its security flag (PID 61 0x03 to 0x00)`. The
-   apply rewrites the tables and the whole security object as a full ETS
-download does; a re-plan
-   then has nothing to do.
-3. Home Assistant, ETS and every other keyring user still hold the old key
-   and keep sending the group address secured, which the device drops once
-   it runs plain. Run `bussard keys export <file.knxkeys>` and load the new
-   export there.
-
-`on` is the reverse: it keeps the store's key or generates a random one as
-ETS does, and is refused while a linked device is not Data Secure capable.
-An ETS re-import of a project that still marks the group address secure
-brings the flags back, and re-importing an old ETS keyring brings the key
-back: change the group address in ETS too. Both now say so (W042): `bussard import`
-and `bussard keys import` print a warning that names the group address and
-the devices the next apply would secure again.
-
-### Switching KNXnet/IP Secure of an IP interface
-
-**Status: oracle verified on 2026-10-26 (offline), not run live.**
-`bussard interface secure on|off <ia>` (and `knx_interface_secure` over MCP)
-switches a KNX IP interface between plain tunnelling and KNXnet/IP Secure the
-way ETS does. The ETS captures of 1.1.200 (`26-10-ipinterface/`) are the
-oracle: `interface secure on --dry-run` against the activation is identical
-(11 of 11 writes: the security mode, the send sequence's length, the three
-secured-family commands and the tunnelling users equal, the tool key, the
-device authentication code and both password-hash writes hash-equal); `off`
-against the decoded half of the deactivation (`phase=fdsk`) is identical (3 of
-3). The other half ran inside a KNXnet/IP Secure session, which a capture
-cannot decrypt (its key comes from an ephemeral X25519 exchange); its frame
-lengths show the families, the security mode, a 16-octet write and a master
-reset under the tool key, which is what `off` sends.
-
-The rails:
-
-- Every credential comes from the key store and new ones go there; the model
-  never holds one. `on` takes the device's FDSK (required), its tool key,
-  device authentication code, management password and one tunnelling user per
-  `[knxnet] tunnels` address from the store; a missing one is generated and
-  **saved before the first write**.
-- `on` runs over a plain tunnel to a device in factory state; it is refused
-  when the interface already reports secure-only tunnelling. Through the
-  interface itself, the session after the restart is a KNXnet/IP Secure
-  session with the store's credentials.
-- `off` needs the tool key. Through a secure session with the interface
-  itself it needs `--allow-self-reconfigure`; MCP refuses it then. The store
-  drops the tool key only after the device verified on its FDSK.
-- Each switch ends with a read-back on a fresh connection under the key the
-  device should now hold (the security mode, and after `on` the tunnelling
-  users), and, through the interface itself, its description's secured
-  service families.
-
-**Recovery.** If a switch stops half way, the device holds every step before
-the one named in the error, and the key store holds the credentials it was
-given and its FDSK (the previous store is `bussard.keys.bak`). Retry the
-command. If the device is unreachable with every credential the store holds,
-factory-reset it (its reset button): it returns to its FDSK and plain
-tunnelling, and `bussard interface secure on <ia>` sets it up again from the
-store. `bussard keys import` of an ETS keyring export restores the ETS
-credentials; the ETS project remains the fallback for the interface.
-
-## The key store
-
-`knx/bussard.keys` is bussard's own copy of the KNX Secure key material: the backbone key, the KNXnet/IP Secure tunnelling users with
-their passwords and the interfaces' authentication codes, every device's tool
-key, serial number, factory key (FDSK), management password and
-authentication code, and the group keys. Anyone who can decrypt it can
-manage every secured device and read and forge every secured group telegram.
-
-- **It is encrypted and signed like an ETS `.knxkeys`**, with the password in
-  `BUSSARD_KEYRING_PASSWORD`. Its protection is exactly the keyring password's
-  strength, the same as the ETS export you already keep; choose it
-  accordingly. The signature makes a wrong password or a hand edit fail the
-  load rather than yield wrong keys.
-- **It is committed on purpose**, so `git checkout` restores the model and its
-  keys together. A repository that holds it is only as private as the
-  password. The `.knxkeys` exports are not committed: `init` lists
-  `*.knxkeys` in the model's `.gitignore`.
-- **The password is never a flag** and never written anywhere by bussard. Keep
-  it in the environment or in an untracked `.env` (see
-  [Secrets and the `.env` file](#secrets-and-the-env-file)).
-- **No key leaves in the clear.** `keys show`, `keys import` and their
-  `--json` print addresses, counts and presence flags only; the store types
-  redact themselves in logs and debug output.
-- **Every write is atomic** (temporary file, then rename) and keeps the
-  previous store as `bussard.keys.bak` until the next successful write, so a
-  bad import can be undone by copying the `.bak` back. The `.bak` is
-  encrypted with the same password.
-- **Sequence counters are not stored.** bussard seeds its Data Secure send
-  sequence from the clock, so restoring an old store never replays a
-  sequence a device has already accepted.
-
-The store is written by `bussard keys import` and by `import`/`init` (which
-merge the `.knxkeys` next to the project when the password is set). Every bus
-command reads it unless `--keyring` or `BUSSARD_KEYRING` names an explicit
-file; `connection.keyring` in `bussard.toml` is deprecated and ignored (with
-a warning) when a store exists. `bussard validate` checks the model's
-secured devices and groups against it.
-
-**Stale keyring exports (W040).** A keyring export is a copy:
-once the store changes, the consumer that loaded the export (Home Assistant,
-ETS, a visualisation) encrypts with keys the devices no longer use, or cannot
-read a newly secured address, and nothing on the bus says why. bussard
-records the time of every write that changes an existing store and of every
-`bussard keys export` in `bussard.keys.meta.toml` next to the store (paths
-and times only, no key; commit it with the store). `bussard validate` then
-warns about each recorded export that still exists and predates the last
-change, and, with `[home_assistant]` configured, when no export is newer
-than that change. Re-export and load the file again; the warning goes away
-with the new export.
-
-**The Data Secure invariants** are validation codes, so a
-broken secured link shows up before a write rather than after one: every
-device on a secured group address can run Data Secure (E035, E036), is
-activated (W037) and has its tool key in the store (W028); the address's
-key is in the store and its flag, the store and the object flags agree
-(W029, W041, both naming `bussard groups secure <ga> on|off` as the fix); a
-Secure sender has a sequence number recorded (W039). A secured group address
-only tunnel clients can write, whose devices admit no tunnelling address
-(W034), is refused at write time as E038 while `admit_tunnel_senders` is
-off: the devices would drop the telegram, and the gateway's confirmation
-would hide that.
-
-## Secrets and the `.env` file
-
-bussard reads `BUSSARD_*` variables from one `.env` file: the
-first of `<model dir>/.env`, the `.env` next to the model directory and
-`./.env`. The full rules are in
-[reference.md](../reference/cli.md#the-env-file). What matters for safety:
-
-- **The file stays out of git.** Keep `BUSSARD_KEYRING_PASSWORD`,
-  `BUSSARD_PROJECT_PASSWORD` and `BUSSARD_HA_TOKEN` there only if `.env` is in `.gitignore` (the
-  repository's own `.gitignore` lists it). `bussard export` never copies a
-  `.env` into a bundle.
-- **No value is printed.** `-vv` and `--timing` name the file that was read
-  and the keys it applied, never a value.
-- **Only `BUSSARD_*` keys enter bussard**, so a `.env` shared with other tools
-  does not leak their secrets into bussard's process.
-- **An export beats the file**, even an empty one, so a one-off
-  `BUSSARD_KEYRING_PASSWORD= bussard ...` still runs without a password.
-- **A `.env` never opens the write gate.** `BUSSARD_ALLOW_REAL_GATEWAY` in the
-  file is ignored with a warning: the gate in
-  `bussard_transport::write_gate` reads the process environment only, and the
-  loader drops the key before anything can read it. A write to a non-loopback
-  gateway still needs `--allow-remote-gateway` or an exported
-  `BUSSARD_ALLOW_REAL_GATEWAY=1` (see
-  [Arm the service laptop](#arm-the-service-laptop-not-the-project)).
-  `BUSSARD_GATEWAY` from the file does select the gateway, as an export
-  would; reads go there, and writes to it stay gated.
-- `BUSSARD_NO_DOTENV=1`, exported, skips the file for a hermetic run.
+Once a command behaves as you expect on the simulator, the only change for
+the real bus is the gateway and the `--allow-remote-gateway` opt-in. Before
+the first write to the real bus, take a `bussard backup` of the whole
+installation.
 
 ## Protected group addresses
 
-A GA marked `protected = true` in `groups.toml` (wind alarms, central functions,
-anything safety-critical) is refused by default. The three entry points do not
-treat the override the same way:
+Mark a group address `protected = true` in `groups.toml` for wind alarms,
+central functions and anything else safety-critical. A write to it is refused
+by default:
 
-| Interface | Protected-GA write |
-| --------- | ------------------ |
+| Interface | Protected write |
+|---|---|
 | CLI (`bussard write`) | refused; overridable with `--force` |
 | viz test-write widget | refused; overridable with an explicit `force` |
-| MCP (LLM over the server) | hard-refused; **no override exists** |
+| MCP (an LLM over the server) | refused; no override exists |
 
-The asymmetry is deliberate: a human at the CLI or the viz page can force a
-protected write when they mean to, but an LLM driving `bussard` over MCP can
-never write a protected GA, with or without `--allow-writes`. Keep genuinely
-dangerous GAs marked `protected = true` so the MCP path can never touch them.
+A human at the CLI or the viz page can force a protected write when they mean
+to. An LLM over MCP never can, with or without `--allow-writes`, and it cannot
+rename, retype or relink a protected address or clear the flag. Only a human
+editing `groups.toml` changes `protected`. [The assistant](assistant.md)
+explains why.
 
-The same refusal covers the MCP model-edit tools: a protected GA cannot be
-renamed or retyped, and no link to it can be added or removed, over MCP. There is
-also no tool parameter that sets or clears `protected`; only a human editing
-`groups.toml` can. Any change that touches a protected GA is rendered with the
-sentence "This group address is protected." and sorted to the top of
-`bussard status`, so it is the first thing anyone reads.
+`bussard test` needs two opt-ins for a protected address: `allow_protected =
+true` in `tests.toml` and `--force` on the command line. With either missing,
+the test is reported as refused and nothing is sent to that address.
 
-`bussard test` runs scripted writes, so it takes the same rails as `bussard
-write` (the non-loopback gateway gate and a confirmation naming the gateway),
-and a protected GA needs two opt-ins instead of one: `allow_protected = true` in
-`tests.toml` and `--force` on the command line. With either missing, the test
-is reported as refused and nothing is written to that GA. The `knx_run_tests`
-MCP tool refuses such a test whatever the file says. `bussard learn` never
-transmits at all.
+## Secrets stay out of git
 
-## MCP programming tier
+bussard reads `BUSSARD_*` variables from one `.env` file, which may hold
+`BUSSARD_KEYRING_PASSWORD`, `BUSSARD_PROJECT_PASSWORD` and `BUSSARD_HA_TOKEN`.
+Keep those there only while `.env` is in `.gitignore`. bussard never prints a
+value and never copies a `.env` into a bundle.
 
-`bussard mcp` runs at one of four tiers; each adds to the one before:
-
-| Tier | Flag | What the assistant can do |
-|---|---|---|
-| Passive | `--passive` | Read and edit the model files, watch the bus. Nothing is transmitted. |
-| Read | none | Also read group values and introspect devices (rate-limited). |
-| Write | `--allow-writes` | Also send group values (`knx_write_group`, `knx_run_tests`). Protected GAs are refused. |
-| Programming | `--allow-programming` | Also write one device's link tables and parameter values (`knx_plan_device`, `knx_apply_device`, with `knx_apply_status` and `knx_last_apply` for the apply job) after the human approved the plan, and replay a parameter backup (`knx_restore_parameters`). Not with `--passive`. |
-
-Model edits (`--no-model-edits` withholds them) touch files only, at every
-tier. Parameter values are edited with `knx_set_parameter` and reach a device
-through the same plan and apply as links: `knx_plan_device` and
-`knx_apply_device` at the programming tier, `bussard plan` and `bussard apply`
-at the CLI. The server's instructions, each
-edit's `next_step` and `knx_project_summary` state the active tier, so the
-assistant tells the human the push that actually applies.
-
-`bussard mcp --allow-programming` exposes the single-device write of `bussard
-apply` to an assistant: the link tables and the parameter octets that differ
-from the model, written by the same code the CLI runs. It is off by default and never available with
-`--passive`. Every gate the CLI has applies, plus one the CLI does not need:
-
-1. **Write gate.** A non-loopback gateway needs `BUSSARD_ALLOW_REAL_GATEWAY=1`
-   or `--allow-remote-gateway`. The server refuses to start without it, and
-   both tools check it again on every call. The policy is the same code the CLI
-   runs.
-2. **Source-address check.** Both tools run the probe described in
-   [Source address check](#source-address-check) before they open a connection.
-3. **Plan digest.** `knx_plan_device` reads the device and returns the plan the
-   CLI prints plus a `plan_digest`: a SHA-256 over the device address, the
-   model's links and parameter values for it, the desired tables, the
-   parameter image the write would stream, and the live tables and parameter
-   memory it read.
-   `knx_apply_device` writes only when that digest was produced by the same
-   server session within `--plan-ttl-minutes` (default 10), and a fresh read of
-   the device, with the current model, reproduces it. If the device was changed
-   by ETS or another tool, or the model was edited, the apply is refused and the
-   digest is retired. A digest is single use. The plan also carries a
-   `state_hash` of the device state read (the same fingerprint `bussard plan
-   --json` prints); `knx_apply_device` with `plan_hash` refuses when a fresh
-   read no longer produces it. The digest stays required either way.
-4. **Human approval.** Both tool descriptions tell the assistant to show the
-   plan to the human and to call `knx_apply_device` only after an explicit yes
-   in the conversation. The digest makes this checkable: an apply can only
-   write what a plan showed.
-5. **Protected GAs.** A plan whose additions or removals touch a
-   `protected = true` GA is refused. There is no override over MCP.
-6. **Identity.** The device's application and mask are compared with what
-   `bussard.lock` pins, as `bussard apply` does. A device that drifted is
-   refused with the `bussard flash` it needs.
-7. **A parameter that shows or hides a com-object** changes the
-   group-object table, which a parameter download does not rewrite. A
-   parameter that shows or hides com-objects is pushed by the same
-   knx_plan_device / knx_apply_device pair; the plan says `method: flash`,
-   the device restarts and is offline for the stated time (30 to 50 s). The
-   plan lists the com-objects that appear or disappear, the table sizes, the
-   parameter backup and the pinned archive (`product_sha256`), and its
-   question asks to flash the device, so the human's yes is a yes to the
-   flash. The flash is the one `bussard flash <ia> --yes` writes, built by the
-   same code from the same inputs, so the offline oracle covers it. It is
-   refused without an archive pinned in `bussard.lock`, for a device that
-   carries another application or whose load state cannot be read, and on
-   every gate above. The parameter memory is backed up to
-   `captures/backups/parameters/` before the download, where
-   `knx_restore_parameters` reads it.
-
-An apply then runs exactly the CLI rails: the pre-apply backups to
-`captures/backups/` (the tables, and the parameter memory when parameters
-change; no backup, no write), a history snapshot
-`mcp knx_apply_device <address> <digest>` that names the gateway (the audit
-line in `bussard history`), the table write when a link changes, then the
-parameter-only download of the differing octets, each verified by reading
-back. The result carries the verify outcome, what was written and the backup
-paths. One device per call; `apply --line`, and a `flash` that loads a new
-application, stay CLI-only.
-
-**The apply job.** A client bridge may cut a tool call at 60 s,
-which a secured apply with a restart and a read-back exceeds; the write then
-completed on the bus while the reply was lost. `knx_apply_device` now runs
-every gate above, the snapshot and both backups inside the call, and the
-write as a job in the server:
-
-- A refusal in the pre-flight is the call's reply; nothing was written and no
-  job remains.
-- After the pre-flight the call waits up to 20 s (from its start) for the
-  write. If it ends, the reply is the full result (`started: false`,
-  `done: true`); if not, the reply is `started: true` with the job id, and
-  `knx_apply_status {job}` reports the step, the download progress and the
-  final result.
-- One apply per server at a time. A second `knx_apply_device`, and a
-  `knx_plan_device`, while a job runs are refused with the running job's id;
-  the job holds the bus lock and the management slot until it ends, so the
-  sequential rule for management calls holds.
-- The job's record is written to `apply-result.json` in its history
-  snapshot's directory under `.bussard/history/`, at the start of the write
-  and at its end. `knx_last_apply {address}` returns the latest job for a
-  device, from the session or from that record, so a lost reply is
-  recoverable after a server restart. A record left running by a stopped
-  server reads as `interrupted`: plan again before trusting the device.
-- The status tools never touch the bus.
-
-**Device-managed parameters.** An `Access="None"` parameter the
-configuration reaches is owned by the application at runtime, for example a
-Download-Flag the application sets after every download. Its octets always
-differ from the model's image, so they are left out of the decision whether
-there is anything to write: a plan whose only difference is such octets is
-`noop` ("nothing to write"), and `apply` and `knx_apply_device` do not write
-them on their own. They are still written, at the model's value, alongside a
-table or parameter write, as ETS does at a download, and the plan still lists
-them in `octet_ranges` with the role `device_managed`. The CLI `plan` and
-`apply` follow the same rule through the shared engine.
-
-### Parameters over MCP
-
-The plan reads the parameter memory on the same connection as the tables,
-with the product data `bussard.lock` pins for the device, and lists every
-parameter that differs by key, vendor text, device value and model value,
-one plan sentence each, so the human approves them by name. The write streams
-only the octets that differ, after the tables, and verifies them by reading
-the memory back. On System B the parameter-only download is refused unless
-the device runs the application the product data describes; on System 7
-every load-state machine must be Loaded and the application's code must read
-back as the product's.
-
-When the product data is missing (the lock pins an archive that is not in
-`products/`, or one whose SHA-256 changed), the parameters are left out of
-the plan with the recovery line (`bussard import-product ...`), and the plan
-says it writes the links only. A links-only plan the human approved applies
-as approved; the parameters follow once the archive is back and a new plan is
-approved.
-
-### Secured devices over MCP
-
-A device the server's keyring lists (`bussard mcp --keyring`,
-`BUSSARD_KEYRING` or `connection.keyring`) is planned and written over KNX
-Data Secure, the way `bussard apply --keyring` does it. Every
-APDU rides `A_SecureData` with the device's tool key, and on System B the
-write also reprograms the security object in the ETS order: unload, the
-security individual address table (PID 54), the group key table (PID 53), the
-group-object security flags (PID 61), load completed. The gates above apply
-unchanged, and three more rules cover the security object:
-
-- The plan shows what the security object receives (`security_object`: the
-  secured senders, the keyed group addresses, the secured objects) as the
-  same line the CLI prints, so the human approves it with the tables. It
-  names addresses and object numbers, never a key.
-- A group the model marks `secure = true` without a group key in the keyring
-  refuses the plan: a download without that key would leave the group
-  unusable.
-- The plan digest covers the security inputs too. A keyring or `secure` flag
-  that changes between plan and apply retires the plan.
-
-A device the model records as `security.activated` but the keyring does not
-list is refused, as on the CLI; plain management cannot reach it. System 7
-devices get their tables written secured and their security object left as
-it is, as with `bussard apply --keyring`.
-
-## MCP Home Assistant tier
-
-`bussard mcp --allow-home-assistant` lets the assistant read
-Home Assistant and rewrite the KNX YAML it reads. It needs the
-`[home_assistant]` table in `bussard.toml` as well as the flag; with only one
-of the two the tools are not registered. The tier never touches the KNX bus.
-
-- **The owner's rule: every Home Assistant change needs an explicit yes.**
-  Reads are free (`knx_ha_status`, `knx_ha_plan`). A write goes through the
-  plan, the sentences shown to the human, and a yes in the conversation, with
-  the same single-use, time-limited digest as `knx_plan_device` and
-  `knx_apply_device`. A digest the session did not produce, an expired one,
-  or one a new plan no longer reproduces (the model, `ha.toml` or the file
-  changed) is refused.
-- **The token** comes only from the variable `home_assistant.token_env` names
-  (default `BUSSARD_HA_TOKEN`), exported or from the `.env`. It is sent as a
-  bearer header, which the HTTP client redacts from its own logs, and appears
-  in no result, error or log line (a test greps stdout and stderr at `-vv`).
-  Keep it in an untracked `.env`. A long-lived token is an admin credential
-  for Home Assistant: revoke it on the profile page when the laptop leaves.
-- **One file.** The only file written is `config_path`, and only when it is
-  YAML-managed (a `knx:` package file, or the inside of a
-  `knx: !include`). Its previous bytes are kept under
-  `captures/backups/ha/` first, and the replacement is atomic (temporary file
-  and rename). KNX entities created in Home Assistant's UI are reported as
-  not visible and never touched.
-- **Reload only after a successful write.** The apply checks that Home
-  Assistant answers with the token before writing, calls the `knx.reload`
-  service only after the write succeeded, and reads the status again. A
-  failed reload is reported with the backup path; restoring is copying the
-  backup over the file and reloading.
-- **Automations are Home Assistant state, and bussard owns only its own.**
-  `knx_ha_automation_plan`, `knx_ha_automation_apply` and
-  `knx_ha_automation_remove` write through Home Assistant's config API, with
-  the same plan, digest and explicit yes. bussard writes only ids starting
-  with `bussard_`, adds the line `managed by bussard (model <dir>)` to each
-  description, and updates or removes only automations that carry both; a
-  hand-made automation is refused, whatever its id. `knx_ha_plan` lists the
-  bussard-managed ones and flags addresses the model no longer has. Before an
-  update or removal the previous automation's JSON is kept under
-  `captures/backups/ha/automation-<id>-<unix seconds>.json`; restoring is
-  posting it back (or re-planning the old rule). Every address must be in
-  `groups.toml` with a matching DPT, and an automation may not send to a
-  `protected` address.
-- **No other Home Assistant change.** The tier calls `knx.reload` and
-  `automation.reload` and no other service, and writes no other
-  configuration.
-
-## History and undo
-
-bussard keeps a full copy of the model files under `<dir>/.bussard/history`
-before every command that writes the model or the bus, and before every model
-edit made over MCP. `bussard status` says what has changed since the last one,
-`bussard history` lists them, and `bussard undo` puts the files back.
-
-`undo` touches **files only**. It sends nothing on the bus and changes no
-device: after an undo the installation behaves exactly as it did a second
-before. The restored model reaches a device only when a human runs
-`bussard plan <ia>` and then `bussard apply <ia>`, behind the usual
-confirmation. An undo is itself snapshotted first, so it can be undone.
-
-Snapshots carry the model files (`bussard.toml`, `groups.toml`, `bussard.lock`,
-`devices/*.toml`, and `tests.toml` and `ha.toml` when present) and nothing else. Product data, captures,
-keyrings and project files are never copied into them, so a snapshot cannot
-leak a key, a password or vendor data.
-
-A `.bussard` bundle from `bussard export` (or `knx_export_bundle`) holds those
-same model files, the history snapshots and a manifest, and nothing else. It
-never contains `products/`, `.bussard/models/`, `captures/`, keyrings, `.knxproj` or
-`.knxprod` files, or `.env`, because the export copies an allow-list rather
-than skipping a deny-list. The manifest names these exclusions. `bussard.toml`
-does travel with it, so the recipient sees your gateway address; an import into
-an existing model keeps the recipient's own `bussard.toml`. Importing a bundle
-writes files only and snapshots first; nothing reaches a device until someone
-runs `plan` and `apply`.
-
-## Source address check
-
-Every command that opens a connection to a device (`scan`, `assign`, `adopt`,
-`describe`, `plan`, `apply`, `flash`, `reconstruct`, `backup`, `restore`,
-`replace`, `commission`, `audit --live`, `plan --line` / `apply --line`, and the
-MCP tools `knx_plan_device` / `knx_apply_device`)
-first checks that no device on the bus answers at the individual address
-bussard itself will use as its source: the address the gateway assigned to the
-tunnel, or `0.0.255` on routing. If a device answers, the command refuses before
-touching anything:
-
-```
-refusing to continue: a device on the bus (mask 07B0) already answers at
-1.1.255, the individual address this connection would use as its source.
-```
-
-This matters because a KNX device tells its management clients apart by source
-individual address and nothing else. If a real device sits at our address, both
-parties' numbered telegrams land inside one layer-4 session at the target: a
-memory write can be applied on behalf of the wrong session while both sides
-still see an acknowledgement. That is silent configuration corruption rather
-than a loud failure. ETS runs the same check before it uses an interface.
-
-The check runs once per tunnel. `flash`, `apply` and `restore` hold one tunnel
-for their read-only pre-flight and their write phase, so they check once. Under
-`--yes`, `flash` also keeps the pre-flight's device connection for the write
-phase; every check the write phase makes (the plan, the
-freshness verdict, the MCB checks, the post-restart verification) is the same
-on that connection. A
-command that opens several tunnels in turn (`commission`, `replace`) checks on
-each. Group-only commands (`read`, `write`, `monitor`, `capture`, `learn`,
-`test`) never open a device connection and skip it.
-
-The check costs one telegram and about 0.6 seconds on a free address. The fix is
-almost always on the gateway: give the tunnel an individual address no device
-owns (many gateways ship with a default that collides on a busy line).
-
-`--skip-address-check` turns it off, for a gateway that misbehaves on the probe
-itself. Nothing else disables it.
-
-**What it does not catch.** The check proves that no *device* answers at our
-address. It cannot see a second passive tool that shares the address without
-answering, for example another bussard in routing mode also sourcing from
-`0.0.255`, or an ETS session on a second tunnel. It also reports free when a
-device replies with something other than a device descriptor, since only a real
-`A_DeviceDescriptor_Response` is treated as proof.
-
-## Supported device masks
-
-Write commands refuse an unsupported device mask during the pre-flight, before
-any write. Support differs by command. This table is generated from the same
-capability table the refusals and `bussard audit` use.
-
-<!-- mask-table:start -->
-| Mask | Family | Medium | `plan` / `apply` | `flash` | `reconstruct` | `describe` | Notes |
-|---|---|---|---|---|---|---|---|
-| `0010` | System 1 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
-| `0011` | System 1 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
-| `0012` | System 1 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
-| `0013` | System 1 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
-| `0020` | System 2 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
-| `0021` | System 2 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
-| `0025` | System 2 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
-| `0300` | System 2 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
-| `0310` | System 2 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
-| `0311` | System 2 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
-| `0700` | System 7 | TP1 | yes | yes | yes | yes | memory-mapped tables (default 0x4000 / 0x4201), A_Authorize required; line-mode `reconstruct --line` records a stub instead of tables |
-| `0701` | System 7 | TP1 | yes | yes | yes | yes | memory-mapped tables (default 0x4000 / 0x4201), A_Authorize required; line-mode `reconstruct --line` records a stub instead of tables |
-| `0705` | System 7 | TP1 | yes | yes | yes | yes | memory-mapped tables (default 0x4000 / 0x4201), A_Authorize required; line-mode `reconstruct --line` records a stub instead of tables |
-| `07B0` | System B | TP1 | yes | yes | yes | yes | tables live in device-allocated segments found via PID_TABLE_REFERENCE; full read and write support |
-| `27B0` | System B | RF | yes | yes | yes | yes | tables live in device-allocated segments found via PID_TABLE_REFERENCE; full read and write support |
-| `57B0` | System B | KNX-IP | yes | yes | yes | yes | tables live in device-allocated segments found via PID_TABLE_REFERENCE; full read and write support |
-<!-- mask-table:end -->
-
-One exception to the `flash` column: on mask `0021` (the Jung IPS 300 SREG KNX
-IP interface) `flash` runs an application whose load procedure holds nothing but
-property compares and writes. Such a download loads no object and
-never factory-resets the interface; it ends with a read-back of every property
-it wrote.
-
-The details per command:
-
-- **`flash`** supports **System B** (`07B0`, and the `57B0` / `27B0` KNX-IP and
-  RF variants) and **System 7** (`0705` / `0701` / `0700`). A mask outside
-  those families, a mask mismatch between the application and the device, or a
-  load procedure containing an operation `bussard` cannot execute all refuse the
-  procedure rather than leaving a device half-flashed.
-- **`apply`, `plan`, and single-device `reconstruct`** support **System B**
-  (`x7B0`) and **System 7** (`0705` / `0701`). On System B each table lives in a
-  segment the device allocates for it: `apply` opens the table object, asks for a
-  segment with `LdCtrlRelSegment`, reads the placement from
-  `PID_TABLE_REFERENCE`, and writes the image there. It never writes the
-  `PID_TABLE` property array, which real devices refuse (a Jung F50 rejected it
-  outright). On System 7 the tables are the absolute memory
-  regions at `0x4000` (address table + group-object descriptors) and `0x4201`
-  (association table), and `apply` rewrites only those two table load-state
-  machines; the parameter LSM and the application image are never touched, and
-  the device is not restarted. Another mask is refused (in line-mode
-  `reconstruct` it is recorded as a stub instead). The refusal names the mask,
-  for example:
-
-  ```
-  1.1.5 reports mask 0012 (System 1) — `bussard apply` supports the
-  System B (x7B0) and System 7 (0705 / 0701) families
-  ```
-
-  Every System 7 table read is bounded by its memory region: a count octet
-  claiming more entries than the region holds (virgin EEPROM reads `0xFF`) is
-  refused rather than followed into neighbouring memory, and an image that would
-  not fit its region is refused before anything is written.
-
-  These three commands run without a `.knxprod`, so the System 7 table bases are
-  the corpus-wide defaults `0x4000` / `0x4201` rather than product-resolved
-  addresses. A device that keeps its tables elsewhere reads back as an empty
-  table set (never as mis-decoded links) and must be programmed with
-  `bussard flash`, which does resolve the addresses from product data.
-
-Everything not on these lists is refused before a write, not attempted and
-rolled back.
-
-## The tunnel budget
-
-A KNXnet/IP tunnelling interface has a fixed number of connection slots, often
-one to five, set by the hardware. Each client holds one slot for as long as it is
-connected: Home Assistant's KNX integration holds one permanently, ETS holds one
-while a project is online, and so does every running `bussard` command, including
-a long-running `bussard viz` or `bussard mcp`. A second bussard command started
-while the first is running needs a second slot.
-
-When every slot is taken, the interface refuses a new connection with
-`E_NO_MORE_CONNECTIONS`. bussard reports that as its own condition, not a
-timeout, and exits with code `4`:
-
-```
-error: 192.0.2.10:3671 has no free tunnelling connection (E_NO_MORE_CONNECTIONS).
-A KNXnet/IP interface has a fixed number of tunnel slots, ...
-```
-
-It is a capacity problem, not a fault: retrying does not help until a slot is
-freed. Close one of the other clients (or wait for a crashed one's slot to time
-out, about two minutes), or run a long-lived observer over routing if the
-interface supports it. `bussard init --gateway <ip>` and `bussard audit --live`
-print `N tunnels, M in use` when the interface reports its slots. A bussard write
-never retries into a full interface, so the refusal happens before anything is
-sent to a device.
-
-On a KNXnet/IP Secure interface each slot is bound to a tunnelling user. With
-`--keyring` bussard picks a user whose slot is free and that no other bussard
-process on this host holds (a lock file per user under
-`<dir>/.bussard/tunnel-users/`); a user the interface refuses hands
-over to the next. With `--secure-user` the slot is fixed by the user you name,
-so pick one Home Assistant does not hold.
-
-**Reconnecting is not a write.** `knx_bus_reconnect` (MCP, read tier) drops the
-server's connection to the interface and opens a new one: a DISCONNECT and a
-session close for the old tunnel, then a new socket, a new KNXnet/IP Secure
-session and a CONNECT. Nothing is sent onto the KNX bus, no device sees it, and
-the tool needs no gate beyond the read tier; it is withheld only in
-`--passive` mode, where the server reconnects on its own. A tool that writes
-while the bus is down is refused with the last connection error, never queued:
-a frame waiting for a connection is dropped after 2 s.
-
-**Keyring without a device entry.** On a secure-only interface
-every command needs the keyring, if only to open the tunnel. A device the
-keyring lists is managed over KNX Data Secure with its tool key. A device the
-keyring does not list is managed in the clear through the encrypted tunnel,
-exactly as through a plain interface. A device whose model file says
-`security.activated: true` is never tried in the clear: without a keyring
-entry the command refuses before anything is sent to it. A device the model
-does not mark activated but that is activated on the bus refuses the plain
-access; the command fails with the hint to export a current keyring from ETS.
-`connection.keyring` in `bussard.toml` sets the keyring once for every
-command; the password stays in `BUSSARD_KEYRING_PASSWORD` and the keyring file
-stays out of git.
-
-## Known limitations
-
-- **KNX Data Secure.** bussard programs a Data Secure device through its tool
-  key (`--keyring <file.knxkeys>` with `BUSSARD_KEYRING_PASSWORD`) on `flash`
-  and `apply`, and reads one back with `describe`, `plan` and `reconstruct`;
-  `bussard keys show` summarises the key store. Each secured connection starts
-  with the S-A_Sync handshake ETS uses, and a secured `flash` or `apply` also
-  programs the security object (group key table and group-object security
-  flags). The handshake and the security-object bytes match an ETS 6.4.1
-  capture of a physical device, and a full `flash` with factory reset has
-  completed on a physical activated push-button module. Still inferred from
-  one device with one group key: the packing of several group-key entries and
-  the meaning of the security-flag bits beyond `0x03`. Secured group
-  communication (`monitor`, `capture`, `read` and `write` with `--keyring`)
-  has been verified against the simulator only.
-- **KNXnet/IP Secure tunnelling.** A secure-only interface needs a tunnelling
-  user: `--keyring` (automatic, see the
-  [reference](../reference/cli.md#knxnetip-secure-tunnelling)) or
-  `--secure-user <id> --secure-password-env <VAR>`. Without either, bussard
-  refuses at once and names the cause. The frame layouts and the interface's
-  authentication MAC match an ETS capture of a Jung interface, and the whole
-  path (a Data Secure flash inside a secure tunnel, a wrong password, a
-  reconnect) runs against the simulator. The first session against real
-  hardware is still to come, so start with a read-only `monitor --keyring`. A
-  mismatch in the MAC input of the wrapped frames would show as a refused
-  authentication, never as a wrong write. The Jung interface drops a session
-  that is idle for 60 s, so bussard sends a keepalive every 30 s
-  (`BUSSARD_SECURE_KEEPALIVE_SECS` changes it; `bussard test --secure-idle
-  <secs>` measures another interface read-only). An interface without a TCP
-  endpoint gets a UDP session only with `--secure-transport udp`. Secure
-  routing (multicast) is not implemented. The tunnel slots on a secure
-  interface belong to users, and bussard picks a free one from the keyring.
+A `.env` never opens the write gate. `BUSSARD_ALLOW_REAL_GATEWAY` in the file
+is ignored with a warning, so a write to a real gateway still needs the flag
+or an exported variable. The key store `bussard.keys` is committed on purpose
+and is only as private as its password. [KNX Secure](knx-secure.md) has the
+full rules.
 
 ## For professionals
 
-The rails above are tuned for an owner doing a first write. An integrator writes to real gateways every day, and the settings below keep the rails without the friction.
+The rails are tuned for an owner doing a first write. An integrator writes to
+real gateways every day, and these settings keep the rails without the
+friction.
 
 ### Arm the service laptop, not the project
 
-Set the real-gateway opt-in once, in the shell profile of the machine that commissions:
+Set the real-gateway opt-in once, in the shell profile of the machine that
+commissions:
 
 ```sh
 export BUSSARD_ALLOW_REAL_GATEWAY=1
 ```
 
-It has the same effect as passing `--allow-remote-gateway` to every write command, and to `mcp --allow-writes` and `viz --allow-writes` at startup. It removes nothing else: every confirmation still names the gateway, protected group addresses still need `--force`, and the MCP server reaches a device's tables only through the programming tier (`--allow-programming`, one approved plan at a time) and never flashes.
+It has the effect of `--allow-remote-gateway` on every write command, and on
+`mcp --allow-writes` and `viz --allow-writes` at startup. It removes nothing
+else: every confirmation still names the gateway, protected addresses still
+need `--force`, and the MCP server reaches a device's tables only through the
+programming tier, one approved plan at a time.
 
-The opt-in is per machine on purpose. The question it answers is "is this computer meant to write to real buses?", and only the machine knows that. A setting in `bussard.toml` would travel with the model: into every bundle handed to a customer, every repository clone, and every assistant session started on that model. The owner who imports the handover bundle would receive an armed tool without choosing it. A `.env` next to a model travels the same way, so bussard ignores the variable there (with a warning); only the shell profile or an explicit export arms the machine.
+The opt-in is per machine on purpose: only the machine knows whether it is
+meant to write to real buses. A setting in `bussard.toml` would travel with
+the model into every bundle handed to a customer, every clone and every
+assistant session. A `.env` next to a model travels the same way, which is
+why bussard ignores the variable there.
 
 ### Share the interface with ETS
 
-An integrator often has ETS and bussard open against the same interface. The [tunnel budget](#the-tunnel-budget) section explains the slot count and exit code `4`. On top of that:
+ETS and bussard often run against the same interface, and each holds a
+tunnelling slot (one of the interface's few connections).
 
-- Check the budget before the session. `bussard init --gateway <ip>` or `bussard audit --live` prints `N tunnels, M in use`. Home Assistant or a visualisation server usually holds one slot permanently.
-- Close the ETS bus connection before a long bussard run such as `apply --line` or `commission`, and close bussard before an ETS download. Each running bussard command holds a slot, and so do `bussard mcp` and `bussard viz` for as long as they run.
-- Never program one device from both tools at once. A device accepts one management connection at a time, so a second tool's download fails or interleaves with the first. Finish in one tool, then plan in the other: `bussard plan <ia>` after an ETS download shows exactly what ETS left on the device.
-- After a crash, a tunnel slot stays taken until the interface times it out, about two minutes. Wait instead of retrying in a loop.
+- Check the budget before the session. `bussard init --gateway <ip>` or
+  `bussard audit --live` prints `N tunnels, M in use`. Home Assistant or a
+  visualisation usually holds one slot permanently.
+- Close the ETS bus connection before a long run such as `apply --line` or
+  `commission`, and close bussard before an ETS download. `bussard mcp` and
+  `bussard viz` hold a slot for as long as they run.
+- Never program one device from both tools at once. A device accepts one
+  management connection at a time, so a second download fails or interleaves
+  with the first. Finish in one tool, then run `bussard plan <ia>` to see
+  exactly what ETS left on the device.
+- After a crash, a slot stays taken until the interface times it out, about
+  two minutes. Wait instead of retrying in a loop.
 
-## See also
+[Device support](device-support.md) explains the slot count and exit code `4`.
 
-- [How do I ...](../how-to/recipes.md): the writing recipes, with the safety note up front.
-- [Reference](../reference/cli.md): every command, flag, and the exact refusal
-  conditions.
+## Next steps
+
+- [What each write command does](write-commands.md): what every write refuses, backs up and verifies.
+- [KNX Secure](knx-secure.md): keys, the key store and the `.env` rules.
+- [The assistant](assistant.md): the MCP tiers, history and undo.
+- [Back up and replace](../how-to/back-up-and-replace.md): take the snapshot before your first write.

@@ -147,7 +147,7 @@ pub(crate) const CONFIG_HEADER: &str = "\
 # bussard.toml: connection settings for `bussard`, hand-editable.
 # Sets the transport (\"tunnel\" or \"routing\"), the gateway, the multicast
 # endpoint and, optionally, the KNX Secure keyring file (relative to this
-# directory). See docs/reference/model-format.md.
+# directory). See docs/reference/files/.
 ";
 
 /// Renders a fresh `bussard.toml`.

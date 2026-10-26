@@ -1,140 +1,52 @@
-# Getting started
+# bussard documentation
 
-bussard is an open-source command line tool for KNX. Your installation is
-described in TOML files that you keep in git. bussard writes that model to the
-devices over a KNXnet/IP gateway and decodes what happens on the bus using the
-same model.
+bussard is an open-source command line tool for a KNX building bus. It keeps your installation as a directory of plain text files, the model, and writes that model to the devices over a KNXnet/IP gateway. It decodes everything on the bus with the same model, and runs as an MCP server so an LLM assistant can read and edit the model with you.
 
-You need a KNXnet/IP gateway (tunneling or routing). An ETS project export
-(`.knxproj`) and vendor product data (`.knxprod`) are optional, but they give
-you a fully named model from the first minute.
+It is for the owner of a KNX house who wants to know what every button does, change one safely and undo it, and for the integrator who needs the exact command, its flags and what it refuses. See the [landing page](../) for the overview and the [GitHub repository](https://github.com/tmbo/bussard) for the source.
 
-## Install
+## Two ways to start
 
-Download the binary for your system from the
-[latest release](https://github.com/tmbo/bussard/releases/latest), or from the
-[landing page](../). Each file comes with a `.sha256` checksum. On macOS and
-Linux:
+- **With an ETS project export** (`.knxproj`): `bussard import` turns it into a fully named model in a minute.
+- **Without one**: `bussard init` creates an empty model, and you scan, reconstruct or adopt the devices you have.
 
-```console
-$ chmod +x bussard-macos-arm64
-$ mv bussard-macos-arm64 /usr/local/bin/bussard
-$ xattr -d com.apple.quarantine /usr/local/bin/bussard   # macOS only, the binary is not notarized
-```
+Either way, start with [Install bussard](getting-started/install.md) and [Your first model](getting-started/first-model.md). Read [Safety](explanation/safety.md) before your first write.
 
-Or build from source with Rust 1.88 or newer:
+The pages below follow the four kinds of the [Divio system](https://docs.divio.com/documentation-system/): tutorials to learn by doing, how-to guides for one task each, reference for every command and file, and explanation for the ideas behind them.
 
-```console
-$ git clone https://github.com/tmbo/bussard
-$ cd bussard
-$ cargo install --path crates/bussard-cli
-```
+## Getting started
 
-## First commands
+- [Install bussard](getting-started/install.md): installers, the binary and its checksum, building from source.
+- [Your first model](getting-started/first-model.md): import or init, validate, monitor.
+- [Connect an assistant](getting-started/assistant.md): an LLM over MCP and a first conversation.
+- [The first weekend](getting-started/first-weekend.md): an owner's path from install to a backup on a USB stick.
 
-With an ETS export:
+## How-to guides
 
-```console
-$ mkdir house && cd house
-$ bussard import ../demo-house.knxproj
-imported 33 group addresses, 10 devices, 55 link entries → the current directory /home/me/house
-$ bussard validate
-0 errors, 4 warnings
-$ bussard monitor
-12:03:44.809  1.1.1 Push Button Hallway → 0/0/0 Hallway Light Switch = On (1.001, obj "Rocker 1")
-12:03:44.981  1.1.3 Switch Actuator     → 0/0/1 Hallway Light Status = On (1.001)
-```
+- [Watch the bus](how-to/watch-the-bus.md): monitor, read, the browser view, capture and history.
+- [Find what you have](how-to/find-what-you-have.md): audit, scan, describe, reconstruct, free tunnel slots.
+- [Change what a button does](how-to/change-a-link.md): plan, apply and undo a link change.
+- [Change a parameter](how-to/change-a-parameter.md): the device dialog, then apply or flash.
+- [Add a device](how-to/add-a-device.md): adopt, flash a fresh device, label on the bench.
+- [Back up and replace a device](how-to/back-up-and-replace.md): backup, restore, replace a dead device.
+- [Commission a line](how-to/commission-a-line.md): plan group addresses, commission, test.
+- [Exchange with ETS](how-to/exchange-with-ets.md): names into ETS, what a new export changes.
+- [Work with an integrator](how-to/work-with-an-integrator.md): bundles and shared repositories.
+- [Handover checklist](how-to/handover-checklist.md): what an owner asks for and an integrator delivers.
+- [Home Assistant](how-to/home-assistant.md): generate and tune the Home Assistant config.
+- [KNX Secure](how-to/knx-secure.md): the keyring, secure tunnelling, secure a group address.
 
-Without one, start empty and adopt devices as you go:
+## Reference
 
-```console
-$ mkdir house && cd house
-$ bussard init
-Found gateway: KNX IP Interface (192.0.2.10:3671, IA 1.1.250)
-Created a fresh KNX model in the current directory /home/me/house.
-$ bussard adopt --product actuator.knxprod    # press the programming button
-adopted 15.15.255 → 1.1.5
-$ bussard flash 1.1.5 --product actuator.knxprod
-```
+- [Commands](reference/index.md): every command by group, with its flags, refusals and verification steps.
+- [Global options](reference/global-options.md) and [environment variables](reference/environment.md): what every command shares, exit codes, the `.env` file.
+- [The model directory](reference/model-directory.md) and its [files](reference/files/device-files.md): every file and key, the lock, the key store, parse errors.
+- [Diagnostics](reference/diagnostics.md), [product data](reference/product-data.md), [JSON output](reference/json-output.md), [MCP tools](reference/mcp-tools.md), [viz API](reference/viz-api.md), [Home Assistant](reference/home-assistant.md).
 
-From there:
+## Explanation
 
-```console
-$ bussard read 4/1/11                # 21.4 °C (9.001)
-$ bussard write 3/0/4 down           # the blind moves
-$ bussard plan 1.1.5                 # diff the device's live tables against the model
-$ bussard apply 1.1.5                # write them: confirm, backup, verify
-$ bussard viz                        # the whole network in a browser, live
-$ bussard ha-config --out ha.yaml    # Home Assistant config from the same model
-$ claude mcp add knx -- bussard mcp --dir "$PWD"    # let Claude debug your bus
-```
-
-## The model directory
-
-`import` and `init` create the model in the current directory (or `--dir`);
-in a directory that already holds other files they ask first. Every other
-command finds the model from wherever you are: the current directory, then
-`./knx`, then the parent directories. A `.env` next to the model (or in its
-parent) is read automatically, so `BUSSARD_PROJECT_PASSWORD` or
-`BUSSARD_KEYRING_PASSWORD` can live there instead of your shell. Everything in
-the model except the lock file is yours to edit, by hand or through an
-assistant over MCP:
-
-```
-house/
-  bussard.toml          connection and lint settings
-  groups.toml           the group-address plan
-  devices/1.1.5.toml    one file per device: name, location, parameters, links
-  bussard.lock          generated by import and adopt, never edited
-```
-
-A device file reads like its ETS dialog, one table per channel with the
-parameters and the group addresses of that channel. From a real import (a
-Jung switch/blind actuator):
-
-```toml
-[channel.relaisausgaenge-1]
-betriebsart = "Lüftungsklappe / Dachfenster"
-langzeitbetrieb.listen = ["3/1/20"]
-rueckmeldung-lueftungsklappen-dachfensterposition.send = "3/1/23"
-```
-
-[The model format](reference/model-format.md) specifies every file and key.
-
-## Before your first write
-
-bussard writes to real building hardware. Read [Safety](explanation/safety.md) once before
-you use `write`, `apply` or `flash` against a live installation. The short
-version: writes to a gateway that is not on localhost are refused until you
-pass `--allow-remote-gateway`, every device write is plan-before-apply with a
-backup, and group addresses marked `protected = true` need `--force` on the CLI
-and cannot be changed over MCP at all.
-
-## Where next
-
-The documentation has four kinds of pages, after the
-[Divio system](https://docs.divio.com/documentation-system/): tutorials to
-learn by doing, how-to guides for one task each, reference for every command
-and file, and explanation for the ideas behind them.
-
-**Tutorials**
-
-- [The first weekend](tutorials/first-weekend.md): an owner's path from install to a backup on a USB stick.
-
-**How-to guides**
-
-- [How do I ...](how-to/recipes.md): recipes, from watching the bus to flashing a device.
-- [Working with an integrator](how-to/work-with-an-integrator.md): exchanging changes by bundle or by repository.
-- [Handover checklist](how-to/handover-checklist.md): what an owner demands and an integrator delivers.
-
-**Reference**
-
-- [Commands](reference/cli.md): every command, flag, environment variable and MCP tool.
-- [The model format](reference/model-format.md): every file in the model directory, its keys and its errors.
-- [Home Assistant](reference/home-assistant.md): how `ha-config` derives entities from the model.
-- [Product data](reference/product-data.md): `.knxprod` handling and what you may and may not commit.
-
-**Explanation**
-
-- [How bussard works](explanation/how-it-works.md): the model, the product data, the bus and what a write does.
-- [Safety](explanation/safety.md): the rails around every write, and what each write command does.
+- [How bussard works](explanation/how-it-works.md): the model, product data, the bus and a write.
+- [Safety](explanation/safety.md): the rules, on one page, to read before the first write.
+- [Write commands](explanation/write-commands.md): what each write command does and its rails.
+- [KNX Secure](explanation/knx-secure.md): keys, the key store, secrets, what secured means.
+- [The assistant](explanation/assistant.md): MCP tiers, history and undo, protected addresses.
+- [Device support](explanation/device-support.md): supported devices, the tunnel budget, known limits.
