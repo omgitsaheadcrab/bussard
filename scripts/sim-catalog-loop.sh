@@ -133,13 +133,21 @@ for r in rows:
               f"{r['seconds']:.0f}s): {r['step']}")
         for line in detail[:4]:
             print(f"        {line[:200]}")
+# Every skipped program with its reason; a reason that covers many programs
+# (an unsupported mask on the full corpus) is counted and its first few named.
 skips = {}
 for r in rows:
     if r["outcome"] == "skip":
         reason = (r.get("detail") or "").split(":")[0]
-        skips[reason] = skips.get(reason, 0) + 1
-for reason, n in sorted(skips.items(), key=lambda kv: -kv[1]):
-    print(f"  skip  {n:4} x {reason}")
+        skips.setdefault(reason, []).append(r)
+for reason, group in sorted(skips.items(), key=lambda kv: -len(kv[1])):
+    if len(group) > 10:
+        print(f"  skip  {len(group):4} x {reason}, e.g. "
+              + ", ".join(r["application"] for r in group[:3]))
+        continue
+    for r in group:
+        detail = (r.get("detail") or "").strip().splitlines() or [""]
+        print(f"  skip  {r['application']} ({r['archive']}): {detail[0][:200]}")
 # --subset: an application with no row at all was never found, because its
 # archive is not in the corpus (not fetched, or not readable). It is skipped,
 # not failed. A sharded run only sees its own share, so it does not judge.
