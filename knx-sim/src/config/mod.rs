@@ -274,6 +274,11 @@ pub struct KnxnetSimConfig {
     /// The tunnelling addresses, e.g. `["1.1.22", "1.1.23"]`.
     #[serde(default)]
     pub tunnels: Vec<String>,
+    /// Whether the object appears in the object-index walk (default `true`).
+    /// `false` serves it by object type and instance only, through the
+    /// extended property services, as the Jung IPS 300 SREG does.
+    #[serde(default = "default_true")]
+    pub listed: bool,
 }
 
 impl KnxnetSimConfig {
@@ -553,12 +558,14 @@ impl SimConfig {
             })?
             .with_l4_exchange_budget(effective_l4_budget(dc.l4_exchange_budget));
             let device = match &dc.knxnet {
-                Some(k) => device.with_knxnet_object(&k.parameters(address).map_err(|reason| {
-                    ConfigError::BadDeviceOption {
-                        device: dc.address.clone(),
-                        reason: format!("knxnet: {reason}"),
-                    }
-                })?),
+                Some(k) => device.with_knxnet(
+                    &k.parameters(address)
+                        .map_err(|reason| ConfigError::BadDeviceOption {
+                            device: dc.address.clone(),
+                            reason: format!("knxnet: {reason}"),
+                        })?,
+                    k.listed,
+                ),
                 None => device,
             };
             bus.add_device(device);

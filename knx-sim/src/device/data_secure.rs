@@ -3,7 +3,7 @@
 //! property services.
 
 use crate::bus::event::Event;
-use crate::wire::apdu::Apdu;
+use crate::wire::apdu::{Apci, Apdu};
 use crate::wire::{CemiLData, IndividualAddress};
 
 use super::{Device, DeviceError, DeviceReaction, SecurityLimits, SecurityObject, security_object};
@@ -209,7 +209,9 @@ impl Device {
     ///
     /// Only a security-activated device carries the security interface object;
     /// a plain device does not implement these services and stays silent (the
-    /// numbered frame is still T_ACKed). An activated device only reaches this
+    /// numbered frame is still T_ACKed). A simulated IP interface answers an
+    /// `A_PropertyExtValue_Read` of its KNXnet/IP parameter object (object type
+    /// 11, bussard issue #391). An activated device only reaches this
     /// through A_SecureData: a plain request is refused by the secure
     /// interception in [`Device::handle_apdu`].
     pub(super) fn on_extended_property(
@@ -217,6 +219,16 @@ impl Device {
         tool: IndividualAddress,
         apdu: &Apdu,
     ) -> Result<DeviceReaction, DeviceError> {
+        if apdu.apci == Apci::PropertyExtValueRead
+            && let Some(obj) = &self.knxnet_by_type
+            && let Some(data) = super::knxnet_object::ext_read(obj, &apdu.data)
+        {
+            let resp = self.respond(tool, 0x1CD, &data);
+            return Ok(DeviceReaction {
+                responses: vec![resp],
+                did_master_reset: false,
+            });
+        }
         let limits = self.security_limits();
         let Some(obj) = self.security_object.as_mut() else {
             return Ok(DeviceReaction::default());

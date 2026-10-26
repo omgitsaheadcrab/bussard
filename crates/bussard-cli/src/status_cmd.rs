@@ -161,14 +161,11 @@ async fn read_device<Ch: bussard_mgmt::L4Channel>(
         .record
         .as_ref()
         .and_then(|r| r.application_id.clone());
-    let table = established.object_table();
-    let (knxnet, knxnet_error) = match bussard_service::knxnet::read_knxnet(l4, &table).await {
-        Ok(knxnet) => (knxnet, None),
-        Err(err) => (None, Some(err.to_string())),
-    };
-    if knxnet.is_some() {
-        facts.remember_knxnet(&mut established, knxnet.clone());
-    }
+    let (knxnet, knxnet_error) =
+        match bussard_service::knxnet::read_knxnet_with_facts(l4, facts, &mut established).await {
+            Ok(knxnet) => (knxnet, None),
+            Err(err) => (None, Some(err.to_string())),
+        };
     Ok(Read {
         mask,
         application_id,

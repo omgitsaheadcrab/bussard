@@ -24,15 +24,19 @@
 //! [`KnxnetAccess::Index`] reads with the plain `A_PropertyValue_Read` on the
 //! object's index (from the object table every device with interface objects
 //! answers); [`KnxnetAccess::Ext`] reads with `A_PropertyExtValue_Read` by
-//! object type 11 and instance, for a device whose object table is not known.
-//! Both return the same octets.
+//! object type 11 and instance, for a device whose object-index walk does not
+//! list the object (the Jung IPS 300 SREG, mask 0021, issue #391). Both return
+//! the same octets. [`probe_knxnet_ext`] and [`knxnet_index_from_io_list`]
+//! find the object when the walk does not.
 //!
 //! The module is read-only: it never sends a write.
+
+use std::time::Duration;
 
 use bussard_model::IndividualAddress;
 
 use crate::connection::{L4Channel, Layer4Connection};
-use crate::error::{MgmtError, Result};
+use crate::error::{MgmtError, Result, SilenceKind};
 use crate::property_ext::{PropertyExtAddress, read_property_ext, read_property_ext_table};
 
 /// The KNXnet/IP parameter object (`OT_KNXIP_PARAMETER`, knx_master.xml `OT-11`).
@@ -186,6 +190,7 @@ pub async fn read_knxnet_property<Ch: L4Channel>(
                 object_instance: instance,
                 property_id: u16::from(pid),
             };
+            let before = l4.numbered_exchanges();
             let result = if array {
                 read_property_ext_table(l4, addr, elem_size).await
             } else {
@@ -195,10 +200,136 @@ pub async fn read_knxnet_property<Ch: L4Channel>(
                 Ok(data) if data.is_empty() && !array => Ok(None),
                 Ok(data) => Ok(Some(data)),
                 Err(MgmtError::ServiceRejected { .. }) => Ok(None),
+                // T_ACKed but never answered: the property is not served, and
+                // the connection stays usable (as `authorize` treats it).
+                Err(err) if acked_but_unanswered(l4, before, &err) => {
+                    l4.reopen_after_unanswered();
+                    Ok(None)
+                }
                 Err(err) => Err(err),
             }
         }
     }
+}
+
+/// How long a probe for the KNXnet/IP parameter object waits for an answer.
+/// A device that serves the object answers a property read within a few
+/// hundred milliseconds (about 200 ms per request on the Data Secure devices
+/// of the speed deep dive of 2026-09-24, the figure the testkit's
+/// `response_delay` models); one that does not implement the extended
+/// property services `T_ACK`s the request and stays silent (knx-sim models
+/// that, the plain-device branch of its extended-service handler), so the
+/// probe would otherwise cost the full 3 s response timeout.
+pub const PROBE_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Whether `err` is a request the device `T_ACK`ed (the exchange counter moved
+/// past `before`) but never answered: the peer is alive and the sequence
+/// numbers agree, so the connection can be reopened.
+fn acked_but_unanswered<Ch: L4Channel>(
+    l4: &Layer4Connection<Ch>,
+    before: u32,
+    err: &MgmtError,
+) -> bool {
+    matches!(
+        err,
+        MgmtError::NoResponse { .. }
+            | MgmtError::MidSessionSilence {
+                kind: SilenceKind::NoResponse,
+                ..
+            }
+    ) && l4.numbered_exchanges() > before
+}
+
+/// Runs `f` with the connection's response timeout shortened to
+/// [`PROBE_RESPONSE_TIMEOUT`] (never lengthened), restoring it afterwards.
+pub async fn with_probe_timeout<Ch: L4Channel, T>(
+    l4: &mut Layer4Connection<Ch>,
+    f: impl AsyncFnOnce(&mut Layer4Connection<Ch>) -> T,
+) -> T {
+    let saved = l4.timeouts();
+    let mut short = saved;
+    short.response_timeout = saved.response_timeout.min(PROBE_RESPONSE_TIMEOUT);
+    l4.set_timeouts(short);
+    let out = f(l4).await;
+    l4.set_timeouts(saved);
+    out
+}
+
+/// Probes for the KNXnet/IP parameter object by type and instance: one
+/// `A_PropertyExtValue_Read` of `PID_KNX_INDIVIDUAL_ADDRESS` (52), element 1,
+/// under [`PROBE_RESPONSE_TIMEOUT`]. `true` when the device answers with the
+/// value. A zero-count answer, an off-service answer, or a request the device
+/// `T_ACK`s and leaves unanswered is `false`, and the connection stays usable.
+///
+/// This is how a KNX IP interface whose object-index walk does not list the
+/// object is found: the Jung IPS 300 SREG (mask 0021) answers the walk with a
+/// device object and an address table only, while ETS writes its KNXnet/IP
+/// parameters by object type 11 (`LdCtrlWriteProp ObjType="11"`).
+///
+/// # Errors
+///
+/// A transport failure, or a device that did not even `T_ACK` the request.
+pub async fn probe_knxnet_ext<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    instance: u16,
+) -> Result<bool> {
+    let addr = PropertyExtAddress {
+        object_type: OT_KNXNET_IP_PARAMETER,
+        object_instance: instance,
+        property_id: u16::from(PID_KNX_INDIVIDUAL_ADDRESS),
+    };
+    with_probe_timeout(l4, async |l4| {
+        let before = l4.numbered_exchanges();
+        match read_property_ext(l4, addr, 1, 1).await {
+            Ok(v) => Ok(v.count >= 1 && v.data.len() >= 2),
+            Err(MgmtError::ServiceRejected { .. } | MgmtError::MalformedResponse { .. }) => {
+                Ok(false)
+            }
+            Err(err) if acked_but_unanswered(l4, before, &err) => {
+                l4.reopen_after_unanswered();
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
+    })
+    .await
+}
+
+/// The index of the KNXnet/IP parameter object as the device object's
+/// `PID_IO_LIST` (71) lists it, when the device offers the list, lists object
+/// type 11, and that index answers a plain read of
+/// `PID_KNX_INDIVIDUAL_ADDRESS`. A second source next to the
+/// `PID_OBJECT_TYPE` walk, for a device whose walk stops early. Read under
+/// [`PROBE_RESPONSE_TIMEOUT`]; any refusal or silence is `None`.
+///
+/// # Errors
+///
+/// A transport failure.
+pub async fn knxnet_index_from_io_list<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+) -> Result<Option<u8>> {
+    with_probe_timeout(l4, async |l4| {
+        let Some(types) = crate::io_list::read_io_list(l4).await? else {
+            return Ok(None);
+        };
+        let Some(position) = types.iter().position(|&t| t == OT_KNXNET_IP_PARAMETER) else {
+            return Ok(None);
+        };
+        let Ok(index) = u8::try_from(position) else {
+            return Ok(None);
+        };
+        let before = l4.numbered_exchanges();
+        match checked_plain(l4, index, PID_KNX_INDIVIDUAL_ADDRESS, 1, 1).await {
+            Ok(resp) if resp.count >= 1 && resp.data.len() >= 2 => Ok(Some(index)),
+            Ok(_) | Err(MgmtError::MalformedResponse { .. }) => Ok(None),
+            Err(err) if acked_but_unanswered(l4, before, &err) => {
+                l4.reopen_after_unanswered();
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    })
+    .await
 }
 
 /// A plain `A_PropertyValue_Read` of one property: element 1 for a scalar;

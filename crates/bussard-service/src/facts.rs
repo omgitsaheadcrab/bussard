@@ -291,6 +291,7 @@ impl FactsCache {
             },
             objects,
             knxnet: None,
+            no_knxnet: false,
         };
         seed(l4, &record, mask);
         self.save(&record);
@@ -302,8 +303,9 @@ impl FactsCache {
     }
 
     /// Records what the KNXnet/IP parameter object of an IP interface reported
-    /// (issue #391) in the facts in effect and writes them. Nothing happens
-    /// when no facts are in effect (an unavailable device).
+    /// (issue #391) in the facts in effect and writes them; `None` records that
+    /// the device has no such object (`no_knxnet`). Nothing happens when no
+    /// facts are in effect (an unavailable device).
     pub fn remember_knxnet(
         &self,
         established: &mut Established,
@@ -312,10 +314,12 @@ impl FactsCache {
         let Some(record) = established.record.as_mut() else {
             return;
         };
-        if record.knxnet == knxnet {
+        let absent = knxnet.is_none();
+        if record.knxnet == knxnet && record.no_knxnet == absent {
             return;
         }
         record.knxnet = knxnet;
+        record.no_knxnet = absent;
         self.save(record);
     }
 

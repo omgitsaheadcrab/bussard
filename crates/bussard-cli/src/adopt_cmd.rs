@@ -637,13 +637,10 @@ async fn read_knxnet_settings(
             let mut established = facts
                 .establish(l4, mask, bussard_service::FactsWant::Table)
                 .await?;
-            let table = established.object_table();
-            if bussard_service::knxnet::knxnet_object_index(&table).is_none() {
-                return Ok(None);
-            }
-            let knxnet = bussard_service::knxnet::read_knxnet(l4, &table).await?;
-            facts.remember_knxnet(&mut established, knxnet.clone());
-            Ok(knxnet)
+            Ok(
+                bussard_service::knxnet::read_knxnet_with_facts(l4, &facts, &mut established)
+                    .await?,
+            )
         })
         .await
 }

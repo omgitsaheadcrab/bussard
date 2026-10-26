@@ -175,3 +175,55 @@ fn test_describe_prints_the_knxnet_section() -> TestResult {
     );
     Ok(())
 }
+
+/// The live shape of 1.1.200 (issue #391): mask 0021, the object-index walk
+/// shows a device object and an address table only, and the KNXnet/IP
+/// parameter object answers by object type 11 and instance 1. `status` finds
+/// it with the extended-service probe and reads it by type and instance.
+#[test]
+fn test_status_address_finds_an_object_the_walk_does_not_list() -> TestResult {
+    let model = TempModel::new("bussard-status-knxnet-unlisted", DEVICE_FILE)?;
+    let knxnet = MockKnxnet {
+        tunnels: (22..=29)
+            .map(|n| format!("1.1.{n}").parse())
+            .collect::<Result<Vec<IndividualAddress>, _>>()?,
+        ..MockKnxnet::default()
+    };
+    let device = MockDevice::new("1.1.200".parse()?)
+        .with_mask(0x0021)
+        .with_object_types(&[0, 1])
+        .with_knxnet_unlisted(&knxnet);
+    let (output, writes) = run_against(device, &model.dir(), &["status", "1.1.200"])?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(output.status.success(), "{stdout}");
+    assert_eq!(writes, 0);
+    for needle in [
+        "KNXnet/IP (object type 11, read",
+        "IP address 192.168.1.74 (dhcp)",
+        "tunnels 1.1.22, 1.1.23, 1.1.24, 1.1.25, 1.1.26, 1.1.27, 1.1.28, 1.1.29",
+    ] {
+        assert!(
+            squash(&stdout).contains(&squash(needle)),
+            "missing {needle:?} in:\n{stdout}"
+        );
+    }
+    Ok(())
+}
+
+/// A device that `T_ACK`s the extended read and never answers: `status`
+/// says it has no KNXnet/IP object and still exits 0.
+#[test]
+fn test_status_address_on_a_device_silent_to_extended_reads() -> TestResult {
+    let model = TempModel::new("bussard-status-silent-ext", DEVICE_FILE)?;
+    let device = MockDevice::new("1.1.200".parse()?)
+        .with_hook(|_, apci, _| (apci == 0x1CC).then_some(bussard_testkit::Reaction::Ack));
+    let (output, _) = run_against(device, &model.dir(), &["status", "1.1.200"])?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("no KNXnet/IP parameter object"), "{stdout}");
+    // The absence is a device fact: the next command reusing the facts does
+    // not probe again.
+    let facts = std::fs::read_to_string(model.dir().join(".bussard/facts/1.1.200.toml"))?;
+    assert!(facts.contains("no_knxnet = true"), "{facts}");
+    Ok(())
+}

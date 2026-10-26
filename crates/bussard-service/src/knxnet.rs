@@ -4,16 +4,18 @@
 //!
 //! `status <ADDRESS>`, `describe` and `adopt` call [`read_knxnet`] on the
 //! connection they already hold. It addresses the object by the index the
-//! object table gives (plain property reads); a device whose object table is
-//! unknown is read with the extended property services by object type and
-//! instance. A device without the object is `None`, at no cost beyond the
-//! object table the command read anyway. Read-only: nothing is written, and
+//! object table or `PID_IO_LIST` gives (plain property reads), else by object
+//! type and instance (the extended property services) after one short probe.
+//! A device without the object is `None`. Read-only: nothing is written, and
 //! no KNXnet/IP Secure property (PID 91 and up) is read.
 
 use bussard_mgmt::knxnet::{
-    KnxnetAccess, KnxnetValues, OT_KNXNET_IP_PARAMETER, read_knxnet_parameters,
+    KnxnetAccess, KnxnetValues, OT_KNXNET_IP_PARAMETER, knxnet_index_from_io_list,
+    probe_knxnet_ext, read_knxnet_parameters, with_probe_timeout,
 };
 use bussard_mgmt::{L4Channel, Layer4Connection, MgmtError};
+
+use crate::facts::{Established, FactsCache};
 use bussard_model::knxnet::{
     IpAssignment, KnxnetFacts, capability_names, format_mac, method_names, state_label,
 };
@@ -29,11 +31,22 @@ pub fn knxnet_object_index(table: &[(u8, u16)]) -> Option<u8> {
 
 /// Reads the KNXnet/IP parameter object of the device behind `l4`.
 ///
-/// `table` is the object table in effect (from the device facts). With the
-/// object in it, the object is read by index; without, `None` is returned
-/// unless the table is empty (unknown), in which case instance 1 of object
-/// type 11 is tried with the extended property services and a device that
-/// refuses them is `None` as well.
+/// `table` is the object table in effect (from the device facts),
+/// `table_from_io_list` whether it came from `PID_IO_LIST`. The object is
+/// found, in this order:
+///
+/// 1. in `table` (the `PID_OBJECT_TYPE` walk or a checked `PID_IO_LIST`): read
+///    by index with the plain property services;
+/// 2. in the device object's `PID_IO_LIST` at an index the walk did not reach,
+///    when that index answers: read by index;
+/// 3. by object type 11, instance 1, with one extended-service probe
+///    ([`probe_knxnet_ext`]): read by type and instance. The Jung IPS 300 SREG
+///    (mask 0021) is found here: its walk lists a device object and an address
+///    table only (live `describe 1.1.200`, 2026-10-26).
+///
+/// Steps 2 and 3 wait at most [`bussard_mgmt::knxnet::PROBE_RESPONSE_TIMEOUT`]
+/// per request, and a device that leaves them unanswered keeps the connection.
+/// A device without the object is `None`.
 ///
 /// # Errors
 ///
@@ -41,18 +54,26 @@ pub fn knxnet_object_index(table: &[(u8, u16)]) -> Option<u8> {
 pub async fn read_knxnet<Ch: L4Channel>(
     l4: &mut Layer4Connection<Ch>,
     table: &[(u8, u16)],
+    table_from_io_list: bool,
 ) -> Result<Option<KnxnetFacts>, MgmtError> {
-    let access = match knxnet_object_index(table) {
+    let from_io_list = if table_from_io_list {
+        // The table already is the checked `PID_IO_LIST`.
+        None
+    } else {
+        knxnet_index_from_io_list(l4).await?
+    };
+    let access = match knxnet_object_index(table).or(from_io_list) {
         Some(index) => KnxnetAccess::Index(index),
-        None if table.is_empty() => KnxnetAccess::Ext { instance: 1 },
+        None if probe_knxnet_ext(l4, 1).await? => KnxnetAccess::Ext { instance: 1 },
         None => return Ok(None),
     };
-    let values = match read_knxnet_parameters(l4, access).await {
-        Ok(values) => values,
-        Err(MgmtError::ServiceRejected { .. }) if matches!(access, KnxnetAccess::Ext { .. }) => {
-            return Ok(None);
+    let values = match access {
+        KnxnetAccess::Index(_) => read_knxnet_parameters(l4, access).await?,
+        // A device found by the probe may leave some of the properties
+        // unanswered; each such read waits the probe timeout, not 3 s.
+        KnxnetAccess::Ext { .. } => {
+            with_probe_timeout(l4, async |l4| read_knxnet_parameters(l4, access).await).await?
         }
-        Err(err) => return Err(err),
     };
     if values == KnxnetValues::default() {
         return Ok(None);
@@ -66,6 +87,33 @@ pub async fn read_knxnet<Ch: L4Channel>(
         index,
         bussard_model::facts::now_stamp(),
     )))
+}
+
+/// The KNXnet/IP state of the device behind `l4` with the device facts in
+/// effect: `None` without a read when the facts record that the device has
+/// no KNXnet/IP parameter object (`no_knxnet`, cleared whenever the facts are
+/// read again, `--refresh-facts` included); otherwise [`read_knxnet`], whose
+/// result (the values, or the absence) is recorded in the facts.
+///
+/// # Errors
+///
+/// As [`read_knxnet`].
+pub async fn read_knxnet_with_facts<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    facts: &FactsCache,
+    established: &mut Established,
+) -> Result<Option<KnxnetFacts>, MgmtError> {
+    if established.record.as_ref().is_some_and(|r| r.no_knxnet) {
+        return Ok(None);
+    }
+    let table = established.object_table();
+    let from_io_list = established
+        .record
+        .as_ref()
+        .is_some_and(|r| r.object_table_source == bussard_model::facts::ObjectTableSource::IoList);
+    let knxnet = read_knxnet(l4, &table, from_io_list).await?;
+    facts.remember_knxnet(established, knxnet.clone());
+    Ok(knxnet)
 }
 
 /// Decodes the raw property values into the stored facts.

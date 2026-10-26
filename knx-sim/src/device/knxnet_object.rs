@@ -147,6 +147,37 @@ pub fn array_read(pid: u8, value: &[u8], count: u8, start: u16) -> Option<(u8, V
     Some((count, value[(first - 1) * size..last * size].to_vec()))
 }
 
+/// The `A_PropertyExtValue_Response` payload for an `A_PropertyExtValue_Read`
+/// (`[type:16][instance:12|pid:12][count][start:16]`) of the KNXnet/IP
+/// parameter object `obj`: the echoed header, the served count, the start and
+/// the elements, with count 0 for an unknown property, another instance or a
+/// range past the end. `None` when the request addresses another object type
+/// (the security object's handler takes it) or is too short.
+pub fn ext_read(obj: &InterfaceObject, request: &[u8]) -> Option<Vec<u8>> {
+    let h = request.get(..8)?;
+    let object_type = u16::from_be_bytes([h[0], h[1]]);
+    if object_type != IOT_KNXNET_IP_PARAMETER {
+        return None;
+    }
+    let packed = (u32::from(h[2]) << 16) | (u32::from(h[3]) << 8) | u32::from(h[4]);
+    let instance = packed >> 12;
+    let pid = u8::try_from(packed & 0x0FFF).ok();
+    let count = h[5];
+    let start = u16::from_be_bytes([h[6], h[7]]);
+    let answer = match (instance, pid) {
+        (1, Some(pid)) if pid != PID_OBJECT_TYPE => obj
+            .property(pid)
+            .and_then(|p| array_read(pid, &p.value, count, start)),
+        _ => None,
+    };
+    let (n, bytes) = answer.unwrap_or((0, Vec::new()));
+    let mut out = h[..5].to_vec();
+    out.push(n);
+    out.extend_from_slice(&start.to_be_bytes());
+    out.extend_from_slice(&bytes);
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
