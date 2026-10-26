@@ -363,13 +363,23 @@ impl FlashPlan {
                     if !written.insert(image.segment_id.clone()) {
                         continue;
                     }
-                    let address = regions
+                    // The whole segment from its base, also where the
+                    // procedure allocates it in parts (issue #413): the
+                    // octets no allocation holds are masked off.
+                    let address = regions.get(&image.segment_id).map_or_else(
+                        || address.saturating_sub(image.offset as u32),
+                        |region| region.address,
+                    );
+                    let len = self
+                        .images
                         .get(&image.segment_id)
-                        .map_or(*address, |region| region.address);
+                        .map_or(image.len, Vec::len);
                     steps.push(FlashStep::WriteMem {
                         address,
                         image: ImageRef {
                             kind: ImageKind::Parameters,
+                            len,
+                            offset: 0,
                             ..image.clone()
                         },
                     });

@@ -3270,3 +3270,114 @@ async fn test_flash_system7_resumes_tunnel_loss_during_terminal_restart_verify()
     );
     Ok(())
 }
+
+/// A 0705 program whose procedure allocates its 16-octet segment at `0x4800`
+/// whole when `P-1` is 0 and as 6 + 4 octets (`0x4800`, `0x4808`) when it
+/// is 1, the MDT `A-0054` shape with `Switching times in the device` = 1
+/// (issue #413).
+fn split_segment_app() -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
+    let xml = r#"<KNX xmlns="http://knx.org/xml/project/20">
+     <ApplicationProgram Id="M-83_A-S" ApplicationNumber="84" ApplicationVersion="20"
+        MaskVersion="MV-0705" Name="Split" LoadProcedureStyle="ProductProcedure">
+      <Static>
+       <Options DownloadInvisibleParameters="Background" PreferPartialDownloadIfApplicationLoaded="true" />
+       <Code>
+        <AbsoluteSegment Id="M-83_A-S_AS-48" Size="16" Address="18432"><Data>AAECAwQFBgcICQoLDA0ODw==</Data></AbsoluteSegment>
+       </Code>
+       <ParameterTypes>
+        <ParameterType Id="M-83_A-S_PT-8"><TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="255" /></ParameterType>
+       </ParameterTypes>
+       <Parameters>
+        <Parameter Id="M-83_A-S_P-1" Name="kept by the device" ParameterType="M-83_A-S_PT-8" Value="0" />
+       </Parameters>
+       <ParameterRefs>
+        <ParameterRef Id="M-83_A-S_P-1_R-1" RefId="M-83_A-S_P-1" />
+       </ParameterRefs>
+       <LoadProcedures>
+        <LoadProcedure>
+         <LdCtrlConnect />
+         <LdCtrlUnload LsmIdx="3" />
+         <LdCtrlLoad LsmIdx="3" />
+         <choose ParamRefId="M-83_A-S_P-1_R-1">
+          <when test="0">
+           <LdCtrlAbsSegment LsmIdx="3" Address="18432" Size="16" />
+          </when>
+          <when test="1">
+           <LdCtrlAbsSegment LsmIdx="3" Address="18432" Size="6" />
+           <LdCtrlAbsSegment LsmIdx="3" Address="18440" Size="4" />
+          </when>
+         </choose>
+         <LdCtrlLoadCompleted LsmIdx="3" />
+         <LdCtrlRestart />
+         <LdCtrlDisconnect />
+        </LoadProcedure>
+       </LoadProcedures>
+      </Static>
+      <Dynamic><ChannelIndependentBlock><ParameterBlock Id="M-83_A-S_PB-1">
+       <ParameterRefRef RefId="M-83_A-S_P-1_R-1" />
+      </ParameterBlock></ChannelIndependentBlock></Dynamic>
+     </ApplicationProgram></KNX>"#;
+    parse_application_program("M-83_A-S", xml.as_bytes())
+        .map_err(|e| format!("parse the split-segment app: {e}").into())
+}
+
+/// Issue #413: each allocation of a segment the procedure allocates in parts
+/// receives the part of the image it holds, and the octets no allocation
+/// holds are never written (the MDT `A-0054` overflowed its first
+/// allocation with the whole 5406-octet image).
+#[tokio::test]
+async fn test_flash_system7_streams_each_allocation_its_part()
+-> Result<(), Box<dyn std::error::Error>> {
+    set_sys7_lsm_env(LsmMode::MemoryMapped);
+    let (mut bus, state, handle) = setup(LsmMode::MemoryMapped, Fault::None).await?;
+    let target: bussard_model::IndividualAddress = "1.1.99".parse()?;
+    let source: bussard_model::IndividualAddress = "0.0.255".parse()?;
+    let overrides: BTreeMap<String, String> = [("P-1_R-1".to_string(), "1".to_string())].into();
+    let plan = plan_flash(
+        &split_segment_app()?,
+        "1.1.99",
+        MASK_0705,
+        &overrides,
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    let l4 = Layer4Connection::connect(&mut bus, target, source).await?;
+    let mut session = authed_session(l4).await?;
+    let outcome = flash(
+        &mut session,
+        &plan,
+        bussard_download::FlashOptions::default(),
+        |_p| {},
+    )
+    .await?;
+    assert!(outcome.ok(), "flash should reach Loaded: {outcome:?}");
+    {
+        let s = lock(&state);
+        let mut written: Vec<u16> = s
+            .memory
+            .keys()
+            .copied()
+            .filter(|a| (0x4800..0x4810).contains(a))
+            .collect();
+        written.sort_unstable();
+        assert_eq!(
+            written,
+            vec![
+                0x4800, 0x4801, 0x4802, 0x4803, 0x4804, 0x4805, 0x4808, 0x4809, 0x480A, 0x480B
+            ]
+        );
+        assert_eq!(s.memory.get(&0x4808).copied(), Some(0x08));
+        // No write runs past the allocation it starts in.
+        for &(addr, len) in &s.segment_writes {
+            let end = usize::from(addr) + len;
+            assert!(
+                (addr >= 0x4800 && end <= 0x4806) || (addr >= 0x4808 && end <= 0x480C),
+                "a write at {addr:#06X} of {len} octets leaves its allocation"
+            );
+        }
+    }
+    drop(handle);
+    let _ = session.into_disconnect().await;
+    Ok(())
+}

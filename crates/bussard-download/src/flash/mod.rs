@@ -543,8 +543,14 @@ pub struct ImageRef {
     pub segment_id: String,
     /// Where the bytes come from.
     pub kind: ImageKind,
-    /// The image length in octets.
+    /// The length in octets of what the step streams: the whole image, or on
+    /// System 7 the part of it one allocation holds (see [`Self::offset`]).
     pub len: usize,
+    /// Where in the image the streamed octets start. `0` and [`Self::len`]
+    /// equal to the image's length stream the whole image; a System 7
+    /// segment that a load procedure's `<choose>` branch allocates in parts
+    /// streams each part into its own allocation (issue #413).
+    pub offset: usize,
 }
 
 /// Whether a memory image is the vendor code image, the computed parameters, or

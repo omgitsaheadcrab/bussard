@@ -594,7 +594,9 @@ async fn sample_code<Ch: bussard_mgmt::L4Channel>(
         else {
             continue;
         };
-        if !code.contains(image.segment_id.as_str()) {
+        // The sample is the segment's leading octets: the part at its base
+        // where the procedure allocates it in parts (issue #413).
+        if image.offset != 0 || !code.contains(image.segment_id.as_str()) {
             continue;
         }
         let Some(expected) = plan.image_bytes(&image.segment_id) else {

@@ -112,17 +112,30 @@ fn image_record(
     address: Option<u32>,
     object: Option<u32>,
     offset: Option<u32>,
+    part: Option<(usize, usize)>,
 ) -> anyhow::Result<Value> {
-    let bytes = plan.image_bytes(&image.segment_id).unwrap_or_default();
+    let whole = plan.image_bytes(&image.segment_id).unwrap_or_default();
+    // A System 7 allocation that holds a part of its segment's image (issue
+    // #413) streams only that part, at its own address: dump the part, its
+    // mask and the placements inside it, offsets relative to the part.
+    let (start, end) = part.map_or((0, whole.len()), |(at, len)| {
+        let start = at.min(whole.len());
+        (start, at.saturating_add(len).min(whole.len()))
+    });
+    let bytes = &whole[start..end];
     let file = write_file(dir, used, stem, step, ".bin", bytes)?;
     let mask_file = match plan.segment_mask(&image.segment_id) {
-        Some(mask) => Some(write_file(dir, used, stem, step, ".mask.bin", mask)?),
+        Some(mask) => {
+            let mask = &mask[start.min(mask.len())..end.min(mask.len())];
+            Some(write_file(dir, used, stem, step, ".mask.bin", mask)?)
+        }
         None => None,
     };
     // The octets a parameter placement wrote (issue #347): the denominator of
     // the oracle's coverage figure. `null` for a segment no parameter lands in.
     let placed = plan.placed_octets(&image.segment_id).map(|set| {
-        let ranges = placed_ranges(set);
+        let set: BTreeSet<usize> = set.range(start..end).map(|i| i - start).collect();
+        let ranges = placed_ranges(&set);
         json!({ "octets": set.len(), "ranges": ranges })
     });
     Ok(json!({
@@ -282,6 +295,7 @@ pub fn write_dump(
                     None,
                     *target,
                     Some(*offset),
+                    None,
                 )?;
                 if image.kind == bussard_download::ImageKind::Table
                     && let Some(t) = target
@@ -300,6 +314,7 @@ pub fn write_dump(
                     &stem,
                     image,
                     Some(*address),
+                    None,
                     None,
                     None,
                 )?;
@@ -325,6 +340,9 @@ pub fn write_dump(
                 }));
                 if let Some(image) = image {
                     let stem = format!("0x{address:06X}");
+                    let whole = plan.image_bytes(&image.segment_id).map_or(0, <[u8]>::len);
+                    let part = (image.offset != 0 || image.len != whole)
+                        .then_some((image.offset, image.len));
                     record["image"] = image_record(
                         dir,
                         &mut used,
@@ -335,6 +353,7 @@ pub fn write_dump(
                         Some(*address),
                         None,
                         None,
+                        part,
                     )?;
                     // How the executor streams it: `read-compare` reads each
                     // chunk and writes only differing ones (a mask without a

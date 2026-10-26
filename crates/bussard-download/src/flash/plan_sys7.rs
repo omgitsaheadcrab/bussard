@@ -272,6 +272,38 @@ pub(super) fn plan_flash_sys7(
     let mut images: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut segment_masks: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
+    // A segment the taken branches allocate in parts (issue #413: the MDT
+    // `A-0054` with `Switching times in the device` = 1 allocates `0x47E4` as
+    // 899 + 2966 + 578 octets of its 5406): each allocation streams the part
+    // of the image it holds, never the whole image into the first one.
+    let allocations: Vec<(u32, u32)> = ops
+        .iter()
+        .filter_map(|op| match op {
+            LoadOp::AbsSegment {
+                address: Some(a),
+                size,
+                ..
+            } => Some((*a, size.unwrap_or(0))),
+            _ => None,
+        })
+        .collect();
+    let mut part_at: BTreeMap<u32, (&bussard_prod::CodeSegment, usize, usize)> = BTreeMap::new();
+    let mut gaps_of: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+    for (&base, seg) in &seg_by_addr {
+        let len = param_images
+            .get(&seg.id)
+            .filter(|b| !b.is_empty())
+            .or(seg.data.as_ref())
+            .map_or(0, Vec::len);
+        let Some(split) = sys7_segment_parts(&allocations, base, len) else {
+            continue;
+        };
+        for &(addr, offset, part_len) in &split.parts {
+            part_at.entry(addr).or_insert((seg, offset, part_len));
+        }
+        gaps_of.insert(seg.id.clone(), split.gaps);
+    }
+
     // With `DynamicTableManagement` ETS sizes the address-table segment to the
     // table and moves the association table directly behind it (issue #383).
     // Only when both tables are computed: a table left to the product's
@@ -378,6 +410,7 @@ pub(super) fn plan_flash_sys7(
                         segment_id: id,
                         kind: ImageKind::Table,
                         len: table.image.len(),
+                        offset: 0,
                     })
                 } else {
                     // Bind the segment's parameter image: its <Data> with every
@@ -389,26 +422,40 @@ pub(super) fn plan_flash_sys7(
                     // parameter segments). A segment with no <Data> that no
                     // parameter targets is an allocate-only record (e.g. the
                     // 0x0700 RAM region), with no stream.
-                    seg_by_addr.get(&addr).and_then(|seg| {
-                        let bytes = param_images
-                            .get(&seg.id)
-                            .filter(|b| !b.is_empty())
-                            .or(seg.data.as_ref());
-                        bytes.map(|data| {
-                            images.insert(seg.id.clone(), data.clone());
-                            if let Some(mask) = &seg.mask {
-                                segment_masks.insert(
-                                    seg.id.clone(),
-                                    effective_mask(mask, placed.get(&seg.id)),
-                                );
-                            }
-                            ImageRef {
-                                segment_id: seg.id.clone(),
-                                kind: ImageKind::Code,
-                                len: data.len(),
-                            }
+                    if let Some(&(seg, offset, len)) = part_at.get(&addr) {
+                        bind_segment_part(
+                            seg,
+                            offset,
+                            len,
+                            &param_images,
+                            &placed,
+                            gaps_of.get(&seg.id).map(Vec::as_slice).unwrap_or(&[]),
+                            &mut images,
+                            &mut segment_masks,
+                        )?
+                    } else {
+                        seg_by_addr.get(&addr).and_then(|seg| {
+                            let bytes = param_images
+                                .get(&seg.id)
+                                .filter(|b| !b.is_empty())
+                                .or(seg.data.as_ref());
+                            bytes.map(|data| {
+                                images.insert(seg.id.clone(), data.clone());
+                                if let Some(mask) = &seg.mask {
+                                    segment_masks.insert(
+                                        seg.id.clone(),
+                                        effective_mask(mask, placed.get(&seg.id)),
+                                    );
+                                }
+                                ImageRef {
+                                    segment_id: seg.id.clone(),
+                                    kind: ImageKind::Code,
+                                    len: data.len(),
+                                    offset: 0,
+                                }
+                            })
                         })
-                    })
+                    }
                 };
                 steps.push(FlashStep::Sys7AbsSegment {
                     lsm,
@@ -620,6 +667,138 @@ fn sys7_code_segments(
         .filter(|id| images.contains_key(*id))
         .cloned()
         .collect()
+}
+
+/// How the allocations of a load procedure hold one absolute segment's image
+/// when no single allocation holds all of it (issue #413).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SegmentParts {
+    /// Per allocation that starts inside the image, in address order: the
+    /// allocation's address, and the offset and length of the part of the
+    /// image it holds (never more than the allocation's size).
+    pub parts: Vec<(u32, usize, usize)>,
+    /// The octet ranges of the image that no allocation holds, as
+    /// `(start, end)` offsets.
+    pub gaps: Vec<(usize, usize)>,
+}
+
+/// Splits the `image_len`-octet image of the absolute segment at `base` over
+/// the `(address, size)` allocations the procedure's taken branches make.
+///
+/// `None` when the image needs no split: one allocation at `base` holds all
+/// of it (the plain case, where the image is streamed whole), or no
+/// allocation starts inside it. Otherwise every allocation that starts inside
+/// the image holds the octets from its address up to its size, and the
+/// octets no allocation holds are the gaps: memory the download does not
+/// allocate, so it never writes it. ETS's download of the MDT `A-0054` with
+/// `Switching times in the device` = 1 leaves the switching times the device
+/// keeps there ("The switch time settings are not transmitted").
+pub(super) fn sys7_segment_parts(
+    allocations: &[(u32, u32)],
+    base: u32,
+    image_len: usize,
+) -> Option<SegmentParts> {
+    let end = u64::from(base) + image_len as u64;
+    let mut inside: Vec<(u32, u32)> = allocations
+        .iter()
+        .copied()
+        .filter(|&(a, s)| s > 0 && a >= base && u64::from(a) < end)
+        .collect();
+    inside.sort_unstable();
+    inside.dedup();
+    if inside.is_empty()
+        || inside
+            .iter()
+            .any(|&(a, s)| a == base && s as usize >= image_len)
+    {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(inside.len());
+    let mut gaps = Vec::new();
+    let mut covered = 0usize;
+    for (addr, size) in inside {
+        let offset = (addr - base) as usize;
+        let len = (size as usize).min(image_len - offset);
+        if offset > covered {
+            gaps.push((covered, offset));
+        }
+        covered = covered.max(offset + len);
+        parts.push((addr, offset, len));
+    }
+    if covered < image_len {
+        gaps.push((covered, image_len));
+    }
+    Some(SegmentParts { parts, gaps })
+}
+
+/// Binds the part `offset..offset + len` of `seg`'s image to the allocation
+/// that holds it (issue #413), registering the whole image and its write mask
+/// the first time the segment is met.
+///
+/// The octets of the segment no allocation holds (`gaps`) are the device's:
+/// the mask marks them unwritten, so a parameter-only download, the diff
+/// against the device and the read-compare leave them alone, as ETS does.
+///
+/// # Errors
+///
+/// [`PlanError::UnsupportedOp`] when a gap holds an octet the configuration
+/// places a parameter in. The download would leave the device's octets
+/// there while the model sets them, and no read-back can make the two agree:
+/// the rule issue #402 set for a System B `<choose>` that writes a segment in
+/// part.
+#[allow(clippy::too_many_arguments)] // the segment, its part, and the plan's image tables.
+fn bind_segment_part(
+    seg: &bussard_prod::CodeSegment,
+    offset: usize,
+    len: usize,
+    param_images: &BTreeMap<String, Vec<u8>>,
+    placed: &bussard_prod::PlacedOctets,
+    gaps: &[(usize, usize)],
+    images: &mut BTreeMap<String, Vec<u8>>,
+    segment_masks: &mut BTreeMap<String, Vec<u8>>,
+) -> std::result::Result<Option<ImageRef>, PlanError> {
+    let Some(data) = param_images
+        .get(&seg.id)
+        .filter(|b| !b.is_empty())
+        .or(seg.data.as_ref())
+    else {
+        return Ok(None);
+    };
+    if !images.contains_key(&seg.id) {
+        let placed_here = placed.get(&seg.id);
+        if let Some(&(start, end)) = gaps
+            .iter()
+            .find(|(start, end)| placed_here.is_some_and(|p| p.range(start..end).next().is_some()))
+        {
+            return Err(PlanError::UnsupportedOp {
+                op: format!(
+                    "LdCtrlAbsSegment allocations that leave octets {start}..{end} of segment \
+                     {} unallocated while the configuration places a parameter there (ETS \
+                     keeps the device's octets there; bussard cannot verify a segment it \
+                     writes only in part)",
+                    seg.id
+                ),
+            });
+        }
+        let mut mask = seg
+            .mask
+            .as_ref()
+            .map(|m| effective_mask(m, placed_here))
+            .unwrap_or_else(|| vec![0xFF; data.len()]);
+        for &(start, end) in gaps {
+            for byte in mask.iter_mut().take(end).skip(start) {
+                *byte = 0x00;
+            }
+        }
+        images.insert(seg.id.clone(), data.clone());
+        segment_masks.insert(seg.id.clone(), mask);
+    }
+    Ok(Some(ImageRef {
+        segment_id: seg.id.clone(),
+        kind: ImageKind::Code,
+        len,
+        offset,
+    }))
 }
 
 /// The write mask of a parameter segment (issue #320): an octet is written
@@ -1424,6 +1603,7 @@ mod tests {
                 segment_id: seg_id.clone(),
                 kind: ImageKind::Code,
                 len: 15,
+                offset: 0,
             }),
         }];
         // The product's first three descriptors, CNT cut to 3.
@@ -1509,6 +1689,7 @@ mod tests {
                     segment_id: seg_id.clone(),
                     kind: ImageKind::Code,
                     len: 15,
+                    offset: 0,
                 }),
             },
         ];
@@ -1626,6 +1807,7 @@ mod tests {
                     segment_id: id.to_string(),
                     kind,
                     len: 16,
+                    offset: 0,
                 }),
             }
         };
@@ -1692,6 +1874,7 @@ mod tests {
                     segment_id: seg_id.clone(),
                     kind: ImageKind::Code,
                     len: 15,
+                    offset: 0,
                 }),
             },
         ];
@@ -1787,6 +1970,7 @@ mod tests {
                     segment_id: seg_id.clone(),
                     kind: ImageKind::Code,
                     len: 15,
+                    offset: 0,
                 }),
             },
         ];
@@ -2607,5 +2791,377 @@ mod tests {
         )
         .expect("a System 7 plan");
         assert!(!plan.sys7_read_compare());
+    }
+
+    /// A System 7 program whose procedure allocates its parameter segment
+    /// `AS-48` (16 octets at `0x4800`) whole when `P-1` is 0 and in two parts
+    /// when it is 1 (`0x4800` 6 octets, `0x4808` 4 octets), the shape of the
+    /// MDT `A-0054` with `Switching times in the device` = 1 (issue #413).
+    /// `P-2` (offset 0) and `P-4` (offset 9) sit in the parts, `P-3` (offset
+    /// 13) in the second gap, shown only when `P-1` is 0 (and, as on the MDT
+    /// programs, a hidden parameter is not downloaded); `gap_param` adds a
+    /// `P-5` at offset 14 that is always shown.
+    fn split_segment_app(
+        gap_param: bool,
+    ) -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
+        let (p5, p5_ref, p5_rr) = if gap_param {
+            (
+                r#"<Parameter Id="M-83_A-S_P-5" Name="kept" ParameterType="M-83_A-S_PT-8" Value="5"><Memory CodeSegment="M-83_A-S_AS-48" Offset="14" BitOffset="0" /></Parameter>"#,
+                r#"<ParameterRef Id="M-83_A-S_P-5_R-5" RefId="M-83_A-S_P-5" />"#,
+                r#"<ParameterRefRef RefId="M-83_A-S_P-5_R-5" />"#,
+            )
+        } else {
+            ("", "", "")
+        };
+        let xml = format!(
+            r#"<KNX xmlns="http://knx.org/xml/project/20">
+         <ApplicationProgram Id="M-83_A-S" ApplicationNumber="84" ApplicationVersion="20"
+            MaskVersion="MV-0705" Name="Split" LoadProcedureStyle="ProductProcedure">
+          <Static>
+           <Options DownloadInvisibleParameters="Background" PreferPartialDownloadIfApplicationLoaded="true" />
+           <Code>
+            <AbsoluteSegment Id="M-83_A-S_AS-48" Size="16" Address="18432"><Data>AAECAwQFBgcICQoLDA0ODw==</Data></AbsoluteSegment>
+           </Code>
+           <ParameterTypes>
+            <ParameterType Id="M-83_A-S_PT-8"><TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="255" /></ParameterType>
+           </ParameterTypes>
+           <Parameters>
+            <Parameter Id="M-83_A-S_P-1" Name="kept by the device" ParameterType="M-83_A-S_PT-8" Value="0" />
+            <Parameter Id="M-83_A-S_P-2" Name="delay" ParameterType="M-83_A-S_PT-8" Value="17"><Memory CodeSegment="M-83_A-S_AS-48" Offset="0" BitOffset="0" /></Parameter>
+            <Parameter Id="M-83_A-S_P-3" Name="switch time" ParameterType="M-83_A-S_PT-8" Value="33"><Memory CodeSegment="M-83_A-S_AS-48" Offset="13" BitOffset="0" /></Parameter>
+            <Parameter Id="M-83_A-S_P-4" Name="level" ParameterType="M-83_A-S_PT-8" Value="44"><Memory CodeSegment="M-83_A-S_AS-48" Offset="9" BitOffset="0" /></Parameter>
+            {p5}
+           </Parameters>
+           <ParameterRefs>
+            <ParameterRef Id="M-83_A-S_P-1_R-1" RefId="M-83_A-S_P-1" />
+            <ParameterRef Id="M-83_A-S_P-2_R-2" RefId="M-83_A-S_P-2" />
+            <ParameterRef Id="M-83_A-S_P-3_R-3" RefId="M-83_A-S_P-3" />
+            <ParameterRef Id="M-83_A-S_P-4_R-4" RefId="M-83_A-S_P-4" />
+            {p5_ref}
+           </ParameterRefs>
+           <LoadProcedures>
+            <LoadProcedure>
+             <LdCtrlConnect />
+             <LdCtrlUnload LsmIdx="3" />
+             <LdCtrlLoad LsmIdx="3" />
+             <choose ParamRefId="M-83_A-S_P-1_R-1">
+              <when test="0">
+               <LdCtrlAbsSegment LsmIdx="3" SegType="0" Address="18432" Size="16" Access="255" MemType="3" SegFlags="128" />
+              </when>
+              <when test="1">
+               <LdCtrlAbsSegment LsmIdx="3" SegType="0" Address="18432" Size="6" Access="255" MemType="3" SegFlags="128" />
+               <LdCtrlAbsSegment LsmIdx="3" SegType="0" Address="18440" Size="4" Access="255" MemType="3" SegFlags="128" />
+              </when>
+             </choose>
+             <LdCtrlLoadCompleted LsmIdx="3" />
+             <LdCtrlRestart />
+             <LdCtrlDisconnect />
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+          <Dynamic><ChannelIndependentBlock><ParameterBlock Id="M-83_A-S_PB-1">
+           <ParameterRefRef RefId="M-83_A-S_P-1_R-1" />
+           <ParameterRefRef RefId="M-83_A-S_P-2_R-2" />
+           <ParameterRefRef RefId="M-83_A-S_P-4_R-4" />
+           {p5_rr}
+           <choose ParamRefId="M-83_A-S_P-1_R-1">
+            <when test="0"><ParameterRefRef RefId="M-83_A-S_P-3_R-3" /></when>
+           </choose>
+          </ParameterBlock></ChannelIndependentBlock></Dynamic>
+         </ApplicationProgram></KNX>"#
+        );
+        Ok(parse_application_program("M-83_A-S", xml.as_bytes())?)
+    }
+
+    /// Plans [`split_segment_app`] with `P-1` at `kept`.
+    fn plan_split(
+        app: &ApplicationProgram,
+        kept: &str,
+    ) -> std::result::Result<FlashPlan, PlanError> {
+        let overrides: BTreeMap<String, String> =
+            [("P-1_R-1".to_string(), kept.to_string())].into();
+        plan_flash(
+            app,
+            "1.1.99",
+            0x0705,
+            &overrides,
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )
+    }
+
+    /// The `(address, allocated size, image offset, streamed length)` of
+    /// every allocation of `AS-48`.
+    fn split_layout(plan: &FlashPlan) -> Vec<(u32, u32, usize, usize)> {
+        plan.steps
+            .iter()
+            .filter_map(|step| match step {
+                FlashStep::Sys7AbsSegment {
+                    address,
+                    size,
+                    image: Some(image),
+                    ..
+                } if image.segment_id == "M-83_A-S_AS-48" => {
+                    Some((*address, *size, image.offset, image.len))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_plan_flash_sys7_streams_each_allocation_its_part()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = split_segment_app(false)?;
+        // P-1 = 0: one allocation holds the whole image, streamed whole.
+        let whole = plan_split(&app, "0")?;
+        assert_eq!(split_layout(&whole), vec![(0x4800, 16, 0, 16)]);
+        assert_eq!(whole.segment_mask("M-83_A-S_AS-48"), None);
+        // P-1 = 1: each allocation streams the part it holds, so what is
+        // streamed into an allocation equals its size.
+        let split = plan_split(&app, "1")?;
+        let layout = split_layout(&split);
+        assert_eq!(layout, vec![(0x4800, 6, 0, 6), (0x4808, 4, 8, 4)]);
+        assert!(layout.iter().all(|&(_, size, _, len)| size as usize == len));
+        // The image is the whole segment's; the octets no allocation holds
+        // are the device's: masked off, so no diff or partial download
+        // writes them.
+        let image = split.image_bytes("M-83_A-S_AS-48").ok_or("the image")?;
+        assert_eq!(image.len(), 16);
+        assert_eq!((image[0], image[9]), (17, 44));
+        let mask = split.segment_mask("M-83_A-S_AS-48").ok_or("a mask")?;
+        let owned: Vec<usize> = (0..16).filter(|&i| mask[i] == 0xFF).collect();
+        assert_eq!(owned, vec![0, 1, 2, 3, 4, 5, 8, 9, 10, 11]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_flash_sys7_refuses_a_parameter_no_allocation_holds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = split_segment_app(true)?;
+        // Allocated whole, P-5 is written as before.
+        assert_eq!(
+            split_layout(&plan_split(&app, "0")?),
+            vec![(0x4800, 16, 0, 16)]
+        );
+        // Allocated in parts, P-5 (offset 14) is in no allocation: the device
+        // would keep its own octet, the model sets 5.
+        match plan_split(&app, "1") {
+            Err(PlanError::UnsupportedOp { op }) => {
+                assert!(
+                    op.contains("octets 12..16 of segment M-83_A-S_AS-48"),
+                    "{op}"
+                );
+            }
+            other => {
+                return Err(format!("expected the partial-write refusal, got {other:?}").into());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_sys7_segment_parts_splits_and_finds_the_gaps() {
+        // One allocation that holds the image: no split.
+        assert_eq!(sys7_segment_parts(&[(0x4800, 16)], 0x4800, 16), None);
+        assert_eq!(sys7_segment_parts(&[(0x4800, 32)], 0x4800, 16), None);
+        // No allocation inside the image: nothing to bind.
+        assert_eq!(sys7_segment_parts(&[(0x0700, 16)], 0x4800, 16), None);
+        // The A-0054 shape: three parts, a 2-octet and a 961-octet gap.
+        let parts = sys7_segment_parts(
+            &[(16384, 513), (18404, 899), (19305, 2966), (23232, 578)],
+            18404,
+            5406,
+        );
+        assert_eq!(
+            parts,
+            Some(SegmentParts {
+                parts: vec![(18404, 0, 899), (19305, 901, 2966), (23232, 4828, 578)],
+                gaps: vec![(899, 901), (3867, 4828)],
+            })
+        );
+        // An allocation smaller than the image leaves the tail unheld.
+        assert_eq!(
+            sys7_segment_parts(&[(0x4800, 10)], 0x4800, 16),
+            Some(SegmentParts {
+                parts: vec![(0x4800, 0, 10)],
+                gaps: vec![(10, 16)],
+            })
+        );
+    }
+
+    /// Corpus count for issue #413 (env-gated on `BUSSARD_PRODUCT_CORPUS`):
+    /// the programs whose load procedure has a `<choose>` branch that
+    /// allocates an absolute segment in parts (System 7) or writes a segment
+    /// only in part (System B, the #402 refusal), each decided one choose and
+    /// one branch at a time. Prints one `SPLIT-SEGMENT` line per such program
+    /// and a `SPLIT-SEGMENT-SUMMARY`, and asserts that no System 7 procedure
+    /// splits a segment outside a `<choose>`: the layout of every other
+    /// System 7 plan is the one before #413.
+    #[test]
+    fn test_sys7_segment_parts_on_the_corpus() -> Result<(), Box<dyn std::error::Error>> {
+        use bussard_prod::application::LoadProcedure;
+        let Some(dir) = std::env::var_os("BUSSARD_PRODUCT_CORPUS") else {
+            return Ok(());
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let dir = [dir.join("cache/vendor"), dir.join("vendor")]
+            .into_iter()
+            .find(|d| d.is_dir())
+            .unwrap_or(dir);
+        // The ops of `blocks` with branch `branch` of choose `choose` (of
+        // block `block`) taken and every other branch of it left out; the
+        // other chooses keep all their branches.
+        fn with_branch<'a>(
+            blocks: &[&'a LoadProcedure],
+            block: usize,
+            choose: usize,
+            branch: usize,
+        ) -> Vec<&'a LoadOp> {
+            blocks
+                .iter()
+                .enumerate()
+                .flat_map(|(bi, p)| {
+                    p.ops.iter().enumerate().filter_map(move |(i, op)| {
+                        let other = bi == block
+                            && p.guards_of(i)
+                                .iter()
+                                .any(|g| g.choose == choose && g.branch != branch);
+                        (!other).then_some(op)
+                    })
+                })
+                .collect()
+        }
+        let mut seen = BTreeSet::new();
+        let (mut sys7, mut sys_b, mut sys7_choose, mut sys_b_choose) = (0, 0, 0, 0);
+        let mut default_splits = Vec::new();
+        for path in crate::sweep::knxprod_files(&dir) {
+            let Ok(product) = bussard_prod::read_knxprod(&path) else {
+                continue;
+            };
+            for app in &product.applications {
+                if !seen.insert(app.id.clone()) {
+                    continue;
+                }
+                let mask = app.mask_version.as_deref().unwrap_or("");
+                let device_mask = u16::from_str_radix(mask.trim(), 16).unwrap_or(0);
+                let profile = bussard_mgmt::MaskProfile::from_mask(device_mask);
+                let is_sys7 = profile.is_system_7();
+                let is_sys_b = profile.capabilities().flash && !is_sys7;
+                let blocks = super::super::plan::self_contained_blocks(app);
+                let segments: Vec<(u32, usize, &str)> = app
+                    .code_segments
+                    .values()
+                    .filter(|seg| seg.kind == SegmentKind::Absolute)
+                    .filter_map(|seg| {
+                        let len = seg
+                            .data
+                            .as_ref()
+                            .map(Vec::len)
+                            .or(seg.size.map(|s| s as usize))?;
+                        Some((seg.address_or_offset?, len, seg.id.as_str()))
+                    })
+                    .collect();
+                let allocations = |ops: &[&LoadOp]| -> Vec<(u32, u32)> {
+                    ops.iter()
+                        .filter_map(|op| match op {
+                            LoadOp::AbsSegment {
+                                address: Some(a),
+                                size,
+                                ..
+                            } => Some((*a, size.unwrap_or(0))),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                // Outside a `<choose>`, no System 7 procedure splits a
+                // segment: the layout of every other plan is the one before
+                // #413.
+                if is_sys7 {
+                    let unguarded: Vec<&LoadOp> = blocks
+                        .iter()
+                        .flat_map(|p| {
+                            p.ops
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| p.guards_of(*i).is_empty())
+                                .map(|(_, op)| op)
+                        })
+                        .collect();
+                    let allocs = allocations(&unguarded);
+                    if segments
+                        .iter()
+                        .any(|&(base, len, _)| sys7_segment_parts(&allocs, base, len).is_some())
+                    {
+                        default_splits.push(app.id.clone());
+                    }
+                }
+                if blocks.iter().all(|p| p.chooses.is_empty()) {
+                    continue;
+                }
+                if is_sys7 {
+                    sys7_choose += 1;
+                } else if is_sys_b {
+                    sys_b_choose += 1;
+                }
+                let mut found: Vec<String> = Vec::new();
+                for (bi, p) in blocks.iter().enumerate() {
+                    for (ci, choose) in p.chooses.iter().enumerate() {
+                        for branch in 0..choose.tests.len() {
+                            let ops = with_branch(&blocks, bi, ci, branch);
+                            if is_sys7 {
+                                let allocations = allocations(&ops);
+                                for &(base, len, id) in &segments {
+                                    if let Some(split) = sys7_segment_parts(&allocations, base, len)
+                                    {
+                                        found.push(format!(
+                                            "{} branch {branch}: {id} in {} parts, gaps {:?}",
+                                            choose.param_ref_id,
+                                            split.parts.len(),
+                                            split.gaps
+                                        ));
+                                    }
+                                }
+                            } else if is_sys_b {
+                                let taken: Vec<LoadOp> =
+                                    ops.iter().map(|op| (*op).clone()).collect();
+                                let every = blocks.iter().flat_map(|p| p.ops.iter());
+                                if let Err(e) =
+                                    super::super::plan_props::refuse_partial_rel_mem(every, &taken)
+                                {
+                                    found.push(format!(
+                                        "{} branch {branch}: {e}",
+                                        choose.param_ref_id
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                found.sort();
+                found.dedup();
+                if found.is_empty() {
+                    continue;
+                }
+                if is_sys7 {
+                    sys7 += 1;
+                } else {
+                    sys_b += 1;
+                }
+                println!(
+                    "SPLIT-SEGMENT|{}|{mask}|{}|{}",
+                    app.id,
+                    if is_sys7 { "System 7" } else { "System B" },
+                    found.first().map(String::as_str).unwrap_or("")
+                );
+            }
+        }
+        println!(
+            "SPLIT-SEGMENT-SUMMARY|System 7 {sys7} of {sys7_choose} with a load <choose>|System B {sys_b} of {sys_b_choose} with a load <choose>|splits outside a choose {}",
+            default_splits.len()
+        );
+        assert!(default_splits.is_empty(), "{default_splits:#?}");
+        Ok(())
     }
 }

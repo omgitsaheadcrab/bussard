@@ -644,6 +644,7 @@ pub fn plan_flash_with_memo(
                     segment_id,
                     kind: ImageKind::Table,
                     len,
+                    offset: 0,
                 };
                 last_written_image = Some(image.clone());
                 written_image_by_object.insert(*idx, image.clone());
@@ -698,6 +699,7 @@ pub fn plan_flash_with_memo(
                     segment_id,
                     kind,
                     len,
+                    offset: 0,
                 };
                 last_written_image = Some(image.clone());
                 if let Some(oi) = obj_idx {
@@ -737,6 +739,7 @@ pub fn plan_flash_with_memo(
                     segment_id,
                     kind: ImageKind::Code,
                     len,
+                    offset: 0,
                 };
                 last_written_image = Some(image.clone());
                 steps.push(FlashStep::WriteMem { address, image });
@@ -1480,6 +1483,7 @@ mod tests {
                         segment_id: "M-1_A-1_RS-1".to_string(),
                         kind: ImageKind::Code,
                         len: 6,
+                        offset: 0,
                     },
                     target: Some(0),
                 },
@@ -1494,6 +1498,7 @@ mod tests {
                         segment_id: "M-1_A-1_RS-2".to_string(),
                         kind: ImageKind::Parameters,
                         len: 1,
+                        offset: 0,
                     },
                     target: Some(0),
                 },
