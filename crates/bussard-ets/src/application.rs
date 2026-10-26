@@ -696,6 +696,12 @@ pub struct ApplicationProgram {
     pub download_invisible_parameters: Option<String>,
     /// Whether `<Options>` declares `PreferPartialDownloadIfApplicationLoaded="true"`.
     pub prefer_partial_download: bool,
+    /// Whether the application declares `DynamicTableManagement` (`1` or
+    /// `true`). On System 7 ETS then sizes the address-table segment to the
+    /// table and allocates the association table directly behind it, instead
+    /// of at the product's static LSM 2 address (issue #383).
+    #[serde(default)]
+    pub dynamic_table_management: bool,
     /// Base com-objects, keyed by full `Id`.
     pub com_objects: HashMap<String, ComObject>,
     /// Com-object refs, keyed by full `Id`.
@@ -1169,6 +1175,8 @@ fn handle_start(
             app.is_secure_enabled = get(m, b"IsSecureEnabled")
                 .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
                 .unwrap_or(false);
+            app.dynamic_table_management = get(m, b"DynamicTableManagement")
+                .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
         }
         b"RelativeSegment" => insert_segment(app, m, SegmentKind::Relative),
         b"AbsoluteSegment" => insert_segment(app, m, SegmentKind::Absolute),
@@ -2372,6 +2380,26 @@ mod tests {
             );
             assert_eq!(app.prefer_partial_download, partial, "{options}");
             assert_eq!(app.downloads_invisible_parameters(), writes, "{options}");
+        }
+        Ok(())
+    }
+
+    /// `DynamicTableManagement` comes in both spellings: `1` on the Jung
+    /// `A-2088`, `true` on the Theben Meteodata `A-140C` (issue #383).
+    #[test]
+    fn test_parse_application_program_dynamic_table_management() -> Result<()> {
+        for (attr, expected) in [
+            (r#" DynamicTableManagement="1""#, true),
+            (r#" DynamicTableManagement="true""#, true),
+            (r#" DynamicTableManagement="0""#, false),
+            (r#" DynamicTableManagement="false""#, false),
+            ("", false),
+        ] {
+            let xml = format!(
+                r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t"{attr}><Static /></ApplicationProgram></KNX>"#
+            );
+            let app = parse_application_program_str("M-1_A-1", &xml)?;
+            assert_eq!(app.dynamic_table_management, expected, "{attr}");
         }
         Ok(())
     }

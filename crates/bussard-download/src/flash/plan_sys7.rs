@@ -262,6 +262,15 @@ pub(super) fn plan_flash_sys7(
     let mut images: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut segment_masks: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
+    // With `DynamicTableManagement` ETS sizes the address-table segment to the
+    // table and moves the association table directly behind it (issue #383).
+    // Only when both tables are computed: a table left to the product's
+    // `<Data>` keeps the product's segments.
+    let packed = match (sys7_tables.get(&1), sys7_tables.get(&2)) {
+        (Some(address), Some(_)) => sys7_packed_tables(app, address.image.len()),
+        _ => None,
+    };
+
     // The TaskSegment trailing marker `[lead][AppNumber:2][ver]` is per-app: the
     // lead byte tracks the mask family (0x04 on 0705, 0x48 on 0701), the middle two
     // octets are the application number, the trailing octet the app version's low
@@ -306,6 +315,13 @@ pub(super) fn plan_flash_sys7(
                 })?;
                 let addr = check_sys7_u16(step_no, "segment address", addr)?;
                 let size = check_sys7_u16(step_no, "segment size", size.unwrap_or(0))?;
+                let (addr, size) = match packed {
+                    Some(p) if lsm == 1 && addr == p.address => (addr, p.address_size),
+                    Some(p) if lsm == 2 && addr == p.static_association => {
+                        (p.association, p.association_size)
+                    }
+                    _ => (addr, size),
+                };
                 // The allocation must also *fit* the 16-bit space: a segment that
                 // starts inside it but runs past 0xFFFF cannot be placed.
                 check_sys7_u16(step_no, "segment end", addr + size.saturating_sub(1))?;
@@ -401,6 +417,12 @@ pub(super) fn plan_flash_sys7(
                     reason: "LdCtrlTaskSegment has no Address".to_string(),
                 })?;
                 let addr = check_sys7_u16(step_no, "task segment address", addr)?;
+                // The association table's descriptor names its packed base, as
+                // ETS's does (`03 02 401F …` on the A-2088).
+                let addr = match packed {
+                    Some(p) if lsm == 2 && addr == p.static_association => p.association,
+                    _ => addr,
+                };
                 // ETS writes a zero-length field + a `[lead][AppNumber:2][ver]`
                 // marker, not the loaded span. Derive the marker from the mask
                 // family + application number (`[system7-spec §4.3]`).
@@ -1127,8 +1149,48 @@ pub(super) fn sys7_op_label(op: &LoadOp) -> String {
 pub struct Sys7TableBases {
     /// The LSM 1 region (the address table).
     pub address: Option<u16>,
-    /// The LSM 2 region (the association table).
+    /// The LSM 2 region (the association table) as the product declares it.
+    /// When [`Self::packed_end`] is set, the association table is not here
+    /// but directly behind the address table.
     pub association: Option<u16>,
+    /// Set when the product declares `DynamicTableManagement` and its two
+    /// table segments are contiguous: ETS allocates the address table at its
+    /// own length and the association table right behind it (issue #383), so
+    /// the association table's base follows from the address table's length.
+    /// The value is where the product's LSM 2 segment ends (exclusive), the
+    /// end of both tables. `None` for static table segments.
+    pub packed_end: Option<u16>,
+}
+
+/// The first `LdCtrlAbsSegment` (address, size) `app`'s procedure allocates on
+/// LSM 1 and on LSM 2.
+fn table_allocations(app: &ApplicationProgram) -> [Option<(u32, u32)>; 2] {
+    let (ops, _) = assemble_ops(app, None);
+    let alloc = |lsm: u32| {
+        ops.iter().find_map(|op| match op {
+            LoadOp::AbsSegment {
+                lsm_idx: Some(l),
+                address: Some(a),
+                size,
+                ..
+            } if *l == lsm => Some((*a, size.unwrap_or(0))),
+            _ => None,
+        })
+    };
+    [alloc(1), alloc(2)]
+}
+
+/// Whether ETS packs `app`'s tables (see [`Sys7TableBases::packed_end`]): the
+/// application declares `DynamicTableManagement` and its LSM 2 segment starts
+/// where its LSM 1 segment ends. The corpus holds 29 System 7 programs with
+/// the attribute (of 332); the 28 that allocate both table segments all have
+/// that contiguous shape. A non-contiguous one keeps the product's addresses,
+/// as no capture shows what ETS does with it.
+fn packs_tables(app: &ApplicationProgram, allocs: &[Option<(u32, u32)>; 2]) -> bool {
+    match allocs {
+        [Some((a1, s1)), Some((a2, _))] => app.dynamic_table_management && a1 + s1 == *a2,
+        _ => false,
+    }
 }
 
 /// The table bases `app`'s System 7 load procedure allocates
@@ -1138,23 +1200,74 @@ pub struct Sys7TableBases {
 /// `M-00B6_A-4548-01` at `0x41D5`, the MDT `M-0083_A-0041-14` (0701) at
 /// `0x4041`, the Zennio 0701 programs at `0x4200`. The table reader falls back
 /// to these when the device does not answer `PID_TABLE_REFERENCE`, as ETS
-/// takes them from the product.
+/// takes them from the product. With `DynamicTableManagement` the association
+/// table follows the address table instead ([`Sys7TableBases::packed_end`]).
 pub fn sys7_table_bases(app: &ApplicationProgram) -> Sys7TableBases {
-    let (ops, _) = assemble_ops(app, None);
-    let base = |lsm: u32| {
-        ops.iter().find_map(|op| match op {
-            LoadOp::AbsSegment {
-                lsm_idx: Some(l),
-                address: Some(a),
-                ..
-            } if *l == lsm => u16::try_from(*a).ok(),
-            _ => None,
-        })
+    let allocs = table_allocations(app);
+    let base = |i: usize| allocs[i].and_then(|(a, _)| u16::try_from(a).ok());
+    let packed_end = match allocs {
+        [_, Some((a2, s2))] if packs_tables(app, &allocs) => {
+            a2.checked_add(s2).and_then(|end| u16::try_from(end).ok())
+        }
+        _ => None,
     };
     Sys7TableBases {
-        address: base(1),
-        association: base(2),
+        address: base(0),
+        association: base(1),
+        packed_end,
     }
+}
+
+/// The two table segments ETS allocates for a System 7 product with
+/// `DynamicTableManagement` (issue #383).
+///
+/// The rule, from the ETS 6.4 download of the Jung `M-0004_A-2088-11`
+/// (product: LSM 1 `0x4000`/511, LSM 2 `0x41FF`/511, next segment `0x43FF`):
+/// ETS allocated LSM 1 at `0x4000` with size 31, the address table's length
+/// with its count octet and own-address slot (15 entries), and LSM 2 at
+/// `0x401F` with size 991, so the association table ends at `0x43FE`, where
+/// the product's LSM 2 segment ends (not at the next segment, `0x43FF`). The
+/// two segments together keep the product's span; the address table gives
+/// up what it does not use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Sys7PackedTables {
+    /// The address table's base: the product's LSM 1 address.
+    pub address: u32,
+    /// The address table's segment size: the table's own length.
+    pub address_size: u32,
+    /// The product's LSM 2 address, which the association table leaves.
+    pub static_association: u32,
+    /// The association table's base: right behind the address table.
+    pub association: u32,
+    /// Its segment size: up to the end of the product's LSM 2 segment.
+    pub association_size: u32,
+}
+
+/// The packed table layout of `app` for an address table of
+/// `address_table_len` octets, or `None` when ETS uses the product's static
+/// segments (no `DynamicTableManagement`, non-contiguous segments) or the
+/// table does not leave room for the association table.
+pub(crate) fn sys7_packed_tables(
+    app: &ApplicationProgram,
+    address_table_len: usize,
+) -> Option<Sys7PackedTables> {
+    let allocs = table_allocations(app);
+    if !packs_tables(app, &allocs) {
+        return None;
+    }
+    let [Some((a1, _)), Some((a2, s2))] = allocs else {
+        return None;
+    };
+    let end = a2.checked_add(s2)?;
+    let len = u32::try_from(address_table_len).ok().filter(|l| *l > 0)?;
+    let association = a1.checked_add(len).filter(|b| *b < end)?;
+    Some(Sys7PackedTables {
+        address: a1,
+        address_size: len,
+        static_association: a2,
+        association,
+        association_size: end - association,
+    })
 }
 
 /// Parses an `LdCtrlCompareMem` raw op's `Address`, `InlineData` and `Size`
@@ -2071,8 +2184,184 @@ mod tests {
             Sys7TableBases {
                 address: Some(0x4000),
                 association: Some(0x41FF),
+                packed_end: None,
             }
         );
+        Ok(())
+    }
+
+    /// A System 7 app with two table segments (LSM 1 at `lsm1`, LSM 2 at
+    /// `lsm2`, each `(address, size)`) and the given `DynamicTableManagement`
+    /// attribute (`None`: not declared).
+    fn sys7_table_app(
+        lsm1: (u32, u32),
+        lsm2: (u32, u32),
+        dynamic: Option<&str>,
+    ) -> std::result::Result<ApplicationProgram, Box<dyn std::error::Error>> {
+        let dtm = dynamic
+            .map(|v| format!(r#" DynamicTableManagement="{v}""#))
+            .unwrap_or_default();
+        let xml = format!(
+            r#"<KNX xmlns="http://knx.org/xml/project/23">
+         <ApplicationProgram Id="M-83_A-D" ApplicationNumber="14" ApplicationVersion="35"
+            MaskVersion="MV-0705" Name="FabS7Dyn" LoadProcedureStyle="ProductProcedure"{dtm}>
+          <Static>
+           <Code />
+           <LoadProcedures>
+            <LoadProcedure>
+             <LdCtrlConnect />
+             <LdCtrlUnload LsmIdx="1" />
+             <LdCtrlUnload LsmIdx="2" />
+             <LdCtrlLoad LsmIdx="1" />
+             <LdCtrlAbsSegment LsmIdx="1" SegType="0" Address="{a1}" Size="{s1}" Access="242" MemType="3" SegFlags="128" />
+             <LdCtrlTaskSegment LsmIdx="1" Address="{a1}" />
+             <LdCtrlLoadCompleted LsmIdx="1" />
+             <LdCtrlLoad LsmIdx="2" />
+             <LdCtrlAbsSegment LsmIdx="2" SegType="0" Address="{a2}" Size="{s2}" Access="242" MemType="3" SegFlags="128" />
+             <LdCtrlTaskSegment LsmIdx="2" Address="{a2}" />
+             <LdCtrlLoadCompleted LsmIdx="2" />
+             <LdCtrlRestart />
+             <LdCtrlDisconnect />
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+         </ApplicationProgram></KNX>"#,
+            a1 = lsm1.0,
+            s1 = lsm1.1,
+            a2 = lsm2.0,
+            s2 = lsm2.1,
+        );
+        Ok(parse_application_program("M-83_A-D", xml.as_bytes())?)
+    }
+
+    /// The System B table images for `n` group addresses, each linked to its
+    /// own object: the 1.1.49 capture's 14 GAs and 14 associations.
+    fn system_b_tables(n: u16) -> BTreeMap<u32, Vec<u8>> {
+        let mut addr = n.to_be_bytes().to_vec();
+        let mut assoc = n.to_be_bytes().to_vec();
+        for i in 0..n {
+            addr.extend_from_slice(&(0x0800 + i).to_be_bytes());
+            assoc.extend_from_slice(&(i + 1).to_be_bytes());
+            assoc.extend_from_slice(&(i + 1).to_be_bytes());
+        }
+        BTreeMap::from([(1, addr), (2, assoc)])
+    }
+
+    /// The (LSM, address, size) of every table allocation and the (LSM,
+    /// address) of every table descriptor commit of `plan`.
+    #[allow(clippy::type_complexity)] // a test helper's two plain lists
+    fn table_layout(plan: &FlashPlan) -> (Vec<(u32, u32, u32)>, Vec<(u32, u32)>) {
+        let allocs = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                FlashStep::Sys7AbsSegment {
+                    lsm, address, size, ..
+                } if *lsm <= 2 => Some((*lsm, *address, *size)),
+                _ => None,
+            })
+            .collect();
+        let tasks = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                FlashStep::Sys7TaskSegment { lsm, address, .. } if *lsm <= 2 => {
+                    Some((*lsm, *address))
+                }
+                _ => None,
+            })
+            .collect();
+        (allocs, tasks)
+    }
+
+    fn plan_tables(
+        app: &ApplicationProgram,
+        n: u16,
+    ) -> std::result::Result<FlashPlan, Box<dyn std::error::Error>> {
+        Ok(plan_flash(
+            app,
+            "1.1.49",
+            0x0705,
+            &no_overrides(),
+            &BTreeMap::new(),
+            None,
+            &system_b_tables(n),
+        )?)
+    }
+
+    /// The Jung `M-0004_A-2088-11` (`DynamicTableManagement="1"`): ETS
+    /// allocated LSM 1 at 0x4000 with the address table's 31 octets and LSM 2
+    /// at 0x401F with 991 octets, up to where the product's LSM 2 segment
+    /// ends (0x43FE), and committed the association table's descriptor at
+    /// 0x401F (capture `schaltaktor-1-1-49.pcapng`, issue #383).
+    #[test]
+    fn test_plan_flash_sys7_packs_the_jung_a2088_tables() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let app = sys7_table_app((0x4000, 511), (0x41FF, 511), Some("1"))?;
+        let plan = plan_tables(&app, 14)?;
+        let (allocs, tasks) = table_layout(&plan);
+        assert_eq!(allocs, vec![(1, 0x4000, 31), (2, 0x401F, 991)]);
+        assert_eq!(tasks, vec![(1, 0x4000), (2, 0x401F)]);
+        let assoc = plan
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                FlashStep::Sys7AbsSegment {
+                    lsm: 2,
+                    image: Some(image),
+                    ..
+                } => Some(image.len),
+                _ => None,
+            })
+            .ok_or("the association table is streamed")?;
+        assert_eq!(assoc, 29);
+        assert_eq!(
+            sys7_table_bases(&app),
+            Sys7TableBases {
+                address: Some(0x4000),
+                association: Some(0x41FF),
+                packed_end: Some(0x43FE),
+            }
+        );
+        Ok(())
+    }
+
+    /// The Theben Meteodata `M-0048_A-140C-14` (`DynamicTableManagement="true"`,
+    /// LSM 1 0x4000/513, LSM 2 0x4201/511). Its capture has no load procedure
+    /// (ETS read-compares a mask 0701 device), so the layout follows the
+    /// A-2088 rule: the address table at its own length, the association
+    /// table behind it up to 0x4400.
+    #[test]
+    fn test_plan_flash_sys7_packs_the_meteodata_tables() -> Result<(), Box<dyn std::error::Error>> {
+        let app = sys7_table_app((0x4000, 513), (0x4201, 511), Some("true"))?;
+        let plan = plan_tables(&app, 3)?;
+        let (allocs, tasks) = table_layout(&plan);
+        // 1 + 2 × (own IA + 3 GAs) = 9 octets.
+        assert_eq!(allocs, vec![(1, 0x4000, 9), (2, 0x4009, 0x4400 - 0x4009)]);
+        assert_eq!(tasks, vec![(1, 0x4000), (2, 0x4009)]);
+        Ok(())
+    }
+
+    /// Without `DynamicTableManagement` (`0`, `false`, or absent) and for
+    /// non-contiguous segments, the product's segments stay as declared:
+    /// 1.1.52's `A-A012` is identical to ETS that way.
+    #[test]
+    fn test_plan_flash_sys7_keeps_static_tables() -> Result<(), Box<dyn std::error::Error>> {
+        for dynamic in [Some("0"), Some("false"), None] {
+            let app = sys7_table_app((0x4000, 511), (0x41FF, 511), dynamic)?;
+            let (allocs, tasks) = table_layout(&plan_tables(&app, 14)?);
+            assert_eq!(
+                allocs,
+                vec![(1, 0x4000, 511), (2, 0x41FF, 511)],
+                "{dynamic:?}"
+            );
+            assert_eq!(tasks, vec![(1, 0x4000), (2, 0x41FF)], "{dynamic:?}");
+            assert_eq!(sys7_table_bases(&app).packed_end, None, "{dynamic:?}");
+        }
+        let gap = sys7_table_app((0x4000, 500), (0x41FF, 511), Some("1"))?;
+        let (allocs, _) = table_layout(&plan_tables(&gap, 14)?);
+        assert_eq!(allocs, vec![(1, 0x4000, 500), (2, 0x41FF, 511)]);
+        assert_eq!(sys7_table_bases(&gap).packed_end, None);
         Ok(())
     }
 
