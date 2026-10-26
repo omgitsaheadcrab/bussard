@@ -36,7 +36,7 @@
 //! `tests-support/product-corpus/sim-loop-baseline.json`; any other failure
 //! fails the shard.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -248,7 +248,10 @@ fn run_shard(index: usize) -> TestResult {
         return Err(format!("{} holds no .knxprod files", settings.corpus.display()).into());
     }
     let started = Instant::now();
-    let mut seen: HashSet<String> = HashSet::new();
+    // Application id to the archive it ran from: an id that two archives
+    // carry (an MDT push-button database ships the same program under two
+    // product files) runs once and is reported as skipped the second time.
+    let mut seen: HashMap<String, String> = HashMap::new();
     let mut reports: Vec<AppReport> = Vec::new();
     for file in &files {
         let archive = file
@@ -279,11 +282,8 @@ fn run_shard(index: usize) -> TestResult {
             // The corpus sweep reports parse failures; say so only when this
             // shard wanted something from the archive.
             Err(e) => {
-                if !mine.is_empty() {
-                    eprintln!(
-                        "sim-loop {archive}: not read ({e}); skipping {}",
-                        mine.join(", ")
-                    );
+                for id in &mine {
+                    reports.push(skipped(id, &archive, format!("archive not read: {e}")));
                 }
                 continue;
             }
@@ -300,10 +300,27 @@ fn run_shard(index: usize) -> TestResult {
             product.applications.clear();
             written.map(|_| ()).map_err(|e| e.to_string())
         };
+        for id in mine.iter().filter(|id| !apps.iter().any(|a| &a.id == *id)) {
+            reports.push(skipped(
+                id,
+                &archive,
+                "not in the parsed archive: the catalog lists it, the parse returned no program"
+                    .to_string(),
+            ));
+        }
         for app in &apps {
-            if !mine.contains(&app.id) || !seen.insert(app.id.clone()) {
+            if !mine.contains(&app.id) {
                 continue;
             }
+            if let Some(first) = seen.get(&app.id) {
+                reports.push(skipped(
+                    &app.id,
+                    &archive,
+                    format!("duplicate application id: already run from {first}"),
+                ));
+                continue;
+            }
+            seen.insert(app.id.clone(), archive.clone());
             let report = run_application(&settings, file, &archive, app, &mut seed, &baseline);
             eprintln!(
                 "sim-loop {:<44} {:<4} {:<5} {:>2} cfg {:>6.1}s {}{}",
@@ -365,6 +382,22 @@ fn run_shard(index: usize) -> TestResult {
             new.join("\n\n")
         )
         .into())
+    }
+}
+
+/// The report of an application the loop did not run, with the reason.
+fn skipped(id: &str, archive: &str, why: String) -> AppReport {
+    eprintln!("sim-loop {id:<44} skip ({archive}): {why}");
+    AppReport {
+        application: id.to_string(),
+        archive: archive.to_string(),
+        mask: String::new(),
+        outcome: "skip",
+        configurations: 0,
+        step: None,
+        detail: Some(why),
+        known: false,
+        seconds: 0.0,
     }
 }
 
@@ -686,9 +719,20 @@ fn random_value(app: &ApplicationProgram, param_ref: &str, rng: &mut SplitMix64)
         .parameter_types
         .get(param.parameter_type.as_deref()?)?
         .kind;
+    draw_value(kind, rng)
+}
+
+/// A random value inside a parameter type's declared range: an enumeration
+/// member, or an integer between the type's `minInclusive` and
+/// `maxInclusive` (both bounds declared, the span computed wide so a full
+/// 64-bit signed range cannot overflow). `None` for a type with no declared
+/// range to draw from (text, float, time, an integer missing a bound): the
+/// parameter keeps its vendor default. A vendor default outside its own type
+/// is the vendor's, not the generator's (#399).
+fn draw_value(kind: &ParameterType, rng: &mut SplitMix64) -> Option<String> {
     match kind {
         ParameterType::Enum { values, .. } if !values.is_empty() => {
-            let i = rng.below(values.len() as u64) as usize;
+            let i = usize::try_from(rng.below(values.len() as u64)).ok()?;
             values.get(i).map(|v| v.value.to_string())
         }
         ParameterType::Int {
@@ -696,9 +740,14 @@ fn random_value(app: &ApplicationProgram, param_ref: &str, rng: &mut SplitMix64)
             max: Some(max),
             ..
         } if max >= min => {
-            let span = u64::try_from(max - min).ok()?.saturating_add(1);
-            let pick = i64::try_from(rng.below(span)).ok()?;
-            Some((min + pick).to_string())
+            let span = i128::from(*max) - i128::from(*min) + 1;
+            let pick = match u64::try_from(span) {
+                Ok(span) => i128::from(rng.below(span)),
+                // The whole 64-bit range: any draw is inside it.
+                Err(_) => i128::from(rng.next()),
+            };
+            let value = i64::try_from(i128::from(*min) + pick).ok()?;
+            (*min..=*max).contains(&value).then(|| value.to_string())
         }
         _ => None,
     }
@@ -1351,5 +1400,62 @@ mod tests {
         assert!(toml.contains("3.send = \"1/0/1\""));
         assert!(toml.contains("3.listen = [\"1/0/2\"]"));
         assert!(config.groups_toml().contains("address = \"1/0/2\""));
+    }
+
+    #[test]
+    fn test_draw_value_stays_inside_a_range_above_zero() -> TestResult {
+        // The ABB/BJE `Dummy_Prio_ENDE` type: minInclusive = maxInclusive = 129.
+        let pinned = ParameterType::Int {
+            size_bits: Some(8),
+            min: Some(129),
+            max: Some(129),
+            signed: false,
+        };
+        let range = ParameterType::Int {
+            size_bits: Some(8),
+            min: Some(129),
+            max: Some(140),
+            signed: false,
+        };
+        let mut rng = SplitMix64::new(346);
+        for _ in 0..500 {
+            assert_eq!(draw_value(&pinned, &mut rng).as_deref(), Some("129"));
+            let v: i64 = draw_value(&range, &mut rng).ok_or("no value")?.parse()?;
+            assert!((129..=140).contains(&v), "{v} outside 129..=140");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_draw_value_full_signed_range_and_undrawable_types() -> TestResult {
+        let full = ParameterType::Int {
+            size_bits: Some(64),
+            min: Some(i64::MIN),
+            max: Some(i64::MAX),
+            signed: true,
+        };
+        let mut rng = SplitMix64::new(7);
+        for _ in 0..100 {
+            draw_value(&full, &mut rng)
+                .ok_or("no value")?
+                .parse::<i64>()?;
+        }
+        let open = ParameterType::Int {
+            size_bits: Some(8),
+            min: Some(10),
+            max: None,
+            signed: false,
+        };
+        assert_eq!(draw_value(&open, &mut rng), None);
+        assert_eq!(
+            draw_value(
+                &ParameterType::Text {
+                    size_bits: Some(64)
+                },
+                &mut rng
+            ),
+            None
+        );
+        Ok(())
     }
 }
