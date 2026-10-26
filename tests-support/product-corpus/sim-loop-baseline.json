@@ -20,7 +20,7 @@
     "M-0083_A-0054-14-0D63": {
       "step": "flash[2] (generated 2)",
       "reason": "`Switching times in the device` = 1 selects a <choose> that splits the 0x47E4 AbsSegment into three; the System 7 path allocates the branch's 899 octets but streams the whole 5406-octet code segment, knx-sim rejects the writes past 0x4B67 and the flash runs into the command timeout; System 7 twin of #411 (#407 sim run)",
-      "issue": null
+      "issue": 413
     },
     "M-0083_A-00A2-10-6169": {
       "step": "flash[2] (generated 2)",
