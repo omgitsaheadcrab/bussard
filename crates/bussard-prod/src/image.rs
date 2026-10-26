@@ -37,13 +37,16 @@
 //! download. If the target segment carries a `<Data>` payload bussard uses it as
 //! the base image and lays parameters over it (so bytes no parameter touches
 //! keep the vendor's bytes); otherwise the image starts as all-`0x00`, sized to
-//! hold every parameter that targets it.
+//! hold every parameter that targets it (to the segment's `Size` on the Dynamic
+//! path). In a relative segment without `<Data>`, every octet no parameter
+//! writes is then set to `0xFF`, the erased flash ETS writes there (issue
+//! #377, see `ERASED_FILL`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use bussard_ets::application::{
-    ApplicationProgram, LabelMatch, ParameterType, enum_member_by_label,
+    ApplicationProgram, LabelMatch, ParameterType, SegmentKind, enum_member_by_label,
 };
 
 use crate::error::{ProdError, Result};
@@ -68,6 +71,46 @@ fn mark(placed: &mut PlacedOctets, seg_id: &str, range: Range<usize>) {
         return;
     }
     placed.entry(seg_id.to_string()).or_default().extend(range);
+}
+
+/// The octet ETS leaves in every unplaced octet of a relative segment that
+/// carries no `<Data>`: erased flash.
+///
+/// Evidence (issue #377): the ETS 6.4 full download of 1.1.201 (Jung IP
+/// interface additional function, `M-0004_A-0024-22-EA66`, capture
+/// `shared-with-windows/26-10-pcaps/ip-schnittstelle-zusatz-1-1-201.pcapng`)
+/// writes `RS-04-00000` (8178 octets, no `<Data>`, no `<Mask>`) as 8107 x
+/// `0xFF`. The 71 other octets are exactly the octets a parameter placement
+/// writes, and in those the bits outside the field are `0`: octet 69 holds a
+/// 1-bit field set to 1 and reads `0x80`, octet 198 a 3-bit field set to 3 and
+/// reads `0x60`. So the fill applies per octet after placement, not as the
+/// base the fields are laid over. A segment with `<Data>` keeps its data (and
+/// `0x00` past a short one), which every other System B capture matches.
+const ERASED_FILL: u8 = 0xFF;
+
+/// Sets every octet that no placement wrote ([`PlacedOctets`]) to
+/// [`ERASED_FILL`] in the image of each relative segment without `<Data>`.
+/// The image length is unchanged.
+fn apply_erased_fill(
+    app: &ApplicationProgram,
+    images: &mut BTreeMap<String, Vec<u8>>,
+    placed: &PlacedOctets,
+) {
+    for (seg_id, image) in images.iter_mut() {
+        let erased = app
+            .code_segments
+            .get(seg_id)
+            .is_some_and(|s| s.kind == SegmentKind::Relative && s.data.is_none());
+        if !erased {
+            continue;
+        }
+        let written = placed.get(seg_id);
+        for (i, octet) in image.iter_mut().enumerate() {
+            if !written.is_some_and(|w| w.contains(&i)) {
+                *octet = ERASED_FILL;
+            }
+        }
+    }
 }
 
 /// Builds the per-segment parameter memory images for `app`, applying
@@ -493,6 +536,7 @@ pub fn compute_parameter_image_placed_with(
         mark(&mut placed, seg_id, range);
     }
 
+    apply_erased_fill(app, &mut images, &placed);
     Ok((images, placed))
 }
 
@@ -652,6 +696,7 @@ fn dynamic_image(
             image.resize(size as usize, 0);
         }
     }
+    apply_erased_fill(app, &mut images, placed);
     Ok(images)
 }
 
@@ -2922,7 +2967,68 @@ mod tests {
         );
         let app = parse_application_program("M-1_A-1", xml.as_bytes())?;
         let images = compute_parameter_image(&app, &no_overrides(), &no_bases())?;
-        assert_eq!(images["M-1_A-1_RS-1"], vec![0, 0, 0, 7]);
+        // The segment has no `<Data>`: the unplaced octets are erased (#377).
+        assert_eq!(images["M-1_A-1_RS-1"], vec![0xFF, 0xFF, 0xFF, 7]);
+        Ok(())
+    }
+
+    /// A relative segment with or without `<Data>`, a 4-octet `Size`, and a
+    /// 1-bit parameter set to 1 at octet 1, bit 0, on the Dynamic path.
+    fn fill_app(data: &str) -> std::result::Result<ApplicationProgram, Box<dyn std::error::Error>> {
+        let xml = format!(
+            r#"<KNX xmlns="http://knx.org/xml/project/23">
+         <ApplicationProgram Id="M-1_A-1" Name="t"><Static>
+          <Code><RelativeSegment Id="M-1_A-1_RS-1" Size="4" LoadStateMachine="4" Offset="0">{data}</RelativeSegment></Code>
+          <ParameterTypes><ParameterType Id="M-1_A-1_PT-0" Name="b"><TypeNumber SizeInBit="1" Type="unsignedInt" maxInclusive="1" /></ParameterType></ParameterTypes>
+          <Parameters><Parameter Id="M-1_A-1_P-0" Name="on" ParameterType="M-1_A-1_PT-0" Value="1"><Memory CodeSegment="M-1_A-1_RS-1" Offset="1" BitOffset="0" /></Parameter></Parameters>
+          <ParameterRefs><ParameterRef Id="M-1_A-1_P-0_R-0" RefId="M-1_A-1_P-0" /></ParameterRefs>
+         </Static>
+         <Dynamic><ChannelIndependentBlock><ParameterBlock Id="M-1_A-1_PB-1"><ParameterRefRef RefId="M-1_A-1_P-0_R-0" /></ParameterBlock></ChannelIndependentBlock></Dynamic>
+         </ApplicationProgram></KNX>"#
+        );
+        Ok(parse_application_program("M-1_A-1", xml.as_bytes())?)
+    }
+
+    /// A relative segment without `<Data>` reads `0xFF` around the one placed
+    /// octet, whose bits outside the field stay `0` (1.1.201 capture, #377).
+    #[test]
+    fn test_compute_parameter_image_placed_without_data_fills_erased()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let app = fill_app("")?;
+        assert!(uses_dynamic_image(&app));
+        let (images, placed) = compute_parameter_image_placed(&app, &no_overrides(), &no_bases())?;
+        assert_eq!(images["M-1_A-1_RS-1"], vec![0xFF, 0x80, 0xFF, 0xFF]);
+        assert_eq!(placed.get("M-1_A-1_RS-1"), Some(&BTreeSet::from([1usize])));
+        assert_eq!(
+            compute_dynamic_parameter_image(&app, &no_overrides())?,
+            images
+        );
+        Ok(())
+    }
+
+    /// A relative segment with `<Data>` keeps it around the placed octet.
+    #[test]
+    fn test_compute_parameter_image_placed_with_data_is_unchanged()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let app = fill_app("<Data>ESIzRA==</Data>")?;
+        let images = compute_parameter_image(&app, &no_overrides(), &no_bases())?;
+        assert_eq!(images["M-1_A-1_RS-1"], vec![0x11, 0xA2, 0x33, 0x44]);
+        Ok(())
+    }
+
+    /// The vendor-default path (no Dynamic section) erases the same way.
+    #[test]
+    fn test_compute_parameter_image_vendor_default_without_data_fills_erased()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let app = app_with(&[(
+            "x",
+            r#"<TypeNumber SizeInBit="3" Type="unsignedInt" maxInclusive="7" />"#,
+            Some("3"),
+            2,
+            0,
+        )])?;
+        assert!(!uses_dynamic_image(&app));
+        assert_eq!(image_of(&app)?, vec![0xFF, 0xFF, 0x60]);
         Ok(())
     }
 
