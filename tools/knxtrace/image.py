@@ -252,6 +252,10 @@ PROPERTY_WRITE_SERVICES = {
     "A_PropertyExtValue_WriteCon": 8,
     "A_PropertyExtValue_WriteUnCon": 8,
     "A_FunctionPropertyExt_Command": 5,
+    # cEMI local device management on a KNXnet/IP device management
+    # connection (issue #398): the body after the message code.
+    "M_PropWrite.req": 6,
+    "M_FuncPropCommand.req": 4,
 }
 PID_LOAD_STATE_CONTROL = 5
 
@@ -335,6 +339,10 @@ def property_writes(ops: DeviceOps) -> List[Dict[str, object]]:
             "data": _value_field(obj_type, obj_index, f["pid"], data),
             "secured": op.detail.get("secured"),
         }
+        if "keyring" in f:
+            # A credential write compared with the keyring (datasecure.
+            # annotate_credentials): names only, never a value.
+            record["keyring"] = f["keyring"]
         salt = os.environ.get(ORACLE_SALT_ENV)
         if (salt and f["pid"] == PID_GRP_KEY_TABLE
                 and is_key_material(obj_type, obj_index, f["pid"], len(data))

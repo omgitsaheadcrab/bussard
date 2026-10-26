@@ -120,12 +120,21 @@ the same way; a gap that never fills resyncs by scanning for the next `06 10`.
 
 **KNXnet/IP.** Search, description, the connection lifecycle (`CONNECT`,
 `CONNECTIONSTATE`, `DISCONNECT`, with status names), `TUNNELING_REQUEST` /
-`TUNNELING_ACK` with channel, sequence and status, device configuration, routing,
-tunnelling features, and the Secure frames `0x0950`-`0x0955` named by type.
+`TUNNELING_ACK` with channel, sequence and status, `CONNECT_REQUEST` with the
+connection type (`tunnel` or `device_management`), device configuration,
+routing, tunnelling features, and the Secure frames `0x0950`-`0x0955` named by
+type (see [KNXnet/IP Secure sessions](#knxnetip-secure-sessions)).
 
 **cEMI.** `L_Data.req` / `.ind` / `.con`, source and destination addresses,
-priority, hop count, repeat and confirm-error flags, plus the management message
-codes by name.
+priority, hop count, repeat and confirm-error flags. On a device management
+connection (`DEVICE_CONFIGURATION_REQUEST`): the transport-layer codes
+`T_Data_Connected` / `T_Data_Individual` (ETS's choice; the TPDU decodes like
+`L_Data`), and the local management services `M_PropRead`, `M_PropWrite`,
+`M_FuncPropCommand`, `M_FuncPropStateRead`, `M_FuncProp.con` and `M_Reset`
+with object type, instance, PID, count, start index and value. Such a frame
+carries no address; it is filed under the interface whose
+`DESCRIPTION_RESPONSE` or `SEARCH_RESPONSE` came from the same IP address, so
+`ops`, `diff` and `image` treat it like a bus-level write to that device.
 
 **Transport layer.** `T_Connect`, `T_Disconnect`, `T_ACK` / `T_NAK` with their
 sequence numbers, and numbered and unnumbered data PDUs.
@@ -137,8 +146,11 @@ index, and for `PID_LOAD_STATE_CONTROL` the load event, the load state and the
 allocation records (`LdCtrlAbsSegment`, `LdCtrlRelSegment`, `LdCtrlTaskPtr`,
 `LdCtrlTaskCtrl1` / `2`, segment address, size, access and memory type); the
 extended services `A_PropertyExtValue_*`, `A_PropertyExtDescription_*` and
-`A_FunctionPropertyExt_*` with object type, instance and PID (ETS uses them on
-the security object during Data Secure activation);
+`A_FunctionPropertyExt_*` with object type, instance and PID, named for the
+KNXnet/IP parameter object (type 11) and the security object (type 17) from
+the KNX master data (`knx_master.xml`), and the IP Secure switches decoded
+(`PID_SECURED_SERVICE_FAMILIES`: family and on/off; `PID_SECURITY_MODE`:
+on/off);
 `A_PropertyDescription_Read` / `_Response` with data type, element count and
 access levels; `A_Memory_Read` / `_Write` / `_Response` with address, count and
 data; `A_MemoryExtended_*` with the 3-octet address; `A_Authorize` and `A_Key`
@@ -229,8 +241,48 @@ verdict: `written: not-comparable, confirmed: 32 of 8169 octets differ at
 octet ETS wrote is never read-confirmed, even when ETS read it before or after
 (the Meteodata clears the `0x4800` marker ETS writes).
 
+`--keyring` is repeatable. ETS drops a device's FDSK from the export once it
+has set a tool key, so a capture that starts under the FDSK and continues
+under a new tool key (an IP Secure activation) needs the export from before
+the rotation and the one after it: `--keyring before.knxkeys --keyring
+after.knxkeys`. Both share `$BUSSARD_KEYRING_PASSWORD`.
+
+A credential write (the tool key, type 17 PID 56; the device authentication
+code, type 11 PID 92; the password hashes, type 11 PID 93, one 16-octet entry
+per user id, 1 the management user) is compared with the keyring: the trace
+and `properties.json` say `keyring=equals the device authentication code of
+1.1.200 (file.knxkeys)` or `user 1 = file.knxkeys; user 2 = ...`, never a
+value.
+
 AES is pure Python so the tool keeps its empty dependency list. That is slow
 per block and fine for a capture's few hundred secure frames.
+
+## KNXnet/IP Secure sessions
+
+```
+uv run tools/knxtrace/knxtrace.py trace interface.pcapng --keyring after.knxkeys --session-shapes
+```
+
+A KNXnet/IP Secure session cannot be decrypted from a capture, with any
+keyring: its key is `SHA-256(X25519 shared secret)[:16]` of an ephemeral
+key exchange whose private halves never leave ETS and the interface
+(`ipsecure.py`, docs/knx-secure-spec.md §7.2). The passwords only
+authenticate. What a capture still shows, per session, is listed at the end
+of `trace` and `devices`:
+
+- the device authentication: the SESSION_RESPONSE MAC is checked against
+  every device authentication code in the keyring(s), which names the
+  credentials the interface held then (`verified: device authentication code
+  of 1.1.200 (after.knxkeys)`, or `matches no code in the keyring`);
+- the connection it carried, from the plain length of the client's second
+  wrapped frame (26 octets a tunnel CONNECT_REQUEST, 24 a device management
+  one), or `authentication only`;
+- the number of wrapped frames each way, and with `--session-shapes` the
+  plain length of each.
+
+The user a session ran as travels encrypted (SESSION_AUTHENTICATE is the
+first wrapped frame). When `ops`, `diff` or `image` find no operation for the
+requested device and the capture holds secure sessions, the error says so.
 
 ## Privacy
 
@@ -249,7 +301,12 @@ not to print anything that should not leave it:
   `tool`, `fdsk` or `group`, and the keyring password is read from
   `$BUSSARD_KEYRING_PASSWORD`, never the command line.
 - KNXnet/IP Secure frames are named, sized and hashed. Nothing is decrypted, and
-  there is no code path that could decrypt.
+  there is no code path that could decrypt. A session's device authentication
+  is checked with the keyring; the result names a keyring entry, never a key.
+- KNXnet/IP Secure passwords from the keyring (device authentication code,
+  management and tunnelling passwords) stay in memory, are derived only to
+  compare, and are never printed. A credential property write (type 17 PID 56,
+  type 11 PIDs 91 to 93) is `redacted:<hash>` on a plain connection too.
 
 Captures themselves live under the gitignored `captures/`, and `.pcap` /
 `.pcapng` files are gitignored everywhere. The tests here build their own
@@ -262,7 +319,8 @@ captures in-process from RFC 5737 TEST-NET-1 addresses.
 | `knxtrace.py` | The CLI: `devices`, `trace`, `ops`, `diff`, `image`, `imgdiff`. |
 | `capture.py` | pcap / pcapng reading, link and IP layers, TCP reassembly. |
 | `knxip.py` | KNXnet/IP, cEMI, transport layer and APCI decoding. |
-| `datasecure.py` | ETS keyring, AES-128, and `A_SecureData` verification and decryption. |
+| `datasecure.py` | ETS keyring, AES-128, and `A_SecureData` verification and decryption; credential writes compared with the keyring. |
+| `ipsecure.py` | KNXnet/IP Secure sessions: device authentication check, connection type and shape. |
 | `normalize.py` | Frame stream to per-device operation sequence. |
 | `opsdiff.py` | The differ and its classification rules. |
 | `image.py` | Composes the memory and the property writes (`properties.json`) a download wrote and diffs both against a `bussard flash --dry-run --dump-images` directory (see [the offline oracle](../../docs/testing-campaign.md#before-a-flash-the-offline-oracle)). |

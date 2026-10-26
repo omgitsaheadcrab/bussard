@@ -122,6 +122,15 @@ CONNECT_STATUS = {
     0x29: "TUNNELLING_LAYER",
 }
 
+# Connection types of a CONNECT_REQUEST's CRI (KNXnet/IP Core).
+CONNECTION_TYPES = {
+    0x03: "device_management",
+    0x04: "tunnel",
+    0x06: "remlog",
+    0x07: "remconf",
+    0x08: "objsvr",
+}
+
 CEMI_MESSAGE_CODES = {
     0x11: "L_Data.req",
     0x2E: "L_Data.con",
@@ -141,7 +150,27 @@ CEMI_MESSAGE_CODES = {
     0xFA: "M_FuncProp.con",
     0xF1: "M_Reset.req",
     0xF0: "M_Reset.ind",
+    # cEMI transport-layer services (KNX 3/6/3 cEMI, "T_Data" message codes).
+    # ETS sends them on a KNXnet/IP device management connection to address
+    # the interface's own management server: the six addressing octets are
+    # reserved (zero) and the TPDU follows as on L_Data (the 1.1.200 captures
+    # of 2026-10-26, issue #398).
+    0x41: "T_Data_Connected.req",
+    0x89: "T_Data_Connected.ind",
+    0x4A: "T_Data_Individual.req",
+    0x94: "T_Data_Individual.ind",
 }
+
+# Message codes laid out like L_Data: ctrl1, ctrl2, source, destination,
+# length, TPDU.
+CEMI_LDATA_LIKE = frozenset({0x11, 0x2E, 0x29, 0x41, 0x89, 0x4A, 0x94})
+# The transport-layer ones, whose addresses are reserved.
+CEMI_TRANSPORT = frozenset({0x41, 0x89, 0x4A, 0x94})
+# cEMI local device management (KNX 3/6/3 §4.1.7): property services on the
+# cEMI server itself, sent on a device management connection.
+CEMI_PROP_SERVICES = frozenset({0xFC, 0xFB, 0xF6, 0xF5, 0xF7})
+CEMI_FUNC_SERVICES = frozenset({0xF8, 0xF9, 0xFA})
+CEMI_RESET_SERVICES = frozenset({0xF1, 0xF0})
 
 PRIORITY_NAMES = {0: "system", 1: "normal", 2: "urgent", 3: "low"}
 
@@ -256,6 +285,72 @@ LOAD_EVENTS = {
 }
 
 LOAD_STATES = {0: "Unloaded", 1: "Loaded", 2: "Loading", 3: "Error"}
+
+# Property ids of the interface object types the extended services address
+# by type. Source: the KNX master data an ETS 6 export ships (`knx_master.xml`,
+# `<InterfaceObjectProperty ObjectType="OT-11">` and `"OT-17"` rows, export
+# of 2026-10-26), the same table `crates/bussard-mgmt/src/knxnet.rs` cites.
+EXT_PID_NAMES = {
+    11: {
+        51: "PID_PROJECT_INSTALLATION_ID",
+        52: "PID_KNX_INDIVIDUAL_ADDRESS",
+        53: "PID_ADDITIONAL_INDIVIDUAL_ADDRESSES",
+        54: "PID_CURRENT_IP_ASSIGNMENT_METHOD",
+        55: "PID_IP_ASSIGNMENT_METHOD",
+        56: "PID_IP_CAPABILITIES",
+        57: "PID_CURRENT_IP_ADDRESS",
+        58: "PID_CURRENT_SUBNET_MASK",
+        59: "PID_CURRENT_DEFAULT_GATEWAY",
+        60: "PID_IP_ADDRESS",
+        61: "PID_SUBNET_MASK",
+        62: "PID_DEFAULT_GATEWAY",
+        63: "PID_DHCP_BOOTP_SERVER",
+        64: "PID_MAC_ADDRESS",
+        65: "PID_SYSTEM_SETUP_MULTICAST_ADDRESS",
+        66: "PID_ROUTING_MULTICAST_ADDRESS",
+        67: "PID_TTL",
+        68: "PID_KNXNETIP_DEVICE_CAPABILITIES",
+        69: "PID_KNXNETIP_DEVICE_STATE",
+        70: "PID_KNXNETIP_ROUTING_CAPABILITIES",
+        71: "PID_PRIORITY_FIFO_ENABLED",
+        72: "PID_QUEUE_OVERFLOW_TO_IP",
+        73: "PID_QUEUE_OVERFLOW_TO_KNX",
+        74: "PID_MSG_TRANSMIT_TO_IP",
+        75: "PID_MSG_TRANSMIT_TO_KNX",
+        76: "PID_FRIENDLY_NAME",
+        78: "PID_ROUTING_BUSY_WAIT_TIME",
+        79: "PID_TUNNELLING_ADDRESSES",
+        91: "PID_BACKBONE_KEY",
+        92: "PID_DEVICE_AUTHENTICATION_CODE",
+        93: "PID_PASSWORD_HASHES",
+        94: "PID_SECURED_SERVICE_FAMILIES",
+        95: "PID_MULTICAST_LATENCY_TOLERANCE",
+        96: "PID_SYNC_LATENCY_FRACTION",
+        97: "PID_TUNNELLING_USERS",
+    },
+    17: {
+        51: "PID_SECURITY_MODE",
+        52: "PID_P2P_KEY_TABLE",
+        53: "PID_GRP_KEY_TABLE",
+        54: "PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE",
+        55: "PID_SECURITY_FAILURES_LOG",
+        56: "PID_TOOL_KEY",
+        57: "PID_SECURITY_REPORT",
+        58: "PID_SECURITY_REPORT_CONTROL",
+        59: "PID_SEQUENCE_NUMBER_SENDING",
+        60: "PID_ZONE_KEYS_TABLE",
+        61: "PID_GO_SECURITY_FLAGS",
+    },
+}
+
+# Function properties (PDT-62 in knx_master.xml) whose command ETS sends when
+# it switches IP Secure on or off. Command data, as the 1.1.200 captures show
+# it: a reserved octet, a service id octet (0 = set), then the arguments.
+# PID_SECURED_SERVICE_FAMILIES (type 11, PID 94): family id (the KNXnet/IP
+# service family numbers of the SUPP_SVC_FAMILIES DIB), activation (0 off,
+# 1 on). PID_SECURITY_MODE (type 17, PID 51): mode (0 off, 1 on).
+FUNC_SECURED_SERVICE_FAMILIES = (11, 94)
+FUNC_SECURITY_MODE = (17, 51)
 
 LD_CTRL_ABS_SEGMENT = 0x01
 LD_CTRL_TASK_SEGMENT = 0x02
@@ -415,11 +510,20 @@ class KnxFrame:
 
 
 def decode_apdu(apci: int, payload: bytes, small_data: int) -> Apdu:
-    """Decodes one APDU.
+    """Decodes one APDU, with key material reduced to a hash.
 
     `small_data` is the low 6 bits of the APCI, which several services use as an
     inline parameter (memory octet count, descriptor type, 6-bit group value).
+    A plain (not Data Secure) frame can carry key material too, e.g. a PID 92
+    write on a device management connection, so the redaction the decrypted
+    path applies (`datasecure.redact_keys`) runs here as well.
     """
+    from datasecure import redact_keys  # local import: datasecure imports knxip lazily
+
+    return redact_keys(_decode_apdu(apci, payload, small_data))
+
+
+def _decode_apdu(apci: int, payload: bytes, small_data: int) -> Apdu:
     name = APCI_EXACT.get(apci)
     if name is not None:
         return _decode_exact(apci, name, payload)
@@ -609,11 +713,15 @@ def _decode_property_ext(apci: int, name: str, payload: bytes) -> Apdu:
         return Apdu(apci, name, {"truncated": True, "len": len(payload)}, payload)
     obj_type = struct.unpack("!H", payload[0:2])[0]
     packed = int.from_bytes(payload[2:5], "big")
+    pid = packed & 0x0FFF
     fields: Dict[str, object] = {
         "obj_type": obj_type,
         "instance": packed >> 12,
-        "pid": packed & 0x0FFF,
+        "pid": pid,
     }
+    pid_name = EXT_PID_NAMES.get(obj_type, {}).get(pid)
+    if pid_name:
+        fields["pid_name"] = pid_name
     rest = payload[5:]
     if apci in (0x1CC, 0x1CD, 0x1CE, 0x1CF, 0x1D0):
         if len(rest) >= 3:
@@ -632,7 +740,25 @@ def _decode_property_ext(apci: int, name: str, payload: bytes) -> Apdu:
     if rest:
         fields["len"] = len(rest)
         fields["data"] = rest.hex()
+    if apci == 0x1D4:
+        fields.update(decode_function_command(obj_type, pid, rest))
     return Apdu(apci, name, fields, payload)
+
+
+def decode_function_command(obj_type: int, pid: int, data: bytes) -> Dict[str, object]:
+    """Names the arguments of the IP Secure function-property commands.
+
+    See `FUNC_SECURED_SERVICE_FAMILIES` and `FUNC_SECURITY_MODE` for the
+    layout. Anything else is left as raw `data`.
+    """
+    if (obj_type, pid) == FUNC_SECURED_SERVICE_FAMILIES and len(data) >= 4:
+        return {
+            "family": FAMILY_NAMES.get(data[2], "0x%02x" % data[2]),
+            "secured": "on" if data[3] else "off",
+        }
+    if (obj_type, pid) == FUNC_SECURITY_MODE and len(data) >= 3:
+        return {"mode": "on" if data[2] else "off"}
+    return {}
 
 
 def _decode_secure(apci: int, name: str, payload: bytes) -> Apdu:
@@ -743,11 +869,13 @@ def decode_npdu(npdu: bytes) -> Optional[L4]:
 
 def decode_cemi(data: bytes) -> Optional[Cemi]:
     """Decodes a cEMI frame; returns None if it is too short to be one."""
-    if len(data) < 2:
+    if len(data) < 2 and not (data and data[0] in CEMI_RESET_SERVICES):
         return None
     mc = data[0]
     name = CEMI_MESSAGE_CODES.get(mc, "cEMI_0x%02X" % mc)
-    if mc not in (0x11, 0x2E, 0x29):
+    if mc in CEMI_PROP_SERVICES or mc in CEMI_FUNC_SERVICES or mc in CEMI_RESET_SERVICES:
+        return Cemi(mc, name, npdu=data[1:], l4=L4("local", apdu=decode_cemi_management(mc, data[1:])))
+    if mc not in CEMI_LDATA_LIKE:
         return Cemi(mc, name, npdu=data[1:])
     add_len = data[1]
     off = 2 + add_len
@@ -775,6 +903,61 @@ def decode_cemi(data: bytes) -> Optional[Cemi]:
         dst_raw=dst_raw,
         ext_ff=ctrl2 & 0x0F,
     )
+
+
+def decode_cemi_management(mc: int, body: bytes) -> Apdu:
+    """Decodes a cEMI local device management message (KNX 3/6/3 §4.1.7).
+
+    The property services address the cEMI server's own interface objects by
+    type and instance: `iot(2) oi(1) pid(1) noe(4 bits) six(12 bits) data`.
+    A confirmation with `noe = 0` carries an error code instead of data. The
+    function-property services carry `iot oi pid` and the data (the
+    confirmation a return code first). The result is an `Apdu` named after the
+    message code, with the fields of the matching bus service (`obj_type`,
+    `instance`, `pid`, `count`, `index`, `data`), so the normalizer and the
+    image treat a device management write like an `A_PropertyExtValue_Write`.
+    """
+    name = CEMI_MESSAGE_CODES.get(mc, "cEMI_0x%02X" % mc)
+    fields: Dict[str, object] = {}
+    if mc in CEMI_RESET_SERVICES:
+        return Apdu(mc, name, fields, body)
+    if len(body) < 4:
+        return Apdu(mc, name, {"truncated": True, "len": len(body)}, body)
+    obj_type = struct.unpack("!H", body[0:2])[0]
+    pid = body[3]
+    fields = {"obj_type": obj_type, "instance": body[2], "pid": pid}
+    pid_name = EXT_PID_NAMES.get(obj_type, {}).get(pid)
+    if pid_name:
+        fields["pid_name"] = pid_name
+    rest = body[4:]
+    if mc in CEMI_PROP_SERVICES:
+        if len(rest) < 2:
+            fields["truncated"] = True
+            return Apdu(mc, name, fields, body)
+        noe = rest[0] >> 4
+        fields["count"] = noe
+        fields["index"] = ((rest[0] & 0x0F) << 8) | rest[1]
+        rest = rest[2:]
+        if noe == 0 and mc in (0xFB, 0xF5) and rest:
+            fields["error"] = "0x%02x" % rest[0]
+            rest = b""
+    elif mc == 0xFA and rest:
+        fields["rc"] = "0x%02x" % rest[0]
+        rest = rest[1:]
+    if rest:
+        fields["len"] = len(rest)
+        fields["data"] = rest.hex()
+    if mc == 0xF8:
+        fields.update(decode_function_command(obj_type, pid, rest))
+    from datasecure import redact_keys  # local import: datasecure imports knxip lazily
+
+    return redact_keys(Apdu(mc, name, fields, body))
+
+
+# Octets of a cEMI management message body (after the message code) before
+# the value: `iot oi pid noe/six` for the property services, `iot oi pid` for
+# the function-property command.
+CEMI_VALUE_OFFSET = {"M_PropWrite.req": 6, "M_PropRead.con": 6, "M_FuncPropCommand.req": 4}
 
 
 # --------------------------------------------------------------------------
@@ -808,12 +991,14 @@ def decode_knxip(ts: float, src: str, dst: str, transport: str, frame: bytes) ->
         elif service == 0x0530:  # ROUTING_INDICATION
             out.cemi = decode_cemi(body)
         elif service == 0x0205:  # CONNECT_REQUEST
-            if body:
-                cri = body[-4:] if len(body) >= 4 else b""
-                if len(cri) >= 2:
-                    out.fields["conn_type"] = "0x%02x" % cri[1]
-                if len(cri) >= 3:
-                    out.fields["layer"] = "0x%02x" % cri[2]
+            # Control HPAI, data HPAI, then the CRI: [len, type, (layer, 0)].
+            # A tunnel CRI is 4 octets, a device management CRI 2.
+            cri = body[16:] if len(body) >= 18 else b""
+            if len(cri) >= 2:
+                out.fields["conn_type"] = "0x%02x" % cri[1]
+                out.fields["connection"] = CONNECTION_TYPES.get(cri[1], "unknown")
+            if len(cri) >= 3:
+                out.fields["layer"] = "0x%02x" % cri[2]
         elif service == 0x0206:  # CONNECT_RESPONSE
             if len(body) >= 2:
                 out.fields["channel"] = body[0]
@@ -1064,6 +1249,38 @@ def frames(packets_iter) -> Iterator[KnxFrame]:
                 yield frame
 
 
+def _ip(endpoint: str) -> str:
+    return endpoint.rsplit(":", 1)[0]
+
+
+def attribute_device_management(frames_iter) -> Iterator[KnxFrame]:
+    """Names the device behind a device management connection.
+
+    A DEVICE_CONFIGURATION_REQUEST addresses the KNXnet/IP server itself, so
+    its cEMI carries no individual address (the T_Data addresses are reserved
+    zeros, the M_Prop* services have none). The server's address comes from
+    the DESCRIPTION_RESPONSE or SEARCH_RESPONSE(_EXTENDED) it sent from the
+    same IP address earlier in the capture. A frame from the server gets that
+    address as its cEMI source, a frame to it as its destination, which is
+    how the normalizer files the operation under the device.
+    """
+    servers: Dict[str, str] = {}
+    for frame in frames_iter:
+        if frame.service in (0x0204, 0x0202, 0x020C) and isinstance(frame.fields.get("ia"), str):
+            servers[_ip(frame.src)] = str(frame.fields["ia"])
+        elif frame.service == 0x0310 and frame.cemi is not None:
+            cemi = frame.cemi
+            from_server = servers.get(_ip(frame.src))
+            to_server = servers.get(_ip(frame.dst))
+            if from_server is not None:
+                cemi.src, cemi.dst = from_server, cemi.dst or "0.0.0"
+                frame.fields["device"] = from_server
+            elif to_server is not None:
+                cemi.src, cemi.dst = cemi.src or "0.0.0", to_server
+                frame.fields["device"] = to_server
+        yield frame
+
+
 def frames_from_file(path: str) -> List[KnxFrame]:
     """Reads a capture file and returns every decoded KNXnet/IP frame."""
-    return list(frames(read_packets(path)))
+    return list(attribute_device_management(frames(read_packets(path))))
