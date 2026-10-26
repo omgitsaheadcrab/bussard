@@ -216,6 +216,7 @@ pub(crate) type DeviceRead = (
     Option<bussard_model::identity::ReportedIdentity>,
     Option<Vec<bussard_download::SecureSenderEntry>>,
     Option<Vec<u8>>,
+    Option<Vec<bussard_service::property_plan::PropertyRow>>,
 );
 
 /// Opens a read-only bus service, reads `target`'s live tables in one management
@@ -236,6 +237,7 @@ pub(crate) fn read_device(
     model: Option<&Model>,
     mut facts: bussard_service::FactsCache,
     tunnel: &[IndividualAddress],
+    properties: Option<&bussard_download::FlashPlan>,
 ) -> anyhow::Result<DeviceRead> {
     let activated = crate::secure_key::model_activated(model, target);
     let tool_key = crate::secure_key::resolve(target, tool_key_source, activated)?;
@@ -295,7 +297,15 @@ pub(crate) fn read_device(
                     let senders = read_admission_table(l4, &read, tunnel).await?;
                     // PID 61 on a secured session (issue #331).
                     let flags = read_security_flags(l4, &read, presented_tool_key).await?;
-                    anyhow::Ok((read, params, identity, senders, flags))
+                    // A property-only procedure (issue #390): no table reader
+                    // speaks the mask, the properties it writes are the plan.
+                    let rows = match (&read, properties) {
+                        (LiveRead::UnsupportedMask { .. }, Some(plan)) => {
+                            Some(bussard_service::property_plan::read_property_rows(l4, plan).await)
+                        }
+                        _ => None,
+                    };
+                    anyhow::Ok((read, params, identity, senders, flags, rows))
                 })
                 .await;
             // Close the bus cleanly (release the gateway tunnel slot), issue #31.
@@ -346,7 +356,6 @@ pub fn run(
     // Whatever was edited outside bussard is now recorded, so it cannot be lost.
     crate::history_cmd::capture_external_edit(dir);
 
-    let desired = compute_desired(&model, target)?;
     // The product file the parameter read-back decodes with (issue #119), when
     // one is given or cached.
     // A read-only command only warns about an override that contradicts the
@@ -369,6 +378,12 @@ pub fn run(
     )?;
     let model_ref = &model;
     let product_ref = product.as_ref();
+    let app = product_ref.and_then(|p| p.app());
+    let desired = compute_desired(&model, target, app)?;
+    // A property-only load procedure (issue #390): what `plan` reads instead
+    // of tables.
+    let properties =
+        app.and_then(|a| bussard_service::property_plan::property_plan(a, Some(model_ref), target));
 
     // `admit_tunnel_senders` (issue #297): the tunnelling addresses to admit,
     // when the device is written secured.
@@ -379,7 +394,7 @@ pub fn run(
     )?;
     let secured = material.tool_key.is_some();
     let tunnel = crate::secure_key::admitted_tunnel(Some(model_ref), tool_key_source, secured)?;
-    let (read, params, identity, live_senders, live_flags) = read_device(
+    let (read, params, identity, live_senders, live_flags, property_rows) = read_device(
         config,
         target,
         &overrides,
@@ -388,10 +403,14 @@ pub fn run(
         Some(model_ref),
         crate::device_facts::cache(dir, true, overrides.refresh_facts),
         &tunnel,
+        properties.as_ref(),
     )?;
     let live_tables = match read {
         LiveRead::Tables(live) => live,
         LiveRead::UnsupportedMask { address, mask } => {
+            if let (Some(rows), Some(app)) = (property_rows, app) {
+                return print_property_plan(target, mask, &app.id, &rows, json);
+            }
             report_unsupported_mask("plan", address, mask);
             return Ok(ExitCode::FAILURE);
         }
@@ -471,12 +490,45 @@ pub fn run(
 }
 
 /// Computes the desired tables from the model's links for `target`, refusing a
-/// device with no links (see [`bussard_download::desired_tables_for`]).
+/// device with no links unless its application `app` has no group objects
+/// (see [`bussard_download::desired_tables_for_app`]).
 pub(crate) fn compute_desired(
     model: &Model,
     target: IndividualAddress,
+    app: Option<&bussard_prod::ApplicationProgram>,
 ) -> anyhow::Result<DesiredTables> {
-    Ok(bussard_download::desired_tables_for(model, target)?)
+    Ok(bussard_download::desired_tables_for_app(
+        model, target, app,
+    )?)
+}
+
+/// Prints the plan of a property-only load procedure (issue #390): each
+/// property it writes, as the device holds it and as the model asks.
+fn print_property_plan(
+    target: IndividualAddress,
+    mask: u16,
+    app_id: &str,
+    rows: &[bussard_service::property_plan::PropertyRow],
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    let noop = !rows.iter().any(|r| r.differs());
+    if json {
+        let out = serde_json::json!({
+            "address": target.to_string(),
+            "mask": format!("{mask:04X}"),
+            "application": app_id,
+            "method": "flash",
+            "property_procedure": rows,
+            "noop": noop,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        print!(
+            "{}",
+            bussard_service::property_plan::render_text(target, app_id, rows)
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn to_json(

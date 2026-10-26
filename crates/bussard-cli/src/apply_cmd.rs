@@ -155,7 +155,6 @@ pub fn run(
     if !crate::validate_cmd::gate(&model, dir, "apply") {
         return Ok(ExitCode::FAILURE);
     }
-    let desired = plan_cmd::compute_desired(&model, target)?;
     // An override that contradicts the lock is refused unless --force (issue
     // #228, item 4), before anything reaches the bus.
     if let Some(loaded) = model.devices.get(&target) {
@@ -176,6 +175,8 @@ pub fn run(
         target,
         crate::param_readback::MissingProduct::Refuse,
     )?;
+    let desired =
+        plan_cmd::compute_desired(&model, target, product.as_ref().and_then(|p| p.app()))?;
     hint_installation_backup(dir);
     apply_desired(
         target,
@@ -374,6 +375,20 @@ pub(crate) fn apply_desired(
     let live_tables = match read {
         plan_cmd::LiveRead::Tables(live) => live,
         plan_cmd::LiveRead::UnsupportedMask { address, mask } => {
+            // A property-only load procedure (issue #390) has no tables to
+            // apply: its properties are written by `flash`.
+            if write
+                .product
+                .and_then(|p| p.app())
+                .is_some_and(bussard_download::has_no_group_objects)
+            {
+                eprintln!(
+                    "{address}'s application has no group objects and no tables to apply; \
+                     `bussard plan {address}` shows its properties and `bussard flash {address}` \
+                     writes them"
+                );
+                return Ok(ExitCode::FAILURE);
+            }
             plan_cmd::report_unsupported_mask(origin.verb(), address, mask);
             return Ok(ExitCode::FAILURE);
         }
