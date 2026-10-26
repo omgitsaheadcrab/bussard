@@ -1939,7 +1939,15 @@ pub fn unindexed_parameters(
         return Ok(out);
     };
     let params = parameter_entries(device);
-    let known: HashSet<&str> = params.iter().map(|p| p.reference.as_str()).collect();
+    // A ref whose only value is a `hidden@` one is not one of the device's
+    // parameters to list (see `Pages::new`), so it is unindexed like a ref
+    // without a value: a key names it, and an edit re-keys the value to the
+    // visible key (issue #375).
+    let known: HashSet<&str> = params
+        .iter()
+        .filter(|p| !crate::files::is_hidden_mem_key(&p.key))
+        .map(|p| p.reference.as_str())
+        .collect();
     let (overrides, _) = device_overrides(device);
     let evaluated = Evaluated::new(product, &overrides);
     let pg = Pages::new(device, &evaluated, &overrides, &params);

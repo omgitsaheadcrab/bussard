@@ -611,17 +611,42 @@ pub fn index_parameter(device: &mut Device, ctx: &KeyContext, mem_key: &str) -> 
     true
 }
 
-/// The key `reference` is stored under, else the one the loader derives.
+/// The visible key `reference` is stored under, else the one the loader
+/// derives. A value stored under `hidden@<ref>` for a ref the configuration
+/// shows (or the lock indexes) takes the derived key: one key per ref, the
+/// visible one, so the edit replaces that value instead of adding a second
+/// key for the ref (issue #375). [`replace_parameter`] drops the old key.
 fn mem_key(device: &Device, ctx: &KeyContext, reference: &str) -> String {
-    device
-        .parameters
-        .keys()
-        .find(|k| ref_of(k) == Some(reference))
-        .cloned()
-        .unwrap_or_else(|| {
-            let key = candidate(device, ctx, reference).map_or(reference, |c| c.key);
-            param_mem_key(key, reference)
-        })
+    let stored = || {
+        device
+            .parameters
+            .keys()
+            .filter(|k| ref_of(k) == Some(reference))
+    };
+    if let Some(visible) = stored().find(|k| !bussard_model::is_hidden_mem_key(k)) {
+        return visible.clone();
+    }
+    let hidden = stored().next();
+    let found = candidate(device, ctx, reference);
+    if let Some(hidden) = hidden
+        && !found.is_some_and(|c| c.indexed || ctx.shown(reference))
+    {
+        return hidden.clone();
+    }
+    param_mem_key(found.map_or(reference, |c| c.key), reference)
+}
+
+/// Stores `value` under the in-memory key `key` (as
+/// [`resolve_parameter_key`] returned it) and drops every other key of the
+/// same ref, a `hidden@` one included: one key per ref (issues #317, #375).
+pub fn replace_parameter(device: &mut Device, key: &str, value: String) {
+    if let Some(reference) = ref_of(key) {
+        let reference = reference.to_string();
+        device
+            .parameters
+            .retain(|k, _| k == key || ref_of(k) != Some(reference.as_str()));
+    }
+    device.parameters.insert(key.to_string(), value);
 }
 
 /// `<place>.<key>` for `reference`: a key that names it on its own.

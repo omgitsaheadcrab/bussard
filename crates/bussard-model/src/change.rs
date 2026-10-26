@@ -967,33 +967,91 @@ fn describe_channels(ia: IndividualAddress, a: &Device, b: &Device, out: &mut Ve
 }
 
 /// Renders parameter values set, changed or cleared on a device.
+///
+/// A parameter is identified by its ref when its key carries one
+/// (`<slug>@<ref>`), by the key otherwise (issue #375): the same ref can sit
+/// under two spellings on the two sides (`label@R` written by the MCP server,
+/// `page-label@R` by an import, `hidden@R` from an import while the
+/// configuration hid it), and that is one parameter, not a removal and an
+/// addition. A ref with the same value on both sides is no change; different
+/// values are one change whose `field` is the shown spelling: the after
+/// side's visible key, else the before side's, else a `hidden@` one.
 fn describe_parameters(ia: IndividualAddress, a: &Device, b: &Device, out: &mut Vec<Change>) {
-    let keys: BTreeSet<&String> = a.parameters.keys().chain(b.parameters.keys()).collect();
+    let before_by_id = parameters_by_identity(&a.parameters);
+    let after_by_id = parameters_by_identity(&b.parameters);
+    let ids: BTreeSet<&str> = before_by_id
+        .keys()
+        .chain(after_by_id.keys())
+        .copied()
+        .collect();
     let device = if b.name.trim().is_empty() {
         ia.to_string()
     } else {
         format!("{} ({ia})", b.name.trim())
     };
-    for key in keys {
-        let before = a.parameters.get(key);
-        let after = b.parameters.get(key);
-        if before == after {
+    for id in ids {
+        let before = before_by_id.get(id).copied();
+        let after = after_by_id.get(id).copied();
+        let (before_value, after_value) = (before.map(|(_, v)| v), after.map(|(_, v)| v));
+        if before_value == after_value {
             continue;
         }
+        let Some(key) = visible_key(after)
+            .or_else(|| visible_key(before))
+            .or_else(|| after.map(|(k, _)| k))
+            .or_else(|| before.map(|(k, _)| k))
+        else {
+            continue;
+        };
         let Some(sentence) = parameter_sentence(
             &parameter_label(key),
             &device,
-            before.map(String::as_str),
-            after.map(String::as_str),
+            before_value.map(String::as_str),
+            after_value.map(String::as_str),
         ) else {
             continue;
         };
         out.push(
             Change::new(ChangeKind::ParameterChanged, sentence)
                 .with_device(ia)
-                .with_field(key.clone(), before.cloned(), after.cloned()),
+                .with_field(key.clone(), before_value.cloned(), after_value.cloned()),
         );
     }
+}
+
+/// The key of a side's value when it is a visible one (not `hidden@`).
+fn visible_key<'a>(side: Option<(&'a String, &'a String)>) -> Option<&'a String> {
+    side.and_then(|(k, _)| (!crate::files::is_hidden_mem_key(k)).then_some(k))
+}
+
+/// What identifies a parameter across two models: the ref of a
+/// `<slug>@<ref>` key, else the key itself.
+fn parameter_identity(key: &str) -> &str {
+    match key.split_once('@') {
+        Some((_, reference)) if !reference.is_empty() => reference,
+        _ => key,
+    }
+}
+
+/// A device's stored parameter values by [`parameter_identity`], each with
+/// the key it sits under. Where one ref sits under two keys (a `hidden@` one
+/// next to a visible one, before a save settles it), the visible key wins,
+/// as it does on disk.
+fn parameters_by_identity(
+    parameters: &BTreeMap<String, String>,
+) -> BTreeMap<&str, (&String, &String)> {
+    let mut out: BTreeMap<&str, (&String, &String)> = BTreeMap::new();
+    for (key, value) in parameters {
+        let id = parameter_identity(key);
+        match out.get(id) {
+            Some((held, _)) if !crate::files::is_hidden_mem_key(held) => {}
+            Some(_) if crate::files::is_hidden_mem_key(key) => {}
+            _ => {
+                out.insert(id, (key, value));
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1310,5 +1368,80 @@ mod tests {
             "Living room blind actuator (1.1.4), channel B, \
              no longer listens to Central down (3/0/1)."
         );
+    }
+
+    /// Two copies of device 1.1.4 holding `before` and `after` as their
+    /// parameters, described.
+    fn parameter_changes(before: &[(&str, &str)], after: &[(&str, &str)]) -> ChangeSet {
+        let side = |params: &[(&str, &str)]| {
+            let mut model = empty();
+            let mut dev = device("1.1.4", "Weather station");
+            dev.device.parameters = params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            model.devices.insert(ia("1.1.4"), dev);
+            model
+        };
+        describe(&side(before), &side(after))
+    }
+
+    /// Issue #375: one ref under the three spellings an import and the MCP
+    /// server write is one parameter.
+    #[test]
+    fn test_describe_parameters_same_ref_under_other_spellings_is_no_change() {
+        let spellings = ["a@P-7_R-7", "page-a@P-7_R-7", "hidden@P-7_R-7"];
+        for before in spellings {
+            for after in spellings {
+                let set = parameter_changes(&[(before, "4")], &[(after, "4")]);
+                assert!(set.is_empty(), "{before} vs {after}: {:?}", set.changes);
+            }
+        }
+    }
+
+    #[test]
+    fn test_describe_parameters_same_ref_other_value_is_one_change_named_visibly() {
+        let cases = [
+            ("hidden@P-7_R-7", "a@P-7_R-7", "a@P-7_R-7"),
+            ("a@P-7_R-7", "hidden@P-7_R-7", "a@P-7_R-7"),
+            ("a@P-7_R-7", "page-a@P-7_R-7", "page-a@P-7_R-7"),
+            ("hidden@P-7_R-7", "hidden@P-7_R-7", "hidden@P-7_R-7"),
+        ];
+        for (before, after, field) in cases {
+            let set = parameter_changes(&[(before, "4")], &[(after, "5")]);
+            assert_eq!(set.len(), 1, "{before} vs {after}: {:?}", set.changes);
+            let change = &set.changes[0];
+            assert_eq!(change.kind, ChangeKind::ParameterChanged);
+            assert_eq!(change.field.as_deref(), Some(field));
+            assert_eq!(change.from.as_deref(), Some("4"));
+            assert_eq!(change.to.as_deref(), Some("5"));
+        }
+    }
+
+    /// A side holding one ref under a hidden and a visible key (before a
+    /// save settles it) compares with the visible key's value.
+    #[test]
+    fn test_describe_parameters_visible_key_wins_over_hidden_on_one_side() {
+        let set = parameter_changes(
+            &[("hidden@P-7_R-7", "1"), ("z@P-7_R-7", "4")],
+            &[("a@P-7_R-7", "4")],
+        );
+        assert!(set.is_empty(), "{:?}", set.changes);
+    }
+
+    #[test]
+    fn test_describe_parameters_key_without_ref_compares_by_key() {
+        let set = parameter_changes(
+            &[("odd", "1"), ("same", "2")],
+            &[("other", "1"), ("same", "2")],
+        );
+        let fields: Vec<_> = set
+            .changes
+            .iter()
+            .filter_map(|c| c.field.as_deref())
+            .collect();
+        assert_eq!(fields, ["odd", "other"]);
+        let set = parameter_changes(&[("odd", "1")], &[("odd", "1")]);
+        assert!(set.is_empty());
     }
 }

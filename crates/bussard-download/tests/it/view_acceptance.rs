@@ -34,7 +34,9 @@ use bussard_model::device_view::{ignored_overrides, parameter_visibility, shown_
 use bussard_model::dynamic::evaluate_dynamic;
 use bussard_model::{IndividualAddress, Model, ProductModel, ProductModels};
 use bussard_prod::image::dynamic_parameter_slots;
-use bussard_prod::{ApplicationProgram, ProductData, parse_application_program};
+use bussard_prod::{
+    ApplicationProgram, ProductData, compute_parameter_image, parse_application_program,
+};
 
 use crate::value_sets::{
     FIXTURES, RANDOM_SETS, Rng, candidates, corpus_vendor, knxprod_files, random_values, seed,
@@ -365,5 +367,71 @@ fn test_view_shows_what_the_download_writes_on_the_corpus() -> TestResult {
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert!(programs > 0, "no program compared");
+    Ok(())
+}
+
+/// Issue #375: the flash takes every stored value by ref, so the parameter
+/// image is the same whether a value is keyed `hidden@<ref>` (the lock's
+/// `hidden[]`) or `<label>@<ref>` (the device file), in memory and after a
+/// save and reload. Re-keying a value never changes what a download writes.
+#[test]
+fn test_parameter_image_is_the_same_under_hidden_and_visible_keys() -> TestResult {
+    let address: IndividualAddress = ADDRESS.parse()?;
+    let mut compared = 0;
+    for (id, xml) in FIXTURES {
+        let app = parse_application_program(id, xml)?;
+        let candidates = candidates(&app);
+        let mut rng = Rng(seed(&app));
+        for _ in 0..5 {
+            let values = random_values(&candidates, &mut rng);
+            if values.is_empty() {
+                continue;
+            }
+            let keyed = |prefix: &str| -> Result<Model, String> {
+                let mut model = one_device(&app.id)?;
+                let device = &mut model.devices.get_mut(&address).ok_or("no device")?.device;
+                for (reference, value) in &values {
+                    device
+                        .parameters
+                        .insert(format!("{prefix}@{reference}"), value.clone());
+                }
+                Ok(model)
+            };
+            let visible = keyed("v")?;
+            let hidden = keyed("hidden")?;
+            let reloaded = Model::from_texts(&hidden.to_texts()?)?;
+            // The lock indexes every ref: the save moves the values into the
+            // device file under the lock's keys.
+            let mut indexed = hidden.clone();
+            let device = &mut indexed.devices.get_mut(&address).ok_or("no device")?.device;
+            for (n, reference) in values.keys().enumerate() {
+                device.lock.parameters.insert(
+                    reference.clone(),
+                    bussard_model::schema::LockedParameter {
+                        key: format!("p-{n}"),
+                        channel: None,
+                        param: None,
+                        default: None,
+                    },
+                );
+            }
+            let texts = indexed.to_texts()?;
+            assert!(!texts["bussard.lock"].contains("hidden"), "{id}");
+            let moved = Model::from_texts(&texts)?;
+            let (expected, _) = parameter_overrides(Some(&visible), address);
+            let image = compute_parameter_image(&app, &expected, &BTreeMap::new())?;
+            for model in [&hidden, &reloaded, &moved] {
+                let (overrides, _) = parameter_overrides(Some(model), address);
+                assert_eq!(overrides, expected, "{id}");
+                assert_eq!(
+                    compute_parameter_image(&app, &overrides, &BTreeMap::new())?,
+                    image,
+                    "{id}"
+                );
+            }
+            compared += 1;
+        }
+    }
+    assert!(compared > 0);
     Ok(())
 }

@@ -953,6 +953,76 @@ async fn test_set_parameter_prefers_the_ref_the_function_shows() -> TestResult {
     Ok(())
 }
 
+/// Issue #375, the #317 duplicate rule: a value the lock keeps in `hidden[]`
+/// for a ref the configuration shows now (an import while the ref was
+/// hidden) is updated under the visible key by `knx_set_parameter`, not left
+/// as `hidden@` next to a second key for the same ref, and the save moves it
+/// into the device file.
+#[tokio::test]
+async fn test_set_parameter_rekeys_a_hidden_value_of_a_shown_ref() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    write_meteo(dir.path())?;
+    let (client, task) = serve(dir.path()).await?;
+    let ia = "1.1.202";
+    let page = "universalkanal-c4-funktion";
+    // Wind shows P-1042_R-1045, which the lock does not index.
+    let body = call(
+        &client,
+        "knx_set_parameter",
+        json!({"address": ia, "parameter": "funktion-des-kanals", "channel": page, "value": "Wind"}),
+    )
+    .await?;
+    assert_ne!(body["refused"], true, "{body}");
+    let lock_path = dir.path().join("bussard.lock");
+    let lock = std::fs::read_to_string(&lock_path)?;
+    assert!(!lock.contains("hidden"), "{lock}");
+    std::fs::write(
+        &lock_path,
+        format!("{lock}hidden = [\n  {{ ref = \"P-1042_R-1045\", value = \"7\" }},\n]\n"),
+    )?;
+    let before = bussard_model::Model::load(dir.path())?;
+    let address: bussard_model::IndividualAddress = ia.parse()?;
+    assert_eq!(
+        before.devices[&address]
+            .device
+            .parameters
+            .get("hidden@P-1042_R-1045")
+            .map(String::as_str),
+        Some("7")
+    );
+
+    let body = call(
+        &client,
+        "knx_set_parameter",
+        json!({"address": ia, "parameter": format!("{page}.helligkeitsschwelle-c4"), "value": "403"}),
+    )
+    .await?;
+    assert_ne!(body["refused"], true, "{body}");
+    assert_eq!(field_ref(&body), Some("P-1042_R-1045"), "{body}");
+    let field = body["detail"]
+        .as_array()
+        .and_then(|d| d.iter().find_map(|c| c["field"].as_str()))
+        .unwrap_or_default()
+        .to_string();
+    assert!(!field.starts_with("hidden@"), "{body}");
+
+    let after = bussard_model::Model::load(dir.path())?;
+    let stored: Vec<(&String, &String)> = after.devices[&address]
+        .device
+        .parameters
+        .iter()
+        .filter(|(k, _)| k.ends_with("@P-1042_R-1045"))
+        .collect();
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert!(!bussard_model::is_hidden_mem_key(stored[0].0), "{stored:?}");
+    assert_eq!(stored[0].1, "403");
+    let lock = std::fs::read_to_string(&lock_path)?;
+    assert!(!lock.contains("hidden"), "{lock}");
+    client.cancel().await?;
+    task.abort();
+    Ok(())
+}
+
 /// The reference in the `field` of a `knx_set_parameter` result's change.
 fn field_ref(body: &Value) -> Option<&str> {
     body["detail"]
