@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 use bussard_download::sweep::knxprod_files;
 use bussard_download::{GroupObjectDescriptor, dynamic_group_object_descriptors, plan_flash};
 use bussard_model::Flags;
+use bussard_prod::application::LoadOp;
 use bussard_prod::dynamic::{DynamicConfig, evaluate_dynamic, visible_parameter_refs};
 use bussard_prod::{AppSelection, ApplicationProgram, ParameterType};
 use sha2::{Digest as _, Sha256};
@@ -706,10 +707,54 @@ fn switches(app: &ApplicationProgram) -> HashSet<String> {
         .collect()
 }
 
+/// Whether a load-procedure op reads the device and refuses the download on a
+/// mismatch: `LdCtrlCompareProp`, `LdCtrlCompareRelMem` or `LdCtrlCompareMem`
+/// (kept raw by the parser).
+fn is_device_compare(op: &LoadOp) -> bool {
+    match op {
+        LoadOp::CompareProp { .. } | LoadOp::CompareRelMem { .. } => true,
+        LoadOp::Raw { name, .. } => name == "LdCtrlCompareMem",
+        _ => false,
+    }
+}
+
+/// The full `Parameter` ids that state the device identity: a `<choose>` of
+/// the application's parsed load procedure, the one `bussard-download`
+/// lowers, tests one of their refs and one of its branches holds a device
+/// compare. A real device has one fixed identity (and knx-sim seeds the one
+/// the vendor defaults select, #400), so the parameter only says which
+/// hardware the project expects; flipping it makes the device refuse the
+/// download at the compare, as ETS would (#407). The generator leaves such a
+/// parameter at its vendor default.
+fn identity_parameters(app: &ApplicationProgram) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for lp in &app.load_procedures {
+        for (i, op) in lp.ops.iter().enumerate() {
+            if !is_device_compare(op) {
+                continue;
+            }
+            for guard in lp.guards_of(i) {
+                let Some(choose) = lp.chooses.get(guard.choose) else {
+                    continue;
+                };
+                let full = format!("{}_{}", app.id, choose.param_ref_id);
+                if let Some(pref) = app.parameter_refs.get(&full) {
+                    out.insert(pref.ref_id.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// A random valid value for an app-relative parameter ref, `None` for one
-/// the user cannot set or whose type has no value to draw.
+/// the user cannot set, whose type has no value to draw, or that states the
+/// device identity ([`identity_parameters`]).
 fn random_value(app: &ApplicationProgram, param_ref: &str, rng: &mut SplitMix64) -> Option<String> {
     let pref = app.parameter_refs.get(&format!("{}_{param_ref}", app.id))?;
+    if identity_parameters(app).contains(&pref.ref_id) {
+        return None;
+    }
     let param = app.parameters.get(&pref.ref_id)?;
     let access = pref.access.as_deref().or(param.access.as_deref());
     if matches!(access, Some("None") | Some("Read")) {
@@ -1400,6 +1445,126 @@ mod tests {
         assert!(toml.contains("3.send = \"1/0/1\""));
         assert!(toml.contains("3.listen = [\"1/0/2\"]"));
         assert!(config.groups_toml().contains("address = \"1/0/2\""));
+    }
+
+    /// A synthetic MDT-style application: `P-1` ("Hardware revision") picks
+    /// one of two `LdCtrlCompareProp`s of the load procedure, `P-2` only
+    /// guards a property write, `P-3` guards nothing.
+    fn identity_app() -> ApplicationProgram {
+        use bussard_model::dynamic::WhenTest;
+        use bussard_prod::application::{
+            LoadChoose, LoadGuard, LoadProcedure, Parameter, ParameterRef, ParameterTypeDecl,
+        };
+        let id = "M-0083_A-0054-14-0D63".to_string();
+        let mut app = ApplicationProgram {
+            id: id.clone(),
+            ..ApplicationProgram::default()
+        };
+        let type_id = format!("{id}_PT-1");
+        app.parameter_types.insert(
+            type_id.clone(),
+            ParameterTypeDecl {
+                id: type_id.clone(),
+                name: None,
+                kind: ParameterType::Int {
+                    size_bits: Some(8),
+                    min: Some(0),
+                    max: Some(1),
+                    signed: false,
+                },
+            },
+        );
+        for n in 1..=3 {
+            let param = format!("{id}_P-{n}");
+            app.parameters.insert(
+                param.clone(),
+                Parameter {
+                    id: param.clone(),
+                    parameter_type: Some(type_id.clone()),
+                    default: Some("1".to_string()),
+                    ..Parameter::default()
+                },
+            );
+            let pref = format!("{param}_R-{n}");
+            app.parameter_refs.insert(
+                pref.clone(),
+                ParameterRef {
+                    id: pref,
+                    ref_id: param,
+                    ..ParameterRef::default()
+                },
+            );
+        }
+        let compare = |data: u8| LoadOp::CompareProp {
+            obj_idx: Some(0),
+            obj_type: None,
+            prop_id: Some(19),
+            inline_data: Some(vec![data, 0, 0, 0]),
+            mask: None,
+            range: None,
+            occurrence: None,
+        };
+        let branches = vec![WhenTest::Values(vec![0]), WhenTest::Values(vec![1])];
+        app.load_procedures.push(LoadProcedure {
+            merge_id: None,
+            ops: vec![
+                LoadOp::Connect,
+                compare(0),
+                compare(1),
+                LoadOp::Restart,
+                LoadOp::Disconnect,
+            ],
+            chooses: vec![
+                LoadChoose {
+                    param_ref_id: "P-1_R-1".to_string(),
+                    tests: branches.clone(),
+                },
+                LoadChoose {
+                    param_ref_id: "P-2_R-2".to_string(),
+                    tests: branches,
+                },
+            ],
+            guards: vec![
+                vec![],
+                vec![LoadGuard {
+                    choose: 0,
+                    branch: 0,
+                }],
+                vec![LoadGuard {
+                    choose: 0,
+                    branch: 1,
+                }],
+                vec![LoadGuard {
+                    choose: 1,
+                    branch: 0,
+                }],
+                vec![],
+            ],
+        });
+        app
+    }
+
+    #[test]
+    fn test_identity_parameters_finds_a_choose_guarding_a_compare() {
+        let app = identity_app();
+        let found = identity_parameters(&app);
+        assert_eq!(
+            found,
+            HashSet::from(["M-0083_A-0054-14-0D63_P-1".to_string()]),
+            "only the parameter whose branch holds a compare states the identity"
+        );
+    }
+
+    #[test]
+    fn test_random_value_leaves_an_identity_parameter_at_its_default() -> TestResult {
+        let app = identity_app();
+        let mut rng = SplitMix64::new(407);
+        for _ in 0..50 {
+            assert_eq!(random_value(&app, "P-1_R-1", &mut rng), None);
+            random_value(&app, "P-2_R-2", &mut rng).ok_or("P-2 draws a value")?;
+            random_value(&app, "P-3_R-3", &mut rng).ok_or("P-3 draws a value")?;
+        }
+        Ok(())
     }
 
     #[test]
