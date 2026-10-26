@@ -7,6 +7,7 @@ use base64::Engine;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
+use crate::prod::branch::{Candidates, ChooseStack, Defaults};
 use crate::prod::model::{
     LSM_ADDRESS_TABLE, LSM_ASSOCIATION_TABLE, LSM_COMOBJECT_TABLE, LdCtrl, LoadProcedure,
     LoadableObject, ProductData, RelativeSegment,
@@ -271,13 +272,18 @@ fn parse_application_program(
     let mut has_comobject_table = false;
     let mut segments: Vec<RelativeSegment> = Vec::new();
     let mut load_procedures: Vec<LoadProcedure> = Vec::new();
-    let mut hardware_type_marker: Option<Vec<u8>> = None;
-    let mut device_compare_props: Vec<(u8, Vec<u8>)> = Vec::new();
+    // Compare candidates with the `<when>` guards they sit under; the vendor
+    // defaults pick one value per property after the parse (issue #400).
+    let mut marker_cands: Candidates<()> = Vec::new();
+    let mut device_cands: Candidates<u8> = Vec::new();
+    let mut object_cands: Candidates<(u8, u8)> = Vec::new();
+    let mut typed_cands: Candidates<(u16, u8)> = Vec::new();
+    let mut chooses = ChooseStack::default();
+    let mut defaults = Defaults::default();
     let mut written_props: Vec<(u8, u8, usize)> = Vec::new();
     let mut task_segment_lsms: Vec<u8> = Vec::new();
     let mut completes_loads = false;
     let mut compare_mems: Vec<(u16, Vec<u8>)> = Vec::new();
-    let mut object_compare_props: Vec<(u8, u8, Vec<u8>)> = Vec::new();
     let mut typed_props: Vec<crate::prod::TypedProperty> = Vec::new();
     // Whether the procedure holds a property op, and any other load op.
     let mut property_ops = false;
@@ -327,6 +333,23 @@ fn parse_application_program(
                     app_version = parse_u32(&e, "ApplicationVersion")?.unwrap_or(0);
                     mask_version = attr(&e, "MaskVersion").unwrap_or_default();
                     in_app = true;
+                }
+                b"Parameter" if in_app => {
+                    if let Some(id) = attr(&e, "Id") {
+                        defaults.parameter(id, attr(&e, "Value"));
+                    }
+                }
+                b"ParameterRef" if in_app => {
+                    if let (Some(id), Some(ref_id)) = (attr(&e, "Id"), attr(&e, "RefId")) {
+                        defaults.parameter_ref(id, ref_id, attr(&e, "Value"));
+                    }
+                }
+                b"choose" if in_app && !is_empty_element => {
+                    chooses.open_choose(attr(&e, "ParamRefId").unwrap_or_default());
+                }
+                b"when" if in_app => {
+                    let default = attr(&e, "default").is_some_and(|v| v == "true");
+                    chooses.open_when(attr(&e, "test").as_deref(), default, !is_empty_element);
                 }
                 b"AddressTable" if in_app => has_address_table = true,
                 b"AssociationTable" if in_app => has_association_table = true,
@@ -468,27 +491,22 @@ fn parse_application_program(
                     {
                         match (obj_idx.and_then(|o| u8::try_from(o).ok()), obj_type) {
                             (Some(object), _) => {
-                                if !object_compare_props
-                                    .iter()
-                                    .any(|(o, p, _)| *o == object && *p == pid)
-                                {
-                                    object_compare_props.push((object, pid, value));
-                                }
+                                object_cands.push(((object, pid), value, chooses.guards()));
                             }
                             (None, Some(object_type)) => {
                                 if let Ok(object_type) = u16::try_from(object_type) {
-                                    match typed_props
-                                        .iter_mut()
-                                        .find(|t| t.object_type == object_type && t.pid == pid)
+                                    if !typed_props
+                                        .iter()
+                                        .any(|t| t.object_type == object_type && t.pid == pid)
                                     {
-                                        Some(t) => t.compare = Some(value),
-                                        None => typed_props.push(crate::prod::TypedProperty {
+                                        typed_props.push(crate::prod::TypedProperty {
                                             object_type,
                                             pid,
-                                            compare: Some(value),
+                                            compare: None,
                                             written: false,
-                                        }),
+                                        });
                                     }
+                                    typed_cands.push(((object_type, pid), value, chooses.guards()));
                                 }
                             }
                             (None, None) => {}
@@ -499,12 +517,10 @@ fn parse_application_program(
                         && let Some(value) = value
                     {
                         if pid == 78 {
-                            hardware_type_marker = Some(value.clone());
+                            marker_cands.push(((), value.clone(), chooses.guards()));
                         }
-                        if let Ok(pid) = u8::try_from(pid)
-                            && !device_compare_props.iter().any(|(p, _)| *p == pid)
-                        {
-                            device_compare_props.push((pid, value));
+                        if let Ok(pid) = u8::try_from(pid) {
+                            device_cands.push((pid, value, chooses.guards()));
                         }
                     }
                 }
@@ -533,6 +549,8 @@ fn parse_application_program(
                     }
                 }
                 b"ApplicationProgram" => in_app = false,
+                b"choose" if in_app => chooses.close_choose(),
+                b"when" if in_app => chooses.close_when(),
                 _ => {}
             },
             _ => {}
@@ -542,6 +560,25 @@ fn parse_application_program(
 
     if app_id.is_empty() {
         return Ok(None);
+    }
+
+    // A compare under a `<choose>` holds only on the hardware that branch
+    // describes; the simulated device is the hardware the vendor defaults
+    // select (issue #400).
+    let hardware_type_marker = defaults.pick(&marker_cands).pop().map(|((), v)| v);
+    let device_compare_props = defaults.pick(&device_cands);
+    let object_compare_props: Vec<(u8, u8, Vec<u8>)> = defaults
+        .pick(&object_cands)
+        .into_iter()
+        .map(|((o, p), v)| (o, p, v))
+        .collect();
+    for ((object_type, pid), value) in defaults.pick(&typed_cands) {
+        if let Some(t) = typed_props
+            .iter_mut()
+            .find(|t| t.object_type == object_type && t.pid == pid)
+        {
+            t.compare = Some(value);
+        }
     }
 
     // Build the loadable-object list. Table objects (LSM 1/2/3) are declared by
@@ -755,6 +792,81 @@ mod tests {
         assert!(has_rel, "expected RelSegment for obj4 size 256");
         assert!(has_master_reset, "expected MasterReset erase code 4");
         assert!(has_write, "expected WriteRelMem for obj4 size 256");
+        Ok(())
+    }
+
+    /// The MDT `M-0083_A-0054-14-0D63` shape (issue #400): a hardware-revision
+    /// parameter selects which object-0 PID 19 value the procedure compares.
+    fn branch_app(revision_default: &str, ref_value: &str) -> String {
+        format!(
+            r#"<KNX><ApplicationProgram Id="M-0083_A-1" MaskVersion="MV-0705"><Static>
+          <Parameters>
+            <Parameter Id="M-0083_A-1_P-833" Name="HW_Revision" Value="{revision_default}" />
+          </Parameters>
+          <ParameterRefs><ParameterRef Id="M-0083_A-1_P-833_R-33" RefId="M-0083_A-1_P-833"{ref_value} /></ParameterRefs>
+          <LoadProcedures><LoadProcedure>
+            <LdCtrlConnect />
+            <LdCtrlCompareProp InlineData="00000000014A00000000" ObjIdx="0" PropId="78" />
+            <choose ParamRefId="M-0083_A-1_P-833_R-33">
+              <when test="0">
+                <LdCtrlCompareProp InlineData="00000000" ObjIdx="0" PropId="19" />
+                <LdCtrlCompareProp InlineData="AA" ObjIdx="3" PropId="13" />
+              </when>
+              <when test="1">
+                <LdCtrlCompareProp InlineData="01000000" ObjIdx="0" PropId="19" />
+                <LdCtrlCompareProp InlineData="BB" ObjIdx="3" PropId="13" />
+              </when>
+            </choose>
+            <LdCtrlUnload LsmIdx="1" />
+          </LoadProcedure></LoadProcedures></Static>
+          <Dynamic><choose ParamRefId="M-0083_A-1_P-833_R-33"><when test="0" /></choose></Dynamic>
+          </ApplicationProgram></KNX>"#
+        )
+    }
+
+    #[test]
+    fn test_parse_application_program_seeds_the_default_branch_compare()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Default "from R2.0" (1): the device reports 01000000, not the first
+        // compare the file lists.
+        let pd = parse_application_program(&branch_app("1", ""), None)?.ok_or("parsed")?;
+        assert_eq!(
+            pd.device_compare_props,
+            vec![
+                (78, vec![0, 0, 0, 0, 0x01, 0x4A, 0, 0, 0, 0]),
+                (19, vec![0x01, 0x00, 0x00, 0x00])
+            ]
+        );
+        assert_eq!(pd.object_compare_props, vec![(3, 13, vec![0xBB])]);
+        assert_eq!(
+            pd.hardware_type_marker,
+            Some(vec![0, 0, 0, 0, 0x01, 0x4A, 0, 0, 0, 0])
+        );
+        // Default "to R1.9" (0): the other branch.
+        let pd = parse_application_program(&branch_app("0", ""), None)?.ok_or("parsed")?;
+        assert_eq!(pd.device_compare_props[1], (19, vec![0x00; 4]));
+        assert_eq!(pd.object_compare_props, vec![(3, 13, vec![0xAA])]);
+        // A ParameterRef value overrides its Parameter's.
+        let pd =
+            parse_application_program(&branch_app("0", r#" Value="1""#), None)?.ok_or("parsed")?;
+        assert_eq!(
+            pd.device_compare_props[1],
+            (19, vec![0x01, 0x00, 0x00, 0x00])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_application_program_without_a_default_takes_the_first_compare()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // No ParameterRef declared: no branch is known to hold, so the first
+        // compare stays (the behaviour before issue #400).
+        let xml = branch_app("1", "").replace(
+            r#"<ParameterRefs><ParameterRef Id="M-0083_A-1_P-833_R-33" RefId="M-0083_A-1_P-833" /></ParameterRefs>"#,
+            "",
+        );
+        let pd = parse_application_program(&xml, None)?.ok_or("parsed")?;
+        assert_eq!(pd.device_compare_props[1], (19, vec![0x00; 4]));
         Ok(())
     }
 

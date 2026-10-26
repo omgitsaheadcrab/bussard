@@ -29,6 +29,17 @@ architecture.
   the object-0/PID78 preflight, and System 7 wire strictness (standard frame
   only, ≤12 memory octets — the trap for a tool wrongly sending 63-byte chunks).
   See `DESIGN.md` and `docs/system7-spec.md`.
+- Product-derived device identity: the properties and memory an application's
+  own `LdCtrlCompareProp`/`LdCtrlCompareMem` preflights expect (hardware type,
+  order info, hardware ids) are seeded from the product, because a real device
+  of that hardware must pass its own vendor procedure. A compare inside a
+  `<choose>` holds only on the hardware that branch describes; the simulated
+  device takes the branch the product's parameter defaults select
+  (`ParameterRef`/`Parameter` `Value`), else the first compare listed. Example:
+  the MDT `M-0083_A-0054-14-0D63` compares object 0 PID 19 with `00000000` for
+  "Hardware revision: to R1.9" and `01000000` for "from R2.0"; the default is
+  "from R2.0", so the simulated device reports `01000000`. A configuration
+  that selects the other revision is refused, as on that hardware.
 - A virtual bus with an **observable event stream** (`src/bus`) — the seam a
   future read-only HTML visualization will consume. Today a `TracingSink` logs
   every telegram + state change to stdout.
