@@ -2,9 +2,9 @@
 
 > Living design document: what bussard is, why it is feasible, the architecture, and the
 > roadmap. Updated as decisions are taken. For a hands-on introduction read the
-> [README](../README.md) and [howto.md](howto.md); the complete command
-> reference is [reference.md](reference.md), and the file format is specified in
-> [model-format.md](model-format.md).
+> [README](../README.md) and [howto.md](../docs/how-to/recipes.md); the complete command
+> reference is [reference.md](../docs/reference/cli.md), and the file format is specified in
+> [model-format.md](../docs/reference/model-format.md).
 
 ## 1. What we're building
 
@@ -80,7 +80,7 @@ application XML is copyrighted: bussard never bundles extracted product data; us
 their own `.knxprod` files (available free from manufacturer service sites and the MyKNX
 catalogue). The EU interoperability exception (Software Directive 2009/24/EC Art. 6)
 covers making an independently created program interoperable, the same footing as Samba
-and Wine. Handling details live in [product-data.md](product-data.md).
+and Wine. Handling details live in [product-data.md](../docs/reference/product-data.md).
 
 ## 4. Ecosystem survey and licensing constraints
 
@@ -179,7 +179,7 @@ The crate never prints; prompts, JSON shapes and status codes stay with the surf
 The user's KNX-as-code repository is a directory of TOML files: `bussard.toml`
 (connection and lint settings), `groups.toml` (the GA plan), one
 `devices/<address>.toml` per device, and the generated `bussard.lock`.
-[model-format.md](model-format.md) is the normative contract for every file, key and
+[model-format.md](../docs/reference/model-format.md) is the normative contract for every file, key and
 error; this section keeps only the decisions behind it.
 
 - **TOML, because the writer is often an LLM.** YAML types a scalar by its spelling:
@@ -254,9 +254,9 @@ the human reads the final plan, the tool executes.
 ### 5.3 Validation
 
 Strict parsing, then rule passes with rustc-style diagnostics and `--json`. The
-diagnostic table lives in [reference.md](reference.md#validation-diagnostics); the
+diagnostic table lives in [reference.md](../docs/reference/cli.md#validation-diagnostics); the
 rules tied to the file format (E020 to E026) are in
-[model-format.md](model-format.md#errors).
+[model-format.md](../docs/reference/model-format.md#errors).
 
 ### 5.4 Monitor and capture
 
@@ -266,13 +266,13 @@ name (from the device file). Unknown GAs/DPTs degrade gracefully to raw hex, nev
 failure; decode-size mismatches are shown inline as a debugging signal. `capture` stores
 raw cEMI bytes plus a decoded snapshot in SQLite so telegrams can be re-decoded after
 model fixes. The JSON Lines contract shared by `monitor --json` and the MCP telegram
-tools is specified in [reference.md](reference.md#telegram-json-contract).
+tools is specified in [reference.md](../docs/reference/cli.md#telegram-json-contract).
 
 ### 5.5 MCP server
 
 Stdio server holding the loaded model and a live bus connection feeding a bounded ring
 buffer. The tool list, parameters and tiers are in
-[reference.md](reference.md#the-mcp-server). The design stance:
+[reference.md](../docs/reference/cli.md#the-mcp-server). The design stance:
 
 - Read-only by default; `--passive` for a server that never transmits; `knx_write_group`
   only with `--allow-writes`, and it hard-refuses `protected = true` GAs with no MCP
@@ -307,11 +307,11 @@ of truth.
 
 **Phase 2, links. Shipped.** `scan` (device discovery with mask/manufacturer/order
 report), `import-product` (`.knxprod` reading with an order-number pointer index, see
-[product-data.md](product-data.md)), `assign` (programming-mode address assignment),
+[product-data.md](../docs/reference/product-data.md)), `assign` (programming-mode address assignment),
 `adopt` (the guided new-device wizard), and `reconstruct` (read a System B device's tables
 back and diff, plus a `--line` sweep that synthesizes a fresh ETS-less model). The link
 downloader itself shipped as `plan` (read-only table diff) and `apply` (backup, write,
-verify) for System B devices. The workflows are documented in [howto.md](howto.md).
+verify) for System B devices. The workflows are documented in [howto.md](../docs/how-to/recipes.md).
 
 **Phase 3, parameters and application download. Shipped for System B.** `flash` does the
 ETS-free application download from a `.knxprod` into a System B device: pre-flight plan
@@ -332,7 +332,7 @@ their own lowering, driven by the per-mask profile (see
 [system7-spec.md](system7-spec.md)). The System B family covers `07B0` and its `57B0`
 (KNX-IP) and `27B0` (RF) variants. The per-mask support table lives in one place,
 `MaskProfile::capabilities`, and is rendered into
-[SAFETY.md](SAFETY.md#supported-device-masks). Unrecognized ops (notably
+[SAFETY.md](../docs/explanation/safety.md#supported-device-masks). Unrecognized ops (notably
 `LdCtrlCompareRelMem`, a read-and-compare that blocks two otherwise-executable MDT apps)
 are refused whole before any write; `LdCtrlCompareRelMem` is the top roadmap op. System 1
 and System 2 masks remain ETS-only.

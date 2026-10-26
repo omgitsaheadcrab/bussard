@@ -127,7 +127,7 @@ pub(super) const SYS7_PRELUDE_UNLOAD_LSMS: [u32; 4] = [1, 2, 3, 4];
 ///
 /// ETS's read-only prelude traffic (`PID_SERIAL_NUMBER`, `PID_MANUFACTURER_ID`,
 /// `PID_HARDWARE_TYPE`, the `0xB6EC` and `0x0060` memory reads) is not
-/// reproduced; `docs/system7-spec.md` §3 lists why.
+/// reproduced; `dev/system7-spec.md` §3 lists why.
 fn add_ets_prelude(steps: &mut Vec<FlashStep>, profile: &bussard_mgmt::Sys7Profile) {
     if !profile.read_compare_write()
         && let Some(first_load) = steps

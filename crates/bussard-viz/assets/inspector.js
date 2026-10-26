@@ -815,7 +815,7 @@ class Inspector {
   /**
    * Ask for an explicit confirmation before putting a telegram on the bus.
    *
-   * `docs/SAFETY.md` promises that every write names its gateway before it
+   * `docs/explanation/safety.md` promises that every write names its gateway before it
    * happens; the CLI does that with a `y/N` prompt, and this is the page's
    * equivalent. It applies to unprotected GAs too: a stray click on a slider
    * or a switch button reaches the real house otherwise. The protected-GA

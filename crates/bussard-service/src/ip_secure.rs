@@ -47,7 +47,7 @@
 //! factory state. `off` drops the tool key from the store (the device is back
 //! on its FDSK) only after the device verified on the FDSK. Recovery from any
 //! state: the device's factory reset (its FDSK is always in the store) and
-//! `bussard keys import` of an ETS export, see `docs/SAFETY.md`.
+//! `bussard keys import` of an ETS export, see `docs/explanation/safety.md`.
 
 use std::collections::BTreeMap;
 use std::path::Path;

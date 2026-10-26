@@ -10,7 +10,7 @@
 //!
 //! The profile is selected from the product's mask version (`MV-07B0` /
 //! `MV-0705` / `MV-0701`) or a `mask:` override in the sim config. The whole
-//! design follows `docs/system7-spec.md`; where that spec marks a constant
+//! design follows `dev/system7-spec.md`; where that spec marks a constant
 //! UNKNOWN, the default here is tagged with the greppable `S7-CAL:` marker.
 
 /// How a System 7 device realises its load-state machines on the wire.
@@ -42,7 +42,7 @@ pub enum LsmAccess {
 /// (so that region is a readable status region, not a written control record).
 /// These constants therefore drive the sim's *alternative* memory-mapped device
 /// side only — the one bussard reaches with `BUSSARD_FLASH_SYS7_LSM=memory` — not
-/// the default. They remain the best-evidence values from `docs/system7-spec.md`
+/// the default. They remain the best-evidence values from `dev/system7-spec.md`
 /// for any 0705 silicon whose product data selects memory-mapped LSM control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryMappedLsm {

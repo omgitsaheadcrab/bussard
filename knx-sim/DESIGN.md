@@ -158,7 +158,7 @@ mask, so a tool classifies the device correctly. An unmodelled mask is refused â
 the simulator will not pretend to be a generation it does not implement.
 
 System 7 differs from System B in four ways the device model reproduces strictly
-(built from `docs/system7-spec.md`, not from any tool):
+(built from `dev/system7-spec.md`, not from any tool):
 
 - **Absolute, memory-mapped download.** No `RelSegment`/`WriteRelMem`. The whole
   download is absolute `A_Memory_Write`s at fixed 16-bit addresses (0x4000

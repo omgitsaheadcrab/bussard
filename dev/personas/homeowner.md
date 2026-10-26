@@ -47,7 +47,7 @@ with the password in a sealed envelope.
 
 | Need | bussard today | Gap | Issue |
 |---|---|---|---|
-| A checklist of what to demand | [handover-checklist.md](../handover-checklist.md), one printed page following the KNX handover and security checklists, with a section for the bussard bundle and its checksum. | None. | D2 |
+| A checklist of what to demand | [handover-checklist.md](../../docs/how-to/handover-checklist.md), one printed page following the KNX handover and security checklists, with a section for the bussard bundle and its checksum. | None. | D2 |
 
 ### Stage 1. Day one: what is in the cabinet?
 
@@ -168,7 +168,7 @@ request and neither will they.
 
 | Need | bussard today | Gap | Issue |
 |---|---|---|---|
-| Take an updated file from the integrator | The assistant previews it with `knx_diff_project` and reads the change sentences; `bussard import` merges a `.knxproj` or bundle, keeps her hand-authored names, reports each disagreement as a sentence and exits 3 until settled (pending merge). [collaboration.md](../collaboration.md) documents the exchange. | None. | D19, D7, D16 |
+| Take an updated file from the integrator | The assistant previews it with `knx_diff_project` and reads the change sentences; `bussard import` merges a `.knxproj` or bundle, keeps her hand-authored names, reports each disagreement as a sentence and exits 3 until settled (pending merge). [collaboration.md](../../docs/how-to/work-with-an-integrator.md) documents the exchange. | None. | D19, D7, D16 |
 | Send her state to the integrator | `bussard export` or `knx_export_bundle` (pending merge), plus `export-groups` so her names land in their ETS. | None. | D19, D12 |
 | Hand a legible package to the next owner | The bundle, the `bussard doc` output and the handover checklist. | A `.knxproj` writer is not planned. | D5, D19, D2 |
 

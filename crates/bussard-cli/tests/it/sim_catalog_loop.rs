@@ -21,7 +21,7 @@
 //! fresh device and the flash must end with its property read-back verified.
 //!
 //! Step 4 of the issue (the same with Data Secure on) waits for the secure
-//! group simulation; see `docs/testing.md`.
+//! group simulation; see `dev/testing.md`.
 //!
 //! The simulator is the separate `knx-sim` workspace. It runs as its own
 //! process (`BUSSARD_KNX_SIM_BIN`, the `serve` binary) on a loopback port and
@@ -190,7 +190,7 @@ impl Settings {
 }
 
 /// The corpus variable may name the product-corpus directory, its `cache/`,
-/// or the vendor directory (docs/testing.md).
+/// or the vendor directory (dev/testing.md).
 fn vendor_dir(dir: PathBuf) -> PathBuf {
     [dir.join("cache/vendor"), dir.join("vendor")]
         .into_iter()

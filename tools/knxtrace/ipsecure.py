@@ -3,13 +3,13 @@
 A KNXnet/IP Secure session cannot be decrypted from a capture, with any
 keyring. The session key is `SHA-256(X25519 shared secret)[:16]` of an
 ephemeral Diffie-Hellman exchange (KNX standard 3/8/9 "KNXnet/IP Secure",
-session establishment; docs/knx-secure-spec.md §7.2, after the MIT XKNX
+session establishment; dev/knx-secure-spec.md §7.2, after the MIT XKNX
 reference `ip_secure.py`). Both private halves stay in ETS and in the
 interface; only the public keys travel. The passwords only authenticate:
 
 - SESSION_RESPONSE carries a MAC under the device authentication code's key
   (PBKDF2-HMAC-SHA256, salt `device-authentication-code.1.secure.ip.knx.org`,
-  65536 iterations, 16 octets; docs/knx-secure-spec.md §3.4, §7.4). It travels
+  65536 iterations, 16 octets; dev/knx-secure-spec.md §3.4, §7.4). It travels
   in the clear, so a keyring's code can be checked against it: that names the
   credentials the interface held at that moment.
 - SESSION_AUTHENTICATE (the user id and a MAC under the user password's key,
@@ -40,7 +40,7 @@ SESSION_RESPONSE = 0x0952
 SECURE_WRAPPER = 0x0950
 PUBLIC_KEY_LEN = 32
 MAC_LEN = 16
-# counter_0 of the handshake MACs (docs/knx-secure-spec.md §7.4, bussard-secure
+# counter_0 of the handshake MACs (dev/knx-secure-spec.md §7.4, bussard-secure
 # `COUNTER_0_HANDSHAKE`).
 COUNTER_0_HANDSHAKE = bytes(14) + b"\xff\x00"
 
@@ -49,7 +49,7 @@ CONNECT_REQUEST_LEN = {26: "tunnel", 24: "device_management"}
 
 
 def session_response_mac(device_auth_key: bytes, session_id: int, client_pub: bytes, server_pub: bytes) -> bytes:
-    """The MAC a SESSION_RESPONSE carries (docs/knx-secure-spec.md §7.4).
+    """The MAC a SESSION_RESPONSE carries (dev/knx-secure-spec.md §7.4).
 
     CBC-MAC (zero `block_0`) under the device authentication key over the
     response header `06 10 09 52 00 38`, the session id and the XOR of the two

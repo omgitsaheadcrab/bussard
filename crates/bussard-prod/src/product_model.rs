@@ -1096,7 +1096,7 @@ const MODEL_BANNER: &str = "\
 # application program: its identity, com-objects, parameters and the load
 # procedure used to download it. Regenerated data under .bussard/: derived from
 # the archive under products/, rebuilt whenever it is missing.
-# Docs: https://github.com/tmbo/bussard/blob/main/docs/product-data.md
+# Docs: https://github.com/tmbo/bussard/blob/main/dev/product-model-format.md
 ";
 
 #[cfg(test)]

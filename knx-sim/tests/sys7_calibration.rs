@@ -1,7 +1,7 @@
 //! Conformance/calibration of the System 7 (mask 0705) device model.
 //!
 //! The knx-sim System 7 device is the executable spec (per
-//! `docs/system7-spec.md` §9): this test *is* the ETS side. It encodes the
+//! `dev/system7-spec.md` §9): this test *is* the ETS side. It encodes the
 //! canonical MDT `M-0083_A-000E` op sequence as raw TPDUs and drives the sim to
 //! `Loaded` on all three parallel LSMs, for BOTH LsmAccess realisations
 //! (memory-mapped and property-based) — mirroring how `ets_calibration.rs`

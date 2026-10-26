@@ -22,7 +22,7 @@ use bussard_download::{FlashStep, plan_flash};
 
 /// The corpus's vendor directory, or `None` (skip) when unset.
 /// `BUSSARD_PRODUCT_CORPUS` may name the product-corpus root, its `cache/`, or
-/// the vendor directory itself (`docs/testing.md`).
+/// the vendor directory itself (`dev/testing.md`).
 fn corpus_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("BUSSARD_PRODUCT_CORPUS")?);
     Some(
@@ -163,7 +163,7 @@ fn plan_lowers_theben_m0048_with_task_ctrl1() {
             // own step, and a post-restart LSM 5 tail (`LdCtrlTaskSegment` and
             // `LdCtrlLoad` on LSM 5). ETS sends nothing after the restart, so
             // the plan ends at it and never names LSM 5 (issue #178,
-            // docs/system7-spec.md, "LSM 5").
+            // dev/system7-spec.md, "LSM 5").
             assert!(
                 count_steps(&plan, |s| matches!(s, FlashStep::Sys7TaskCtrl1 { .. })) >= 1,
                 "Theben FIX2 must lower its LdCtrlTaskCtrl1"

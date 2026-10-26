@@ -3,7 +3,7 @@
 //!
 //! The captures, the project export and the model are private and never
 //! committed, so the rows test is env-gated like the other corpus tests
-//! (`docs/testing.md`):
+//! (`dev/testing.md`):
 //!
 //! ```text
 //! BUSSARD_ORACLE_ROWS=captures/campaign/rows/rows-house-16.txt:captures/campaign/rows/rows-secure-s3.txt \
@@ -137,7 +137,7 @@ fn test_offline_oracle_check_skips_a_row_without_its_capture() -> TestResult {
 #[test]
 fn test_offline_oracle_rows_pass_the_check() -> TestResult {
     let Some(rows) = std::env::var_os("BUSSARD_ORACLE_ROWS") else {
-        eprintln!("SKIP: BUSSARD_ORACLE_ROWS is not set (docs/testing.md)");
+        eprintln!("SKIP: BUSSARD_ORACLE_ROWS is not set (dev/testing.md)");
         return Ok(());
     };
     if !tools_available() {

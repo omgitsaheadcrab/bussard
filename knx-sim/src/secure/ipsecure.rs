@@ -1,4 +1,4 @@
-//! The KNXnet/IP Secure **server** side (docs/knx-secure-spec.md §7-§9), an
+//! The KNXnet/IP Secure **server** side (dev/knx-secure-spec.md §7-§9), an
 //! independent implementation for the cross-implementation conformance loop
 //! (issue #71 Phase B). No code is shared with bussard.
 //!
@@ -377,7 +377,7 @@ mod tests {
     }
 
     /// The vectors a third implementation (Python `cryptography`, script in
-    /// docs/knx-secure-spec.md §12.1) produced; bussard asserts the same ones.
+    /// dev/knx-secure-spec.md §12.1) produced; bussard asserts the same ones.
     #[test]
     fn test_matches_the_reference_vectors() {
         let client = [0x11u8; 32];

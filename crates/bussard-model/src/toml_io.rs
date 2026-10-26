@@ -2,7 +2,7 @@
 //!
 //! Every model file goes through here. A parse error keeps the `toml` crate's
 //! message and caret and adds a `help:` line where the raw message misleads (the
-//! table in `docs/model-format.md`, section Errors). The rules match on the
+//! table in `docs/reference/model-format.md`, section Errors). The rules match on the
 //! message and on the text around the caret, so they fire for the mistakes
 //! people actually make: an unclosed inline table, a YAML-style `-` marker, a
 //! bare float where a string belongs, curly quotes pasted from a word

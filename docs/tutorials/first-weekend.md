@@ -4,14 +4,14 @@ This guide is for the owner of a KNX house who wants to understand it, back it u
 
 An assistant does most of the work. bussard runs as an MCP server, so an assistant such as Claude reads the model, watches the bus, answers questions and proposes changes. The human types the commands that program devices, because those need a hand on the keyboard and a look at the confirmation.
 
-Each step below names the safety rail that protects it. [SAFETY.md](SAFETY.md) explains all of them in one place.
+Each step below names the safety rail that protects it. [SAFETY.md](../explanation/safety.md) explains all of them in one place.
 
 ## What to have ready
 
 - A KNXnet/IP interface or router in the cabinet, and its IP address. Many houses from the 2010s have only a USB interface; an IP interface is then the first purchase.
 - A laptop on the same network as the interface.
 - An assistant that speaks MCP: Claude Code, Claude Desktop, or any other MCP client.
-- Whatever the previous owner or integrator handed over: the `.knxproj` project file and its password, the `.knxkeys` keyring for KNX Secure devices. [The handover checklist](handover-checklist.md) lists what to ask for. A house with no project file works too; it takes longer.
+- Whatever the previous owner or integrator handed over: the `.knxproj` project file and its password, the `.knxkeys` keyring for KNX Secure devices. [The handover checklist](../how-to/handover-checklist.md) lists what to ask for. A house with no project file works too; it takes longer.
 
 ## Step 1. Install bussard
 
@@ -27,7 +27,7 @@ On Windows, in PowerShell:
 > irm https://raw.githubusercontent.com/tmbo/bussard/main/install.ps1 | iex
 ```
 
-Without a package manager, use the install script from the [README](../README.md#install); it downloads the binary and checks its SHA-256 checksum. `bussard --version` confirms it is on the PATH.
+Without a package manager, use the install script from the [README](../../README.md#install); it downloads the binary and checks its SHA-256 checksum. `bussard --version` confirms it is on the PATH.
 
 ## Step 2. Create the model with `bussard init`
 
@@ -42,7 +42,7 @@ Created a fresh KNX model in the current directory /Users/nadia/house.
 
 `init` finds the interface, writes its address into `bussard.toml` and creates an empty model in the current directory. In a directory that already holds other files it asks first. Every later command finds the model from this directory or any directory below it, so there is no `--dir` to remember. Keep passwords in a `.env` file here (for example `BUSSARD_PROJECT_PASSWORD=...`): bussard reads it automatically, and the `.gitignore` that `init` writes already lists `.env`, so the passwords stay out of git. `BUSSARD_ALLOW_REAL_GATEWAY` is never taken from it: arming writes to the real bus stays a flag or an exported variable. If discovery finds nothing, pass the address: `bussard init --gateway 192.0.2.10`.
 
-The tunnel count matters. An interface has a fixed number of connection slots, often one to five. Home Assistant holds one permanently, ETS holds one while a project is online, and every running bussard command holds one, including the assistant's server. "4 tunnels, 1 in use" leaves room for the assistant and a command at the same time. With a one-tunnel interface and Home Assistant running, bussard gets no slot; it says so and exits with code 4 instead of hanging. [The tunnel budget](SAFETY.md#the-tunnel-budget) has the details.
+The tunnel count matters. An interface has a fixed number of connection slots, often one to five. Home Assistant holds one permanently, ETS holds one while a project is online, and every running bussard command holds one, including the assistant's server. "4 tunnels, 1 in use" leaves room for the assistant and a command at the same time. With a one-tunnel interface and Home Assistant running, bussard gets no slot; it says so and exits with code 4 instead of hanging. [The tunnel budget](../explanation/safety.md#the-tunnel-budget) has the details.
 
 Safety rail: `init` only reads from the network.
 
@@ -244,7 +244,7 @@ model sha256 3f1c…
 
 The `.bussard` file holds the model, the history and a checksum of the model. It never holds the `.knxproj`, the `.knxkeys` keyring, vendor product files or passwords; keep those next to it on the stick, or in a password manager. Put the stick in the cabinet with the handover papers. After every `apply`, bussard reminds you when the last export is older than the model you just programmed.
 
-`bussard import house.bussard` in an empty directory on a new laptop brings everything back, history included. The same file is what to send to an integrator; [the collaboration guide](collaboration.md) describes that exchange.
+`bussard import house.bussard` in an empty directory on a new laptop brings everything back, history included. The same file is what to send to an integrator; [the collaboration guide](../how-to/work-with-an-integrator.md) describes that exchange.
 
 ## The rails at a glance
 
@@ -259,4 +259,4 @@ The `.bussard` file holds the model, the history and a checksum of the model. It
 
 ## A note for git users
 
-bussard does not need git. For those who use it anyway, the model directory is git-friendly: commit `bussard.toml`, `groups.toml`, `devices/`, `bussard.lock` and `tests.toml`, and let the generated ignore file keep the rest local. The repository track in [the collaboration guide](collaboration.md#the-repository-track) shows how an owner and an integrator share one repository with pull requests and CI.
+bussard does not need git. For those who use it anyway, the model directory is git-friendly: commit `bussard.toml`, `groups.toml`, `devices/`, `bussard.lock` and `tests.toml`, and let the generated ignore file keep the rest local. The repository track in [the collaboration guide](../how-to/work-with-an-integrator.md#the-repository-track) shows how an owner and an integrator share one repository with pull requests and CI.

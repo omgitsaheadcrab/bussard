@@ -298,7 +298,7 @@ fn test_view_shows_what_the_download_writes_on_every_fixture() -> TestResult {
     Ok(())
 }
 
-/// Corpus-gated (`BUSSARD_PRODUCT_CORPUS`, docs/testing.md): the same over
+/// Corpus-gated (`BUSSARD_PRODUCT_CORPUS`, dev/testing.md): the same over
 /// every application program of every archive in the corpus.
 #[test]
 fn test_view_shows_what_the_download_writes_on_the_corpus() -> TestResult {

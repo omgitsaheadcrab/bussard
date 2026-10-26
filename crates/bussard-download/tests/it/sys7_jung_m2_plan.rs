@@ -26,7 +26,7 @@ const MASK_0705: u16 = 0x0705;
 
 /// The Jung 3361-1M product in the corpus's vendor directory.
 /// `BUSSARD_PRODUCT_CORPUS` may name the product-corpus root, its `cache/` or
-/// the vendor directory (`docs/testing.md`); unset, the in-repo cache is
+/// the vendor directory (`dev/testing.md`); unset, the in-repo cache is
 /// tried. A missing file makes the tests skip.
 fn jung_knxprod_path() -> PathBuf {
     let dir = std::env::var_os("BUSSARD_PRODUCT_CORPUS")
@@ -186,7 +186,7 @@ fn test_bussard_property_plan_matches_m2_jung_shape() {
 /// LSM to unload; ETS then sets verify mode (`obj0/PID_DEVICE_CONTROL` read,
 /// `04` written, ops 33 and 34) before the first memory write, which
 /// `Sys7EnableVerifyMode` reproduces ahead of LSM 3's `StartLoading`
-/// (`docs/system7-spec.md` section 3.1: nothing depends on that order).
+/// (`dev/system7-spec.md` section 3.1: nothing depends on that order).
 #[test]
 fn test_parameters_only_jung_plan_writes_in_place() -> Result<(), Box<dyn std::error::Error>> {
     let path = jung_knxprod_path();

@@ -448,7 +448,7 @@ fn test_product_model_round_trips_the_dynamic_tree_on_every_fixture() -> TestRes
     Ok(())
 }
 
-/// Corpus-gated (`BUSSARD_PRODUCT_CORPUS`, docs/testing.md): the round trip
+/// Corpus-gated (`BUSSARD_PRODUCT_CORPUS`, dev/testing.md): the round trip
 /// over every application program of every archive in the corpus.
 #[test]
 fn test_product_model_round_trips_the_dynamic_tree_on_the_corpus() -> TestResult {

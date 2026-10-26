@@ -217,7 +217,7 @@ next data frame.
 
 `image --keyring` composes a Secure download like a plain one, and also writes
 the property writes of the download to `properties.json` (see
-[the offline oracle](../../docs/testing-campaign.md#before-a-flash-the-offline-oracle)):
+[the offline oracle](../../dev/testing-campaign.md#before-a-flash-the-offline-oracle)):
 object, PID, count, index, length and value, with security-object key material
 reduced to `redacted:<sha256[:8]>` by the same rule as the trace.
 With `$BUSSARD_ORACLE_SALT` set (the oracle script draws one per run and
@@ -276,7 +276,7 @@ uv run tools/knxtrace/knxtrace.py trace interface.pcapng --keyring after.knxkeys
 A KNXnet/IP Secure session cannot be decrypted from a capture, with any
 keyring: its key is `SHA-256(X25519 shared secret)[:16]` of an ephemeral
 key exchange whose private halves never leave ETS and the interface
-(`ipsecure.py`, docs/knx-secure-spec.md §7.2). The passwords only
+(`ipsecure.py`, dev/knx-secure-spec.md §7.2). The passwords only
 authenticate. What a capture still shows, per session, is listed at the end
 of `trace` and `devices`:
 
@@ -333,8 +333,8 @@ captures in-process from RFC 5737 TEST-NET-1 addresses.
 | `ipsecure.py` | KNXnet/IP Secure sessions: device authentication check, connection type and shape. |
 | `normalize.py` | Frame stream to per-device operation sequence. |
 | `opsdiff.py` | The differ and its classification rules. |
-| `image.py` | Composes the memory and the property writes (`properties.json`) a download wrote and diffs both against a `bussard flash --dry-run --dump-images` directory (see [the offline oracle](../../docs/testing-campaign.md#before-a-flash-the-offline-oracle)). |
+| `image.py` | Composes the memory and the property writes (`properties.json`) a download wrote and diffs both against a `bussard flash --dry-run --dump-images` directory (see [the offline oracle](../../dev/testing-campaign.md#before-a-flash-the-offline-oracle)). |
 | `test_knxtrace.py` | Tests, on synthetic captures and the `knx-sim` fixtures. |
 
-See [`docs/testing-campaign.md`](../../docs/testing-campaign.md) for how this
+See [`dev/testing-campaign.md`](../../dev/testing-campaign.md) for how this
 fits into the campaign runbook.

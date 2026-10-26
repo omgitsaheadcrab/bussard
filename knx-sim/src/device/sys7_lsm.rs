@@ -1,7 +1,7 @@
 //! System 7 load-event decoding and the memory-mapped / property LSM access.
 //!
 //! System 7 (mask 0705/0701) runs three parallel load-state machines and drives
-//! them with the abstract KNX load-event model (spec `docs/system7-spec.md` §4).
+//! them with the abstract KNX load-event model (spec `dev/system7-spec.md` §4).
 //! A load event is a 10-octet record whose first octet selects the event;
 //! `AdditionalLoadControls` (0x03) uses octet 1 as a sub-command selector for
 //! absolute-segment allocation, task-segment finalize, and task-control writes.

@@ -58,7 +58,7 @@ fn corpus_app(product: &str, app_id: &str) -> TestResult<Option<bussard_prod::Ap
         eprintln!("BUSSARD_PRODUCT_CORPUS unset; skipping {app_id}.");
         return Ok(None);
     };
-    // The corpus root, its `cache/`, or the vendor directory (docs/testing.md).
+    // The corpus root, its `cache/`, or the vendor directory (dev/testing.md).
     let dir = PathBuf::from(dir);
     let path = [dir.join("cache/vendor"), dir.join("vendor"), dir]
         .into_iter()

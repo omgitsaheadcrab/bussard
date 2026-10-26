@@ -2,7 +2,7 @@
 //! application-download path (issue #49).
 //!
 //! Self-contained, mirroring `flash_mock.rs` but modelling a System 7 device
-//! rather than System B — all from KNX spec / `docs/system7-spec.md` semantics,
+//! rather than System B — all from KNX spec / `dev/system7-spec.md` semantics,
 //! never from bussard's own encoders:
 //!
 //! - descriptor **0705**, an **authorize gate** (free-access key), and object-0

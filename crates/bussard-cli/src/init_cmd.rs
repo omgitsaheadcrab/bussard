@@ -877,7 +877,7 @@ copyrighted vendor data: committing it is your decision (a private repository
 is the usual case), and a clone without it cannot flash until it is restored. A git user then has two histories, one in git and one in bussard;
 `bussard undo` reads bussard's.
 
-Guide for new owners: https://github.com/tmbo/bussard/blob/main/docs/getting-started-owner.md
+Guide for new owners: https://bussard.tmbo.dev/docs/tutorials/first-weekend/
 ";
 
 /// Prints crisp next steps to stdout.

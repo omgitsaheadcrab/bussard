@@ -62,7 +62,7 @@ Two things protect you:
 
 Point at a test bus by giving a loopback gateway explicitly, either
 `--gateway 127.0.0.1` on the command or `gateway = "127.0.0.1:3671"` under `[connection]`
-in `bussard.toml`. The [`knx-sim`](../knx-sim/README.md) simulator is the
+in `bussard.toml`. The [`knx-sim`](../../knx-sim/README.md) simulator is the
 easiest safe target: from the `knx-sim/` directory run
 `cargo run -- examples/da_tp.yaml`, which listens on `127.0.0.1:3671`, then
 point `bussard` at it. Because it is loopback, no opt-in flag is needed.
@@ -75,8 +75,8 @@ live installation. Two safe practice targets:
 - **The simulator.** `knx-sim` is a strict, independent device model. It
   accepts the same programming a real System B or System 7 device does and
   rejects out-of-order or out-of-bounds operations, so a mistake fails on the
-  sim instead of on your wall. See the [flash walk-through](howto.md#-flash-a-factory-fresh-device)
-  and the [`bussard flash` reference](reference.md#bussard-flash-address).
+  sim instead of on your wall. See the [flash walk-through](../how-to/recipes.md#-flash-a-factory-fresh-device)
+  and the [`bussard flash` reference](../reference/cli.md#bussard-flash-address).
 - **A spare device on the bench**, powered and reachable but not wired into
   anything that moves.
 
@@ -116,7 +116,7 @@ number, a percentage). It is a runtime command, not device programming: nothing
 is stored on a device, but actuators move. The confirmation names the GA, the
 decoded value, and the gateway.
 
-**Secured group addresses (KNX Data Secure, issue #172).** A device with a
+**Secured group addresses (KNX Data Secure).** A device with a
 secured group object ignores a plain telegram on its GA. `write`, `read` (and
 MCP `knx_write_group` / `knx_read_group`, and viz) send such a GA as an
 `A_SecureData` group telegram when it has a group key in `--keyring` or is
@@ -137,7 +137,7 @@ accepts `write --keyring` from them. Both are off by default because they
 widen who the device trusts; the next ETS download of the device removes them
 again. Before a secured write or read bussard checks whether the devices on
 the GA admit its tunnel address and refuses when the recorded evidence says
-they do not (issue #297). `monitor --keyring` is read-only on the bus. See [Secured group
+they do not. `monitor --keyring` is read-only on the bus. See [Secured group
 writes from bussard](#secured-group-writes-from-bussard) for the workflow.
 
 **`apply <ADDRESS>`** writes the model to a device: its link tables (group
@@ -184,7 +184,7 @@ and writes nothing. `restore` writes link tables only.
 
 `bussard restore --parameters <backup.json> <ADDRESS>` replays a parameter
 backup (`captures/backups/parameters/`, written before every parameter write)
-with the parameter-only download below (issue #290). It refuses a backup of
+with the parameter-only download below. It refuses a backup of
 another device, application or mask before planning, writes only the octets a
 parameter is placed in under the model's configuration, keeps device-managed
 octets (`Access="None"` values the application owns at runtime) as the device
@@ -219,10 +219,10 @@ application object's type and load state; the other objects' `Loaded` comes
 from their own `LoadCompleted` before the restart, and a segment whose MCB CRC
 check already passed before the restart is not sampled again. If the
 application is not `Loaded` after the reboot, every object's state and every
-sample is read, as before (issue #215). Each load-state change (unload, open, segment
+sample is read, as before. Each load-state change (unload, open, segment
 allocation, completion) is confirmed by the state the device returns in its
 answer to the write, as ETS does; when that answer carries no state octet or
-not the expected state, `flash` reads the state back instead (issue #211). A flash takes **no backup**, because a
+not the expected state, `flash` reads the state back instead. A flash takes **no backup**, because a
 factory-fresh device has no prior application to save. The command states this
 plainly before it writes:
 
@@ -272,7 +272,7 @@ same application": any loaded System 7 device needs `--force`.
 applications allocate their segment with a fill byte and bussard, like ETS,
 then writes only the octets that differ from it. The device's fill is
 bookkeeping, not an erase: on a re-flash, every octet the new image leaves out
-keeps whatever the previous image put there. On the #89 campaign a Jung F50
+keeps whatever the previous image put there. On the test campaign a Jung F50
 re-flashed this way kept a blinking status LED until ETS ran "reset device" and
 a full download. So `flash` opens such a download the way ETS opens an initial
 one: a confirmed master reset with erase code 7 ("factory reset without
@@ -295,12 +295,12 @@ every region in full and never reset.
 security-activated device keeps its group keys and the per-group-object
 security flags in its security interface object, not in the link tables. With
 `--keyring` (or `--tool-key`), `flash` programs that object the way the ETS
-secured download does (issue #156): it unloads it right after the other
+secured download does: it unloads it right after the other
 objects, and after the tables and parameters it reloads it with the security
 individual address table (cleared, then one `[IA][sequence]` entry per device
 that sends on a secured group address this device listens to, with the
 sender's keyring `SequenceNumber` when the model marks the sender `activated`,
-else 0; issue #181), the group key table (one
+else 0), the group key table (one
 entry per keyed group address the device links, from the keyring) and the
 group-object security flags, then completes it. `apply --keyring` (and
 `restore`, and `apply --line` with a keyring) rewrites the security object next
@@ -324,7 +324,7 @@ After any restart `flash` itself triggers on a Data Secure device (the
 factory reset, a load procedure's master reset, the terminal restart before the
 post-restart check), the device can answer at the transport layer before its
 security layer is ready, and then drops the first S-A_Sync_Req without an
-answer (issue #166, seen on 1.1.12). `flash` waits like ETS instead: it probes
+answer (seen on 1.1.12). `flash` waits like ETS instead: it probes
 the rebooted device with a plain `A_DeviceDescriptor_Read` every 500 ms for up
 to 30 s (ETS's capture shows the device back about 14 s after the reset; a
 probe that answers earlier ends the wait), keeps that connection and sends the
@@ -335,7 +335,7 @@ five attempts with a 1, 2, 4, 8 s backoff after a restart and three attempts
 answer the Data Secure sync request". Plain devices keep the shorter reboot
 poll and see no extra frames.
 
-How long `flash` waits after a restart (issue #212): after a restart the
+How long `flash` waits after a restart: after a restart the
 device confirmed (the factory reset, the terminal confirmed restart) it waits
 the process time the device reported, never less, and probes from 0.5 s after
 that; after a bare `A_Restart` it stays quiet for 1.5 s first. A probe waits
@@ -411,7 +411,7 @@ fall back to downloading it with ETS. Do not assume a device is functional until
 a flash reports the application `Loaded` and verified.
 
 **`flash --parameters-only <ADDRESS>`** rewrites only the parameter memory of
-a device that already runs the application (issue #119); `apply` runs the same
+a device that already runs the application; `apply` runs the same
 download for the parameters that differ, after the tables. Unlike a full flash
 it has something to lose, the parameters the device holds, so it works like
 `apply`: it reads the parameter memory first, shows the parameters that change,
@@ -421,7 +421,7 @@ octets that differ, completes the load, restarts the device and verifies by
 reading the memory back. It never unloads, never allocates a segment, never
 factory-resets and never touches the link tables.
 
-**What a partial write touches (issue #290, ETS parity).** Only the octets a
+**What a partial write touches (ETS parity).** Only the octets a
 parameter is placed in under the current configuration: a parameter the
 Dynamic section reaches, a hidden parameter the application downloads at its
 default, and the device-managed octets alongside another write. An octet the
@@ -451,11 +451,11 @@ System 7 exposes no application id, so there the identity check is every
 load-state machine `Loaded` plus the first octets of each code segment matching
 the product. A code segment is one streamed verbatim from the product: never a
 link table, the group-object descriptor table, RAM or parameter memory, whose
-octets change with the configuration (issue #355). A product with no code
+octets change with the configuration. A product with no code
 segment (the Theben Meteodata 140 S) is judged by its load-state machines
 alone, and the pre-flight says so. On System 7 the download opens LSM 3 and writes the parameter octets in
 place, with no allocation record, and the executor re-reads LSM 3 right before
-and writes nothing unless it is `Loaded` (issue #146). If a parameter download
+and writes nothing unless it is `Loaded`. If a parameter download
 fails midway and the application still reads `Loaded`, re-run it (it writes
 only the octets that still differ); if it does not, recover with a full
 `flash --force`. The backup file holds the memory as it was.
@@ -470,7 +470,7 @@ next free address on the line.
 **Changing the address of a Data Secure device.** After the address write,
 `assign` verifies by reading the device at its new address. A Data
 Secure-activated device answers a plain descriptor read with mask `FFFF`, so
-`assign` verifies it over `A_SecureData` with its tool key (issue #203). The
+`assign` verifies it over `A_SecureData` with its tool key. The
 keyring lists tool keys by individual address, so it finds the key under the
 new address only after ETS re-exports it. Until then `assign` takes the key
 from the old address's entry and prints a note to re-export the keyring;
@@ -482,7 +482,7 @@ lists it there. Without any key, `assign` still verifies that the device
 answers at the new address, reports "Data Secure activated (mask hidden), no
 tool key in the keyring", and records no mask in the stub device file.
 
-**Adopting a Data Secure device reads only (issue #201).** When the keyring
+**Adopting a Data Secure device reads only.** When the keyring
 (`--keyring`, `BUSSARD_KEYRING` or `connection.keyring`) lists the device in programming mode, `adopt` treats it
 as a device ETS has commissioned. It refuses a target address other than the
 device's own before anything is sent (the keyring's tool key is keyed by that
@@ -497,7 +497,7 @@ device stays in programming mode until its button is pressed. An activated devic
 the keyring does not list (mask `FFFF` in the clear) fails before any device
 file is written, with a hint to re-export the keyring. Activating a Secure
 device, re-keying it or turning Data Secure off stays with ETS; tier 2 of
-#201 (activation from the FDSK certificate) is not implemented.
+Activation from the FDSK certificate is not implemented.
 
 The PID 54 table read back is kept in the lock (`secure_senders`). A later
 secured `flash` or `apply` of that device writes those senders back next to
@@ -525,11 +525,11 @@ table (PID 54) must list that address. ETS lists the devices that send on a
 secured GA the receiver listens to, and a tunnelling address only when group
 addresses are assigned to that tunnelling address in ETS (the keyring then
 carries the assignment as the interface's `<Group Address=… Senders=…>`). The
-reference installation assigns none, so its S3 captures (issue #90) show no
+reference installation assigns none, so its S3 captures show no
 tunnel address in any PID 54. A receiver that does not admit the sender drops
 the telegram without a word.
 
-**What bussard checks before sending (issue #297).** `write`, `read`,
+**What bussard checks before sending.** `write`, `read`,
 `knx_write_group` and `knx_read_group` on a secured GA look up the tunnel
 address the gateway assigned and the devices the model links to the GA, then
 weigh the evidence:
@@ -573,7 +573,7 @@ that does not admit the sender.
    object with every tunnelling address of the key store at sequence 0 (the
    device learns the clock-seeded sequence from the first telegram). Every
    tunnel user is admitted, not just one, because bussard picks the
-   tunnelling user per connection and host (issue #288). This is what ETS
+   tunnelling user per connection and host. This is what ETS
    does when group addresses are assigned to the interface's tunnelling
    addresses. The verified write records the table it wrote in the lock
    (`secure_senders`, the shape `adopt` writes), so the check above reports
@@ -596,22 +596,6 @@ again.
 
 ### Switching Data Secure off for one group address
 
-**Status: oracle verified on 2026-10-24.** An ETS download of 1.1.5 (ABB
-switch actuator, System B, Data Secure) with 1/0/4 and 1/0/5 set to security
-Off (`1-1-5-no-secure-ga.pcapng`) was compared with
-`scripts/campaign/95-offline-oracle.sh --keyring` against a copy of the model
-where `bussard groups secure 1/0/4 off` and `1/0/5 off` had run: address and
-association tables identical, the group key table (PID 53) and the object
-security flags (PID 61) hash-equal, and the same differences every Secure row
-shows (ETS's commissioning writes of PID 51, 56 and 59, and the PID 54
-sequence numbers, which an offline run cannot know). The row is in the
-campaign rows file. The capture rewrote the tables and the security object
-only (1 of 943 placed parameter octets), so the row is judged with
-`scope=addr,assoc`: 184 of 184 table octets compared. Since issue #347 the
-script plans the bussard side with the model's key store and uses the keyring
-only to decode the capture, and it honours the model's
-`admit_tunnel_senders` (`--no-admit` plans without it).
-
 `bussard groups secure <GA> off` (or `knx_set_group` with `secure: false`)
 lets a Secure device run one group address plain, for example so a
 non-Secure sender can switch it:
@@ -627,7 +611,7 @@ non-Secure sender can switch it:
    Secure off for 1/0/4 (…): its group key leaves the group key table (PID
    53) and object 12 loses its security flag (PID 61 0x03 to 0x00)`. The
    apply rewrites the tables and the whole security object as a full ETS
-   download does ([knx-secure-spec.md §11.2](knx-secure-spec.md)); a re-plan
+download does; a re-plan
    then has nothing to do.
 3. Home Assistant, ETS and every other keyring user still hold the old key
    and keep sending the group address secured, which the device drops once
@@ -638,7 +622,7 @@ non-Secure sender can switch it:
 ETS does, and is refused while a linked device is not Data Secure capable.
 An ETS re-import of a project that still marks the group address secure
 brings the flags back, and re-importing an old ETS keyring brings the key
-back: change the group address in ETS too. Both now say so (W042, issue #348): `bussard import`
+back: change the group address in ETS too. Both now say so (W042): `bussard import`
 and `bussard keys import` print a warning that names the group address and
 the devices the next apply would secure again.
 
@@ -688,8 +672,7 @@ credentials; the ETS project remains the fallback for the interface.
 
 ## The key store
 
-`knx/bussard.keys` is bussard's own copy of the KNX Secure key material
-(issue #241): the backbone key, the KNXnet/IP Secure tunnelling users with
+`knx/bussard.keys` is bussard's own copy of the KNX Secure key material: the backbone key, the KNXnet/IP Secure tunnelling users with
 their passwords and the interfaces' authentication codes, every device's tool
 key, serial number, factory key (FDSK), management password and
 authentication code, and the group keys. Anyone who can decrypt it can
@@ -725,7 +708,7 @@ file; `connection.keyring` in `bussard.toml` is deprecated and ignored (with
 a warning) when a store exists. `bussard validate` checks the model's
 secured devices and groups against it.
 
-**Stale keyring exports (W040, issue #348).** A keyring export is a copy:
+**Stale keyring exports (W040).** A keyring export is a copy:
 once the store changes, the consumer that loaded the export (Home Assistant,
 ETS, a visualisation) encrypts with keys the devices no longer use, or cannot
 read a newly secured address, and nothing on the bus says why. bussard
@@ -737,7 +720,7 @@ change, and, with `[home_assistant]` configured, when no export is newer
 than that change. Re-export and load the file again; the warning goes away
 with the new export.
 
-**The Data Secure invariants (issue #348)** are validation codes, so a
+**The Data Secure invariants** are validation codes, so a
 broken secured link shows up before a write rather than after one: every
 device on a secured group address can run Data Secure (E035, E036), is
 activated (W037) and has its tool key in the store (W028); the address's
@@ -751,10 +734,10 @@ would hide that.
 
 ## Secrets and the `.env` file
 
-bussard reads `BUSSARD_*` variables from one `.env` file (issue #251): the
+bussard reads `BUSSARD_*` variables from one `.env` file: the
 first of `<model dir>/.env`, the `.env` next to the model directory and
 `./.env`. The full rules are in
-[reference.md](reference.md#the-env-file). What matters for safety:
+[reference.md](../reference/cli.md#the-env-file). What matters for safety:
 
 - **The file stays out of git.** Keep `BUSSARD_KEYRING_PASSWORD`,
   `BUSSARD_PROJECT_PASSWORD` and `BUSSARD_HA_TOKEN` there only if `.env` is in `.gitignore` (the
@@ -830,7 +813,7 @@ assistant tells the human the push that actually applies.
 
 `bussard mcp --allow-programming` exposes the single-device write of `bussard
 apply` to an assistant: the link tables and the parameter octets that differ
-from the model, written by the same code the CLI runs (issue #274). It is off by default and never available with
+from the model, written by the same code the CLI runs. It is off by default and never available with
 `--passive`. Every gate the CLI has applies, plus one the CLI does not need:
 
 1. **Write gate.** A non-loopback gateway needs `BUSSARD_ALLOW_REAL_GATEWAY=1`
@@ -861,7 +844,7 @@ from the model, written by the same code the CLI runs (issue #274). It is off by
 6. **Identity.** The device's application and mask are compared with what
    `bussard.lock` pins, as `bussard apply` does. A device that drifted is
    refused with the `bussard flash` it needs.
-7. **A parameter that shows or hides a com-object** (issue #303) changes the
+7. **A parameter that shows or hides a com-object** changes the
    group-object table, which a parameter download does not rewrite. A
    parameter that shows or hides com-objects is pushed by the same
    knx_plan_device / knx_apply_device pair; the plan says `method: flash`,
@@ -887,7 +870,7 @@ back. The result carries the verify outcome, what was written and the backup
 paths. One device per call; `apply --line`, and a `flash` that loads a new
 application, stay CLI-only.
 
-**The apply job (issue #289).** A client bridge may cut a tool call at 60 s,
+**The apply job.** A client bridge may cut a tool call at 60 s,
 which a secured apply with a restart and a read-back exceeds; the write then
 completed on the bus while the reply was lost. `knx_apply_device` now runs
 every gate above, the snapshot and both backups inside the call, and the
@@ -912,7 +895,7 @@ write as a job in the server:
   server reads as `interrupted`: plan again before trusting the device.
 - The status tools never touch the bus.
 
-**Device-managed parameters (issue #289).** An `Access="None"` parameter the
+**Device-managed parameters.** An `Access="None"` parameter the
 configuration reaches is owned by the application at runtime, for example a
 Download-Flag the application sets after every download. Its octets always
 differ from the model's image, so they are left out of the decision whether
@@ -946,7 +929,7 @@ approved.
 
 A device the server's keyring lists (`bussard mcp --keyring`,
 `BUSSARD_KEYRING` or `connection.keyring`) is planned and written over KNX
-Data Secure, the way `bussard apply --keyring` does it (issue #205). Every
+Data Secure, the way `bussard apply --keyring` does it. Every
 APDU rides `A_SecureData` with the device's tool key, and on System B the
 write also reprograms the security object in the ETS order: unload, the
 security individual address table (PID 54), the group key table (PID 53), the
@@ -970,7 +953,7 @@ it is, as with `bussard apply --keyring`.
 
 ## MCP Home Assistant tier
 
-`bussard mcp --allow-home-assistant` (issue #280) lets the assistant read
+`bussard mcp --allow-home-assistant` lets the assistant read
 Home Assistant and rewrite the KNX YAML it reads. It needs the
 `[home_assistant]` table in `bussard.toml` as well as the flag; with only one
 of the two the tools are not registered. The tier never touches the KNX bus.
@@ -1070,7 +1053,7 @@ than a loud failure. ETS runs the same check before it uses an interface.
 The check runs once per tunnel. `flash`, `apply` and `restore` hold one tunnel
 for their read-only pre-flight and their write phase, so they check once. Under
 `--yes`, `flash` also keeps the pre-flight's device connection for the write
-phase (issue #213); every check the write phase makes (the plan, the
+phase; every check the write phase makes (the plan, the
 freshness verdict, the MCB checks, the post-restart verification) is the same
 on that connection. A
 command that opens several tunnels in turn (`commission`, `replace`) checks on
@@ -1094,10 +1077,8 @@ device replies with something other than a device descriptor, since only a real
 ## Supported device masks
 
 Write commands refuse an unsupported device mask during the pre-flight, before
-any write. Support differs by command. This table is the single source: it is
-rendered from `MaskProfile::capabilities` in `bussard-mgmt`, the same table the
-refusals and `bussard audit` use, and a test
-(`crates/bussard-cli/tests/it/docs_consistency.rs`) fails when it drifts.
+any write. Support differs by command. This table is generated from the same
+capability table the refusals and `bussard audit` use.
 
 <!-- mask-table:start -->
 | Mask | Family | Medium | `plan` / `apply` | `flash` | `reconstruct` | `describe` | Notes |
@@ -1122,7 +1103,7 @@ refusals and `bussard audit` use, and a test
 
 One exception to the `flash` column: on mask `0021` (the Jung IPS 300 SREG KNX
 IP interface) `flash` runs an application whose load procedure holds nothing but
-property compares and writes (issue #390). Such a download loads no object and
+property compares and writes. Such a download loads no object and
 never factory-resets the interface; it ends with a read-back of every property
 it wrote.
 
@@ -1195,7 +1176,7 @@ sent to a device.
 On a KNXnet/IP Secure interface each slot is bound to a tunnelling user. With
 `--keyring` bussard picks a user whose slot is free and that no other bussard
 process on this host holds (a lock file per user under
-`<dir>/.bussard/tunnel-users/`, issue #287); a user the interface refuses hands
+`<dir>/.bussard/tunnel-users/`); a user the interface refuses hands
 over to the next. With `--secure-user` the slot is fixed by the user you name,
 so pick one Home Assistant does not hold.
 
@@ -1208,7 +1189,7 @@ the tool needs no gate beyond the read tier; it is withheld only in
 while the bus is down is refused with the last connection error, never queued:
 a frame waiting for a connection is dropped after 2 s.
 
-**Keyring without a device entry (issue #189).** On a secure-only interface
+**Keyring without a device entry.** On a secure-only interface
 every command needs the keyring, if only to open the tunnel. A device the
 keyring lists is managed over KNX Data Secure with its tool key. A device the
 keyring does not list is managed in the clear through the encrypted tunnel,
@@ -1223,70 +1204,36 @@ stays out of git.
 
 ## Known limitations
 
-- **KNX Secure: Data Secure tool access, verified on a physical device;
-  KNXnet/IP Secure tunnelling implemented, not yet run against real
-  hardware.** `bussard` can program a KNX Data Secure
-  device through its tool key (`--keyring <file.knxkeys>` with
-  `BUSSARD_KEYRING_PASSWORD`, or `--tool-key` for tests) on `flash` and
-  `apply`, and read one back with `describe`, `plan` and `reconstruct`;
-  `bussard keys show` summarizes the key store. Each secured
-  connection starts with the same S-A_Sync handshake ETS uses, and a secured
-  `flash` or `apply` also programs the security object (group key table,
-  group-object security flags). The crypto, the handshake and the
-  security-object bytes are calibrated against an ETS 6.4.1 capture of a
-  physical device (every frame verifies; the group key table and flags
-  bussard builds equal the ones ETS wrote), the full path runs against the
-  knx-sim activated device, and on 2026-09-24 a secured `describe`, a no-op
-  `apply` and a full `flash` with factory reset and security object completed
-  on a physical activated push-button module. After a restart it triggers,
-  bussard probes the device with a plain descriptor read and retries the Sync
-  request before giving up, because the security layer comes up later than the
-  transport layer. Still inferred (one device, one group key): the packing of
-  several group-key entries and the meaning of the security-flag bits beyond
-  `0x03`. Secured group communication (`monitor`, `capture`, `read`, `write`
-  with `--keyring`, [#172](https://github.com/tmbo/bussard/issues/172)) runs
-  against the knx-sim secured group object; the group-address CCM nonce is
-  confirmed by the capture's broadcast S-A_Sync frames, but no secured group
-  telegram of a real device has been verified yet.
-- **KNXnet/IP Secure tunnelling** ([#71](https://github.com/tmbo/bussard/issues/71)
-  Phase B). A secure-only interface needs a tunnelling user: `--keyring`
-  (automatic, see the [reference](reference.md#knxnetip-secure-tunnelling)) or
+- **KNX Data Secure.** bussard programs a Data Secure device through its tool
+  key (`--keyring <file.knxkeys>` with `BUSSARD_KEYRING_PASSWORD`) on `flash`
+  and `apply`, and reads one back with `describe`, `plan` and `reconstruct`;
+  `bussard keys show` summarises the key store. Each secured connection starts
+  with the S-A_Sync handshake ETS uses, and a secured `flash` or `apply` also
+  programs the security object (group key table and group-object security
+  flags). The handshake and the security-object bytes match an ETS 6.4.1
+  capture of a physical device, and a full `flash` with factory reset has
+  completed on a physical activated push-button module. Still inferred from
+  one device with one group key: the packing of several group-key entries and
+  the meaning of the security-flag bits beyond `0x03`. Secured group
+  communication (`monitor`, `capture`, `read` and `write` with `--keyring`)
+  has been verified against the simulator only.
+- **KNXnet/IP Secure tunnelling.** A secure-only interface needs a tunnelling
+  user: `--keyring` (automatic, see the
+  [reference](../reference/cli.md#knxnetip-secure-tunnelling)) or
   `--secure-user <id> --secure-password-env <VAR>`. Without either, bussard
-  refuses at once and names the cause instead of retrying
-  ([#182](https://github.com/tmbo/bussard/issues/182)). The frame layouts, the
-  DIBs and the interface's authentication MAC are checked against an ETS
-  capture of the Jung interface, and the whole path (flash of a Data Secure
-  device inside a secure tunnel, wrong password, reconnect) runs against the
-  knx-sim secure interface; the first session against real hardware is still
-  to come. Start with a read-only `monitor --keyring` against the interface
-  before any write. What the wire cannot yet confirm: the MAC input of the
-  wrapped frames (a mismatch shows as a refused authentication, never as a
-  wrong write). The interface's idle timeout is measured: the Jung interface
-  drops a session idle for 60 s, and bussard sends a keepalive every 30 s
+  refuses at once and names the cause. The frame layouts and the interface's
+  authentication MAC match an ETS capture of a Jung interface, and the whole
+  path (a Data Secure flash inside a secure tunnel, a wrong password, a
+  reconnect) runs against the simulator. The first session against real
+  hardware is still to come, so start with a read-only `monitor --keyring`. A
+  mismatch in the MAC input of the wrapped frames would show as a refused
+  authentication, never as a wrong write. The Jung interface drops a session
+  that is idle for 60 s, so bussard sends a keepalive every 30 s
   (`BUSSARD_SECURE_KEEPALIVE_SECS` changes it; `bussard test --secure-idle
-  <secs>` measures another interface read-only). An interface without
-  a TCP endpoint can get a UDP session with `--secure-transport udp`
-  ([#197](https://github.com/tmbo/bussard/issues/197)), implemented from the
-  KNX specification and verified against knx-sim only; bussard never picks UDP
-  on its own.
-  Secure routing (multicast) is not implemented. The tunnel
-  slots on a secure interface belong to users: each ETS tunnelling user has
-  its own tunnel address, and bussard picks a free one from the keyring.
-
-## See also
-
-- [How do I ...](howto.md): the writing recipes, with the safety note up front.
-- [Reference](reference.md): every command, flag, and the exact refusal
-  conditions.
-
-## Private data (the maintainer's installation, and yours)
-
-The repository must never describe a real installation. Raw installation data
-(`knx/`, `*.knxproj`, `*.knxkeys`, captures, `shared-with-windows/`, the product
-corpus cache) is gitignored. Fixtures, examples and tests use invented names
-and TEST-NET addresses; review a diff for room names, device names and LAN
-addresses before you commit it.
-If you flash your own house, keep your `knx/` out of any fork you publish.
+  <secs>` measures another interface read-only). An interface without a TCP
+  endpoint gets a UDP session only with `--secure-transport udp`. Secure
+  routing (multicast) is not implemented. The tunnel slots on a secure
+  interface belong to users, and bussard picks a free one from the keyring.
 
 ## For professionals
 
@@ -1312,3 +1259,9 @@ An integrator often has ETS and bussard open against the same interface. The [tu
 - Close the ETS bus connection before a long bussard run such as `apply --line` or `commission`, and close bussard before an ETS download. Each running bussard command holds a slot, and so do `bussard mcp` and `bussard viz` for as long as they run.
 - Never program one device from both tools at once. A device accepts one management connection at a time, so a second tool's download fails or interleaves with the first. Finish in one tool, then plan in the other: `bussard plan <ia>` after an ETS download shows exactly what ETS left on the device.
 - After a crash, a tunnel slot stays taken until the interface times it out, about two minutes. Wait instead of retrying in a loop.
+
+## See also
+
+- [How do I ...](../how-to/recipes.md): the writing recipes, with the safety note up front.
+- [Reference](../reference/cli.md): every command, flag, and the exact refusal
+  conditions.

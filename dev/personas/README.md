@@ -90,5 +90,5 @@ a human runs `apply` or `flash`. Group writes over MCP exist only on a server
 started with `--allow-writes`.
 
 Git is optional throughout. History and undo are built in, and exchange with a
-professional is by file ([collaboration.md](../collaboration.md)). The owner's
-path is written up in [the first weekend guide](../getting-started-owner.md).
+professional is by file ([collaboration.md](../../docs/how-to/work-with-an-integrator.md)). The owner's
+path is written up in [the first weekend guide](../../docs/tutorials/first-weekend.md).

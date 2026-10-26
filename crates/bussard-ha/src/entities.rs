@@ -139,7 +139,7 @@ pub struct BinarySensor {
 /// For the central-heating installation this targets, the operation mode is the
 /// control and temperature/valve are read-only telemetry; the setpoint-shift and
 /// target-temperature fields are part of the schema but left unwired by the
-/// derivation (see `derive::derive_climate` and docs/ha-config.md). They remain
+/// derivation (see `derive::derive_climate` and docs/reference/home-assistant.md). They remain
 /// on the struct so an `ha.toml` override can populate them for installations
 /// that do per-room setpoint control.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -80,7 +80,7 @@ if [[ $subset -eq 1 ]]; then
 fi
 
 if [[ -z "${BUSSARD_PRODUCT_CORPUS:-}" ]]; then
-  echo "BUSSARD_PRODUCT_CORPUS is unset: point it at the product corpus (docs/testing.md)." >&2
+  echo "BUSSARD_PRODUCT_CORPUS is unset: point it at the product corpus (dev/testing.md)." >&2
   exit 2
 fi
 

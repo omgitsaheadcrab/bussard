@@ -224,7 +224,7 @@ function initHeaderStatus() {
     if (!label) return;
     const state = status.connected ? "connected" : status.state || "offline";
     // Name the bus in the header: the operator should never have to guess
-    // which installation this page is pointed at (docs/SAFETY.md).
+    // which installation this page is pointed at (docs/explanation/safety.md).
     label.textContent = status.gateway ? `${state} · ${status.gateway}` : state;
     label.title = status.gateway
       ? `${status.gateway}${status.loopback ? " (loopback)" : " (real gateway)"}`

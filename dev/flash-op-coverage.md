@@ -30,7 +30,7 @@ rendered `load_procedure:` block. Unknown `LdCtrl*` ops render as
 > and `0700` through a separate absolute-addressed lowering (`LdCtrlAbsSegment`,
 > `LdCtrlTaskSegment`, `LdCtrlTaskCtrl1`, `LdCtrlCompareMem`, the obj0/PID78
 > compare); see [system7-spec.md](system7-spec.md). The per-mask support table
-> lives in [SAFETY.md](SAFETY.md#supported-device-masks). The tallies below are
+> lives in [SAFETY.md](../docs/explanation/safety.md#supported-device-masks). The tallies below are
 > the original System-B-only snapshot and have not been re-run against the
 > System 7 lowering.
 
