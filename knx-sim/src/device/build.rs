@@ -97,12 +97,53 @@ fn object_type_for(object_index: u8) -> u16 {
 /// to object 4 or 5 PID 16 before its image, others object 0 PID 52 or 86),
 /// and a write the simulated device refused would go unanswered and time the
 /// flash out.
-fn seed_written_props(objects: &mut BTreeMap<u8, InterfaceObject>, product: &ProductData) {
+///
+/// With `add_objects` (System 7), an object the device does not otherwise
+/// model is added (bussard issue #390: the MDT 0705 programs write their
+/// label texts to object 6), with `PID_OBJECT_TYPE` reporting its index as
+/// the type. A System B device keeps its object list: a tool skips a template
+/// write to an object the device lacks.
+fn seed_written_props(
+    objects: &mut BTreeMap<u8, InterfaceObject>,
+    product: &ProductData,
+    add_objects: bool,
+) {
     for &(object, pid, len) in &product.written_props {
-        if let Some(io) = objects.get_mut(&object)
-            && !io.has_property(pid)
-        {
+        if !add_objects && !objects.contains_key(&object) {
+            continue;
+        }
+        let io = objects.entry(object).or_insert_with(|| {
+            let mut io = InterfaceObject::new();
+            io.set_property(
+                PID_OBJECT_TYPE,
+                Property::read_only(object_type_for(object).to_be_bytes().to_vec()),
+            );
+            io
+        });
+        if !io.has_property(pid) {
             io.set_property(pid, Property::writable(vec![0x00; len]));
+        }
+    }
+}
+
+/// Seeds the properties of non-device objects the application's own
+/// `LdCtrlCompareProp` preflights expect (bussard issue #390: the ABB 0701
+/// programs compare object 3 PID 13, the application object's program
+/// version, with their application number): a device of that hardware holds
+/// them. A property the procedure also writes stays writable.
+fn seed_object_compare_props(objects: &mut BTreeMap<u8, InterfaceObject>, product: &ProductData) {
+    for (object, pid, value) in &product.object_compare_props {
+        let written = product
+            .written_props
+            .iter()
+            .any(|&(o, p, _)| o == *object && p == *pid);
+        if let Some(io) = objects.get_mut(object) {
+            let prop = if written {
+                Property::writable(value.clone())
+            } else {
+                Property::read_only(value.clone())
+            };
+            io.set_property(*pid, prop);
         }
     }
 }
@@ -227,7 +268,8 @@ impl Device {
             );
         }
 
-        seed_written_props(&mut objects, product);
+        seed_object_compare_props(&mut objects, product);
+        seed_written_props(&mut objects, product, false);
         let mut device = Self {
             address,
             profile,
@@ -245,6 +287,7 @@ impl Device {
             prog_mode,
             security_object: secure.as_ref().map(|_| SecurityObject::new_activated()),
             knxnet_by_type: None,
+            typed_objects: BTreeMap::new(),
             secure,
             restart_process_time_s: DEFAULT_RESTART_PROCESS_TIME_S,
             events,
@@ -378,7 +421,8 @@ impl Device {
             );
         }
 
-        seed_written_props(&mut objects, product);
+        seed_object_compare_props(&mut objects, product);
+        seed_written_props(&mut objects, product, true);
         // The factory memory the product's CompareMem preflights check.
         let mut memory = Memory::new();
         for (address, value) in &product.compare_mems {
@@ -401,12 +445,108 @@ impl Device {
             prog_mode,
             security_object: secure.as_ref().map(|_| SecurityObject::new_activated()),
             knxnet_by_type: None,
+            typed_objects: BTreeMap::new(),
             secure,
             restart_process_time_s: DEFAULT_RESTART_PROCESS_TIME_S,
             events,
         };
         device.refresh_group_comm();
         device
+    }
+}
+
+impl Device {
+    /// Build a property-only device (bussard issue #390): the Jung IPS 300
+    /// SREG KNX IP interface (mask 0021), whose load procedure only compares
+    /// and writes properties. Its object-index walk lists a device object and
+    /// an address table (as the real 1.1.200 does, bussard issue #393); the
+    /// KNXnet/IP parameter object (type 11) and every further object the
+    /// procedure names by type are reached by type through the extended
+    /// property services. The device object holds what the procedure's
+    /// compares expect, and every property it writes is writable.
+    pub(super) fn build_property_device(
+        address: IndividualAddress,
+        product: &ProductData,
+        profile: Profile,
+        prog_mode: bool,
+        events: std::sync::Arc<dyn EventSink>,
+    ) -> Self {
+        let mut objects: BTreeMap<u8, InterfaceObject> = BTreeMap::new();
+        let mut device_object = InterfaceObject::new();
+        device_object.set_property(
+            PID_OBJECT_TYPE,
+            Property::read_only(object_type_for(0).to_be_bytes().to_vec()),
+        );
+        device_object.set_property(PID_PROGMODE, Property::writable(vec![u8::from(prog_mode)]));
+        let mfr = manufacturer_id_from_app(&product.application_id).unwrap_or(0x0004);
+        device_object.set_property(0x0C, Property::read_only(mfr.to_be_bytes().to_vec()));
+        device_object.set_property(
+            0x0F,
+            Property::read_only(order_info_bytes(&product.application_id)),
+        );
+        // PID_MAX_APDU_LENGTH: the IPS 300 SREG answers 00F8 (capture of
+        // 2026-10-26).
+        device_object.set_property(0x38, Property::read_only(vec![0x00, 0xF8]));
+        for (pid, value) in &product.device_compare_props {
+            device_object.set_property(*pid, Property::read_only(value.clone()));
+        }
+        objects.insert(0, device_object);
+        let mut address_table = InterfaceObject::new();
+        address_table.set_property(
+            PID_OBJECT_TYPE,
+            Property::read_only(iot::ADDRESS_TABLE.to_be_bytes().to_vec()),
+        );
+        objects.insert(1, address_table);
+
+        let mut knxnet = None;
+        let mut typed_objects: BTreeMap<u16, InterfaceObject> = BTreeMap::new();
+        for typed in &product.typed_props {
+            let obj = if typed.object_type == super::knxnet_object::IOT_KNXNET_IP_PARAMETER {
+                knxnet.get_or_insert_with(|| {
+                    super::knxnet_object::KnxnetParameters::dhcp(address.raw(), Vec::new()).object()
+                })
+            } else {
+                typed_objects.entry(typed.object_type).or_insert_with(|| {
+                    let mut io = InterfaceObject::new();
+                    io.set_property(
+                        PID_OBJECT_TYPE,
+                        Property::read_only(typed.object_type.to_be_bytes().to_vec()),
+                    );
+                    io
+                })
+            };
+            if let Some(value) = &typed.compare {
+                obj.set_property(typed.pid, Property::read_only(value.clone()));
+            }
+            if typed.written {
+                match obj.property_mut(typed.pid) {
+                    Some(prop) => prop.read_only = false,
+                    None => obj.set_property(typed.pid, Property::writable(vec![0x00])),
+                }
+            }
+        }
+        Self {
+            address,
+            profile,
+            sys7: None,
+            objects,
+            loadables: BTreeMap::new(),
+            memory: Memory::new(),
+            access_level: 15,
+            connected: false,
+            tx_seq: 0,
+            rx_seq: 0,
+            l4_exchange_budget: None,
+            l4_exchanges: 0,
+            group_comm: None,
+            prog_mode,
+            security_object: None,
+            knxnet_by_type: knxnet,
+            typed_objects,
+            secure: None,
+            restart_process_time_s: DEFAULT_RESTART_PROCESS_TIME_S,
+            events,
+        }
     }
 }
 

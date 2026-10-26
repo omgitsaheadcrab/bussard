@@ -409,3 +409,19 @@ async fn test_flash_property_procedure_falls_back_when_ext_goes_unanswered() -> 
     assert_eq!(dev.property(2, 211), Some(&RATE[..]));
     Ok(())
 }
+
+#[test]
+fn test_flash_gate_lets_a_property_only_plan_through() -> TestResult {
+    // The IPS 300 SREG answers no load state, so the probe cannot call it
+    // fresh; the procedure loads nothing, so that does not decide it.
+    let app = ip_interface_app("0021")?;
+    let plan = plan_for(&app, 0x0021)?;
+    let unknown = bussard_download::Freshness::Unknown {
+        reason: "no object reported a load state".to_string(),
+    };
+    assert_eq!(
+        bussard_download::flash_gate(&unknown, &plan, None, None),
+        bussard_download::Freshness::Fresh
+    );
+    Ok(())
+}

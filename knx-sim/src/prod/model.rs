@@ -126,6 +126,34 @@ pub struct ProductData {
     /// compares its hardware id at `0xB610`. A factory device of that hardware
     /// holds exactly these octets, so the simulated device serves them.
     pub compare_mems: Vec<(u16, Vec<u8>)>,
+    /// The properties of interface objects other than the device object that
+    /// the application's own `LdCtrlCompareProp` preflights expect, as
+    /// `(object index, PID, value)` (bussard issue #390: the ABB 0701 programs
+    /// compare the application object's `PID_PROGRAM_VERSION`, object 3 PID
+    /// 13, with their application number). A device of that hardware holds
+    /// them, so the simulated device serves them.
+    pub object_compare_props: Vec<(u8, u8, Vec<u8>)>,
+    /// The properties the procedure compares or writes on an object it names by
+    /// type (`ObjType`, bussard issue #390: the IPS 300 SREG's KNXnet/IP
+    /// parameter object, type 11, and a vendor object, type 50001).
+    pub typed_props: Vec<TypedProperty>,
+    /// Whether the application's load procedure holds nothing but property
+    /// compares and writes (and the session around them): a property-only
+    /// device, the Jung IPS 300 SREG (mask 0021).
+    pub property_only: bool,
+}
+
+/// A property a load procedure addresses on an object named by type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedProperty {
+    /// The interface object type.
+    pub object_type: u16,
+    /// The property id.
+    pub pid: u8,
+    /// The value an `LdCtrlCompareProp` expects, when the procedure compares it.
+    pub compare: Option<Vec<u8>>,
+    /// Whether an `LdCtrlWriteProp` writes it.
+    pub written: bool,
 }
 
 impl ProductData {

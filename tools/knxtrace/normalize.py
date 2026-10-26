@@ -52,6 +52,7 @@ KIND_RESTART = "restart"
 KIND_IA_WRITE = "ia-write"
 KIND_GROUP = "group-value"
 KIND_SECURE = "secure-data"
+KIND_FUNC_PROP = "function-prop"
 KIND_OTHER = "other"
 
 # Kinds that are pure session plumbing: a difference in how many times these
@@ -286,6 +287,9 @@ def _op_from_apdu(apdu: Apdu, direction: str, ts: float) -> Optional[Op]:
             kind = KIND_PROP_READ
         return Op(kind, key, detail, direction, ts, data=data)
 
+    if name.startswith("A_PropertyExt") or name.startswith("A_FunctionPropertyExt"):
+        return _ext_op(apdu, direction, ts)
+
     if name.startswith("A_PropertyDescription"):
         key = "obj%s/%s" % (f.get("obj"), f.get("pid_name", f.get("pid")))
         return Op(KIND_PROP_DESC_READ, key, dict(f), direction, ts)
@@ -358,6 +362,59 @@ def _op_from_apdu(apdu: Apdu, direction: str, ts: float) -> Optional[Op]:
         return Op(KIND_SECURE, str(f.get("service", "S-A_Data")), dict(f), direction, ts)
 
     return Op(KIND_OTHER, name, dict(f), direction, ts, data=apdu.payload)
+
+
+# Octets before the value: extended value (type:2, inst/pid:3, count, index:2),
+# extended function property (type:2, inst/pid:3).
+_EXT_HEADER = {
+    "A_PropertyExtValue_WriteCon": 8,
+    "A_PropertyExtValue_WriteUnCon": 8,
+    "A_PropertyExtValue_Response": 8,
+    "A_FunctionPropertyExt_Command": 5,
+}
+
+
+def _ext_op(apdu: Apdu, direction: str, ts: float) -> Op:
+    """The extended property services (issue #390), named like the plain ones:
+    a value write (`A_PropertyExtValue_WriteCon`/`_WriteUnCon`, and the
+    confirmation) is a prop-write, a value read and its response a prop-read,
+    a description read a prop-desc-read, and `A_FunctionPropertyExt_*` a
+    function-prop. The key names the object by type and instance
+    (`type11.1/PID205`). Key material is never fingerprinted.
+    """
+    from datasecure import is_key_material
+
+    name = apdu.name
+    f = apdu.fields
+    key = "type%s.%s/PID%s" % (f.get("obj_type", "?"), f.get("instance", "?"), f.get("pid", "?"))
+    header = _EXT_HEADER.get(name)
+    data = bytes(apdu.payload[header:]) if header is not None else b""
+    secret = isinstance(f.get("data"), str) and str(f["data"]).startswith("redacted:")
+    if f.get("obj_type") is not None and is_key_material(
+        int(f["obj_type"]), None, f.get("pid"), len(data)
+    ):
+        secret = True
+    detail: Dict[str, object] = {}
+    for k in ("count", "index", "rc"):
+        if k in f:
+            detail[k] = f[k]
+    if data:
+        detail["len"] = len(data)
+        if not secret:
+            detail["sha"] = sha8(data)
+    if secret:
+        detail["key_material"] = True
+        data = b""
+    if name.startswith("A_FunctionPropertyExt"):
+        kind = KIND_FUNC_PROP
+    elif name in ("A_PropertyExtValue_WriteCon", "A_PropertyExtValue_WriteUnCon",
+                  "A_PropertyExtValue_WriteConResponse"):
+        kind = KIND_PROP_WRITE
+    elif name.startswith("A_PropertyExtDescription"):
+        kind = KIND_PROP_DESC_READ
+    else:
+        kind = KIND_PROP_READ
+    return Op(kind, key, detail, direction, ts, data=data)
 
 
 def _addr_int(text: object) -> Optional[int]:

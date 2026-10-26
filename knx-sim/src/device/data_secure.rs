@@ -219,15 +219,38 @@ impl Device {
         tool: IndividualAddress,
         apdu: &Apdu,
     ) -> Result<DeviceReaction, DeviceError> {
-        if apdu.apci == Apci::PropertyExtValueRead
-            && let Some(obj) = &self.knxnet_by_type
-            && let Some(data) = super::knxnet_object::ext_read(obj, &apdu.data)
+        // An object reached by type: the KNXnet/IP parameter object (type 11)
+        // or a further typed object of a property-only device (bussard issue
+        // #390). Read and confirmed write; the security object keeps its own
+        // handler below.
+        let object_type = apdu.data.get(..2).map(|t| u16::from_be_bytes([t[0], t[1]]));
+        if let Some(object_type) = object_type
+            && matches!(
+                apdu.apci,
+                Apci::PropertyExtValueRead | Apci::PropertyExtValueWriteCon
+            )
         {
-            let resp = self.respond(tool, 0x1CD, &data);
-            return Ok(DeviceReaction {
-                responses: vec![resp],
-                did_master_reset: false,
+            let obj = if object_type == super::knxnet_object::IOT_KNXNET_IP_PARAMETER {
+                self.knxnet_by_type.as_mut()
+            } else {
+                self.typed_objects.get_mut(&object_type)
+            };
+            let reply = obj.and_then(|obj| {
+                if apdu.apci == Apci::PropertyExtValueRead {
+                    super::knxnet_object::typed_ext_read(object_type, obj, &apdu.data)
+                        .map(|data| (0x1CD, data))
+                } else {
+                    super::knxnet_object::typed_ext_write(object_type, obj, &apdu.data)
+                        .map(|data| (0x1CF, data))
+                }
             });
+            if let Some((apci, data)) = reply {
+                let resp = self.respond(tool, apci, &data);
+                return Ok(DeviceReaction {
+                    responses: vec![resp],
+                    did_master_reset: false,
+                });
+            }
         }
         let limits = self.security_limits();
         let Some(obj) = self.security_object.as_mut() else {

@@ -888,6 +888,15 @@ def _obj_label(obj: Dict[str, int]) -> str:
     return "obj%d" % obj["index"]
 
 
+def _key_object(key: list) -> Dict[str, int]:
+    """The object a `_prop_key` label names (`type11.1` or `obj4`)."""
+    label = str(key[0])
+    if label.startswith("type"):
+        t, _, inst = label[4:].partition(".")
+        return {"type": int(t), "instance": int(inst or 1)}
+    return {"index": int(label[3:])}
+
+
 def _prop_key(entry: Dict[str, object]) -> Tuple[str, int, int]:
     return (_obj_label(entry["object"]), int(entry["pid"]), int(entry["length"]))
 
@@ -1058,6 +1067,22 @@ def _value_check(ours: Dict[str, object], theirs: Dict[str, object]) -> Tuple[st
     return ("hash-equal", "") if same else ("differs", "hash differs")
 
 
+# The commissioning ETS writes to a KNX IP interface beside the application's
+# load procedure (issue #390, the 1.1.200 capture of 2026-10-26): the security
+# object's tool key and mode (type 17) and the KNXnet/IP parameter object's IP
+# and tunnelling configuration (type 11), parts 2 and 3 of #389. On a
+# property-only plan they are listed, not counted.
+COMMISSIONING_OBJECT_TYPES = frozenset({11, 17})
+
+
+def _is_commissioning(entry: Dict[str, object], ours_keys: set) -> bool:
+    obj = entry["object"]
+    return (
+        obj.get("type") in COMMISSIONING_OBJECT_TYPES
+        and (_obj_label(obj), int(entry["pid"])) not in ours_keys
+    )
+
+
 def compare_properties(
     plan: dict, image_dir: str, ets_groups: Optional[Dict[int, str]] = None
 ) -> Dict[str, object]:
@@ -1117,13 +1142,32 @@ def compare_properties(
     counts: Dict[str, int] = {}
     for m in matched:
         counts[m["value"]] = counts.get(m["value"], 0) + 1
+    # A property-only plan (issue #390): ETS's interface commissioning is
+    # listed, not counted, and a capture in which ETS wrote none of the
+    # properties the procedure writes did not run the procedure at all.
+    commissioning: List[Dict[str, object]] = []
+    reason = ""
+    property_only = plan.get("system") == "properties"
+    if property_only:
+        ours_keys = {(_obj_label(e["object"]), int(e["pid"])) for e in ours}
+        commissioning = [e for e in ets_only if _is_commissioning(
+            {"object": _key_object(e["key"]), "pid": e["key"][1]}, ours_keys)]
+        ets_only = [e for e in ets_only if e not in commissioning]
+        ets_keys = {(_obj_label(e["object"]), int(e["pid"])) for e in ets}
     if bussard_only or ets_only or counts.get("differs"):
         verdict = DIFFERS
     elif not matched:
         verdict = NOT_COMPARABLE
     else:
         verdict = IDENTICAL
-    return {
+    if property_only and not matched and ours and not (ours_keys & ets_keys):
+        verdict = NOT_COMPARABLE
+        reason = (
+            "ETS did not run the load procedure in this capture: none of bussard's %d "
+            "property write(s) (%s) appears among ETS's %d"
+            % (len(ours), ", ".join(_key_text(list(_prop_key(e))) for e in ours), len(ets))
+        )
+    out: Dict[str, object] = {
         "verdict": verdict,
         "bussard_writes": len(ours),
         "ets_writes": len(ets),
@@ -1135,6 +1179,10 @@ def compare_properties(
         "group_key_table": group_keys,
         "sender_table": senders,
     }
+    if property_only:
+        out["reason"] = reason
+        out["commissioning"] = commissioning
+    return out
 
 
 def _group_key_table(ours: list, ets: list) -> Optional[Dict[str, str]]:
@@ -1320,8 +1368,14 @@ def _key_text(key) -> str:
 def render_properties(props: Optional[Dict[str, object]]) -> List[str]:
     if not props:
         return []
-    if props["verdict"] == NOT_COMPARABLE and "reason" in props:
+    if props["verdict"] == NOT_COMPARABLE and props.get("reason") and "matched" not in props:
         return ["  property writes: not comparable: %s" % props["reason"]]
+    if props["verdict"] == NOT_COMPARABLE and props.get("reason"):
+        lines = ["  property writes: not comparable: %s" % props["reason"]]
+        for b in props["bussard_only"]:
+            lines.append("      bussard only: step %3s %s" % (b["step"], _key_text(b["key"])))
+        lines.extend(_commissioning_lines(props))
+        return lines
     if not (props["bussard_writes"] or props["ets_writes"]):
         return ["  property writes: none on either side"]
     counts = props["value_counts"]
@@ -1359,4 +1413,14 @@ def render_properties(props: Optional[Dict[str, object]]) -> List[str]:
         lines.append(
             "      ETS only:     #%-3s %s %s" % (e["ets_seq"], e["service"], _key_text(e["key"]))
         )
+    lines.extend(_commissioning_lines(props))
     return lines
+
+
+def _commissioning_lines(props: Dict[str, object]) -> List[str]:
+    """ETS's interface commissioning on a property-only plan, not counted."""
+    return [
+        "      ETS commissioning (not counted): #%-3s %s %s"
+        % (e["ets_seq"], e["service"], _key_text(e["key"]))
+        for e in props.get("commissioning") or []
+    ]
