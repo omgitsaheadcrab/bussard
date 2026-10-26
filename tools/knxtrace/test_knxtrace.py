@@ -1023,6 +1023,163 @@ class TestPropertyWrites(unittest.TestCase):
             [(1, ("type17.1", 5, 10)), (1, ("type17.1", 54, 2))],
         )
 
+    @staticmethod
+    def sec(pid: int, data: str, **extra) -> dict:
+        entry = {"object": {"type": 17, "instance": 1}, "pid": pid, "data": data}
+        entry.update(extra)
+        return entry
+
+    def test_value_check_pid54_compares_by_sender_address(self):
+        ours = self.sec(54, "1105" + "0040102ea9ce")
+        ets = self.sec(54, "1105" + "0040ab845d77")
+        self.assertEqual(
+            memimage._value_check(ours, ets),
+            ("equal", "sequence numbers differ: ETS 0040ab845d77, bussard 0040102ea9ce"),
+        )
+        self.assertEqual(memimage._value_check(ours, dict(ets, data=ours["data"])), ("equal", ""))
+        outcome, why = memimage._value_check(ours, self.sec(54, "1106" + "0040ab845d77"))
+        self.assertEqual((outcome, why), ("differs", "senders differ: ETS 1.1.6, bussard 1.1.5"))
+        two = "1105" + "000000000001" + "1106" + "000000000001"
+        swapped = "1106" + "000000000001" + "1105" + "000000000001"
+        outcome, why = memimage._value_check(self.sec(54, two), self.sec(54, swapped))
+        self.assertEqual(outcome, "differs")
+        self.assertIn("sender order differs", why)
+        # Not a whole entry list (the clearing write): plain byte compare.
+        self.assertEqual(memimage._value_check(self.sec(54, "0000"), self.sec(54, "0000")),
+                         ("equal", ""))
+        # Not the security object: plain byte compare.
+        plain = {"object": {"index": 4}, "pid": 54, "data": ours["data"]}
+        self.assertEqual(memimage._value_check(plain, dict(plain, data=ets["data"])),
+                         ("differs", "bytes differ"))
+
+    @staticmethod
+    def key_table(*indexes: int) -> bytes:
+        """A group key table value: per entry the address table index and a
+        16-octet key derived from it."""
+        return b"".join(struct.pack(">H", i) + bytes([0x10 + i] * 16) for i in indexes)
+
+    def key_write(self, table: bytes, salt: str = "run-salt", groups=None) -> dict:
+        """A PID 53 write as either side lists it; `groups` (index to group
+        address) names the entries, as bussard's dump does."""
+        entries = memimage.group_key_entries(table, salt)
+        for e in entries:
+            if groups and e["index"] in groups:
+                e["ga"] = groups[e["index"]]
+        return self.sec(53, self.redacted(table), length=len(table), entries=entries)
+
+    def test_value_check_pid53_names_the_group_per_entry(self):
+        groups = {1: "0/0/6", 2: "1/2/3"}
+        ours_table = self.key_table(1, 2)
+        ets_table = struct.pack(">H", 1) + bytes([0x33] * 16) + self.key_table(2)
+        ours = self.key_write(ours_table, groups=groups)
+        self.assertEqual([(e["index"], e["ga"]) for e in ours["entries"]],
+                         [(1, "0/0/6"), (2, "1/2/3")])
+        # ETS's entries carry the index only: named by bussard's group.
+        ets = self.key_write(ets_table)
+        self.assertEqual(memimage._value_check(ours, ets), ("differs", "0/0/6: key differs"))
+        self.assertEqual(memimage._value_check(ours, dict(ours)), ("hash-equal", ""))
+        ets_one = self.key_write(self.key_table(2))
+        self.assertEqual(memimage._value_check(ours, ets_one),
+                         ("differs", "0/0/6: missing in ETS"))
+        self.assertEqual(memimage._value_check(ets_one, ours),
+                         ("differs", "0/0/6: missing in bussard"))
+        # With ETS's own address table resolved, entries match by group even
+        # when the indexes moved (ETS's table has an extra group first).
+        ets_shifted = self.key_write(self.key_table(2, 3), groups={2: "0/0/6", 3: "1/2/3"})
+        for e, idx in zip(ets_shifted["entries"], (1, 2)):
+            # Same keys as ours under a different index.
+            e["key"] = ours["entries"][idx - 1]["key"]
+        self.assertEqual(memimage._value_check(ours, ets_shifted), ("hash-equal", ""))
+        # The entry hash is salted: never the hash or hex of a bare key.
+        text = json.dumps(ours)
+        for i in (1, 2):
+            key = bytes([0x10 + i] * 16)
+            self.assertNotIn(self.redacted(key)[len("redacted:"):], text)
+            self.assertNotIn(key.hex(), text)
+        other = memimage.group_key_entries(ours_table, "other-salt")
+        self.assertNotEqual(other[0]["key"], ours["entries"][0]["key"])
+        # Without entries on one side (no salt): the whole-value hash, as before.
+        self.assertEqual(memimage._value_check(dict(ours, entries=None), ets),
+                         ("differs", "hash differs"))
+
+    def test_group_key_table_compares_across_chunks(self):
+        groups = {i: "0/0/%d" % i for i in range(1, 6)}
+        # bussard writes 3 + 1 entries, ETS 2 + 3: index 4 is extra on the ETS side.
+        ours = [self.key_write(self.key_table(1, 2, 3), groups=groups),
+                self.key_write(self.key_table(5), groups=groups)]
+        ets = [self.key_write(self.key_table(1, 2)), self.key_write(self.key_table(3, 4, 5))]
+        gk = memimage._group_key_table(ours, ets)
+        self.assertEqual((gk["value"], gk["why"]), ("differs", "index 4: missing in bussard"))
+        self.assertEqual((gk["bussard_entries"], gk["ets_entries"]), (4, 5))
+        same = memimage._group_key_table(
+            [self.key_write(self.key_table(1, 2, 3), groups=groups)],
+            [self.key_write(self.key_table(1)), self.key_write(self.key_table(2, 3))],
+        )
+        self.assertEqual(same["value"], "hash-equal")
+        # One side without salted entries: no table verdict.
+        self.assertIsNone(memimage._group_key_table([dict(ours[0], entries=None)], ets))
+        props = {
+            "verdict": memimage.DIFFERS, "bussard_writes": 2, "ets_writes": 2,
+            "value_counts": {}, "bussard_only": [], "ets_only": [], "matched": [],
+            "group_key_table": gk,
+        }
+        self.assertIn("      group key table (PID 53, bussard 4, ETS 5 entries): "
+                      "index 4: missing in bussard", memimage.render_properties(props))
+
+    def test_ets_groups_reads_the_address_table_ets_wrote(self):
+        class Mem:
+            def __init__(self, base: int, data: bytes):
+                self.base, self.data = base, data
+
+            def get(self, at: int):
+                i = at - self.base
+                return self.data[i] if 0 <= i < len(self.data) else None
+
+        table = struct.pack(">HHH", 2, 0x0006, 0x0A03)  # count 2: 0/0/6, 1/2/3
+        results = [{"region": "address table", "address": 0x4000}]
+        self.assertEqual(
+            memimage._ets_groups({"system": "B"}, results, Mem(0x4000, table)),
+            {1: "0/0/6", 2: "1/2/3"},
+        )
+        self.assertEqual(memimage._ets_groups({"system": "7"}, results, Mem(0x4000, table)), {})
+        self.assertEqual(memimage._ets_groups({"system": "B"}, results, Mem(0x5000, table)), {})
+
+    def test_compose_lists_group_key_entries_under_the_salt(self):
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {memimage.ORACLE_SALT_ENV: "run-salt"}):
+            out = self.image_dir()
+        with open(os.path.join(out, "properties.json")) as fh:
+            text = fh.read()
+        props = json.loads(text)
+        self.assertEqual(props[4]["pid"], 53)
+        self.assertEqual(props[4]["entries"],
+                         memimage.group_key_entries(self.GROUP_KEYS, "run-salt"))
+        self.assertNotIn(self.GROUP_KEYS.hex(), text)
+        self.assertNotIn(self.GROUP_KEYS[2:].hex(), text)
+        self.assertNotIn("run-salt", text)
+        with mock.patch.dict(os.environ, {memimage.ORACLE_SALT_ENV: ""}):
+            out = self.image_dir()
+        with open(os.path.join(out, "properties.json")) as fh:
+            self.assertNotIn("entries", json.load(fh)[4])
+
+    def test_render_properties_prints_the_pid54_note(self):
+        props = {
+            "verdict": memimage.IDENTICAL, "bussard_writes": 1, "ets_writes": 1,
+            "value_counts": {"equal": 1}, "bussard_only": [], "ets_only": [],
+            "matched": [{"step": 25, "key": ["type17.1", 54, 8], "value": "equal",
+                         "why": "sequence numbers differ: ETS 0040ab845d77, bussard 0040102ea9ce"}],
+        }
+        props["matched"].append({"step": 26, "key": ["obj4", 13, 5], "value": "no-value",
+                                 "why": "plan.json carries no value for this step"})
+        lines = memimage.render_properties(props)
+        self.assertFalse(any("obj4 PID 13" in line for line in lines))
+        self.assertIn(
+            "      step  25 type17.1 PID 54 (8 octets): equal "
+            "(sequence numbers differ: ETS 0040ab845d77, bussard 0040102ea9ce)",
+            lines,
+        )
+
     def test_compare_properties_without_properties_json(self):
         ets = self.image_dir()
         os.unlink(os.path.join(ets, "properties.json"))

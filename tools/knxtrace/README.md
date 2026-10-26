@@ -208,6 +208,12 @@ the property writes of the download to `properties.json` (see
 [the offline oracle](../../docs/testing-campaign.md#before-a-flash-the-offline-oracle)):
 object, PID, count, index, length and value, with security-object key material
 reduced to `redacted:<sha256[:8]>` by the same rule as the trace.
+With `$BUSSARD_ORACLE_SALT` set (the oracle script draws one per run and
+passes it to both sides), a group key table write (PID 53) also lists its
+entries: the address table index and `sha256(salt || key)[:8]`. `imgdiff`
+names each entry's group from the address table ETS wrote, so it can say
+`0/0/6: key differs`. PID 54 is compared by sender address; differing
+sequence numbers are a note on an `equal` match.
 
 AES is pure Python so the tool keeps its empty dependency list. That is slow
 per block and fine for a capture's few hundred secure frames.

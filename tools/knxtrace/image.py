@@ -50,7 +50,7 @@ import re
 import struct
 from typing import Dict, List, Optional, Tuple
 
-from datasecure import is_key_material
+from datasecure import SECURITY_OBJECT_TYPE, is_key_material
 from normalize import KIND_ALLOC, KIND_MEM_WRITE, DeviceOps, coalesce
 
 # LdCtrl subtypes of an `AdditionalLoadControls` (event 3) record.
@@ -200,6 +200,45 @@ PROPERTY_WRITE_SERVICES = {
 PID_LOAD_STATE_CONTROL = 5
 
 
+# The offline oracle's per-run salt (issue #378), shared with `bussard flash
+# --dry-run --dump-images` through the environment and never written to disk.
+ORACLE_SALT_ENV = "BUSSARD_ORACLE_SALT"
+PID_GRP_KEY_TABLE = 53
+PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE = 54
+GROUP_KEY_ENTRY_LEN = 18  # group address (2) + key (16)
+SENDER_ENTRY_LEN = 8  # individual address (2) + sequence number (6)
+
+
+def _ga_text(raw: int) -> str:
+    return "%d/%d/%d" % ((raw >> 11) & 0x1F, (raw >> 8) & 0x07, raw & 0xFF)
+
+
+def _ia_text(raw: int) -> str:
+    return "%d.%d.%d" % (raw >> 12, (raw >> 8) & 0x0F, raw & 0xFF)
+
+
+def group_key_entries(data: bytes, salt: str) -> List[Dict[str, object]]:
+    """A group key table value as its entries: the address table index the
+    entry names and the salted short hash `sha256(salt || key)[:8]` of its
+    key, never the key.
+
+    The same form `bussard flash --dump-images` writes under the same salt
+    (bussard also adds the group address), so the two sides compare per group
+    without either file holding a hash of a bare key. `compare` names the
+    ETS entries' groups from the address table ETS wrote.
+    """
+    out: List[Dict[str, object]] = []
+    for i in range(0, len(data) - GROUP_KEY_ENTRY_LEN + 1, GROUP_KEY_ENTRY_LEN):
+        entry = data[i:i + GROUP_KEY_ENTRY_LEN]
+        out.append(
+            {
+                "index": struct.unpack(">H", entry[:2])[0],
+                "key": sha256(salt.encode() + entry[2:])[:8],
+            }
+        )
+    return out
+
+
 def _value_field(obj_type: Optional[int], obj_index: Optional[int], pid, data: bytes) -> str:
     if is_key_material(obj_type, obj_index, pid, len(data)):
         return "redacted:%s" % sha256(data)[:8]
@@ -230,19 +269,23 @@ def property_writes(ops: DeviceOps) -> List[Dict[str, object]]:
         else:
             obj_type, obj_index = None, int(f.get("obj", 0))
             obj = {"index": obj_index}
-        out.append(
-            {
-                "seq": len(out) + 1,
-                "service": apdu.name,
-                "object": obj,
-                "pid": f["pid"],
-                "count": f.get("count"),
-                "index": f.get("index"),
-                "length": len(data),
-                "data": _value_field(obj_type, obj_index, f["pid"], data),
-                "secured": op.detail.get("secured"),
-            }
-        )
+        record = {
+            "seq": len(out) + 1,
+            "service": apdu.name,
+            "object": obj,
+            "pid": f["pid"],
+            "count": f.get("count"),
+            "index": f.get("index"),
+            "length": len(data),
+            "data": _value_field(obj_type, obj_index, f["pid"], data),
+            "secured": op.detail.get("secured"),
+        }
+        salt = os.environ.get(ORACLE_SALT_ENV)
+        if (salt and f["pid"] == PID_GRP_KEY_TABLE
+                and is_key_material(obj_type, obj_index, f["pid"], len(data))
+                and data and len(data) % GROUP_KEY_ENTRY_LEN == 0):
+            record["entries"] = group_key_entries(data, salt)
+        out.append(record)
     return out
 
 
@@ -515,7 +558,7 @@ def compare(
     # The property parity has its own verdict: `verdict` stays the image
     # verdict the pre-flash gate reads, so a known extra property write does
     # not hide whether the memory images match.
-    props = compare_properties(plan, image_dir)
+    props = compare_properties(plan, image_dir, _ets_groups(plan, results, ets))
     for r in results:
         r["in_scope"] = scope is None or region_short(r["region"]) in scope
     judged = [r for r in results if r["in_scope"]]
@@ -543,6 +586,35 @@ def compare(
         "ets_only_ranges": _ranges(ets_only)[:20],
         "properties": props,
     }
+
+
+def _ets_groups(plan: dict, results: List[dict], ets: "EtsMemory") -> Dict[int, str]:
+    """Address table index to group address, read from the address table
+    ETS wrote at the place bussard's address table goes (System B: a 2-octet
+    count, then one 2-octet group address per entry, index 1 first). Empty
+    when the plan is not System B or ETS did not write the table.
+    """
+    if plan.get("system") != "B":
+        return {}
+    for r in results:
+        if r["region"] != "address table" or r.get("address") is None:
+            continue
+        addr = int(r["address"])
+
+        def word(at: int) -> Optional[int]:
+            hi, lo = ets.get(at), ets.get(at + 1)
+            return None if hi is None or lo is None else (hi << 8) | lo
+
+        count = word(addr)
+        if count is None:
+            return {}
+        out: Dict[int, str] = {}
+        for i in range(1, count + 1):
+            raw = word(addr + 2 * i)
+            if raw is not None:
+                out[i] = _ga_text(raw)
+        return out
+    return {}
 
 
 # `write property (object 4, type 0, PID 27, 10 byte(s) from element 1)`, the
@@ -663,6 +735,7 @@ def _structured_entry(step: dict, rec: dict) -> Dict[str, object]:
         "length": int(rec.get("length", len(data) // 2 if isinstance(data, str) else 0)),
         "data": data if isinstance(data, str) else None,
         "sha256": rec.get("sha256"),
+        "entries": rec.get("entries"),
     }
 
 
@@ -676,8 +749,108 @@ def _prop_key(entry: Dict[str, object]) -> Tuple[str, int, int]:
     return (_obj_label(entry["object"]), int(entry["pid"]), int(entry["length"]))
 
 
+def _is_security_object(entry: Dict[str, object]) -> bool:
+    return entry["object"].get("type") == SECURITY_OBJECT_TYPE
+
+
+def _sender_check(ours_hex: str, ets_hex: str) -> Optional[Tuple[str, str]]:
+    """PID 54 (security individual address table) by sender address.
+
+    An entry is the individual address (2 octets) and the last sequence
+    number received from it (6 octets). The sender list, set and order, is
+    what admits a frame; the stored sequence number only has to be below the
+    sender's next one, and bussard seeds it from the clock (#228), so it is a
+    note, not a difference. None when the value is not a whole entry list.
+    """
+    n = SENDER_ENTRY_LEN * 2
+    if not ours_hex or len(ours_hex) % n or len(ets_hex) % n:
+        return None
+    try:
+        ours_b, ets_b = bytes.fromhex(ours_hex), bytes.fromhex(ets_hex)
+    except ValueError:
+        return None
+
+    def split(b: bytes) -> Tuple[List[str], List[str]]:
+        rows = [b[i:i + SENDER_ENTRY_LEN] for i in range(0, len(b), SENDER_ENTRY_LEN)]
+        return [_ia_text(struct.unpack(">H", r[:2])[0]) for r in rows], [r[2:].hex() for r in rows]
+
+    ours_ia, ours_seq = split(ours_b)
+    ets_ia, ets_seq = split(ets_b)
+    if ours_ia != ets_ia:
+        if sorted(ours_ia) == sorted(ets_ia):
+            return "differs", "sender order differs: ETS %s, bussard %s" % (
+                " ".join(ets_ia), " ".join(ours_ia))
+        return "differs", "senders differ: ETS %s, bussard %s" % (
+            " ".join(ets_ia) or "none", " ".join(ours_ia) or "none")
+    if ours_seq != ets_seq:
+        return "equal", "sequence numbers differ: ETS %s, bussard %s" % (
+            " ".join(ets_seq), " ".join(ours_seq))
+    return "equal", ""
+
+
+def _group_key_check(ours: list, theirs: list) -> Tuple[str, str]:
+    """PID 53 (group key table) per entry, from both sides' salted entries.
+
+    Entries are matched by group address when both sides name one (bussard
+    does; `compare` resolves ETS's address table index through the address
+    table ETS wrote), else by address table index, named by bussard's group
+    for that index. Names the groups whose key differs or that one side
+    lacks; never a key or a hash of one.
+    """
+    by_ga = all(e.get("ga") for e in ours) and all(e.get("ga") for e in theirs)
+    names: Dict[object, str] = {}
+
+    def ident(e: dict) -> object:
+        if by_ga:
+            return e["ga"]
+        idx = int(e["index"])
+        if e.get("ga"):
+            names.setdefault(idx, str(e["ga"]))
+        return idx
+
+    ours_ids = [ident(e) for e in ours]
+    ets_ids = [ident(e) for e in theirs]
+    ours_by = dict(zip(ours_ids, (e["key"] for e in ours)))
+    ets_by = dict(zip(ets_ids, (e["key"] for e in theirs)))
+
+    def name(i: object) -> str:
+        if by_ga:
+            return str(i)
+        return names.get(i, "index %s" % i)
+
+    problems = []
+    for i in ours_ids + [i for i in ets_ids if i not in ours_by]:
+        if i not in ets_by:
+            problems.append("%s: missing in ETS" % name(i))
+        elif i not in ours_by:
+            problems.append("%s: missing in bussard" % name(i))
+        elif ours_by[i] != ets_by[i]:
+            problems.append("%s: key differs" % name(i))
+    if problems:
+        return "differs", "; ".join(problems)
+    if ours_ids != ets_ids:
+        return "differs", "entry order differs"
+    return "hash-equal", ""
+
+
 def _value_check(ours: Dict[str, object], theirs: Dict[str, object]) -> Tuple[str, str]:
-    """(outcome, why): `equal`, `hash-equal`, `differs` or `no-value`."""
+    """(outcome, why): `equal`, `hash-equal`, `differs` or `no-value`.
+
+    `why` says what differs; on `equal` it may carry a note (PID 54's
+    sequence numbers).
+    """
+    if _is_security_object(ours) and _is_security_object(theirs):
+        pid = int(ours["pid"])
+        ours_entries, ets_entries = ours.get("entries"), theirs.get("entries")
+        if pid == PID_GRP_KEY_TABLE and isinstance(ours_entries, list) \
+                and isinstance(ets_entries, list):
+            return _group_key_check(ours_entries, ets_entries)
+        ours_data, ets_data = ours.get("data"), str(theirs.get("data") or "")
+        if pid == PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE and isinstance(ours_data, str) \
+                and not ours_data.startswith("redacted:") and not ets_data.startswith("redacted:"):
+            sender = _sender_check(ours_data, ets_data)
+            if sender is not None:
+                return sender
     ets_value = str(theirs.get("data") or "")
     redacted = ets_value.startswith("redacted:")
     ours_hex = ours.get("data")
@@ -699,8 +872,14 @@ def _value_check(ours: Dict[str, object], theirs: Dict[str, object]) -> Tuple[st
     return ("hash-equal", "") if same else ("differs", "hash differs")
 
 
-def compare_properties(plan: dict, image_dir: str) -> Dict[str, object]:
+def compare_properties(
+    plan: dict, image_dir: str, ets_groups: Optional[Dict[int, str]] = None
+) -> Dict[str, object]:
     """Aligns bussard's property-write steps with ETS's `properties.json`.
+
+    `ets_groups` maps an address table index to the group address in the
+    address table ETS wrote; it names the entries of ETS's group key table
+    (PID 53), which store the index, not the group.
 
     PID_LOAD_STATE_CONTROL writes on the plain services are left out on the
     ETS side: they are the load state machine (unload, allocate, complete),
@@ -717,6 +896,12 @@ def compare_properties(plan: dict, image_dir: str) -> Dict[str, object]:
         if not ("index" in e["object"] and e["pid"] == PID_LOAD_STATE_CONTROL
                 and e["service"] == "A_PropertyValue_Write")
     ]
+    if ets_groups:
+        for e in ets:
+            for entry in e.get("entries") or []:
+                ga = ets_groups.get(int(entry.get("index", 0)))
+                if ga:
+                    entry["ga"] = ga
     ours = plan_property_writes(plan)
     matcher = difflib.SequenceMatcher(
         None, [_prop_key(e) for e in ours], [_prop_key(e) for e in ets], autojunk=False
@@ -741,6 +926,7 @@ def compare_properties(plan: dict, image_dir: str) -> Dict[str, object]:
         for b in ets[j1:j2]:
             ets_only.append({"ets_seq": b["seq"], "service": b["service"], "key": list(_prop_key(b)),
                              "data": b["data"]})
+    group_keys = _group_key_table(ours, ets)
     counts: Dict[str, int] = {}
     for m in matched:
         counts[m["value"]] = counts.get(m["value"], 0) + 1
@@ -759,7 +945,32 @@ def compare_properties(plan: dict, image_dir: str) -> Dict[str, object]:
         "value_counts": counts,
         "bussard_only": bussard_only,
         "ets_only": ets_only,
+        "group_key_table": group_keys,
     }
+
+
+def _group_key_table(ours: list, ets: list) -> Optional[Dict[str, str]]:
+    """The whole group key table (every PID 53 write on the security object,
+    in order) compared per group address, or None when a side has no such
+    write or one without salted entries.
+
+    The per-write check names what differs within one chunk; a table written
+    in chunks of different sizes shifts entries between them, so this is the
+    line that says which groups really differ.
+    """
+    def entries(side: list) -> Optional[list]:
+        writes = [e for e in side if _is_security_object(e) and int(e["pid"]) == PID_GRP_KEY_TABLE
+                  and int(e["length"]) > 0]
+        if not writes or not all(isinstance(e.get("entries"), list) for e in writes):
+            return None
+        return [x for e in writes for x in e["entries"]]
+
+    ours_entries, ets_entries = entries(ours), entries(ets)
+    if ours_entries is None or ets_entries is None:
+        return None
+    value, why = _group_key_check(ours_entries, ets_entries)
+    return {"value": value, "why": why, "bussard_entries": len(ours_entries),
+            "ets_entries": len(ets_entries)}
 
 
 def _add_coverage(
@@ -893,6 +1104,17 @@ def render_properties(props: Optional[Dict[str, object]]) -> List[str]:
     for m in props["matched"]:
         if m["value"] == "differs":
             lines.append("      step %3s %s: %s" % (m["step"], _key_text(m["key"]), m["why"]))
+        elif m["value"] in ("equal", "hash-equal") and m["why"]:
+            # A note on a match (PID 54's sequence numbers).
+            lines.append(
+                "      step %3s %s: %s (%s)" % (m["step"], _key_text(m["key"]), m["value"], m["why"])
+            )
+    gk = props.get("group_key_table")
+    if gk and gk["value"] == "differs":
+        lines.append(
+            "      group key table (PID 53, bussard %d, ETS %d entries): %s"
+            % (gk["bussard_entries"], gk["ets_entries"], gk["why"])
+        )
     for b in props["bussard_only"]:
         lines.append("      bussard only: step %3s %s" % (b["step"], _key_text(b["key"])))
     for e in props["ets_only"]:

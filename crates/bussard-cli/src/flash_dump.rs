@@ -36,6 +36,36 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The environment variable that carries the offline oracle's per-run salt
+/// (issue #378). When set, each group key table record also lists its
+/// entries: the address table index, the group address, and
+/// `sha256(salt || key)[:8]`, so `knxtrace imgdiff` can name the group whose
+/// key differs. Without it only the whole-chunk hash is written. The salt is
+/// never written to the dump.
+const ORACLE_SALT_ENV: &str = "BUSSARD_ORACLE_SALT";
+
+/// Octets of one group key table entry: address table index (2) + key (16).
+const GROUP_KEY_ENTRY_LEN: usize = 18;
+
+/// The per-entry records of group key table entries: the address table index
+/// the device stores, the group address it names, and the salted short hash
+/// of the key, never the key.
+fn group_key_entries(entries: &[bussard_download::GroupKeyEntry], salt: &str) -> Vec<Value> {
+    entries
+        .iter()
+        .map(|e| {
+            let encoded = e.encode();
+            let mut salted = salt.as_bytes().to_vec();
+            salted.extend_from_slice(&encoded[2..]);
+            json!({
+                "index": e.address_index,
+                "ga": e.group_address.to_string(),
+                "key": &sha256_hex(&salted)[..8],
+            })
+        })
+        .collect()
+}
+
 /// A segment id reduced to characters safe in a file name.
 fn file_safe(id: &str) -> String {
     id.chars()
@@ -131,7 +161,10 @@ const DUMP_NOMINAL_MAX_APDU: u16 = 233;
 /// property records (`knxtrace imgdiff` aligns them with ETS's
 /// `properties.json`, issue #156). A group key table value is reduced to the
 /// same `redacted:<sha256[:8]>` the tool writes, never the key bytes.
-fn security_property_records(step: &FlashStep) -> Vec<serde_json::Value> {
+///
+/// `salt` is the oracle's per-run salt (`BUSSARD_ORACLE_SALT`); with it a
+/// group key table record also lists its entries (see `group_key_entries`).
+fn security_property_records(step: &FlashStep, salt: Option<&str>) -> Vec<serde_json::Value> {
     use bussard_mgmt::property_ext::{
         OT_SECURITY, PID_GO_SECURITY_FLAGS, PID_GRP_KEY_TABLE,
         PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE, PID_SECURITY_LOAD_STATE_CONTROL,
@@ -141,21 +174,35 @@ fn security_property_records(step: &FlashStep) -> Vec<serde_json::Value> {
         DUMP_NOMINAL_MAX_APDU - bussard_mgmt::SECURE_APDU_OVERHEAD - PROPERTY_EXT_WRITE_OVERHEAD,
     );
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    let chunked = |pid: u16, elem: usize, bytes: &[u8], secret: bool| -> Vec<serde_json::Value> {
+    // `secret` holds the group key entries behind `bytes` (one per element)
+    // when the value is key material: it is then hashed, never written as hex.
+    let chunked = |pid: u16,
+                   elem: usize,
+                   bytes: &[u8],
+                   secret: Option<&[bussard_download::GroupKeyEntry]>|
+     -> Vec<serde_json::Value> {
         let per = (budget / elem).max(1) * elem;
         bytes
             .chunks(per)
             .enumerate()
             .map(|(i, chunk)| {
-                let data = if secret {
+                let data = if secret.is_some() {
                     format!("redacted:{}", &sha256_hex(chunk)[..8])
                 } else {
                     hex(chunk)
                 };
-                json!({
+                let mut record = json!({
                     "object_type": OT_SECURITY, "instance": 1, "pid": pid,
                     "start_element": 1 + i * per / elem, "length": chunk.len(), "data": data,
-                })
+                });
+                if let (Some(entries), Some(salt)) = (secret, salt) {
+                    let first = i * per / elem;
+                    let n = chunk.len() / elem;
+                    if let Some(slice) = entries.get(first..first + n) {
+                        record["entries"] = json!(group_key_entries(slice, salt));
+                    }
+                }
+                record
             })
             .collect()
     };
@@ -173,13 +220,18 @@ fn security_property_records(step: &FlashStep) -> Vec<serde_json::Value> {
             PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE,
             bussard_download::SecureSenderEntry::LEN,
             &bussard_download::sender_table_bytes(entries),
-            false,
+            None,
         ),
         FlashStep::SecurityGroupKeys { entries } => {
             let table: Vec<u8> = entries.iter().flat_map(|e| e.encode()).collect();
-            chunked(PID_GRP_KEY_TABLE, 18, &table, true)
+            chunked(
+                PID_GRP_KEY_TABLE,
+                GROUP_KEY_ENTRY_LEN,
+                &table,
+                Some(entries),
+            )
         }
-        FlashStep::SecurityGoFlags { flags } => chunked(PID_GO_SECURITY_FLAGS, 1, flags, false),
+        FlashStep::SecurityGoFlags { flags } => chunked(PID_GO_SECURITY_FLAGS, 1, flags, None),
         _ => Vec::new(),
     }
 }
@@ -198,6 +250,9 @@ pub fn write_dump(
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let labels = trace(plan);
+    let salt = std::env::var(ORACLE_SALT_ENV)
+        .ok()
+        .filter(|s| !s.is_empty());
     let mut used = BTreeSet::new();
     let mut steps = Vec::with_capacity(plan.steps.len());
     let mut allocations = Vec::new();
@@ -320,7 +375,7 @@ pub fn write_dump(
             | FlashStep::SecuritySenders { .. }
             | FlashStep::SecurityGroupKeys { .. }
             | FlashStep::SecurityGoFlags { .. } => {
-                record["properties"] = json!(security_property_records(step));
+                record["properties"] = json!(security_property_records(step, salt.as_deref()));
             }
             _ => {}
         }
@@ -410,6 +465,34 @@ mod tests {
         let set: BTreeSet<usize> = [0, 1, 2, 5, 7, 8].into_iter().collect();
         assert_eq!(placed_ranges(&set), vec![[0, 3], [5, 6], [7, 9]]);
         assert!(placed_ranges(&BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn test_group_key_entries_names_group_and_salts_key() -> anyhow::Result<()> {
+        use bussard_download::GroupKeyEntry;
+        let entry = |index: u16, ga: &str, fill: u8| -> anyhow::Result<GroupKeyEntry> {
+            Ok(GroupKeyEntry {
+                address_index: index,
+                group_address: ga.parse()?,
+                key: bussard_secure::Key16::new([fill; 16]),
+            })
+        };
+        let entries = [entry(2, "0/0/6", 0x11)?, entry(5, "1/2/3", 0x22)?];
+        let a = group_key_entries(&entries, "salt-a");
+        assert_eq!(a.len(), 2);
+        assert_eq!(
+            (a[0]["index"].as_u64(), a[0]["ga"].as_str()),
+            (Some(2), Some("0/0/6"))
+        );
+        assert_eq!(a[1]["ga"], "1/2/3");
+        let mut salted = b"salt-a".to_vec();
+        salted.extend_from_slice(&[0x11; 16]);
+        assert_eq!(a[0]["key"], sha256_hex(&salted)[..8]);
+        // Never the unsalted hash of the key alone.
+        assert_ne!(a[0]["key"], sha256_hex(&[0x11; 16])[..8]);
+        let b = group_key_entries(&entries, "salt-b");
+        assert_ne!(a[0]["key"], b[0]["key"]);
+        Ok(())
     }
 
     #[test]

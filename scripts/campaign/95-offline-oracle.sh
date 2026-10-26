@@ -79,7 +79,12 @@
 # Per device the result is identical / differs (octets, first differing
 # offset, both hex excerpts, per region) / not comparable (why), plus the
 # property-write parity against `properties.json` (security-object key
-# material redacted to a hash). Everything is written under
+# material redacted to a hash). PID 54 (the security individual address table)
+# is compared by sender address, set and order; its sequence numbers are a
+# note. PID 53 (the group key table) is compared per entry and names the group
+# addresses whose key differs or is missing on one side: both sides hash each
+# key with a random salt drawn per run ($BUSSARD_ORACLE_SALT, exported to
+# `knxtrace image` and the bussard dry run, never written to disk). Everything is written under
 # captures/campaign/<date>/offline-oracle/ (gitignored) unless --out says
 # otherwise; the rows file and the results stay local.
 
@@ -118,6 +123,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# Per-run salt for the per-entry group key hashes (issue #378).
+BUSSARD_ORACLE_SALT="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+export BUSSARD_ORACLE_SALT
 
 [ -n "$ROWS_FILE" ] || [ -n "$SINGLE_ROW" ] || die "pass --rows FILE or --row 'device|capture|product[|application]'"
 
