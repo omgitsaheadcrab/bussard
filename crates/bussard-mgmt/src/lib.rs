@@ -137,12 +137,12 @@ pub fn is_system_b(mask: u16) -> bool {
 ///
 /// - `0x07B0` / `0x57B0` / `0x27B0` → System B (TP1 / KNX-IP / RF)
 /// - `0x0705`, `0x0701` → System 7
-/// - `0x0300`, `0x0310`, `0x0311` → System 2
-/// - `0x0010`–`0x0013`, `0x0020`/`0x0021`/`0x0025` → System 1 (BCU1 family)
+/// - `0x0020`/`0x0021`/`0x0025`, `0x0300`, `0x0310`, `0x0311` → System 2
+/// - `0x0010`–`0x0013` → System 1 (BCU1 family)
 ///
-/// The `0x002x` masks are the BCU1-family realisation type reported by some IP
-/// interfaces; a live scan found a Jung IP interface reporting `0021` (issue
-/// #30). Unknown masks return `"System ?"`.
+/// The `0x002x` masks are the BCU2 family; a live scan found a Jung IP
+/// interface reporting `0021` (issues #30, #390). Unknown masks return
+/// `"System ?"`.
 ///
 /// The classification is delegated to [`MaskProfile`]; this wrapper only adds
 /// the medium suffix on System B masks (`"System B (IP)"` / `"System B (RF)"`)
@@ -167,10 +167,10 @@ mod tests {
         assert_eq!(system_type(0x07B0), "System B");
         assert_eq!(system_type(0x0705), "System 7");
         assert_eq!(system_type(0x0012), "System 1");
-        // BCU1-family realisation type reported by a Jung IP interface (#30).
-        assert_eq!(system_type(0x0021), "System 1");
-        assert_eq!(system_type(0x0020), "System 1");
-        assert_eq!(system_type(0x0025), "System 1");
+        // The BCU2 mask a Jung IP interface reports (#30, #390).
+        assert_eq!(system_type(0x0021), "System 2");
+        assert_eq!(system_type(0x0020), "System 2");
+        assert_eq!(system_type(0x0025), "System 2");
         assert_eq!(system_type(0x0300), "System 2");
         assert_eq!(system_type(0x1234), "System ?");
     }

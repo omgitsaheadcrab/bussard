@@ -1062,9 +1062,9 @@ refusals and `bussard audit` use, and a test
 | `0011` | System 1 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
 | `0012` | System 1 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
 | `0013` | System 1 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
-| `0020` | System 1 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
-| `0021` | System 1 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
-| `0025` | System 1 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
+| `0020` | System 2 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
+| `0021` | System 2 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
+| `0025` | System 2 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
 | `0300` | System 2 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
 | `0310` | System 2 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
 | `0311` | System 2 | TP1 | no | no | no | yes | classified but unsupported; program it with ETS |
@@ -1075,6 +1075,12 @@ refusals and `bussard audit` use, and a test
 | `27B0` | System B | RF | yes | yes | yes | yes | tables live in device-allocated segments found via PID_TABLE_REFERENCE; full read and write support |
 | `57B0` | System B | KNX-IP | yes | yes | yes | yes | tables live in device-allocated segments found via PID_TABLE_REFERENCE; full read and write support |
 <!-- mask-table:end -->
+
+One exception to the `flash` column: on mask `0021` (the Jung IPS 300 SREG KNX
+IP interface) `flash` runs an application whose load procedure holds nothing but
+property compares and writes (issue #390). Such a download loads no object and
+never factory-resets the interface; it ends with a read-back of every property
+it wrote.
 
 The details per command:
 

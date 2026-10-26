@@ -575,6 +575,38 @@ pub async fn read_property_ext_table<Ch: L4Channel>(
     Ok(out)
 }
 
+/// Runs the extended-property exchange `f` and tells a device that declines
+/// the extended services apart from a failure (issue #390): `Ok(None)` when
+/// the device refuses the request (a zero count or a non-zero return code),
+/// answers with another service, or `T_ACK`s it and leaves it unanswered (the
+/// connection is then reopened, the peer is alive and the sequence numbers
+/// agree), so the caller can address the object by its index instead.
+///
+/// # Errors
+///
+/// A transport failure, or a request the device did not even `T_ACK`.
+pub async fn declined_as_none<Ch: L4Channel, T>(
+    l4: &mut Layer4Connection<Ch>,
+    f: impl AsyncFnOnce(&mut Layer4Connection<Ch>) -> Result<T>,
+) -> Result<Option<T>> {
+    let before = l4.numbered_exchanges();
+    match f(l4).await {
+        Ok(v) => Ok(Some(v)),
+        Err(MgmtError::ServiceRejected { .. } | MgmtError::MalformedResponse { .. }) => Ok(None),
+        Err(
+            MgmtError::NoResponse { .. }
+            | MgmtError::MidSessionSilence {
+                kind: crate::error::SilenceKind::NoResponse,
+                ..
+            },
+        ) if l4.numbered_exchanges() > before => {
+            l4.reopen_after_unanswered();
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Writes `count` elements from `start` with `A_PropertyExtValue_WriteCon` and
 /// checks the device's confirmation: the echoed header, count and start, and a
 /// zero return code. A non-zero return code is [`MgmtError::ServiceRejected`].

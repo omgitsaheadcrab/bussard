@@ -377,3 +377,35 @@ async fn test_write_property_value_splits_elements_to_the_apdu_budget() -> TestR
     assert_eq!(writes, vec![(2, 1), (2, 3), (2, 5), (2, 7)]);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_flash_property_procedure_falls_back_when_ext_goes_unanswered() -> TestResult {
+    // A device that T_ACKs the extended services and never answers them, and
+    // whose object walk stops early: the object is found in PID_IO_LIST.
+    let device = ip_interface(false)?.with_hook(|_, apci, _| {
+        matches!(apci, 0x1CC | 0x1CE).then_some(bussard_testkit::Reaction::Ack)
+    });
+    let gw = MockGateway::builder().device(device).start().await?;
+    let app = ip_interface_app("0021")?;
+    let plan = plan_for(&app, 0x0021)?;
+    let mut bus = connect(&gw).await?;
+    let mut l4 = Layer4Connection::connect(&mut bus, ia("1.1.200")?, ia("0.0.255")?).await?;
+    l4.set_timeouts(bussard_mgmt::Timeouts {
+        response_timeout: std::time::Duration::from_millis(150),
+        ..l4.timeouts()
+    });
+    let mut session = Session::from_connection(l4);
+    let outcome = flash(
+        &mut session,
+        &plan,
+        bussard_download::FlashOptions::default(),
+        |_| {},
+    )
+    .await?;
+    let _ = session.into_disconnect().await;
+    assert!(outcome.ok(), "{outcome:?}");
+    let dev = gw.with_device(ia("1.1.200")?, |d| d.clone())?;
+    assert_eq!(dev.property(1, 205), Some(&PREFERRED[..]));
+    assert_eq!(dev.property(2, 211), Some(&RATE[..]));
+    Ok(())
+}
