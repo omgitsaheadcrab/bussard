@@ -96,6 +96,37 @@ pub fn synthetic_mdt_sys7_product() -> crate::prod::ProductData {
     }
 }
 
+/// A synthetic System B product (mask `07B0`) with one empty application
+/// object and no load procedure, built in memory: the stand-in for a device
+/// whose config names no `.knxprod`, such as a simulated KNX IP interface
+/// (bussard issue #391), which is programmed through its KNXnet/IP parameter
+/// object, not through a download.
+pub fn synthetic_system_b_product() -> crate::prod::ProductData {
+    use crate::prod::{LoadableObject, ProductData};
+    ProductData {
+        application_id: "M-0083_A-0001-01-0000".into(),
+        application_number: 1,
+        application_version: 1,
+        mask_version: "MV-07B0".into(),
+        objects: vec![LoadableObject {
+            lsm_index: 4,
+            name: "application program".into(),
+            max_size: None,
+            image: Vec::new(),
+        }],
+        load_procedures: Vec::new(),
+        segments: Vec::new(),
+        hardware_type_marker: None,
+        device_compare_props: Vec::new(),
+        written_props: Vec::new(),
+        task_segment_lsms: None,
+        compare_mems: Vec::new(),
+        object_compare_props: Vec::new(),
+        typed_props: Vec::new(),
+        property_only: false,
+    }
+}
+
 /// Skip the current test (return early) if the DA.tp fixture is absent, printing
 /// a note. Use as: `let bytes = match knx_sim::testfixtures::da_tp_knxprod() { ... }`.
 #[macro_export]

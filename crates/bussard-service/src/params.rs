@@ -1426,6 +1426,7 @@ pub fn build_device_plan(
             association_table: report.resulting_association_count,
             tables_change,
         }),
+        interface_properties: Vec::new(),
     };
     let root = backups_root(dir);
     let backup_dir = if parameter_octets > 0 {

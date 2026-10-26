@@ -428,7 +428,7 @@ impl WriteReadback {
         }
     }
 
-    fn push(&mut self, kind: LeftoverKind, item: String, device: String, model: String) {
+    pub(crate) fn push(&mut self, kind: LeftoverKind, item: String, device: String, model: String) {
         self.leftovers.push(Leftover {
             kind,
             item,

@@ -224,7 +224,14 @@ impl Device {
         // #390). Read and confirmed write; the security object keeps its own
         // handler below.
         let object_type = apdu.data.get(..2).map(|t| u16::from_be_bytes([t[0], t[1]]));
+        // The PIDs the `[knxnet]` table sets (bussard issue #391) are written
+        // with array semantics below (element counts, both copies in step).
+        let knxnet_write = apdu.apci == Apci::PropertyExtValueWriteCon
+            && object_type == Some(super::knxnet_object::IOT_KNXNET_IP_PARAMETER)
+            && super::knxnet_object::ext_pid(&apdu.data)
+                .is_some_and(|pid| super::knxnet_object::WRITABLE.contains(&pid));
         if let Some(object_type) = object_type
+            && !knxnet_write
             && matches!(
                 apdu.apci,
                 Apci::PropertyExtValueRead | Apci::PropertyExtValueWriteCon
@@ -251,6 +258,36 @@ impl Device {
                     did_master_reset: false,
                 });
             }
+        }
+        let slots = self.knxnet_slots;
+        if knxnet_write
+            && let Some(obj) = self.knxnet_by_type.as_mut()
+            && let Some((data, written)) = super::knxnet_object::ext_write(obj, &apdu.data, slots)
+        {
+            if let Some(pid) = written {
+                self.knxnet_sync(pid, false);
+                let object = self.knxnet_index().unwrap_or(u8::MAX);
+                self.emit(Event::PropertyWritten {
+                    device: self.address,
+                    object,
+                    pid,
+                });
+            }
+            let resp = self.respond(tool, super::knxnet_object::EXT_WRITE_CON_RESPONSE, &data);
+            return Ok(DeviceReaction {
+                responses: vec![resp],
+                did_master_reset: false,
+            });
+        }
+        if apdu.apci == Apci::PropertyExtDescriptionRead
+            && let Some(obj) = &self.knxnet_by_type
+            && let Some(data) = super::knxnet_object::ext_description(obj, &apdu.data, slots)
+        {
+            let resp = self.respond(tool, super::knxnet_object::EXT_DESCRIPTION_RESPONSE, &data);
+            return Ok(DeviceReaction {
+                responses: vec![resp],
+                did_master_reset: false,
+            });
         }
         let limits = self.security_limits();
         let Some(obj) = self.security_object.as_mut() else {

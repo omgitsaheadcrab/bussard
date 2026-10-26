@@ -64,6 +64,13 @@ impl Device {
             }
         });
 
+        // The KNXnet/IP parameter object describes its real element counts.
+        let desc = match (desc, self.objects.get(&object)) {
+            (Some(d), Some(obj)) if super::knxnet_object::is_knxnet(obj) => {
+                Some(super::knxnet_object::refine(d, obj, self.knxnet_slots))
+            }
+            (desc, _) => desc,
+        };
         // The 7-octet response payload. On absence, echo the addressing with a
         // zero type / zero count / zero access — a real "no property" descriptor.
         let data = match desc {
@@ -222,6 +229,45 @@ impl Device {
         if self.access_level != 0 {
             return Err(DeviceError::Unauthorized {
                 level: self.access_level,
+            });
+        }
+
+        // The KNXnet/IP parameter object of an IP interface (bussard issue
+        // #391) takes writes element by element; a refused write is the
+        // zero-count response.
+        if pid != super::interface_object::PID_OBJECT_TYPE
+            && self
+                .objects
+                .get(&object)
+                .is_some_and(super::knxnet_object::is_knxnet)
+        {
+            let slots = self.knxnet_slots;
+            let taken = self
+                .objects
+                .get_mut(&object)
+                .and_then(|o| o.property_mut(pid))
+                .filter(|p| !p.read_only)
+                .is_some_and(|p| {
+                    super::knxnet_object::array_write(pid, &mut p.value, start, value, slots)
+                });
+            let mut data = vec![
+                object,
+                pid,
+                ((if taken { count } else { 0 }) << 4) | ((start >> 8) as u8 & 0x0F),
+                (start & 0xFF) as u8,
+            ];
+            if taken {
+                data.extend_from_slice(value);
+                self.knxnet_sync(pid, true);
+                self.emit(Event::PropertyWritten {
+                    device: self.address,
+                    object,
+                    pid,
+                });
+            }
+            return Ok(DeviceReaction {
+                responses: vec![self.respond(tool, 0x3D6, &data)],
+                did_master_reset: false,
             });
         }
 

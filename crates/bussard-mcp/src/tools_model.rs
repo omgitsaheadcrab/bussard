@@ -145,6 +145,41 @@ pub struct SetParameterArgs {
     pub force: bool,
 }
 
+/// Arguments for `knx_set_interface`. Every field but `address` is optional;
+/// pass only what changes.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct SetInterfaceArgs {
+    /// The IP interface's individual address, e.g. `"1.1.200"`.
+    pub address: String,
+    /// How the interface gets its IP address: `"dhcp"` or `"static"`.
+    /// Switching to `"dhcp"` drops the static address, netmask and gateway.
+    #[serde(default)]
+    pub assignment: Option<String>,
+    /// The static IP address, e.g. `"192.168.1.80"` (`"static"` only).
+    #[serde(default)]
+    pub ip_address: Option<String>,
+    /// The static netmask, e.g. `"255.255.255.0"` (`"static"` only).
+    #[serde(default)]
+    pub netmask: Option<String>,
+    /// The static default gateway, e.g. `"192.168.1.1"`; `""` removes it.
+    #[serde(default)]
+    pub default_gateway: Option<String>,
+    /// The friendly name, at most 30 ISO 8859-1 characters; `""` removes it
+    /// from the table (the device keeps the name it has).
+    #[serde(default)]
+    pub friendly_name: Option<String>,
+    /// The whole list of tunnelling addresses, in slot order, replacing the
+    /// current one.
+    #[serde(default)]
+    pub tunnels: Option<Vec<String>>,
+    /// Tunnelling addresses to append (one already listed is kept where it is).
+    #[serde(default)]
+    pub add_tunnels: Vec<String>,
+    /// Tunnelling addresses to remove.
+    #[serde(default)]
+    pub remove_tunnels: Vec<String>,
+}
+
 /// Arguments for `knx_remove_group`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RemoveGroupArgs {
@@ -182,7 +217,7 @@ pub struct UndoArgs {
 ///
 /// `knx_scaffold_groups` and `knx_reserve_groups` live on the group-planning
 /// router but write `groups.toml`, so they are withheld with the others.
-pub const MODEL_EDIT_TOOLS: [&str; 10] = [
+pub const MODEL_EDIT_TOOLS: [&str; 11] = [
     "knx_scaffold_groups",
     "knx_reserve_groups",
     "knx_set_group",
@@ -191,6 +226,7 @@ pub const MODEL_EDIT_TOOLS: [&str; 10] = [
     "knx_remove_link",
     "knx_set_device",
     "knx_set_parameter",
+    "knx_set_interface",
     "knx_undo",
     "knx_discard_edits",
 ];
@@ -666,6 +702,91 @@ impl BussardMcp {
             index_parameter(&mut loaded.device, &keys, &key);
             replace_parameter(&mut loaded.device, &key, value);
             Ok(refresh_device_facts(&dir, model, ia, tiers))
+        })
+    }
+
+    /// `knx_set_interface`.
+    #[tool(
+        description = "Edit the [knxnet] table of a KNX IP interface's device file \
+        (devices/<address>.toml): how it gets its IP address (assignment `dhcp` or `static`, \
+        with ip_address, netmask and default_gateway for static), its friendly name, and its \
+        tunnelling addresses (tunnels replaces the list; add_tunnels and remove_tunnels change \
+        it). Pass only what changes. The table is validated before it is saved: a static \
+        assignment needs an address and a netmask, static settings under dhcp, a friendly name \
+        over 30 ISO 8859-1 characters, a tunnel address listed twice, off the interface's line \
+        or used by a device of the model are refused (E043 to E046), and the result's \
+        `warnings` carry W047 when the tunnels differ from the ones the server's keyring lists \
+        for the interface. The device must already have a [knxnet] table (import and adopt \
+        write it). This edits FILES ONLY: knx_plan_device shows the property writes and \
+        knx_apply_device writes them to the interface's KNXnet/IP parameter object; a change of \
+        the IP assignment, address or tunnel addresses of the interface this server tunnels \
+        through is refused there (the owner applies it with `bussard apply <address> --allow-self-reconfigure`). \
+        Returns the change as sentences: quote them to the human."
+    )]
+    async fn knx_set_interface(
+        &self,
+        Parameters(args): Parameters<SetInterfaceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ia: IndividualAddress = match args.address.parse() {
+            Ok(ia) => ia,
+            Err(_) => {
+                return refusal(format!(
+                    "{:?} is not an individual address like \"1.1.200\"",
+                    args.address
+                ));
+            }
+        };
+        if args.assignment.is_none()
+            && args.ip_address.is_none()
+            && args.netmask.is_none()
+            && args.default_gateway.is_none()
+            && args.friendly_name.is_none()
+            && args.tunnels.is_none()
+            && args.add_tunnels.is_empty()
+            && args.remove_tunnels.is_empty()
+        {
+            return refusal(
+                "nothing to change: pass at least one of assignment, ip_address, netmask, \
+                 default_gateway, friendly_name, tunnels, add_tunnels or remove_tunnels",
+            );
+        }
+        let keyring = self.state().keyring.clone();
+        self.edit_with_note("knx_set_interface", vec![ia.to_string()], move |model| {
+            let devices: Vec<IndividualAddress> = model.devices.keys().copied().collect();
+            let Some(loaded) = model.devices.get_mut(&ia) else {
+                return Err(format!("{ia} is not a device in this model"));
+            };
+            let Some(table) = loaded.device.knxnet.as_mut() else {
+                return Err(format!(
+                    "devices/{ia}.toml has no [knxnet] table: {ia} is not modelled as a KNX IP \
+                     interface (import the project or adopt the interface to write one)"
+                ));
+            };
+            set_interface(table, &args)?;
+            let issues = bussard_model::knxnet::check_config(ia, table, &devices);
+            if !issues.is_empty() {
+                let lines: Vec<String> = issues
+                    .iter()
+                    .map(|i| format!("{}: {}", i.code, i.message))
+                    .collect();
+                return Err(format!(
+                    "the [knxnet] table of {ia} would not validate, nothing was written: {}",
+                    lines.join("; ")
+                ));
+            }
+            let facts = keyring
+                .as_deref()
+                .map(|path| bussard_service::secure::keyring_facts(path, "the server's keyring"));
+            let warnings: Vec<String> =
+                bussard_service::admission::knxnet_tunnel_keyring_diagnostics(
+                    model,
+                    facts.as_ref(),
+                )
+                .into_iter()
+                .filter(|d| d.location.starts_with(&format!("devices/{ia}.toml")))
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .collect();
+            Ok((!warnings.is_empty()).then(|| warnings.join(" ")))
         })
     }
 
@@ -1647,9 +1768,10 @@ pub(crate) fn knxnet_section(dir: &Path, model: &Model, ia: IndividualAddress) -
         "how_to_change": format!(
             "The KNXnet/IP settings live in the [knxnet] table of devices/{ia}.toml \
              (assignment, address, netmask, gateway, friendly_name, tunnels); \
-             knx_set_parameter does not edit them, and bussard does not write them to the \
-             device yet. `device` is what the interface reported the last time \
-             `bussard status {ia}` or `bussard describe {ia}` read it."
+             knx_set_interface edits them (knx_set_parameter does not), and \
+             knx_plan_device then knx_apply_device write them to the interface's KNXnet/IP \
+             parameter object. `device` is what the interface reported the last time it \
+             was read (`bussard status {ia}`, `describe`, or a plan)."
         ),
     }))
 }
@@ -1767,4 +1889,73 @@ fn refusal(reason: impl Into<String>) -> Result<CallToolResult, ErrorData> {
         "refused": true,
         "reason": reason.into(),
     }))
+}
+
+/// Applies `args` to the `[knxnet]` table: the assignment (dhcp drops the
+/// static settings), the static settings, the friendly name and the tunnel
+/// list. `Err` names the first value that does not parse.
+fn set_interface(
+    table: &mut bussard_model::knxnet::KnxnetConfig,
+    args: &SetInterfaceArgs,
+) -> Result<(), String> {
+    use bussard_model::knxnet::IpAssignment;
+    use std::net::Ipv4Addr;
+    let ip = |what: &str, value: &str| -> Result<Option<Ipv4Addr>, String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Ok(None);
+        }
+        value
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("{what} {value:?} is not an IPv4 address like 192.168.1.80"))
+    };
+    let ia = |value: &str| -> Result<IndividualAddress, String> {
+        value
+            .trim()
+            .parse()
+            .map_err(|_| format!("{value:?} is not an individual address like \"1.1.22\""))
+    };
+    if let Some(assignment) = &args.assignment {
+        table.assignment = match assignment.trim().to_ascii_lowercase().as_str() {
+            "dhcp" => IpAssignment::Dhcp,
+            "static" | "manual" => IpAssignment::Static,
+            other => {
+                return Err(format!(
+                    "assignment {other:?} is neither \"dhcp\" nor \"static\""
+                ));
+            }
+        };
+        if table.assignment == IpAssignment::Dhcp {
+            table.address = None;
+            table.netmask = None;
+            table.gateway = None;
+        }
+    }
+    if let Some(v) = &args.ip_address {
+        table.address = ip("ip_address", v)?;
+    }
+    if let Some(v) = &args.netmask {
+        table.netmask = ip("netmask", v)?;
+    }
+    if let Some(v) = &args.default_gateway {
+        table.gateway = ip("default_gateway", v)?;
+    }
+    if let Some(name) = &args.friendly_name {
+        table.friendly_name = (!name.is_empty()).then(|| name.clone());
+    }
+    if let Some(list) = &args.tunnels {
+        table.tunnels = list.iter().map(|t| ia(t)).collect::<Result<_, _>>()?;
+    }
+    for t in &args.add_tunnels {
+        let t = ia(t)?;
+        if !table.tunnels.contains(&t) {
+            table.tunnels.push(t);
+        }
+    }
+    for t in &args.remove_tunnels {
+        let t = ia(t)?;
+        table.tunnels.retain(|x| *x != t);
+    }
+    Ok(())
 }

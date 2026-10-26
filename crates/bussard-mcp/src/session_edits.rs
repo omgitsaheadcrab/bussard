@@ -266,7 +266,8 @@ fn by_subject(changes: &ChangeSet) -> BTreeMap<Subject, (Vec<String>, Vec<bool>)
             ChangeKind::ParameterChanged
             | ChangeKind::LinkAdded
             | ChangeKind::LinkRemoved
-            | ChangeKind::ObjectSecurityChanged => change
+            | ChangeKind::ObjectSecurityChanged
+            | ChangeKind::InterfaceChanged => change
                 .device
                 .as_deref()
                 .and_then(|d| d.parse::<IndividualAddress>().ok())

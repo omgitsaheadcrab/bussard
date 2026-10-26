@@ -115,6 +115,9 @@ pub(crate) struct ApplyInputs<'a> {
     /// `--force`: use a `--product` / `--application` that contradicts
     /// `bussard.lock`, and pin the product archive for the device.
     pub force: bool,
+    /// `--allow-self-reconfigure`: an IP interface plan that reconfigures the
+    /// interface the command tunnels through is written (issue #391).
+    pub allow_self_reconfigure: bool,
 }
 
 /// Writes the model to a device: validate, plan, ask once, back up, write the
@@ -175,6 +178,26 @@ pub fn run(
         target,
         crate::param_readback::MissingProduct::Refuse,
     )?;
+    // A KNX IP interface (a `[knxnet]` table, no links) is written as
+    // properties of its KNXnet/IP parameter object (issue #391); a
+    // property-only load procedure it also has stays `flash`'s.
+    if crate::interface_cmd::interface_only(&model, target).is_some() {
+        hint_installation_backup(dir);
+        return crate::interface_cmd::apply(
+            target,
+            dir,
+            &model,
+            config,
+            &overrides,
+            tool_key_source,
+            crate::interface_cmd::InterfaceApplyInputs {
+                yes,
+                allow_remote_gateway,
+                plan_hash: inputs.plan_hash,
+                allow_self_reconfigure: inputs.allow_self_reconfigure,
+            },
+        );
+    }
     let desired =
         plan_cmd::compute_desired(&model, target, product.as_ref().and_then(|p| p.app()))?;
     hint_installation_backup(dir);

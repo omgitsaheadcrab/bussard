@@ -29,7 +29,11 @@
 //! the same octets. [`probe_knxnet_ext`] and [`knxnet_index_from_io_list`]
 //! find the object when the walk does not.
 //!
-//! The module is read-only: it never sends a write.
+//! The module never sends a write. The write side of the object (issue #391,
+//! `plan`/`apply` of the `[knxnet]` table) goes through the property step
+//! executor every load procedure shares (`bussard_download::write_property_value`);
+//! [`describe_knxnet_property`] gives it the device's own description of a
+//! property (writable, maximum element count) before it plans an array write.
 
 use std::time::Duration;
 
@@ -37,7 +41,9 @@ use bussard_model::IndividualAddress;
 
 use crate::connection::{L4Channel, Layer4Connection};
 use crate::error::{MgmtError, Result, SilenceKind};
-use crate::property_ext::{PropertyExtAddress, read_property_ext, read_property_ext_table};
+use crate::property_ext::{
+    PropertyExtAddress, read_property_ext, read_property_ext_description, read_property_ext_table,
+};
 
 /// The KNXnet/IP parameter object (`OT_KNXIP_PARAMETER`, knx_master.xml `OT-11`).
 pub const OT_KNXNET_IP_PARAMETER: u16 = 11;
@@ -210,6 +216,83 @@ pub async fn read_knxnet_property<Ch: L4Channel>(
             }
         }
     }
+}
+
+/// What a device says about one property of its KNXnet/IP parameter object
+/// (`A_PropertyDescription_Read` by index, `A_PropertyExtDescription_Read` by
+/// object type): whether it takes writes and how many elements it holds at
+/// most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnxnetPropertyDescription {
+    /// The write-enable bit.
+    pub writable: bool,
+    /// The maximum number of elements (the array capacity).
+    pub max_elements: u16,
+}
+
+/// Reads the description of `pid` of the KNXnet/IP parameter object. `None`
+/// when the device does not describe it: a zero-element description, a
+/// refusal, or a request it acknowledges and leaves unanswered (the
+/// connection stays usable). Read under [`PROBE_RESPONSE_TIMEOUT`].
+///
+/// # Errors
+///
+/// A transport failure. A PID of [`FIRST_SECURE_PID`] or above is refused
+/// before anything is sent.
+pub async fn describe_knxnet_property<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    access: KnxnetAccess,
+    pid: u8,
+) -> Result<Option<KnxnetPropertyDescription>> {
+    if pid >= FIRST_SECURE_PID {
+        return Err(MgmtError::MalformedResponse {
+            address: l4.target(),
+            reason: format!(
+                "PID {pid} of the KNXnet/IP parameter object is KNXnet/IP Secure; bussard does \
+                 not touch it"
+            ),
+        });
+    }
+    with_probe_timeout(l4, async |l4| {
+        let before = l4.numbered_exchanges();
+        let answer = match access {
+            KnxnetAccess::Index(index) => {
+                crate::connection::property_description_request(l4, index, pid, 0)
+                    .await
+                    .map(|d| {
+                        (d.property_id == pid).then_some(KnxnetPropertyDescription {
+                            writable: d.writable,
+                            max_elements: d.max_elements,
+                        })
+                    })
+            }
+            KnxnetAccess::Ext { instance } => {
+                let addr = PropertyExtAddress {
+                    object_type: OT_KNXNET_IP_PARAMETER,
+                    object_instance: instance,
+                    property_id: u16::from(pid),
+                };
+                read_property_ext_description(l4, addr, 0).await.map(|d| {
+                    (d.addr.property_id == u16::from(pid)).then_some(KnxnetPropertyDescription {
+                        writable: d.write_enable,
+                        max_elements: d.max_elements,
+                    })
+                })
+            }
+        };
+        match answer {
+            Ok(desc) => Ok(desc.filter(|d| d.max_elements > 0)),
+            Err(MgmtError::ServiceRejected { .. } | MgmtError::MalformedResponse { .. }) => {
+                Ok(None)
+            }
+            Err(err) if acked_but_unanswered(l4, before, &err) => {
+                l4.reopen_after_unanswered();
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    })
+    .await
 }
 
 /// How long a probe for the KNXnet/IP parameter object waits for an answer.

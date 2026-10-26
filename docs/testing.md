@@ -193,6 +193,14 @@ write names its rows and their figures.
 
 ## CI
 
+The `sim-conformance` job also runs the KNX IP interface loop
+(`sim_interface_loop`, issue #391): it builds knx-sim's `serve`, starts a
+simulated interface with no product file, applies a `[knxnet]` table to it
+with `bussard apply` and requires the plan after it to be a no-op. Locally:
+`cargo build --manifest-path knx-sim/Cargo.toml --bin serve`, then
+`BUSSARD_KNX_SIM_BIN=$PWD/knx-sim/target/debug/serve cargo nextest run -p
+bussard-cli -E 'test(/sim_interface_loop/)'`.
+
 The `corpus-sweep` job runs the committed-fixture sweep on every push and pull
 request. The `sim-catalog-loop` job runs the flash-then-plan loop over the
 curated subset (`--subset`) and needs the corpus like the corpus-gated tests:

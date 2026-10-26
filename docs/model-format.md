@@ -361,8 +361,15 @@ the key store lists for the interface, which `admit_tunnel_senders` admits).
 `diff` and `status` describe a change as `Interface KNX IP Interface
 (1.1.200): tunnel address 1.1.30 added.`
 
-The write side (`plan` and `apply` of these settings) is not implemented yet;
-bussard reads and validates the table but does not write it to the device.
+`plan` and `apply` of an interface with this table and no links write it to
+the device as property writes on its KNXnet/IP parameter object: the friendly
+name (PID 76), the tunnel addresses (PID 53), the static address set (PIDs 60
+to 62) and the assignment method (PID 55), each read back after the write. A
+field the table leaves out, and an empty `tunnels`, stays as the device holds
+it. Changing the assignment, the static address or the tunnel addresses of the
+interface the command tunnels through needs `apply --allow-self-reconfigure`. Over MCP,
+`knx_set_interface` edits the table and `knx_plan_device` / `knx_apply_device`
+write it. See [reference.md](reference.md#bussard-plan-address).
 
 ## `bussard.lock`
 

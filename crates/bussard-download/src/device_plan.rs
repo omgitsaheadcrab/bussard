@@ -68,6 +68,9 @@ pub enum ChangeSubject {
     /// table (PID 54, issue #297), the group key table (PID 53) and the
     /// group-object security flags (PID 61, issue #331).
     Security,
+    /// The KNXnet/IP parameter object of an IP interface: the `[knxnet]`
+    /// table of its device file (issue #391).
+    Interface,
 }
 
 /// One line of a device plan.
@@ -123,6 +126,10 @@ pub struct PlanWrites {
     /// the tables, whatever else differs (issue #326).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_image: Option<FullImage>,
+    /// The properties of the KNXnet/IP parameter object the write sets, by
+    /// PID in write order (issue #391).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub interface_properties: Vec<u8>,
 }
 
 /// What a full application download writes, for the plan's `writes` line.
@@ -180,6 +187,7 @@ impl PlanWrites {
             && self.parameter_octets == 0
             && !self.security_object
             && self.full_image.is_none()
+            && self.interface_properties.is_empty()
     }
 
     /// `address table (4 entries), association table (5 entries), 1 parameter
@@ -209,6 +217,14 @@ impl PlanWrites {
                 self.parameter_octets,
                 if self.parameter_octets == 1 { "" } else { "s" }
             ));
+        }
+        if !self.interface_properties.is_empty() {
+            let pids: Vec<String> = self
+                .interface_properties
+                .iter()
+                .map(|p| format!("PID {p}"))
+                .collect();
+            parts.push(format!("KNXnet/IP parameter object ({})", pids.join(", ")));
         }
         if parts.is_empty() {
             "nothing".to_string()
@@ -326,6 +342,9 @@ impl DevicePlan {
                 "  unchanged: {objects}, {p} parameter{}\n",
                 if p == 1 { "" } else { "s" }
             )),
+            // An interface plan (issue #391) compares no objects.
+            None if self.unchanged_objects == 0 && !self.writes.interface_properties.is_empty() => {
+            }
             None => out.push_str(&format!("  unchanged: {objects}\n")),
         }
         out.push_str(&format!("  writes: {}\n", self.writes.describe()));
@@ -674,6 +693,7 @@ mod tests {
                 parameter_octets: 0,
                 security_object: false,
                 full_image: None,
+                interface_properties: Vec::new(),
             },
             backup_dir: "knx/captures/backups/".to_string(),
             notes: Vec::new(),
