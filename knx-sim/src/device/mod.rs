@@ -260,6 +260,10 @@ pub struct Device {
     /// when the device is security-activated. Served through the extended
     /// property services (see [`security_object`]).
     security_object: Option<SecurityObject>,
+    /// The KNXnet/IP parameter object as the extended property services reach
+    /// it (object type 11, instance 1), on a simulated IP interface (bussard
+    /// issue #391). `None` on every other device.
+    knxnet_by_type: Option<InterfaceObject>,
     /// The process time (seconds) reported in the `A_Restart_Response` to a
     /// factory reset (erase code 7).
     restart_process_time_s: u16,
@@ -397,13 +401,26 @@ impl Device {
     /// Gives the device a KNXnet/IP parameter object (interface object type
     /// 11) at the next free object index, serving `params` read-only: the
     /// simulated KNX IP interface of bussard issue #391.
-    pub fn with_knxnet_object(mut self, params: &knxnet_object::KnxnetParameters) -> Self {
-        let index = self
-            .objects
-            .keys()
-            .next_back()
-            .map_or(0, |last| last.saturating_add(1));
-        self.objects.insert(index, params.object());
+    pub fn with_knxnet_object(self, params: &knxnet_object::KnxnetParameters) -> Self {
+        self.with_knxnet(params, true)
+    }
+
+    /// Gives the device a KNXnet/IP parameter object, reachable by object
+    /// type 11 and instance 1 through `A_PropertyExtValue_Read` and, when
+    /// `listed`, also at the next object index for the plain services. An
+    /// unlisted object models the Jung IPS 300 SREG (mask 0021, bussard issue
+    /// #391), whose object-index walk shows a device object and an address
+    /// table only while ETS programs the KNXnet/IP parameters by object type.
+    pub fn with_knxnet(mut self, params: &knxnet_object::KnxnetParameters, listed: bool) -> Self {
+        if listed {
+            let index = self
+                .objects
+                .keys()
+                .next_back()
+                .map_or(0, |last| last.saturating_add(1));
+            self.objects.insert(index, params.object());
+        }
+        self.knxnet_by_type = Some(params.object());
         self
     }
 
@@ -713,6 +730,50 @@ mod tests {
         let write = dev.handle_cemi(&data(&dev, 0x3D7, &[index, 52, 0x11, 0x01, 0x11, 0x05]));
         assert!(write.is_err(), "an unauthorized write is refused");
         assert_eq!(read(&mut dev, 52, 1, 1)?, (1, vec![0x11, 0xC8]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_unlisted_knxnet_object_answers_by_type_only() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // The IPS 300 SREG shape (bussard issue #391): the walk does not list
+        // object type 11, the extended services reach it by type and instance.
+        let params = knxnet_object::KnxnetParameters::dhcp(0x11C8, vec![0x1116, 0x1117]);
+        let mut dev = system_b_device()?.with_knxnet(&params, false);
+        assert!(
+            dev.objects.values().all(|o| o
+                .property(interface_object::PID_OBJECT_TYPE)
+                .map(|p| p.value.clone())
+                != Some(vec![0, 11])),
+            "the object-index walk does not list it"
+        );
+        connect(&mut dev)?;
+        // A_PropertyExtValue_Read type 11, instance 1, PID 52, count 1, start 1.
+        let r = dev.handle_cemi(&data(&dev, 0x1CC, &[0x00, 0x0B, 0x00, 0x10, 0x34, 1, 0, 1]))?;
+        assert_eq!(r.responses.len(), 1);
+        assert_eq!(r.responses[0].tpdu[1], 0xCD, "A_PropertyExtValue_Response");
+        assert_eq!(
+            &r.responses[0].tpdu[2..],
+            &[0x00, 0x0B, 0x00, 0x10, 0x34, 1, 0, 1, 0x11, 0xC8]
+        );
+        // The tunnel count, then instance 2 is refused with count 0.
+        let r = dev.handle_cemi(&data(&dev, 0x1CC, &[0x00, 0x0B, 0x00, 0x10, 0x35, 1, 0, 0]))?;
+        assert_eq!(&r.responses[0].tpdu[7..], &[1, 0, 0, 0, 2]);
+        let r = dev.handle_cemi(&data(&dev, 0x1CC, &[0x00, 0x0B, 0x00, 0x20, 0x34, 1, 0, 1]))?;
+        assert_eq!(r.responses[0].tpdu[7], 0, "another instance");
+        // A plain device only T_ACKs the extended services.
+        let mut plain = system_b_device()?;
+        connect(&mut plain)?;
+        let r = plain.handle_cemi(&data(
+            &plain,
+            0x1CC,
+            &[0x00, 0x0B, 0x00, 0x10, 0x34, 1, 0, 1],
+        ))?;
+        assert!(
+            r.responses.iter().all(|f| f.tpdu.len() == 1),
+            "{:?}",
+            r.responses
+        );
         Ok(())
     }
 }

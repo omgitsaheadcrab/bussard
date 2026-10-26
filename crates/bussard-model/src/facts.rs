@@ -90,6 +90,11 @@ pub struct DeviceFactsRecord {
     /// without one, or before the first read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knxnet: Option<crate::knxnet::KnxnetFacts>,
+    /// The device was probed for a KNXnet/IP parameter object (object table,
+    /// `PID_IO_LIST`, the extended-service probe) and has none (issue #391), so
+    /// a command reusing these facts does not probe again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_knxnet: bool,
 }
 
 /// How a device answered `A_Authorize_Request`.
@@ -336,6 +341,7 @@ mod tests {
                 },
             ],
             knxnet: None,
+            no_knxnet: false,
         })
     }
 

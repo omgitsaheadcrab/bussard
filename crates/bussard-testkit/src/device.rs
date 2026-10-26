@@ -385,6 +385,18 @@ impl MockDevice {
         self
     }
 
+    /// Serves `knxnet` as instance 1 of object type 11 to
+    /// `A_PropertyExtValue_Read` only, without listing the object in the
+    /// object table: the Jung IPS 300 SREG (mask 0021), whose object-index walk
+    /// shows a device object and an address table only while ETS programs its
+    /// KNXnet/IP parameters by object type (issue #391).
+    pub fn with_knxnet_unlisted(mut self, knxnet: &MockKnxnet) -> Self {
+        for (pid, size, data) in knxnet.properties() {
+            self = self.with_property_ext(OT_KNXNET_IP_PARAMETER, u16::from(pid), size, &data);
+        }
+        self
+    }
+
     /// A device at `address` with mask `0x07B0` (System B), a device object
     /// only, not in programming mode, authorize level 0, and memory writes
     /// allowed anywhere with a `Memory_Response` echo.

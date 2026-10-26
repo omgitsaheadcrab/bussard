@@ -26,7 +26,6 @@ use bussard_mgmt::{Layer4Connection, PropertyDesc, system_type};
 use bussard_model::IndividualAddress;
 use bussard_service::describe::{object_type_name, pid_name};
 use bussard_service::facts::property_desc;
-use bussard_service::knxnet::knxnet_object_index;
 use bussard_service::{FactsCache, FactsSource, FactsWant, L4Options, SourcePolicy, WritePolicy};
 
 use crate::conn_cmd::{ConnOverrides, load_model_required, open_service, resolve_config};
@@ -346,21 +345,14 @@ async fn introspect<Ch: bussard_mgmt::L4Channel>(
         .with_context(|| format!("describing the interface objects of {address}"))?;
     // An IP interface's KNXnet/IP parameter object (issue #391): read every
     // time (the address in use can change under DHCP) and kept with the facts.
-    let knxnet = match knxnet_object_index(&established.object_table()) {
-        Some(_) => {
-            match bussard_service::knxnet::read_knxnet(l4, &established.object_table()).await {
-                Ok(knxnet) => knxnet,
-                Err(err) => {
-                    tracing::warn!("{address}: the KNXnet/IP parameter object did not read: {err}");
-                    None
-                }
+    let knxnet =
+        match bussard_service::knxnet::read_knxnet_with_facts(l4, facts, &mut established).await {
+            Ok(knxnet) => knxnet,
+            Err(err) => {
+                tracing::warn!("{address}: the KNXnet/IP parameter object did not read: {err}");
+                None
             }
-        }
-        None => None,
-    };
-    if knxnet.is_some() {
-        facts.remember_knxnet(&mut established, knxnet.clone());
-    }
+        };
     let facts_note = match (&established.source, &established.record) {
         (FactsSource::Cached, Some(record)) if !full => Some(format!(
             "(device facts of {} reused; pass --full to walk the property descriptions again)",
