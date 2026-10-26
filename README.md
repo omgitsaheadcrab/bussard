@@ -30,7 +30,7 @@ All the configuration for your KNX setup is stored in TOML files, ready for your
 
 ## Quickstart
 
-New to KNX ownership? Read [the first weekend guide](https://bussard.tmbo.dev/docs/tutorials/first-weekend/).
+New to KNX ownership? Read [the first weekend guide](https://bussard.tmbo.dev/docs/getting-started/first-weekend/).
 
 Have an ETS export? Import it and watch your bus decode itself:
 
@@ -95,7 +95,7 @@ $ claude mcp add knx -- bussard mcp --dir "$PWD"    # let Claude debug your bus
 
 ## Install
 
-See [the install docs](https://bussard.tmbo.dev/docs/#install) on how to get bussard running on your system.
+See [the install docs](https://bussard.tmbo.dev/docs/getting-started/install/) on how to get bussard running on your system.
 
 ## Safety
 

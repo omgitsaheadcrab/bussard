@@ -8,6 +8,7 @@ is rendered there.
 
 | Page | What it is |
 |---|---|
+| [docs-guide.md](docs-guide.md) | How the user documentation is written: the reader, page anatomy, style rules, the page map. |
 | [agent-brief.md](agent-brief.md) | Standing instructions for an implementation agent: worktree rules, commands, PR steps, report shape. |
 | [DESIGN.md](DESIGN.md) | The living design document: goals, feasibility, architecture, roadmap. |
 | [testing.md](testing.md) | How to run the test suites, the gated corpus tests, the simulator loop and the test knobs. |

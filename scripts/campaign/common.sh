@@ -67,7 +67,7 @@ parse_common_args() {
 # --- The .env file (issue #251) ---------------------------------------------
 
 # Exports the BUSSARD_* variables of the model's .env, with bussard's own rules
-# (docs/reference/cli.md, "Environment variables"): the first of $MODEL_DIR/.env,
+# (docs/reference/environment.md): the first of $MODEL_DIR/.env,
 # the .env next to $MODEL_DIR, ./.env is read; a variable already exported
 # wins; only BUSSARD_* keys; KEY=value, optional `export `, # comments, single
 # or double quotes, no interpolation. BUSSARD_ALLOW_REAL_GATEWAY is never taken

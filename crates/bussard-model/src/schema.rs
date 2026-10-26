@@ -1,6 +1,6 @@
 //! The in-memory model of a bussard KNX-as-code repository.
 //!
-//! The files on disk are described in `docs/reference/model-format.md`: `bussard.toml`,
+//! The files on disk are described in `docs/reference/files/`: `bussard.toml`,
 //! `groups.toml`, `devices/<address>.toml` and the generated `bussard.lock`.
 //! [`crate::loader`] joins a device file with its lock entry into the
 //! [`Device`] defined here and splits it again on save; `bussard.toml` maps
@@ -99,7 +99,7 @@ pub struct ImportConfig {
     /// parameter keys, enum labels), as an ETS language identifier such as
     /// `"de-DE"`. It overrides the language the import would choose and the
     /// one `bussard.lock` recorded; see "Text language" in
-    /// `docs/reference/model-format.md`.
+    /// `docs/reference/files/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 }

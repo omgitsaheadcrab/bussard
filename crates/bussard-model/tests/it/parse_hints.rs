@@ -1,4 +1,4 @@
-//! The parse-error hint layer (docs/reference/model-format.md, Errors): each case is a
+//! The parse-error hint layer (docs/reference/files/errors.md): each case is a
 //! TOML input with a typical mistake and the exact rendered error, caret,
 //! message and `help:` line included.
 

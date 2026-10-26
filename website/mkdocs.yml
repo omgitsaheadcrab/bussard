@@ -37,6 +37,7 @@ theme:
         name: Light mode
   features:
     - navigation.sections
+    - navigation.indexes
     - navigation.top
     - navigation.footer
     - toc.follow
@@ -72,18 +73,59 @@ hooks:
   - hooks.py
 
 nav:
-  - Getting started: index.md
-  - Tutorials:
-      - The first weekend: tutorials/first-weekend.md
+  - Home: index.md
+  - Getting started:
+      - Install: getting-started/install.md
+      - Your first model: getting-started/first-model.md
+      - Connect an assistant: getting-started/assistant.md
+      - The first weekend: getting-started/first-weekend.md
   - How-to guides:
-      - How do I ...: how-to/recipes.md
-      - Working with an integrator: how-to/work-with-an-integrator.md
+      - how-to/index.md
+      - Watch the bus: how-to/watch-the-bus.md
+      - Find what you have: how-to/find-what-you-have.md
+      - Change what a button does: how-to/change-a-link.md
+      - Change a parameter: how-to/change-a-parameter.md
+      - Add a device: how-to/add-a-device.md
+      - Back up and replace: how-to/back-up-and-replace.md
+      - Commission a line: how-to/commission-a-line.md
+      - Exchange with ETS: how-to/exchange-with-ets.md
+      - Work with an integrator: how-to/work-with-an-integrator.md
       - Handover checklist: how-to/handover-checklist.md
+      - Home Assistant: how-to/home-assistant.md
+      - KNX Secure: how-to/knx-secure.md
   - Reference:
-      - Commands: reference/cli.md
-      - Model format: reference/model-format.md
-      - Home Assistant: reference/home-assistant.md
+      - reference/index.md
+      - Global options: reference/global-options.md
+      - Environment variables: reference/environment.md
+      - Commands:
+          - Model: reference/commands/model.md
+          - Bus: reference/commands/bus.md
+          - Devices: reference/commands/devices.md
+          - Programming: reference/commands/programming.md
+          - KNX Secure: reference/commands/secure.md
+          - History: reference/commands/history.md
+          - Servers: reference/commands/servers.md
+      - Files:
+          - bussard.toml: reference/files/bussard-toml.md
+          - groups.toml: reference/files/groups-toml.md
+          - Device files: reference/files/device-files.md
+          - bussard.lock: reference/files/bussard-lock.md
+          - bussard.keys: reference/files/bussard-keys.md
+          - tests.toml: reference/files/tests-toml.md
+          - ha.toml: reference/files/ha-toml.md
+          - Errors: reference/files/errors.md
+      - The model directory: reference/model-directory.md
+      - Validation diagnostics: reference/diagnostics.md
+      - JSON output: reference/json-output.md
+      - MCP tools: reference/mcp-tools.md
+      - viz API: reference/viz-api.md
       - Product data: reference/product-data.md
+      - Home Assistant: reference/home-assistant.md
   - Explanation:
+      - explanation/index.md
       - How bussard works: explanation/how-it-works.md
       - Safety: explanation/safety.md
+      - Write commands: explanation/write-commands.md
+      - KNX Secure: explanation/knx-secure.md
+      - The assistant: explanation/assistant.md
+      - Device support: explanation/device-support.md

@@ -77,7 +77,7 @@ pub fn run(dir: &Path, options: TestOptions, overrides: ConnOverrides) -> anyhow
         .unwrap_or_else(|| dir.join(tests_schema::TESTS_FILE));
     if !path.exists() {
         bail!(
-            "no test file at {}; write one (see `bussard test` in docs/reference/cli.md) or pass \
+            "no test file at {}; write one (see `bussard test` in docs/reference/commands/bus.md) or pass \
              --file",
             path.display()
         );

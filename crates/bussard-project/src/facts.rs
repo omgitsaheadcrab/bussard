@@ -1,7 +1,7 @@
 //! The lock-side facts of one device, derived from its application program
 //! and parameter values: channel handles, object keys, parameter keys and the
 //! channel labels `bussard.lock` records (see "Key derivation" in
-//! `docs/reference/model-format.md`).
+//! `docs/reference/files/`).
 //!
 //! `bussard import` derives them from the ETS project's values and `bussard
 //! adopt` from the vendor defaults, through the same two calls:
