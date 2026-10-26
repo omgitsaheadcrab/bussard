@@ -15,6 +15,7 @@
 //!
 //! It is a clean-room parser: it does not reuse the tool's importer.
 
+mod branch;
 mod model;
 mod reader;
 

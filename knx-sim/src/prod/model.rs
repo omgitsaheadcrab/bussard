@@ -108,7 +108,9 @@ pub struct ProductData {
     /// `LdCtrlCompareProp` preflights expect, as `(PID, value)` from their
     /// `InlineData`: an ABB i-bus program compares `PID_ORDER_INFO` (15) with
     /// its hardware's id. A factory device of that hardware holds exactly
-    /// these values, so the simulated device serves them.
+    /// these values, so the simulated device serves them. A compare inside a
+    /// `<choose>` counts only when the product's parameter defaults select its
+    /// branch (bussard issue #400), else the first compare of that PID does.
     pub device_compare_props: Vec<(u8, Vec<u8>)>,
     /// Every property the application's `LdCtrlWriteProp` steps write, as
     /// `(object index, PID, value length)`. A real device of that hardware

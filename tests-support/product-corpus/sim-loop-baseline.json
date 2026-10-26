@@ -5,27 +5,37 @@
     "M-0002_A-A075-20-4647": {
       "step": "flash[1] (generated 1)",
       "reason": "vendor default of `Vent Dummy Prio Ende` (Access=None, Value=1) is outside its own type (129..129); the generated configuration shows the block holding it, bussard refuses the out-of-range default; not the generator (#399)",
-      "issue": 399
+      "issue": 405
     },
     "M-0007_A-A074-20-BCAC-O0002": {
       "step": "flash[1] (generated 1)",
       "reason": "vendor default of `Vent Dummy Prio Ende` (Access=None, Value=1) is outside its own type (129..129); the generated configuration shows the block holding it, bussard refuses the out-of-range default; not the generator (#399)",
-      "issue": 399
+      "issue": 405
     },
     "M-0007_A-A075-20-DEF8-O0002": {
       "step": "flash[1] (generated 1)",
       "reason": "vendor default of `Vent Dummy Prio Ende` (Access=None, Value=1) is outside its own type (129..129); the generated configuration shows the block holding it, bussard refuses the out-of-range default; not the generator (#399)",
-      "issue": 399
+      "issue": 405
     },
     "M-0083_A-0054-14-0D63": {
-      "step": "flash[0] (defaults)",
-      "reason": "knx-sim seeds object 0 PID 19 from the first LdCtrlCompareProp, the defaults take the <choose> branch that expects 01000000; the sim cannot decide which hardware variant the device is (#390 sim run)",
-      "issue": 400
+      "step": "flash[1] (generated 1)",
+      "reason": "the generator sets `Hardware revision` to `to R1.9`, the procedure then compares object 0 PID 19 with 00000000; knx-sim is the R2.0 device the vendor default selects (01000000) and refuses, as the hardware would (#400)",
+      "issue": 407
     },
     "M-0083_A-0255-21-0ECA": {
       "step": "flash[2] (generated 2)",
       "reason": "label text `Scènario` is 9 octets in UTF-8 for an 8-octet TypeText property; bussard encodes TypeText as UTF-8, no capture shows ETS's encoding (#390 sim run)",
       "issue": 401
+    },
+    "M-0083_A-047A-11-B6E0": {
+      "step": "flash[1] (generated 1)",
+      "reason": "the generator sets `Device selection` to another variant, the procedure then compares PID 78 with that variant's hardware type; knx-sim is the variant the vendor default selects and refuses, as the hardware would (#400 sim run)",
+      "issue": 407
+    },
+    "M-0083_A-04C0-10-7517": {
+      "step": "flash[1] (generated 1)",
+      "reason": "the generator sets `Device selection` to another variant, the procedure then compares PID 78 with that variant's hardware type; knx-sim is the variant the vendor default selects and refuses, as the hardware would (#400 sim run)",
+      "issue": 407
     }
   }
 }
