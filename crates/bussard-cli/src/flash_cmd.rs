@@ -1736,6 +1736,7 @@ mod tests {
             com_objects: Default::default(),
             security: None,
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
         };
         let mut devices = std::collections::BTreeMap::new();

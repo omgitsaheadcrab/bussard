@@ -36,6 +36,7 @@ pub mod history;
 pub mod identity;
 pub mod keyring_checks;
 pub mod keystore_meta;
+pub mod knxnet;
 pub mod label;
 pub mod lint;
 pub mod loader;

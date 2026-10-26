@@ -56,6 +56,7 @@ pub mod group_security;
 /// the transport crate so the libraries below this one share it.
 pub use bussard_transport::guidance;
 pub mod identity;
+pub mod knxnet;
 pub mod model_handle;
 pub mod params;
 pub mod policy;

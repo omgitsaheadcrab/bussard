@@ -632,6 +632,7 @@ mod tests {
                         com_objects: Default::default(),
                         security: None,
                         application_override: None,
+                        knxnet: None,
                         lock: Default::default(),
                     },
                     file_stem: s.to_string(),

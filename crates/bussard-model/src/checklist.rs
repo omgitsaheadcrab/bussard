@@ -207,7 +207,8 @@ pub fn checklist(set: &ChangeSet, old: &Model, new: &Model, products: &ProductMo
             | ChangeKind::DeviceRenamed
             | ChangeKind::DeviceMoved
             | ChangeKind::DeviceProductChanged
-            | ChangeKind::ChannelRenamed => {
+            | ChangeKind::ChannelRenamed
+            | ChangeKind::InterfaceChanged => {
                 if let Some(ia) = ia {
                     let mut item = Item::note(change);
                     item.text = change.sentence.trim_end_matches('.').to_string();

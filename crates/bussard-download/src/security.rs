@@ -1126,6 +1126,7 @@ mod tests {
                 }),
                 replaced: None,
                 application_override: None,
+                knxnet: None,
                 lock: Default::default(),
             };
             devices.insert(

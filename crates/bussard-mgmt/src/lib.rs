@@ -54,6 +54,7 @@ pub mod connection;
 pub mod device;
 pub mod error;
 pub mod io_list;
+pub mod knxnet;
 pub mod load;
 pub mod manufacturers;
 pub mod memory;

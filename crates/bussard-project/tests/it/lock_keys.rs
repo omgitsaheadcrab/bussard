@@ -420,6 +420,7 @@ fn test_derive_facts_with_vendor_defaults() -> TestResult {
         module_bases: BTreeMap::new(),
         com_objects: BTreeMap::new(),
         application_override: None,
+        knxnet: None,
         lock: Default::default(),
         security: None,
     };
@@ -520,6 +521,7 @@ fn test_access_none_parameter_value_goes_to_hidden_not_the_file() -> TestResult 
         module_bases: BTreeMap::new(),
         com_objects: BTreeMap::new(),
         application_override: None,
+        knxnet: None,
         lock: Default::default(),
         security: None,
     };

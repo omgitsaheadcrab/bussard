@@ -738,6 +738,33 @@ fn entry_item(value: &EntryValue) -> Item {
     }
 }
 
+/// The `[knxnet]` table of an IP interface (issue #391), keys in the order the
+/// model format documents.
+fn knxnet_table(k: &crate::knxnet::KnxnetConfig) -> Table {
+    let mut t = Table::new();
+    t.insert("assignment", string_item(k.assignment.label()));
+    for (key, value) in [
+        ("address", k.address),
+        ("netmask", k.netmask),
+        ("gateway", k.gateway),
+    ] {
+        if let Some(v) = value {
+            t.insert(key, string_item(&v.to_string()));
+        }
+    }
+    if let Some(name) = &k.friendly_name {
+        t.insert("friendly_name", string_item(name));
+    }
+    if !k.tunnels.is_empty() {
+        let mut a = Array::new();
+        for ia in &k.tunnels {
+            a.push(string_value(&ia.to_string()));
+        }
+        t.insert("tunnels", Item::Value(Value::Array(a)));
+    }
+    t
+}
+
 /// The desired device document, built fresh.
 fn desired_device(device: &Device, entries: &[(Placement, EntryValue)]) -> DocumentMut {
     let mut doc = DocumentMut::new();
@@ -781,6 +808,9 @@ fn desired_device(device: &Device, entries: &[(Placement, EntryValue)]) -> Docum
             toml_edit::value(sec.secure_commissioning),
         );
         doc.insert("security", Item::Table(t));
+    }
+    if let Some(knxnet) = &device.knxnet {
+        doc.insert("knxnet", Item::Table(knxnet_table(knxnet)));
     }
 
     // Group the entries per table: params (sorted by key) before objects (in

@@ -960,6 +960,7 @@ mod tests {
             com_objects: BTreeMap::new(),
             security: None,
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
         };
         let mut devices = BTreeMap::new();

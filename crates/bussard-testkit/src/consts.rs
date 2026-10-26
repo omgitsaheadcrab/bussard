@@ -92,6 +92,8 @@ pub const OT_ASSOCIATION_TABLE: u16 = 2;
 pub const OT_APPLICATION_PROGRAM: u16 = 3;
 /// Interface object type: group object table.
 pub const OT_GROUP_OBJECT_TABLE: u16 = 9;
+/// Interface object type: KNXnet/IP parameter object (issue #391).
+pub const OT_KNXNET_IP_PARAMETER: u16 = 11;
 
 /// Load state `Unloaded`.
 pub const LS_UNLOADED: u8 = 0;

@@ -453,6 +453,7 @@ pub fn build_model(
             com_objects,
             security,
             application_override: None,
+            knxnet: knxnet_of(raw_dev),
             lock: bussard_model::schema::DeviceLock {
                 language: Some(language.clone()),
                 ..Default::default()
@@ -1202,6 +1203,52 @@ pub(crate) fn slugify(name: &str) -> String {
     }
 }
 
+/// The `[knxnet]` table of an IP interface from its `<IPConfig>` and
+/// `<AdditionalAddresses>` (issue #391), `None` for a device with neither.
+///
+/// `Assign="Fixed"` (or `Static`, `Manual`) is a static assignment with the
+/// project's address, netmask and gateway; anything else, including no
+/// `Assign` at all (the real IPS 300 SREG export), is DHCP, the ETS default,
+/// and then the project's `IPAddress` is the last address ETS saw, a device
+/// fact the table does not hold. The tunnel addresses are the
+/// `AdditionalAddresses` device numbers on the device's own line. Nothing is
+/// read from the device's `<Security>` element.
+fn knxnet_of(raw: &crate::project::RawDevice) -> Option<bussard_model::knxnet::KnxnetConfig> {
+    use bussard_model::knxnet::{IpAssignment, KnxnetConfig};
+    if raw.ip_config.is_none() && raw.additional_addresses.is_empty() {
+        return None;
+    }
+    let ip = raw.ip_config.clone().unwrap_or_default();
+    let assignment = match ip.assign.as_deref() {
+        Some(a)
+            if a.eq_ignore_ascii_case("Fixed")
+                || a.eq_ignore_ascii_case("Static")
+                || a.eq_ignore_ascii_case("Manual") =>
+        {
+            IpAssignment::Static
+        }
+        _ => IpAssignment::Dhcp,
+    };
+    let static_ip = |v: &Option<String>| {
+        v.as_deref()
+            .and_then(|s| s.trim().parse::<std::net::Ipv4Addr>().ok())
+            .filter(|_| assignment == IpAssignment::Static)
+    };
+    let tunnels = raw
+        .additional_addresses
+        .iter()
+        .filter_map(|&n| IndividualAddress::new(raw.address.area(), raw.address.line(), n).ok())
+        .collect();
+    Some(KnxnetConfig {
+        assignment,
+        address: static_ip(&ip.ip_address),
+        netmask: static_ip(&ip.subnet_mask),
+        gateway: static_ip(&ip.default_gateway),
+        friendly_name: None,
+        tunnels,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1484,6 +1531,8 @@ mod tests {
             has_device_certificate: false,
             has_tool_key: false,
             has_loaded_tool_key: false,
+            ip_config: None,
+            additional_addresses: Vec::new(),
         })
     }
 

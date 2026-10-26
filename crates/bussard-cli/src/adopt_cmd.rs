@@ -540,6 +540,43 @@ async fn adopt_flow(
     } else {
         (device, None, None)
     };
+    // A KNX IP interface (issue #391): its KNXnet/IP settings become the
+    // device file's `[knxnet]` table, read from the device (the assignment
+    // method, the static settings, the friendly name, the tunnel addresses).
+    // A table the model already holds is the user's and stays.
+    let mut device = device;
+    let had_knxnet = device.knxnet.is_some()
+        || model
+            .and_then(|m| m.devices.get(&target))
+            .is_some_and(|d| d.device.knxnet.is_some());
+    if !had_knxnet {
+        match read_knxnet_settings(service, source, target, dir, &material).await {
+            Ok(Some(knxnet)) => {
+                let config = knxnet.as_config();
+                println!(
+                    "  KNXnet/IP: assignment {}, {} tunnel address(es){}",
+                    config.assignment.label(),
+                    config.tunnels.len(),
+                    knxnet
+                        .current_address
+                        .map(|a| format!(", address in use {a}"))
+                        .unwrap_or_default()
+                );
+                if knxnet.assignment_mode.is_none() {
+                    println!(
+                        "  note: {target} reports no IP assignment method the model spells; \
+                         recorded as dhcp"
+                    );
+                }
+                device.knxnet = Some(config);
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!(
+                "note: the KNXnet/IP settings of {target} were not read ({err:#}); the device \
+                 file has no [knxnet] table"
+            ),
+        }
+    }
     crate::history_cmd::snapshot(
         dir,
         bussard_model::history::SnapshotReason::new("adopt")
@@ -574,6 +611,41 @@ async fn adopt_flow(
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Reads the KNXnet/IP parameter object of `target` (issue #391) on a fresh
+/// connection, storing it with the device facts: `None` for a device that has
+/// none. Read-only.
+async fn read_knxnet_settings(
+    service: &BusService,
+    source: IndividualAddress,
+    target: IndividualAddress,
+    dir: &Path,
+    material: &SecureMaterial,
+) -> anyhow::Result<Option<bussard_model::knxnet::KnxnetFacts>> {
+    let options = L4Options {
+        source: SourcePolicy::Known(source),
+        tool_key: material.tool_key.clone(),
+        high_water: bussard_secure::SequenceHighWater::new(),
+        authorize: Authorize::BestEffort(bussard_mgmt::apci::FREE_ACCESS_KEY),
+        ..L4Options::default()
+    };
+    let facts = bussard_service::FactsCache::new(dir, false);
+    service
+        .with_l4(target, &options, async |l4| {
+            let mask = bussard_mgmt::read_device_descriptor(l4).await?;
+            let mut established = facts
+                .establish(l4, mask, bussard_service::FactsWant::Table)
+                .await?;
+            let table = established.object_table();
+            if bussard_service::knxnet::knxnet_object_index(&table).is_none() {
+                return Ok(None);
+            }
+            let knxnet = bussard_service::knxnet::read_knxnet(l4, &table).await?;
+            facts.remember_knxnet(&mut established, knxnet.clone());
+            Ok(knxnet)
+        })
+        .await
 }
 
 /// The product data for the order number a device reported: the cached
@@ -687,6 +759,7 @@ fn build_device(
         // an adopted-from-bus device carries none.
         security: None,
         application_override: None,
+        knxnet: None,
         lock: Default::default(),
     };
     // The lock facts under the vendor defaults: the objects the program
@@ -1393,6 +1466,7 @@ mod tests {
                         com_objects: Default::default(),
                         security: None,
                         application_override: None,
+                        knxnet: None,
                         lock: Default::default(),
                     },
                     file_stem: format!("{addr}-d"),

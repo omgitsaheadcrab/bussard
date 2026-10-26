@@ -56,6 +56,7 @@ fn device(
             com_objects,
             security: None,
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
         },
         file_stem: address.to_string(),

@@ -1622,6 +1622,38 @@ fn put_changes(result: &mut Value, changes: &ChangeSet) {
     }
 }
 
+/// The `knxnet` section of `knx_show_device` for an IP interface (issue
+/// #391): the device file's `[knxnet]` table (`model`), what the device's
+/// KNXnet/IP parameter object last reported (`device`, from the device facts
+/// `status` and `describe` keep, with its `read_at`), where the two differ
+/// (`drift`) and how to change it. `None` for a device with neither.
+pub(crate) fn knxnet_section(dir: &Path, model: &Model, ia: IndividualAddress) -> Option<Value> {
+    let config = model.devices.get(&ia).and_then(|d| d.device.knxnet.clone());
+    let facts = bussard_model::facts::load_facts(dir, ia)
+        .ok()
+        .flatten()
+        .and_then(|r| r.knxnet);
+    if config.is_none() && facts.is_none() {
+        return None;
+    }
+    let drift = match (&facts, &config) {
+        (Some(f), Some(c)) => f.drift(c),
+        _ => Vec::new(),
+    };
+    Some(json!({
+        "model": config,
+        "device": facts,
+        "drift": drift,
+        "how_to_change": format!(
+            "The KNXnet/IP settings live in the [knxnet] table of devices/{ia}.toml \
+             (assignment, address, netmask, gateway, friendly_name, tunnels); \
+             knx_set_parameter does not edit them, and bussard does not write them to the \
+             device yet. `device` is what the interface reported the last time \
+             `bussard status {ia}` or `bussard describe {ia}` read it."
+        ),
+    }))
+}
+
 /// Settles the parameter changes of `changes` against the product models of
 /// the devices they name (issue #279): a label on one side and its code on
 /// the other is no change, and an enum value reads as its label with the

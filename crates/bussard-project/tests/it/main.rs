@@ -8,4 +8,5 @@ mod default_params;
 mod ets_versions;
 mod import;
 mod import_adversarial;
+mod knxnet_import;
 mod lock_keys;

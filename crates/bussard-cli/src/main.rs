@@ -50,6 +50,7 @@ mod restore_cmd;
 
 mod scan_cmd;
 mod secure_key;
+mod status_cmd;
 mod test_cmd;
 mod timing;
 mod validate_cmd;
@@ -202,6 +203,10 @@ impl Command {
     fn role(&self) -> Role {
         match self {
             Command::Init { .. } | Command::Import { .. } => Role::Creates,
+            // `status <ADDRESS>` reads a device; plain `status` reads files.
+            Command::Status {
+                address: Some(_), ..
+            } => Role::Bus { slot: true },
             Command::Scan { .. }
             | Command::Assign { .. }
             | Command::Reconstruct { .. }
@@ -1083,10 +1088,17 @@ enum Command {
         #[arg(long, value_name = "HEX", conflicts_with = "keyring")]
         tool_key: Option<String>,
     },
-    /// Show what has changed in the model since the last history snapshot.
+    /// Show what has changed in the model since the last history snapshot,
+    /// or, given a device ADDRESS, read that device's live state over the bus:
+    /// its identity and, for a KNX IP interface, its IP settings, MAC address,
+    /// tunnelling addresses and state (issue #391).
     Status {
+        /// The device to read, e.g. `1.1.200`. Without it, the model's change
+        /// summary.
+        #[arg(value_name = "ADDRESS")]
+        address: Option<String>,
         /// Print the file-level diff instead of the plain-language rendering.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "address")]
         raw: bool,
     },
     /// List the model's history snapshots, oldest first.
@@ -1822,7 +1834,18 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
             g.tool_keys(tool_key.as_deref()),
             g.mgmt(),
         ),
-        Command::Status { raw } => history_cmd::run_status(dir, json, raw),
+        Command::Status {
+            address: Some(address),
+            ..
+        } => status_cmd::run(
+            &address,
+            dir,
+            json,
+            g.refresh_facts,
+            g.tool_keys(None),
+            g.mgmt(),
+        ),
+        Command::Status { raw, .. } => history_cmd::run_status(dir, json, raw),
         Command::History {} => history_cmd::run_history(dir, json),
         Command::Device {
             address,

@@ -57,6 +57,7 @@ impl ModelBuilder {
                 com_objects: BTreeMap::new(),
                 security: None,
                 application_override: None,
+                knxnet: None,
                 lock: Default::default(),
             },
             links: Vec::new(),
@@ -425,6 +426,7 @@ fn no_duplicate_entity_for_shared_command_ga() -> Result<(), Box<dyn std::error:
         },
         security: None,
         application_override: None,
+        knxnet: None,
         lock: Default::default(),
     };
     model.devices.insert(
@@ -580,6 +582,7 @@ fn cover_requires_command_ga_not_a_button_sender() -> Result<(), Box<dyn std::er
             },
             security: None,
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
         };
         model.devices.insert(

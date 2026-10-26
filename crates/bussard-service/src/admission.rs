@@ -53,6 +53,9 @@ pub struct InterfaceGroups {
     pub ia: IndividualAddress,
     /// Whether this is a tunnelling interface (`Type="Tunneling"`).
     pub tunnelling: bool,
+    /// The device that hosts the interface address (the keyring's `Host`,
+    /// the IP interface itself), when listed (issue #391).
+    pub host: Option<IndividualAddress>,
     /// The group addresses assigned to this interface address in ETS (the
     /// `<Group>` children), each with the individual addresses of its
     /// `Senders` attribute: the senders the interface itself accepts on it.
@@ -81,6 +84,7 @@ impl AdmissionEvidence {
             .map(|i| InterfaceGroups {
                 ia: i.ia,
                 tunnelling: i.interface_type.eq_ignore_ascii_case("Tunneling"),
+                host: i.host,
                 groups: i
                     .gas
                     .iter()
@@ -689,6 +693,93 @@ pub fn tunnel_gap_diagnostics(
         .collect()
 }
 
+/// The tunnelling addresses the key store lists for the IP interface `host`
+/// (its `Host` entries), ascending, or empty when it lists none.
+pub fn tunnel_addresses_hosted_by(
+    evidence: &AdmissionEvidence,
+    host: IndividualAddress,
+) -> Vec<IndividualAddress> {
+    evidence
+        .interfaces
+        .iter()
+        .filter(|i| i.tunnelling && i.host == Some(host))
+        .map(|i| i.ia)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// W047 (issue #391): the `[knxnet]` tunnels of an IP interface against the
+/// tunnelling addresses the key store lists for it, the addresses
+/// `admit_tunnel_senders` admits on the Secure devices. A warning with both
+/// lists when the sets differ; nothing for an interface the store lists no
+/// tunnelling address for.
+pub fn knxnet_tunnel_diagnostics(
+    model: &Model,
+    evidence: &AdmissionEvidence,
+) -> Vec<bussard_model::Diagnostic> {
+    let mut out = Vec::new();
+    for (ia, loaded) in &model.devices {
+        let Some(knxnet) = &loaded.device.knxnet else {
+            continue;
+        };
+        let store = tunnel_addresses_hosted_by(evidence, *ia);
+        if store.is_empty() {
+            continue;
+        }
+        let model_set: BTreeSet<IndividualAddress> = knxnet.tunnels.iter().copied().collect();
+        let store_set: BTreeSet<IndividualAddress> = store.iter().copied().collect();
+        if model_set == store_set {
+            continue;
+        }
+        let list = |set: &BTreeSet<IndividualAddress>| {
+            if set.is_empty() {
+                "none".to_string()
+            } else {
+                set.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        };
+        out.push(bussard_model::Diagnostic {
+            code: "W047",
+            severity: bussard_model::Severity::Warning,
+            location: format!("devices/{ia}.toml [knxnet]"),
+            message: format!(
+                "the tunnel addresses of {ia} are {} in [knxnet], but the key store lists {} \
+                 as its tunnelling addresses (the ones admit_tunnel_senders admits on the \
+                 Secure devices); re-export the keyring after changing the tunnels in ETS, or \
+                 correct [knxnet]",
+                list(&model_set),
+                list(&store_set)
+            ),
+        });
+    }
+    out
+}
+
+/// W047 for the keyring the caller checked ([`knxnet_tunnel_diagnostics`]).
+/// Nothing unless the keyring loaded.
+pub fn knxnet_tunnel_keyring_diagnostics(
+    model: &Model,
+    facts: Option<&bussard_model::KeyringFacts>,
+) -> Vec<bussard_model::Diagnostic> {
+    let Some(facts) = facts else {
+        return Vec::new();
+    };
+    if !matches!(facts.status, bussard_model::KeyringStatus::Loaded { .. }) {
+        return Vec::new();
+    }
+    if !model.devices.values().any(|d| d.device.knxnet.is_some()) {
+        return Vec::new();
+    }
+    match crate::secure::load_admission_evidence(&facts.path) {
+        Ok(evidence) => knxnet_tunnel_diagnostics(model, &evidence),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Why [`record_secure_senders`] could not update the lock.
 #[derive(Debug, thiserror::Error)]
 pub enum RecordSendersError {
@@ -820,6 +911,7 @@ mod tests {
             security: Some(security),
             replaced: None,
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
         };
         let mut devices = BTreeMap::new();
@@ -847,6 +939,7 @@ mod tests {
             interfaces: vec![InterfaceGroups {
                 ia: ia(ia_)?,
                 tunnelling: true,
+                host: None,
                 groups,
             }],
         })
@@ -967,6 +1060,7 @@ mod tests {
             evidence.interfaces.push(InterfaceGroups {
                 ia: ia(address)?,
                 tunnelling: true,
+                host: None,
                 groups: BTreeMap::new(),
             });
         }
@@ -974,6 +1068,7 @@ mod tests {
         evidence.interfaces.push(InterfaceGroups {
             ia: ia("1.1.40")?,
             tunnelling: false,
+            host: None,
             groups: BTreeMap::new(),
         });
         let tunnel = evidence.tunnel_addresses();
@@ -1146,6 +1241,55 @@ mod tests {
         // Unreadable: every address is written.
         let unread = TunnelAdmission::new(ia("1.1.5")?, &tunnel, None);
         assert_eq!(unread.missing.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_knxnet_tunnel_diagnostics_warns_when_the_store_differs() -> TestResult {
+        let mut model = model(&[])?;
+        let device = model.devices.get_mut(&ia("1.1.5")?).ok_or("device")?;
+        device.device.knxnet = Some(bussard_model::knxnet::KnxnetConfig {
+            tunnels: vec![ia("1.1.22")?, ia("1.1.23")?],
+            ..Default::default()
+        });
+        let entry = |address: &str,
+                     host: Option<&str>|
+         -> Result<InterfaceGroups, Box<dyn std::error::Error>> {
+            Ok(InterfaceGroups {
+                ia: ia(address)?,
+                tunnelling: true,
+                host: host.map(ia).transpose()?,
+                groups: BTreeMap::new(),
+            })
+        };
+        let same = AdmissionEvidence {
+            interfaces: vec![
+                entry("1.1.23", Some("1.1.5"))?,
+                entry("1.1.22", Some("1.1.5"))?,
+                entry("1.1.40", Some("1.1.6"))?,
+            ],
+        };
+        assert!(knxnet_tunnel_diagnostics(&model, &same).is_empty());
+        let other = AdmissionEvidence {
+            interfaces: vec![
+                entry("1.1.22", Some("1.1.5"))?,
+                entry("1.1.24", Some("1.1.5"))?,
+            ],
+        };
+        let diags = knxnet_tunnel_diagnostics(&model, &other);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "W047");
+        assert!(
+            diags[0].message.contains("1.1.22, 1.1.23 in [knxnet]")
+                && diags[0].message.contains("lists 1.1.22, 1.1.24"),
+            "{}",
+            diags[0].message
+        );
+        // A store without host entries for the interface says nothing.
+        let unhosted = AdmissionEvidence {
+            interfaces: vec![entry("1.1.29", None)?],
+        };
+        assert!(knxnet_tunnel_diagnostics(&model, &unhosted).is_empty());
         Ok(())
     }
 }

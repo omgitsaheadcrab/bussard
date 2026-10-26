@@ -59,6 +59,7 @@ fn small_model() -> TestResult<Model> {
                 com_objects: BTreeMap::new(),
                 security: None,
                 application_override: None,
+                knxnet: None,
                 lock: Default::default(),
             },
             file_stem: "1.1.4-dev".to_string(),

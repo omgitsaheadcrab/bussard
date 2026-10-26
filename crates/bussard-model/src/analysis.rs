@@ -397,6 +397,7 @@ mod tests {
             security: None,
             replaced: None,
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
         }
     }

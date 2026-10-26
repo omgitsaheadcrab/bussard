@@ -750,6 +750,7 @@ fn synthesize_model(found: &[LineDevice], overrides: &ConnOverrides, dir: &Path)
             // KNX Secure state comes only from the knxproj importer (issue #71).
             security: None,
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
         };
         devices.insert(

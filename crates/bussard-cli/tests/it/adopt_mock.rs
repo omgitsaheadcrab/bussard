@@ -958,3 +958,101 @@ fn test_adopt_secure_device_refuses_a_new_address() -> TestResult {
     assert!(run.device_file.is_none());
     Ok(())
 }
+
+/// Issue #391: adopting a KNX IP interface writes its KNXnet/IP settings, read
+/// from the device's KNXnet/IP parameter object, as the device file's
+/// `[knxnet]` table. The device answers the identity reads like the factory
+/// device and serves object type 11 through the testkit's built-ins.
+#[test]
+fn test_adopt_ip_interface_writes_the_knxnet_table() -> TestResult {
+    let identity = Identity {
+        mask: 0x07B0,
+        manufacturer: 0x0083,
+        serial: [0x00, 0x01, 0x02, 0x03, 0x04, 0x05],
+        order: b"MDT-BE-04001.02".to_vec(),
+    };
+    let knxnet = bussard_testkit::MockKnxnet {
+        tunnels: vec![ia("1.1.22")?, ia("1.1.23")?],
+        friendly_name: "Haus".to_string(),
+        ..bussard_testkit::MockKnxnet::default()
+    };
+    let device = MockDevice::new(ia("15.15.255")?)
+        .with_programming(true)
+        .with_knxnet(&knxnet)
+        .with_hook(move |_, apci_val, data| {
+            let identity_read = apci_val == apci::A_PROPERTY_VALUE_READ
+                && apci::decode_property_value_read(data).is_some_and(|pv| {
+                    pv.object_index == 0
+                        && [
+                            apci::PID_MANUFACTURER_ID,
+                            apci::PID_SERIAL_NUMBER,
+                            apci::PID_ORDER_INFO,
+                        ]
+                        .contains(&pv.property_id)
+                });
+            if identity_read || apci_val == apci::A_AUTHORIZE_REQUEST {
+                return device_response(&identity, apci_val, data)
+                    .map(|(rapci, rdata)| Reaction::Answer(rapci, rdata));
+            }
+            None
+        });
+    let (_rt, gw) = start_gateway(vec![device])?;
+    let port = gw.port();
+    let tmp = std::env::temp_dir().join(format!("bussard-adopt-knxnet-{}", std::process::id()));
+    let model_dir = tmp.join("knx");
+    write_model(&model_dir)?;
+    let knxprod = tmp.join("fixture.knxprod");
+    build_knxprod(&knxprod)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
+        .env("BUSSARD_ASSIGN_WAIT_MS", "200")
+        .args([
+            "adopt",
+            "1.1.200",
+            "--yes",
+            "--product",
+            knxprod.to_str().ok_or("temp path is not UTF-8")?,
+            "--dir",
+            model_dir.to_str().ok_or("temp path is not UTF-8")?,
+            "--gateway",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    drop(gw);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let body = std::fs::read_to_string(model_dir.join("devices").join("1.1.200.toml")).ok();
+    let facts = std::fs::read_to_string(model_dir.join(".bussard/facts/1.1.200.toml")).ok();
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(
+            "KNXnet/IP: assignment dhcp, 2 tunnel address(es), address in use 192.168.1.74"
+        ),
+        "stdout:\n{stdout}"
+    );
+    let body = body.ok_or("device file")?;
+    assert!(
+        body.contains(
+            "[knxnet]\nassignment = \"dhcp\"\nfriendly_name = \"Haus\"\ntunnels = [\"1.1.22\", \"1.1.23\"]\n"
+        ),
+        "device body:\n{body}"
+    );
+    assert!(
+        !body.contains("192.168"),
+        "the address in use is a fact:\n{body}"
+    );
+    let facts = facts.ok_or("facts file")?;
+    assert!(
+        facts.contains("current_address = \"192.168.1.74\""),
+        "{facts}"
+    );
+    Ok(())
+}

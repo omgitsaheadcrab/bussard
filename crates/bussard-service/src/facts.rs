@@ -290,6 +290,7 @@ impl FactsCache {
                 ObjectTableSource::Walk => facts::ObjectTableSource::Walk,
             },
             objects,
+            knxnet: None,
         };
         seed(l4, &record, mask);
         self.save(&record);
@@ -298,6 +299,24 @@ impl FactsCache {
             record: Some(record),
             invalidated: None,
         })
+    }
+
+    /// Records what the KNXnet/IP parameter object of an IP interface reported
+    /// (issue #391) in the facts in effect and writes them. Nothing happens
+    /// when no facts are in effect (an unavailable device).
+    pub fn remember_knxnet(
+        &self,
+        established: &mut Established,
+        knxnet: Option<bussard_model::knxnet::KnxnetFacts>,
+    ) {
+        let Some(record) = established.record.as_mut() else {
+            return;
+        };
+        if record.knxnet == knxnet {
+            return;
+        }
+        record.knxnet = knxnet;
+        self.save(record);
     }
 
     /// Writes `record`, logging a failure (the facts are a cache).

@@ -216,6 +216,7 @@ pub fn model_from_json(json: &str) -> Result<Model> {
             // The JSON (xknxproject) dump carries no KNX Secure state.
             security: None,
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
         };
         let file_stem = address.to_string();

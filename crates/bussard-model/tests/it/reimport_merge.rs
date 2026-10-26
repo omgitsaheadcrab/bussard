@@ -70,6 +70,7 @@ fn device_with_comobject(addr: &str, name: &str, dpt: Dpt) -> LoadedDevice {
         com_objects,
         security: None,
         application_override: None,
+        knxnet: None,
         lock: Default::default(),
     };
     let file_stem = format!("{addr}-{}", name.to_lowercase().replace(' ', "-"));
@@ -715,6 +716,7 @@ fn push_button(drop: &[u16]) -> LoadedDevice {
             ..DeviceSecurity::default()
         }),
         application_override: None,
+        knxnet: None,
         lock: Default::default(),
     };
     LoadedDevice {

@@ -112,6 +112,32 @@ pub struct RawDevice {
     /// loaded the tool key into the device, i.e. Data Secure is activated.
     /// Presence only.
     pub has_loaded_tool_key: bool,
+    /// The device's `<IPConfig>` child: the KNXnet/IP settings ETS keeps for
+    /// an IP interface or router (issue #391). Only the assignment and the
+    /// address attributes are read.
+    pub ip_config: Option<RawIpConfig>,
+    /// The device numbers of the `<AdditionalAddresses><Address Address="22"/>`
+    /// children: the tunnelling addresses of an IP interface, on the
+    /// device's own line, in document (slot) order (issue #391).
+    pub additional_addresses: Vec<u8>,
+}
+
+/// The `<IPConfig>` child of a device instance (issue #391). The real export
+/// of the IPS 300 SREG carries `IPAddress` and `MACAddress` only; `Assign`
+/// (ETS: `Auto` or `Fixed`) and the static netmask and gateway appear when
+/// set. The importer reads nothing else from the device's children: the
+/// `<Security>` element (device authentication code, management password,
+/// tool key) is never consulted for these settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawIpConfig {
+    /// `Assign`, when present.
+    pub assign: Option<String>,
+    /// `IPAddress`, when present.
+    pub ip_address: Option<String>,
+    /// `SubnetMask`, when present.
+    pub subnet_mask: Option<String>,
+    /// `DefaultGateway`, when present.
+    pub default_gateway: Option<String>,
 }
 
 /// A device's location within the building.
@@ -286,6 +312,8 @@ pub fn parse_project(xml: &str, schema: SchemaVersion) -> Result<RawProject> {
     let mut in_parameter_refs = false;
     // The id of the module instance whose `<Arguments>` we are currently reading.
     let mut current_module_instance: Option<String> = None;
+    // Whether we're inside the AdditionalAddresses block of the current device.
+    let mut in_additional_addresses = false;
 
     loop {
         let ev = reader.read_event().map_err(|source| ImportError::Xml {
@@ -354,6 +382,20 @@ pub fn parse_project(xml: &str, schema: SchemaVersion) -> Result<RawProject> {
                         let ty = attr_value(&e, b"Type", context)?.unwrap_or_default();
                         let name = attr_value(&e, b"Name", context)?;
                         space_stack.push((ty, name));
+                    }
+                    // KNXnet/IP settings of an IP interface (issue #391).
+                    b"AdditionalAddresses" => {
+                        in_additional_addresses = current_device.is_some();
+                    }
+                    b"Address" if in_additional_addresses => {
+                        if let Some(dev) = current_device.as_mut() {
+                            push_additional_address(dev, &e, context)?;
+                        }
+                    }
+                    b"IPConfig" => {
+                        if let Some(dev) = current_device.as_mut() {
+                            dev.ip_config = Some(parse_ip_config(&e, context)?);
+                        }
                     }
                     // KNX Secure state (issue #71, spec §11): a `<Security>` start
                     // tag (it may carry children) still carries the sequence
@@ -435,6 +477,17 @@ pub fn parse_project(xml: &str, schema: SchemaVersion) -> Result<RawProject> {
                             apply_device_security(dev, &e, context)?;
                         }
                     }
+                    // KNXnet/IP settings of an IP interface (issue #391).
+                    b"Address" if in_additional_addresses => {
+                        if let Some(dev) = current_device.as_mut() {
+                            push_additional_address(dev, &e, context)?;
+                        }
+                    }
+                    b"IPConfig" => {
+                        if let Some(dev) = current_device.as_mut() {
+                            dev.ip_config = Some(parse_ip_config(&e, context)?);
+                        }
+                    }
                     // Factory FDSK certificate presence (spec §11 / §2.2): record
                     // ONLY that a certificate exists — never the FDSK value.
                     b"DeviceCertificate" => {
@@ -476,6 +529,9 @@ pub fn parse_project(xml: &str, schema: SchemaVersion) -> Result<RawProject> {
                 }
                 b"ParameterInstanceRefs" => {
                     in_parameter_refs = false;
+                }
+                b"AdditionalAddresses" => {
+                    in_additional_addresses = false;
                 }
                 b"ModuleInstance" => {
                     current_module_instance = None;
@@ -536,7 +592,30 @@ fn parse_device_start(
         has_device_certificate: false,
         has_tool_key: false,
         has_loaded_tool_key: false,
+        ip_config: None,
+        additional_addresses: Vec::new(),
     }))
+}
+
+/// Reads a device's `<IPConfig>`: the assignment and the three address
+/// attributes, nothing else (issue #391).
+fn parse_ip_config(e: &BytesStart, context: &str) -> Result<RawIpConfig> {
+    let m = attrs_map(e, context)?;
+    Ok(RawIpConfig {
+        assign: non_empty(get(&m, b"Assign")),
+        ip_address: non_empty(get(&m, b"IPAddress")),
+        subnet_mask: non_empty(get(&m, b"SubnetMask")),
+        default_gateway: non_empty(get(&m, b"DefaultGateway")),
+    })
+}
+
+/// Records one `<AdditionalAddresses><Address Address="22"/>` child.
+fn push_additional_address(dev: &mut RawDevice, e: &BytesStart, context: &str) -> Result<()> {
+    let m = attrs_map(e, context)?;
+    if let Some(n) = get(&m, b"Address").and_then(|v| v.parse::<u8>().ok()) {
+        dev.additional_addresses.push(n);
+    }
+    Ok(())
 }
 
 /// Records a device's `<Security>` child: the sequence number, and whether the

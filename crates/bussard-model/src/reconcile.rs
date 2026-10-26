@@ -150,6 +150,17 @@ pub fn take_theirs(merged: &mut Model, theirs: &Model, conflict: &Conflict) -> b
                     product.order_number = incoming.and_then(|p| p.order_number.clone());
                 }
             }
+            "knxnet.tunnels" | "knxnet.address" => {
+                let (Some(k), Some(incoming)) = (mine.knxnet.as_mut(), incoming.knxnet.as_ref())
+                else {
+                    return false;
+                };
+                if field == "knxnet.tunnels" {
+                    k.tunnels = incoming.tunnels.clone();
+                } else {
+                    k.address = incoming.address;
+                }
+            }
             other if other.starts_with("parameters.") => {
                 let key = &other["parameters.".len()..];
                 let Some(value) = incoming.parameters.get(key) else {
@@ -298,6 +309,8 @@ fn field_phrase(field: &str) -> String {
         "product.order_number" => "the order number".to_string(),
         "send" => "the send address".to_string(),
         "listen" => "the listen addresses".to_string(),
+        "knxnet.tunnels" => "the tunnel addresses".to_string(),
+        "knxnet.address" => "the static IP address".to_string(),
         other => {
             if let Some(key) = other.strip_prefix("parameters.") {
                 let slug = key.split_once('@').map_or(key, |(slug, _)| slug);

@@ -26,6 +26,7 @@ use bussard_mgmt::{Layer4Connection, PropertyDesc, system_type};
 use bussard_model::IndividualAddress;
 use bussard_service::describe::{object_type_name, pid_name};
 use bussard_service::facts::property_desc;
+use bussard_service::knxnet::knxnet_object_index;
 use bussard_service::{FactsCache, FactsSource, FactsWant, L4Options, SourcePolicy, WritePolicy};
 
 use crate::conn_cmd::{ConnOverrides, load_model_required, open_service, resolve_config};
@@ -99,6 +100,10 @@ struct Report {
     /// #228): `match`, `drift` or `unmodelled`. Read-only, never refuses.
     #[serde(skip_serializing_if = "Option::is_none")]
     identity: Option<bussard_model::identity::IdentityCheck>,
+    /// What the KNXnet/IP parameter object (object type 11) of an IP
+    /// interface reported (issue #391); absent on any other device.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    knxnet: Option<bussard_model::knxnet::KnxnetFacts>,
 }
 
 /// KNX Secure status, split into the imported model's claims and what this run
@@ -335,10 +340,27 @@ async fn introspect<Ch: bussard_mgmt::L4Channel>(
     // the mask and application id still match, read (and stored) otherwise.
     // The property descriptions are walked only when the facts lack them or
     // `--full` asks (issue #209).
-    let established = facts
+    let mut established = facts
         .establish(l4, mask, FactsWant::Properties { force: full })
         .await
         .with_context(|| format!("describing the interface objects of {address}"))?;
+    // An IP interface's KNXnet/IP parameter object (issue #391): read every
+    // time (the address in use can change under DHCP) and kept with the facts.
+    let knxnet = match knxnet_object_index(&established.object_table()) {
+        Some(_) => {
+            match bussard_service::knxnet::read_knxnet(l4, &established.object_table()).await {
+                Ok(knxnet) => knxnet,
+                Err(err) => {
+                    tracing::warn!("{address}: the KNXnet/IP parameter object did not read: {err}");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    if knxnet.is_some() {
+        facts.remember_knxnet(&mut established, knxnet.clone());
+    }
     let facts_note = match (&established.source, &established.record) {
         (FactsSource::Cached, Some(record)) if !full => Some(format!(
             "(device facts of {} reused; pass --full to walk the property descriptions again)",
@@ -382,6 +404,7 @@ async fn introspect<Ch: bussard_mgmt::L4Channel>(
             // Filled in by `run` from the model (introspect has no model handle).
             secure: None,
             identity: None,
+            knxnet,
         },
         application_id,
     })
@@ -457,6 +480,9 @@ fn print_text(report: &Report) {
     }
     if let (Some(identity), Ok(target)) = (&report.identity, report.address.parse()) {
         println!("  {}", crate::device_facts::identity_line(target, identity));
+    }
+    if let Some(knxnet) = &report.knxnet {
+        crate::status_cmd::print_knxnet(knxnet);
     }
     let Some(objects) = &report.objects else {
         return;

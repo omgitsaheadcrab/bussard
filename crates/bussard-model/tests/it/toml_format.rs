@@ -344,6 +344,7 @@ fn imported_model() -> Result<Model, Box<dyn std::error::Error>> {
         com_objects,
         security: None,
         application_override: None,
+        knxnet: None,
         lock: Default::default(),
     };
     let mut devices = BTreeMap::new();
@@ -431,6 +432,7 @@ fn module_instance_model() -> Result<Model, Box<dyn std::error::Error>> {
         com_objects: BTreeMap::new(),
         security: None,
         application_override: None,
+        knxnet: None,
         lock: Default::default(),
     };
     let mut devices = BTreeMap::new();
@@ -836,6 +838,103 @@ fn test_save_keeps_a_hidden_value_of_an_indexed_ref_hidden() -> TestResult {
         Some("5")
     );
     assert!(!d.parameters.contains_key("hidden@P-19_R-38"));
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// The `[knxnet]` table of an IP interface (issue #391): read into the
+/// device, written back byte-identically, an edit rewrites only the table,
+/// a fresh render writes it in the documented key order, and an unknown key
+/// is refused.
+#[test]
+fn test_knxnet_table_round_trips_through_the_device_file() -> TestResult {
+    use bussard_model::knxnet::IpAssignment;
+    const IFACE: &str = r#"address = "1.1.200"
+name = "KNX IP Interface"
+
+[knxnet]
+assignment = "dhcp"
+friendly_name = "Bocklisch Alpha"   # shown in the ETS bus search
+tunnels = ["1.1.22", "1.1.23", "1.1.24"]
+"#;
+    let dir = tmp("knxnet")?;
+    write(&dir, "groups.toml", GROUPS)?;
+    write(&dir, "devices/1.1.200.toml", IFACE)?;
+    let mut model = Model::load(&dir)?;
+    let addr = ia("1.1.200")?;
+    let knxnet = model.devices[&addr]
+        .device
+        .knxnet
+        .clone()
+        .ok_or("[knxnet] loads")?;
+    assert_eq!(knxnet.assignment, IpAssignment::Dhcp);
+    assert_eq!(knxnet.friendly_name.as_deref(), Some("Bocklisch Alpha"));
+    assert_eq!(
+        knxnet.tunnels,
+        vec![ia("1.1.22")?, ia("1.1.23")?, ia("1.1.24")?]
+    );
+
+    model.save(&dir)?;
+    assert_eq!(fs::read_to_string(dir.join("devices/1.1.200.toml"))?, IFACE);
+
+    {
+        let k = model
+            .devices
+            .get_mut(&addr)
+            .ok_or("device")?
+            .device
+            .knxnet
+            .as_mut()
+            .ok_or("knxnet")?;
+        k.tunnels.push(ia("1.1.30")?);
+        k.assignment = IpAssignment::Static;
+        k.address = Some("192.168.1.74".parse()?);
+        k.netmask = Some("255.255.255.0".parse()?);
+    }
+    model.save(&dir)?;
+    let text = fs::read_to_string(dir.join("devices/1.1.200.toml"))?;
+    assert!(text.contains("assignment = \"static\""), "{text}");
+    assert!(text.contains("address = \"192.168.1.74\""), "{text}");
+    assert!(
+        text.contains("friendly_name = \"Bocklisch Alpha\"   # shown in the ETS bus search"),
+        "an untouched key keeps its comment:\n{text}"
+    );
+    assert!(text.contains("\"1.1.30\"]"), "{text}");
+    assert_eq!(Model::load(&dir)?, model);
+
+    // A fresh render (no existing file) writes the documented order.
+    fs::remove_file(dir.join("devices/1.1.200.toml"))?;
+    model.save(&dir)?;
+    let fresh = fs::read_to_string(dir.join("devices/1.1.200.toml"))?;
+    let order: Vec<usize> = [
+        "assignment",
+        "address",
+        "netmask",
+        "friendly_name",
+        "tunnels",
+    ]
+    .iter()
+    .map(|k| {
+        fresh
+            .find(&format!("\n{k} = "))
+            .ok_or(format!("{k} in\n{fresh}"))
+    })
+    .collect::<Result<_, _>>()?;
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{fresh}");
+    assert_eq!(Model::load(&dir)?, model);
+
+    write(
+        &dir,
+        "devices/1.1.200.toml",
+        &IFACE.replace(
+            "assignment = \"dhcp\"",
+            "assignment = \"dhcp\"\nmac = \"x\"",
+        ),
+    )?;
+    assert!(
+        Model::load(&dir).is_err(),
+        "facts are not the file's to set"
+    );
     fs::remove_dir_all(&dir)?;
     Ok(())
 }

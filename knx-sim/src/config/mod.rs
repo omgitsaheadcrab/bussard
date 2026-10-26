@@ -245,6 +245,77 @@ pub struct DeviceConfig {
     /// block marks the device security-activated with a SYNTHETIC tool key.
     #[serde(default)]
     pub security: Option<SecurityConfig>,
+    /// Makes the device a KNX IP interface (bussard issue #391): a KNXnet/IP
+    /// parameter object (interface object type 11) with these values, served
+    /// read-only. Omit for any other device.
+    #[serde(default)]
+    pub knxnet: Option<KnxnetSimConfig>,
+}
+
+/// The KNXnet/IP parameter object of a simulated IP interface.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnxnetSimConfig {
+    /// `dhcp` (the default) or `static`.
+    #[serde(default)]
+    pub assignment: Option<String>,
+    /// The address in use (default `192.168.1.74`).
+    #[serde(default)]
+    pub address: Option<String>,
+    /// The netmask in use (default `255.255.255.0`).
+    #[serde(default)]
+    pub netmask: Option<String>,
+    /// The default gateway in use (default `192.168.1.1`).
+    #[serde(default)]
+    pub gateway: Option<String>,
+    /// The friendly name (at most 30 ISO 8859-1 characters).
+    #[serde(default)]
+    pub friendly_name: Option<String>,
+    /// The tunnelling addresses, e.g. `["1.1.22", "1.1.23"]`.
+    #[serde(default)]
+    pub tunnels: Vec<String>,
+}
+
+impl KnxnetSimConfig {
+    /// The object's values for the interface at `address`.
+    pub fn parameters(
+        &self,
+        address: IndividualAddress,
+    ) -> Result<crate::device::knxnet_object::KnxnetParameters, String> {
+        let mut tunnels = Vec::new();
+        for t in &self.tunnels {
+            let ia: IndividualAddress = t.parse().map_err(|e| format!("tunnel {t:?}: {e}"))?;
+            tunnels.push(ia.raw());
+        }
+        let mut p = crate::device::knxnet_object::KnxnetParameters::dhcp(address.raw(), tunnels);
+        let ip = |v: &Option<String>, fallback: [u8; 4]| -> Result<[u8; 4], String> {
+            match v {
+                Some(s) => s
+                    .parse::<std::net::Ipv4Addr>()
+                    .map(|a| a.octets())
+                    .map_err(|e| format!("{s:?}: {e}")),
+                None => Ok(fallback),
+            }
+        };
+        p.current = [
+            ip(&self.address, p.current[0])?,
+            ip(&self.netmask, p.current[1])?,
+            ip(&self.gateway, p.current[2])?,
+        ];
+        match self.assignment.as_deref() {
+            None | Some("dhcp") => {}
+            Some("static") => {
+                p.current_assignment = 0x01;
+                p.assignment = 0x01;
+                p.configured = p.current;
+            }
+            Some(other) => return Err(format!("assignment {other:?}: expected dhcp or static")),
+        }
+        if let Some(name) = &self.friendly_name {
+            p.friendly_name = name.clone();
+        }
+        Ok(p)
+    }
 }
 
 fn default_initial_state() -> InitialState {
@@ -481,6 +552,15 @@ impl SimConfig {
                 reason,
             })?
             .with_l4_exchange_budget(effective_l4_budget(dc.l4_exchange_budget));
+            let device = match &dc.knxnet {
+                Some(k) => device.with_knxnet_object(&k.parameters(address).map_err(|reason| {
+                    ConfigError::BadDeviceOption {
+                        device: dc.address.clone(),
+                        reason: format!("knxnet: {reason}"),
+                    }
+                })?),
+                None => device,
+            };
             bus.add_device(device);
         }
         bus.set_stimulus(self.build_stimulus()?);
@@ -722,6 +802,23 @@ devices:
         let sink = Arc::new(RecordingSink::new());
         let bus = cfg.build_bus(&base, sink)?;
         assert_eq!(bus.device_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_knxnet_sim_config_parameters() -> Result<(), Box<dyn std::error::Error>> {
+        let cfg: KnxnetSimConfig = serde_norway::from_str(
+            "assignment: static\naddress: \"10.0.0.5\"\nfriendly_name: Haus\ntunnels: [\"1.1.22\", \"1.1.23\"]\n",
+        )?;
+        let p = cfg.parameters("1.1.200".parse()?)?;
+        assert_eq!(p.assignment, 0x01);
+        assert_eq!(p.current[0], [10, 0, 0, 5]);
+        assert_eq!(p.configured[0], [10, 0, 0, 5]);
+        assert_eq!(p.tunnels, vec![0x1116, 0x1117]);
+        assert_eq!(p.individual_address, 0x11C8);
+        assert_eq!(p.friendly_name, "Haus");
+        let bad: KnxnetSimConfig = serde_norway::from_str("assignment: bootp\n")?;
+        assert!(bad.parameters("1.1.200".parse()?).is_err());
         Ok(())
     }
 }
