@@ -28,7 +28,8 @@ _(none)_
 
 | family | apps | exec | refused | unsupported | panicked |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| System 1 | 95 | 1 | 0 | 94 | 0 |
+| System 1 | 44 | 0 | 0 | 44 | 0 |
+| System 2 | 51 | 1 | 0 | 50 | 0 |
 | System 7 | 378 | 377 | 1 | 0 | 0 |
 | System ? | 23 | 0 | 0 | 23 | 0 |
 | System B | 851 | 850 | 1 | 0 | 0 |

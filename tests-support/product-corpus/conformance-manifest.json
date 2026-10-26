@@ -28,10 +28,17 @@
   "parse_failure_ranking": [],
   "family_coverage": {
     "System 1": {
-      "apps": 95,
+      "apps": 44,
+      "executable": 0,
+      "refused": 0,
+      "not_supported_family": 44,
+      "panicked": 0
+    },
+    "System 2": {
+      "apps": 51,
       "executable": 1,
       "refused": 0,
-      "not_supported_family": 94,
+      "not_supported_family": 50,
       "panicked": 0
     },
     "System 7": {
@@ -936,7 +943,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -1083,7 +1090,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -1104,7 +1111,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -1125,7 +1132,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -1146,7 +1153,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -1167,7 +1174,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -1188,7 +1195,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -1209,7 +1216,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -1230,7 +1237,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -3165,7 +3172,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         },
         {
@@ -3561,7 +3568,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         },
         {
@@ -12552,7 +12559,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -12573,7 +12580,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -12594,7 +12601,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -12615,7 +12622,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -12636,7 +12643,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -12657,7 +12664,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -12678,7 +12685,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -12699,7 +12706,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -12720,7 +12727,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -12741,7 +12748,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -12783,7 +12790,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -17461,7 +17468,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -17482,7 +17489,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -17503,7 +17510,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -17524,7 +17531,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -18508,7 +18515,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -18529,7 +18536,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -18700,7 +18707,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -19708,7 +19715,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -19729,7 +19736,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -19750,7 +19757,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -19771,7 +19778,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -19792,7 +19799,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -19813,7 +19820,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -19834,7 +19841,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -19855,7 +19862,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -20143,7 +20150,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -20164,7 +20171,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -20185,7 +20192,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -20281,7 +20288,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -20617,7 +20624,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -20638,7 +20645,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -20659,7 +20666,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -20680,7 +20687,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -20701,7 +20708,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -20722,7 +20729,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -20743,7 +20750,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -20764,7 +20771,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]
@@ -20785,7 +20792,7 @@
           },
           "plan": {
             "plan": "not_supported_family",
-            "system": "System 1"
+            "system": "System 2"
           }
         }
       ]

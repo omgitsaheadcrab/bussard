@@ -17,7 +17,8 @@ use bussard_mgmt::MgmtError;
 use bussard_mgmt::connection::{L4Channel, Layer4Connection};
 use bussard_mgmt::load::{WriteError, read_property_elements, write_property};
 use bussard_mgmt::property_ext::{
-    PropertyExtAddress, max_read_elements, read_property_ext, write_property_ext_chunked,
+    PropertyExtAddress, declined_as_none, max_read_elements, read_property_ext,
+    write_property_ext_chunked,
 };
 
 /// The octets an `A_PropertyValue_Write`/`_Response` adds to its value on the
@@ -43,40 +44,43 @@ fn ext_address(object_type: u16, occurrence: u16, prop_id: u32) -> PropertyExtAd
     }
 }
 
-/// Whether `err` is a device declining the extended services (refused, an
-/// unexpected answer, or no answer at all), after which the object is
-/// addressed by index instead.
-fn ext_declined(err: &MgmtError) -> bool {
-    matches!(
-        err,
-        MgmtError::ServiceRejected { .. }
-            | MgmtError::MalformedResponse { .. }
-            | MgmtError::NoResponse { .. }
-    )
-}
-
-/// The index of the `occurrence`-th object of `object_type`, from the
-/// device's interface-object table (walked with `PID_OBJECT_TYPE`).
+/// The index of the `occurrence`-th object of `object_type`: from the device
+/// object's `PID_IO_LIST` when the device offers it, else from the
+/// `PID_OBJECT_TYPE` walk. The IPS 300 SREG's walk stops before its
+/// KNXnet/IP parameter object (object 7 on 1.1.200, issue #393); its own
+/// writes go out on the extended services, so this is the fallback for a
+/// device that refuses those.
 async fn index_of_type<Ch: L4Channel>(
     l4: &mut Layer4Connection<Ch>,
     object_type: u16,
     occurrence: u16,
 ) -> Result<u8, WriteError> {
+    let nth = |types: &[u16]| {
+        types
+            .iter()
+            .enumerate()
+            .filter(|(_, ot)| **ot == object_type)
+            .nth(usize::from(occurrence))
+            .and_then(|(index, _)| u8::try_from(index).ok())
+    };
+    if let Some(types) = bussard_mgmt::read_io_list(l4).await?
+        && let Some(index) = nth(&types)
+    {
+        return Ok(index);
+    }
     let table = bussard_mgmt::probe_object_types(l4).await?;
-    table
-        .iter()
-        .filter(|(_, ot)| *ot == object_type)
-        .nth(usize::from(occurrence))
-        .map(|(index, _)| *index)
-        .ok_or_else(|| {
-            WriteError::Mgmt(MgmtError::MalformedResponse {
-                address: l4.target(),
-                reason: format!(
-                    "the device has no interface object of type {object_type} (occurrence \
-                     {occurrence}); its objects are {table:?}"
-                ),
-            })
+    let types: Vec<u16> = table.iter().map(|(_, ot)| *ot).collect();
+    // The walk lists objects from index 0 without gaps.
+    nth(&types).ok_or_else(|| {
+        WriteError::Mgmt(MgmtError::MalformedResponse {
+            address: l4.target(),
+            reason: format!(
+                "the device has no interface object of type {object_type} (occurrence \
+                 {occurrence}) in its object list or walk {table:?}, and declined the \
+                 extended property services"
+            ),
         })
+    })
 }
 
 /// The octets per element of `value` written as `count` elements.
@@ -196,14 +200,15 @@ pub async fn read_property_value<Ch: L4Channel>(
             occurrence,
         } => {
             let addr = ext_address(object_type, occurrence, prop_id);
-            match read_ext(l4, addr, start, count, elem).await {
-                Ok(data) => Ok(data),
-                Err(e) if ext_declined(&e) => {
+            match declined_as_none(l4, async |l4| read_ext(l4, addr, start, count, elem).await)
+                .await?
+            {
+                Some(data) => Ok(data),
+                None => {
                     let index = index_of_type(l4, object_type, occurrence).await?;
                     let pid = u8::try_from(prop_id).unwrap_or(u8::MAX);
                     read_plain(l4, index, pid, start, count, elem).await
                 }
-                Err(e) => Err(WriteError::Mgmt(e)),
             }
         }
     }
@@ -238,15 +243,18 @@ pub async fn write_property_value<Ch: L4Channel>(
             occurrence,
         } => {
             let addr = ext_address(object_type, occurrence, prop_id);
-            match write_property_ext_chunked(l4, addr, start, elem, value, |_| {}).await {
-                Ok(()) => object,
-                Err(e) if ext_declined(&e) => {
+            let written = declined_as_none(l4, async |l4| {
+                write_property_ext_chunked(l4, addr, start, elem, value, |_| {}).await
+            })
+            .await?;
+            match written {
+                Some(()) => object,
+                None => {
                     let index = index_of_type(l4, object_type, occurrence).await?;
                     let pid = u8::try_from(prop_id).unwrap_or(u8::MAX);
                     write_plain(l4, index, pid, start, count, value).await?;
                     PropObject::Index(u32::from(index))
                 }
-                Err(e) => return Err(WriteError::Mgmt(e)),
             }
         }
     };
