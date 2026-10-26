@@ -423,7 +423,16 @@ pub fn planned_parameter_regions(plan: &FlashPlan) -> ParamRegions {
                     .get(&image.segment_id)
                     .is_some_and(|b| !b.is_empty())
             {
-                add(&image.segment_id, *address, image.len);
+                // The whole segment from its base, also where the procedure
+                // allocates it in parts (issue #413).
+                let len = plan
+                    .image_bytes(&image.segment_id)
+                    .map_or(image.len, <[u8]>::len);
+                add(
+                    &image.segment_id,
+                    address.saturating_sub(image.offset as u32),
+                    len,
+                );
             }
         }
         return out;
@@ -517,13 +526,19 @@ pub async fn read_parameter_regions_with_objects<Ch: L4Channel>(
             if !carries_params || out.contains_key(&image.segment_id) {
                 continue;
             }
-            match read_memory_range(l4, *address, image.len).await {
+            // The whole segment from its base, also where the procedure
+            // allocates it in parts (issue #413).
+            let base = address.saturating_sub(image.offset as u32);
+            let len = plan
+                .image_bytes(&image.segment_id)
+                .map_or(image.len, <[u8]>::len);
+            match read_memory_range(l4, base, len).await {
                 Ok(bytes) => {
                     out.insert(
                         image.segment_id.clone(),
                         ParamRegion {
                             segment_id: image.segment_id.clone(),
-                            address: *address,
+                            address: base,
                             bytes,
                         },
                     );

@@ -6,7 +6,7 @@ use super::session::{
     Connector, MAX_RESUME_RECONNECTS, Session, reconnect_exchange_threshold, resumable_death,
 };
 use super::verify::take_sample;
-use super::{FlashOptions, FlashOutcome, FlashPlan, FlashStep, Progress};
+use super::{FlashOptions, FlashOutcome, FlashPlan, FlashStep, ImageRef, Progress};
 use bussard_mgmt::load::{LoadControl, LoadState, WriteError, read_mcb_table, read_memory};
 
 /// Executes a validated **System 7** [`FlashPlan`] (`[system7-spec §3/§4]`).
@@ -150,14 +150,9 @@ pub(super) async fn flash_sys7<C: Connector, F: FnMut(Progress)>(
                         // 2. Stream the segment's <Data>, if any, to its absolute address.
                         //    A data-less segment (0x0700 RAM region) is allocate-only.
                         if let Some(img) = image {
-                            let blind = stream_sys7_image(
-                                session,
-                                plan,
-                                seg_addr,
-                                &img.segment_id,
-                                &mut progress,
-                            )
-                            .await?;
+                            let blind =
+                                stream_sys7_image(session, plan, seg_addr, img, &mut progress)
+                                    .await?;
                             // Spot-check only unmasked, checksum-controlled segments
                             // written blind: a masked segment leaves device-owned
                             // bytes untouched, so the image's leading octets do not
@@ -171,7 +166,8 @@ pub(super) async fn flash_sys7<C: Connector, F: FnMut(Progress)>(
                                 && checksum_ctrl != 0
                                 && let Some(bytes) = plan.images.get(&img.segment_id)
                             {
-                                written_samples.push((seg_addr, take_sample(bytes)));
+                                let part = image_part(bytes, img);
+                                written_samples.push((seg_addr, take_sample(part)));
                             }
                         }
                     }
@@ -179,8 +175,7 @@ pub(super) async fn flash_sys7<C: Connector, F: FnMut(Progress)>(
                     // record: the System 7 parameter-only download (issue #146).
                     FlashStep::WriteMem { address, image } => {
                         let addr = sys7_u16(session.l4().target(), "write address", *address)?;
-                        stream_sys7_image(session, plan, addr, &image.segment_id, &mut progress)
-                            .await?;
+                        stream_sys7_image(session, plan, addr, image, &mut progress).await?;
                     }
                     FlashStep::Sys7TaskSegment {
                         lsm: idx,
@@ -457,6 +452,14 @@ pub(super) async fn flash_sys7<C: Connector, F: FnMut(Progress)>(
     Ok(outcome)
 }
 
+/// The octets of `bytes` (an image, its mask or its baseline) that `image`
+/// streams: `image.len` octets from `image.offset`, clamped to `bytes`.
+fn image_part<'a>(bytes: &'a [u8], image: &ImageRef) -> &'a [u8] {
+    let start = image.offset.min(bytes.len());
+    let end = image.offset.saturating_add(image.len).min(bytes.len());
+    &bytes[start..end]
+}
+
 /// Streams the plan's image for `segment_id` to `addr` and reports whether it
 /// was written blind (`true`) or read-compare-written (`false`).
 ///
@@ -470,26 +473,35 @@ async fn stream_sys7_image<C: Connector, F: FnMut(Progress)>(
     session: &mut Session<C>,
     plan: &FlashPlan,
     addr: u16,
-    segment_id: &str,
+    image: &ImageRef,
     progress: &mut F,
 ) -> Result<bool, WriteError> {
     let ctx = plan
         .sys7
         .as_ref()
         .expect("stream_sys7_image called on a non-System-7 plan");
-    let bytes = plan
+    let whole = plan
         .images
-        .get(segment_id)
+        .get(&image.segment_id)
         .expect("System 7 segment image resolved at plan time");
-    let mask = ctx.segment_masks.get(segment_id);
-    let diff_mask = plan.baseline.get(segment_id).map(|current| {
+    // The part of the image this step's allocation holds (issue #413): the
+    // whole image unless the procedure allocates the segment in parts. The
+    // mask and the baseline are indexed like the image, so they are cut the
+    // same way.
+    let bytes = image_part(whole, image);
+    let mask = ctx
+        .segment_masks
+        .get(&image.segment_id)
+        .map(|m| image_part(m, image));
+    let diff_mask = plan.baseline.get(&image.segment_id).map(|current| {
+        let current = image_part(current, image);
         let mut owned = vec![0u8; bytes.len()];
         // The historic gap on System 7 (see `LEGACY_MERGE_GAP`): any join
         // within it counts as saving a request, as before issue #210.
         let regions = super::execute::diff_regions(
             bytes,
             current,
-            mask.map(Vec::as_slice),
+            mask,
             super::execute::LEGACY_MERGE_GAP,
             &|_, _| usize::MAX,
         );
@@ -498,7 +510,7 @@ async fn stream_sys7_image<C: Connector, F: FnMut(Progress)>(
         }
         owned
     });
-    let mask_slice = diff_mask.as_deref().or(mask.map(Vec::as_slice));
+    let mask_slice = diff_mask.as_deref().or(mask);
     if ctx.profile.read_compare_write() {
         read_compare_sys7_segment(session, addr, bytes, mask_slice, progress).await?;
         Ok(false)

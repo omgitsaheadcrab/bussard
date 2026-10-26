@@ -364,6 +364,7 @@ mod tests {
             segment_id: segment_id.to_string(),
             kind: ImageKind::Code,
             len: 4,
+            offset: 0,
         }
     }
 
