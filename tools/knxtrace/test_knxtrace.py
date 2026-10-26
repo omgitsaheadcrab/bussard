@@ -1161,6 +1161,88 @@ class TestPropertyWrites(unittest.TestCase):
         self.assertIn("bussard only: step   4 obj5 PID 13 (5 octets)", lines)
         self.assertNotIn(self.GROUP_KEYS.hex(), lines)
 
+    def ip_capture(self, procedure: bool) -> str:
+        """An IP interface download (issue #390): commissioning on objects 17
+        and 11, with or without the load procedure's PID 204 write."""
+        path = tempfile.mkstemp(suffix=".pcapng")[1]
+        self.addCleanup(os.unlink, path)
+        tool, dev = "0.0.0", "1.1.200"
+        frames = [
+            cemi_ldata(tool, dev, t_connect()),
+            cemi_ldata(tool, dev, func_command(17, 51, bytes([0, 0, 1]), seq=0)),
+            cemi_ldata(tool, dev, ext_write(11, 76, 30, 1, b"IP".ljust(30, b"\0"), seq=1)),
+            cemi_ldata(tool, dev, ext_write(11, 92, 1, 1, bytes([0x77] * 16), seq=2)),
+        ]
+        if procedure:
+            frames.append(cemi_ldata(tool, dev, ext_write(11, 204, 1, 1, bytes([10]), seq=3)))
+        frames.append(cemi_ldata(tool, dev, t_disconnect()))
+        udp_capture(path, [(tunneling_request(f, seq=n), True) for n, f in enumerate(frames)])
+        return path
+
+    def ip_plan(self) -> str:
+        plan_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, plan_dir, ignore_errors=True)
+        plan = {
+            "device": "1.1.200", "system": "properties", "application": {"id": "M-0004_A-1"},
+            "tables": [],
+            "steps": [
+                {"index": 1, "label": "1.", "property": {
+                    "object_type": 11, "instance": 1, "pid": 204, "start_element": 1,
+                    "count": 1, "length": 1, "data": "0a"}},
+            ],
+        }
+        with open(os.path.join(plan_dir, "plan.json"), "w") as fh:
+            json.dump(plan, fh)
+        return plan_dir
+
+    def test_compare_properties_lists_ip_commissioning_without_counting_it(self):
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        self.assertEqual(main(["image", self.ip_capture(True), "--device", "1.1.200", "--out", out]), 0)
+        props = memimage.compare(self.ip_plan(), out)["properties"]
+        self.assertEqual(props["verdict"], memimage.IDENTICAL)
+        self.assertEqual(
+            [e["key"] for e in props["commissioning"]],
+            [["type17.1", 51, 3], ["type11.1", 76, 30], ["type11.1", 92, 16]],
+        )
+        self.assertEqual(props["ets_only"], [])
+        # The device authentication code is never written out as hex.
+        with open(os.path.join(out, "properties.json")) as fh:
+            self.assertNotIn("77" * 16, fh.read())
+        lines = "\n".join(memimage.render_properties(props))
+        self.assertIn("ETS commissioning (not counted): #3   A_PropertyExtValue_WriteCon type11.1 PID 92", lines)
+
+    def test_compare_properties_names_a_capture_without_the_procedure(self):
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        self.assertEqual(main(["image", self.ip_capture(False), "--device", "1.1.200", "--out", out]), 0)
+        props = memimage.compare(self.ip_plan(), out)["properties"]
+        self.assertEqual(props["verdict"], memimage.NOT_COMPARABLE)
+        self.assertIn("ETS did not run the load procedure", props["reason"])
+        self.assertEqual(len(props["commissioning"]), 3)
+        lines = "\n".join(memimage.render_properties(props))
+        self.assertIn("bussard only: step   1 type11.1 PID 204 (1 octets)", lines)
+
+    def test_normalize_names_the_extended_property_services(self):
+        buckets = norm.normalize(knxip.frames_from_file(self.ip_capture(True)), "1.1.200")
+        ops = buckets["1.1.200"].requests()
+        kinds = [(op.kind, op.key) for op in ops if op.kind not in (norm.KIND_CONNECT, norm.KIND_DISCONNECT)]
+        self.assertEqual(
+            kinds,
+            [
+                (norm.KIND_FUNC_PROP, "type17.1/PID51"),
+                (norm.KIND_PROP_WRITE, "type11.1/PID76"),
+                (norm.KIND_PROP_WRITE, "type11.1/PID92"),
+                (norm.KIND_PROP_WRITE, "type11.1/PID204"),
+            ],
+        )
+        secret = [op for op in ops if op.key == "type11.1/PID92"][0]
+        self.assertTrue(secret.detail.get("key_material"))
+        self.assertNotIn("sha", secret.detail)
+        self.assertEqual(secret.data, b"")
+        self.assertTrue(ds.is_key_material(11, None, 93, 32))
+        self.assertFalse(ds.is_key_material(11, None, 205, 32))
+
     def test_compare_properties_accepts_a_list_of_records(self):
         # One plan step that goes out as several writes lists them under
         # `properties` (the security object's chunked writes, issue #156).

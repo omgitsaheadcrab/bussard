@@ -277,6 +277,11 @@ fn parse_application_program(
     let mut task_segment_lsms: Vec<u8> = Vec::new();
     let mut completes_loads = false;
     let mut compare_mems: Vec<(u16, Vec<u8>)> = Vec::new();
+    let mut object_compare_props: Vec<(u8, u8, Vec<u8>)> = Vec::new();
+    let mut typed_props: Vec<crate::prod::TypedProperty> = Vec::new();
+    // Whether the procedure holds a property op, and any other load op.
+    let mut property_ops = false;
+    let mut other_ops = false;
 
     // Transient state while parsing a RelativeSegment (which has a child <Data>).
     let mut cur_segment: Option<RelativeSegment> = None;
@@ -292,6 +297,22 @@ fn parse_application_program(
         // A self-closing `<RelativeSegment/>` (no `<Data>` child) never emits an
         // End event, so its segment must be flushed here rather than on End.
         let is_empty_element = matches!(event, Event::Empty(_));
+        // A load op that is neither a property op nor the session around it:
+        // the procedure is not property-only.
+        if in_app
+            && let Event::Start(e) | Event::Empty(e) = &event
+            && e.name().as_ref().starts_with(b"LdCtrl")
+            && !matches!(
+                e.name().as_ref(),
+                b"LdCtrlConnect"
+                    | b"LdCtrlDisconnect"
+                    | b"LdCtrlRestart"
+                    | b"LdCtrlWriteProp"
+                    | b"LdCtrlCompareProp"
+            )
+        {
+            other_ops = true;
+        }
         match event {
             Event::Eof => break,
             Event::Start(e) | Event::Empty(e) => match e.name().as_ref() {
@@ -369,6 +390,25 @@ fn parse_application_program(
                     }
                 }
                 b"LdCtrlWriteProp" if in_app => {
+                    property_ops = true;
+                    let obj_type = parse_u32(&e, "ObjType")?.and_then(|v| u16::try_from(v).ok());
+                    let pid8 = parse_u32(&e, "PropId")?.and_then(|v| u8::try_from(v).ok());
+                    if parse_u32(&e, "ObjIdx")?.is_none()
+                        && let (Some(object_type), Some(pid)) = (obj_type, pid8)
+                    {
+                        match typed_props
+                            .iter_mut()
+                            .find(|t| t.object_type == object_type && t.pid == pid)
+                        {
+                            Some(t) => t.written = true,
+                            None => typed_props.push(crate::prod::TypedProperty {
+                                object_type,
+                                pid,
+                                compare: None,
+                                written: true,
+                            }),
+                        }
+                    }
                     let object = parse_u32(&e, "ObjIdx")?.and_then(|v| u8::try_from(v).ok());
                     let pid = parse_u32(&e, "PropId")?.and_then(|v| u8::try_from(v).ok());
                     let len = attr(&e, "InlineData")
@@ -413,10 +453,50 @@ fn parse_application_program(
                     // simulated device can seed PID 78 with the value its own
                     // vendor procedure expects (see `ProductData`).
                     let pid = parse_u32(&e, "PropId")?.unwrap_or(0);
+                    if in_app {
+                        property_ops = true;
+                    }
+                    let obj_idx = parse_u32(&e, "ObjIdx")?;
+                    let obj_type = parse_u32(&e, "ObjType")?;
+                    // The device object, by index or by type 0.
+                    let device_object =
+                        obj_idx == Some(0) || (obj_idx.is_none() && obj_type == Some(0));
+                    let value = attr(&e, "InlineData").and_then(|hex| decode_hex(&hex));
                     if in_app
-                        && parse_u32(&e, "ObjIdx")?.unwrap_or(u32::MAX) == 0
-                        && let Some(hex) = attr(&e, "InlineData")
-                        && let Some(value) = decode_hex(&hex)
+                        && !device_object
+                        && let (Some(value), Ok(pid)) = (value.clone(), u8::try_from(pid))
+                    {
+                        match (obj_idx.and_then(|o| u8::try_from(o).ok()), obj_type) {
+                            (Some(object), _) => {
+                                if !object_compare_props
+                                    .iter()
+                                    .any(|(o, p, _)| *o == object && *p == pid)
+                                {
+                                    object_compare_props.push((object, pid, value));
+                                }
+                            }
+                            (None, Some(object_type)) => {
+                                if let Ok(object_type) = u16::try_from(object_type) {
+                                    match typed_props
+                                        .iter_mut()
+                                        .find(|t| t.object_type == object_type && t.pid == pid)
+                                    {
+                                        Some(t) => t.compare = Some(value),
+                                        None => typed_props.push(crate::prod::TypedProperty {
+                                            object_type,
+                                            pid,
+                                            compare: Some(value),
+                                            written: false,
+                                        }),
+                                    }
+                                }
+                            }
+                            (None, None) => {}
+                        }
+                    }
+                    if in_app
+                        && device_object
+                        && let Some(value) = value
                     {
                         if pid == 78 {
                             hardware_type_marker = Some(value.clone());
@@ -517,6 +597,9 @@ fn parse_application_program(
         written_props,
         task_segment_lsms: completes_loads.then_some(task_segment_lsms),
         compare_mems,
+        object_compare_props,
+        typed_props,
+        property_only: property_ops && !other_ops,
     }))
 }
 
@@ -672,6 +755,32 @@ mod tests {
         assert!(has_rel, "expected RelSegment for obj4 size 256");
         assert!(has_master_reset, "expected MasterReset erase code 4");
         assert!(has_write, "expected WriteRelMem for obj4 size 256");
+        Ok(())
+    }
+
+    #[test]
+    fn test_reader_records_property_procedures() -> Result<(), Box<dyn std::error::Error>> {
+        let xml = r#"<KNX><ManufacturerData><Manufacturer RefId="M-0004"><ApplicationPrograms>
+          <ApplicationProgram Id="M-0004_A-1" ApplicationNumber="22" ApplicationVersion="16" MaskVersion="MV-0021">
+           <Static><LoadProcedures><LoadProcedure>
+            <LdCtrlCompareProp InlineData="0004" ObjType="0" PropId="12" />
+            <LdCtrlCompareProp InlineData="0000A04200" Mask="0000FFFF00" ObjIdx="3" PropId="13" />
+            <LdCtrlWriteProp ObjType="11" PropId="205" Count="8" Verify="true" />
+            <LdCtrlWriteProp ObjType="50001" PropId="211" Verify="false" />
+           </LoadProcedure></LoadProcedures></Static>
+          </ApplicationProgram>
+         </ApplicationPrograms></Manufacturer></ManufacturerData></KNX>"#;
+        let pd = parse_application_program(xml, None)?.ok_or("parsed")?;
+        assert!(pd.property_only);
+        assert_eq!(pd.device_compare_props, vec![(12, vec![0x00, 0x04])]);
+        assert_eq!(
+            pd.object_compare_props,
+            vec![(3, 13, vec![0x00, 0x00, 0xA0, 0x42, 0x00])]
+        );
+        assert_eq!(pd.typed_props.len(), 2);
+        assert!(pd.typed_props.iter().all(|t| t.written));
+        assert_eq!(pd.typed_props[0].object_type, 11);
+        assert_eq!(pd.typed_props[1].object_type, 50001);
         Ok(())
     }
 }

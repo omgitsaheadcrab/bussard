@@ -457,6 +457,11 @@ for dev in devices:
         detail += "  props=differs(bussard-only %d, ets-only %d, value %d)" % (
             len(props.get("bussard_only", [])), len(props.get("ets_only", [])),
             props.get("value_counts", {}).get("differs", 0))
+    elif props.get("verdict") == "not-comparable" and props.get("reason") and "matched" in props:
+        detail += "  props=n/c(bussard %d, ETS ran no procedure write)" % len(
+            props.get("bussard_only", []))
+    if props.get("commissioning"):
+        detail += " [ETS commissioning %d, not counted]" % len(props["commissioning"])
     if r.get("verdict") == "not-comparable" and parts and not r.get("reason", "").startswith("thin"):
         detail += "  (%s)" % (r.get("reason") or "nothing compared")
     print(FMT % (dev, r.get("system") or "-", r["verdict"], cov_text, conf_text, detail))

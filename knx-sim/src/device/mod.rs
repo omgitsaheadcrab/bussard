@@ -264,6 +264,11 @@ pub struct Device {
     /// it (object type 11, instance 1), on a simulated IP interface (bussard
     /// issue #391). `None` on every other device.
     knxnet_by_type: Option<InterfaceObject>,
+    /// Further interface objects the extended property services reach by
+    /// object type (instance 1), keyed by type: the vendor object of a
+    /// property-only device (bussard issue #390, the IPS 300 SREG's object
+    /// type 50001). Empty on every other device.
+    typed_objects: BTreeMap<u16, InterfaceObject>,
     /// The process time (seconds) reported in the `A_Restart_Response` to a
     /// factory reset (erase code 7).
     restart_process_time_s: u16,
@@ -352,6 +357,17 @@ impl Device {
                     .and_then(|m| <[u8; 10]>::try_from(m).ok())
                     .unwrap_or_else(|| profile::default_hardware_type(product.application_number)),
             }),
+            // A property-only procedure on mask 0021 (bussard issue #390): the
+            // Jung IPS 300 SREG KNX IP interface.
+            profile::MaskFamily::Other if mask == 0x0021 && product.property_only => {
+                return Ok(Self::build_property_device(
+                    address,
+                    product,
+                    Profile::SystemB { mask },
+                    overrides.prog_mode,
+                    events,
+                ));
+            }
             profile::MaskFamily::Other => {
                 return Err(format!(
                     "mask 0x{mask:04x} is not a modelled family (only System B 07B0 and \
@@ -773,6 +789,98 @@ mod tests {
             r.responses.iter().all(|f| f.tpdu.len() == 1),
             "{:?}",
             r.responses
+        );
+        Ok(())
+    }
+
+    /// The IPS 300 SREG's shape (bussard issue #390) as `ProductData`.
+    fn property_only_product() -> crate::prod::ProductData {
+        let mut pd = crate::testfixtures::synthetic_mdt_sys7_product();
+        pd.application_id = "M-0004_A-0016-10-EBD7-O00A6".into();
+        pd.mask_version = "MV-0021".into();
+        pd.objects.clear();
+        pd.hardware_type_marker = None;
+        pd.device_compare_props = vec![(78, vec![0, 0, 0, 0x16, 0, 0])];
+        pd.typed_props = vec![
+            crate::prod::TypedProperty {
+                object_type: 11,
+                pid: 205,
+                compare: None,
+                written: true,
+            },
+            crate::prod::TypedProperty {
+                object_type: 50001,
+                pid: 211,
+                compare: None,
+                written: true,
+            },
+        ];
+        pd.property_only = true;
+        pd
+    }
+
+    #[test]
+    fn test_property_only_device_takes_writes_by_type() -> Result<(), Box<dyn std::error::Error>> {
+        let pd = property_only_product();
+        let sink = std::sync::Arc::new(crate::bus::event::RecordingSink::new());
+        let mut dev = Device::from_product_with_overrides(
+            IndividualAddress::new(1, 1, 200),
+            &pd,
+            LoadState::Loaded,
+            ProfileOverrides::default(),
+            sink,
+        )?;
+        assert_eq!(dev.profile.mask(), 0x0021);
+        connect(&mut dev)?;
+        let r = dev.handle_cemi(&data(&dev, 0x3D1, &[0, 0xFF, 0xFF, 0xFF, 0xFF]))?;
+        assert!(!r.responses.is_empty(), "authorize answered");
+        // The compare the procedure runs: object 0 PID 78.
+        let r = dev.handle_cemi(&data(&dev, 0x3D5, &[0, 78, 0x10, 1]))?;
+        assert_eq!(prop_response_value(&r), vec![0, 0, 0, 0x16, 0, 0]);
+        // PID 205 of type 11: two 4-octet elements, written then read back.
+        let mut write = vec![0x00, 0x0B, 0x00, 0x10, 0xCD, 2, 0, 1];
+        write.extend_from_slice(&[192, 168, 1, 2, 10, 0, 0, 2]);
+        let r = dev.handle_cemi(&data(&dev, 0x1CE, &write))?;
+        assert_eq!(
+            &r.responses[0].tpdu[1..],
+            &[0xCF, 0x00, 0x0B, 0x00, 0x10, 0xCD, 2, 0, 1, 0]
+        );
+        let r = dev.handle_cemi(&data(&dev, 0x1CC, &[0x00, 0x0B, 0x00, 0x10, 0xCD, 2, 0, 1]))?;
+        assert_eq!(&r.responses[0].tpdu[10..], &[192, 168, 1, 2, 10, 0, 0, 2]);
+        // The vendor object, type 50001.
+        let r = dev.handle_cemi(&data(
+            &dev,
+            0x1CE,
+            &[0xC3, 0x51, 0x00, 0x10, 0xD3, 1, 0, 1, 40],
+        ))?;
+        assert_eq!(r.responses[0].tpdu.last(), Some(&0));
+        // A property the procedure does not write is refused.
+        let r = dev.handle_cemi(&data(
+            &dev,
+            0x1CE,
+            &[0x00, 0x0B, 0x00, 0x10, 0x34, 1, 0, 1, 0x11, 0x05],
+        ))?;
+        assert_eq!(r.responses[0].tpdu.last(), Some(&1));
+        // The object walk lists the device object and the address table only.
+        let r = dev.handle_cemi(&data(&dev, 0x3D5, &[2, 1, 0x10, 1]))?;
+        assert!(prop_response_value(&r).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_property_only_product_needs_mask_0021() -> Result<(), Box<dyn std::error::Error>> {
+        let mut pd = property_only_product();
+        pd.mask_version = "MV-0012".into();
+        let sink = std::sync::Arc::new(crate::bus::event::RecordingSink::new());
+        assert!(
+            Device::from_product_with_overrides(
+                IndividualAddress::new(1, 1, 200),
+                &pd,
+                LoadState::Loaded,
+                ProfileOverrides::default(),
+                sink,
+            )
+            .is_err()
         );
         Ok(())
     }

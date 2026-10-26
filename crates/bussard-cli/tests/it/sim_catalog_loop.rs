@@ -16,6 +16,10 @@
 //!    parameters that keep the object table, a link added, a link removed)
 //!    with `bussard apply`, plans (no-op), flashes again and plans (no-op).
 //!
+//! A property-only application on mask `0021` (the Jung IPS 300 SREG, issue
+//! #390) has no com-objects and no `plan`: each configuration is flashed to a
+//! fresh device and the flash must end with its property read-back verified.
+//!
 //! Step 4 of the issue (the same with Data Secure on) waits for the secure
 //! group simulation; see `docs/testing.md`.
 //!
@@ -465,6 +469,9 @@ fn run_loop(
     mask: &str,
     flashed: &mut usize,
 ) -> Result<(), Stop> {
+    if mask == PROPERTY_ONLY_MASK {
+        return run_property_loop(settings, file, app, seed, flashed);
+    }
     if !SIM_MASKS.contains(&mask) {
         return Err(Stop::Skip(format!("mask {mask} is not simulated")));
     }
@@ -546,6 +553,61 @@ fn run_loop(
             "plan after flash[{k}] ({}) over the last",
             first.label
         ))?;
+    }
+    drop(bench);
+    if settings.work.is_none() {
+        let _ = std::fs::remove_dir_all(&work.root);
+    }
+    Ok(())
+}
+
+/// The mask of a property-only application knx-sim simulates (issue #390).
+const PROPERTY_ONLY_MASK: &str = "0021";
+
+/// The loop for a property-only application (issue #390): the defaults and
+/// the generated configurations, each flashed to a fresh device; the flash
+/// must report its property read-back verified. There is nothing to link and
+/// no `plan` for the family.
+fn run_property_loop(
+    settings: &Settings,
+    file: &Path,
+    app: &ApplicationProgram,
+    seed: &mut Seed<'_>,
+    flashed: &mut usize,
+) -> Result<(), Stop> {
+    let plan = plan_flash(
+        app,
+        DEVICE,
+        0x0021,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )
+    .map_err(|e| Stop::Skip(format!("bussard does not flash it: {e}")))?;
+    if !plan.is_property_only() {
+        return Err(Stop::Skip("not a property-only procedure".to_string()));
+    }
+    let mut rng = SplitMix64::new(settings.seed ^ fnv1a(&app.id));
+    let mut configs = vec![Configuration::defaults(app, &mut rng)];
+    for k in 1..=settings.configs {
+        configs.push(Configuration::generated(app, &mut rng, k));
+    }
+    let work = Work::create(settings, app, file).map_err(infra("setup"))?;
+    seed(app, &work.model).map_err(infra("write the product model"))?;
+    let mut bench = Bench {
+        settings,
+        work: &work,
+        app,
+        mask: PROPERTY_ONLY_MASK,
+        sim: None,
+        gateway: String::new(),
+    };
+    for (k, config) in configs.iter().enumerate() {
+        bench.fresh_device(k == 0)?;
+        bench.write_device(config).map_err(infra("setup"))?;
+        bench.flash_properties(&format!("flash[{k}] ({})", config.label))?;
+        *flashed += 1;
     }
     drop(bench);
     if settings.work.is_none() {
@@ -1162,6 +1224,23 @@ impl Bench<'_> {
             .bussard(&["flash", DEVICE, "--yes"])
             .map_err(infra(step))?;
         if run.ok && run.stdout.contains("is Loaded on") {
+            Ok(())
+        } else {
+            Err(Stop::Fail(step.to_string(), run.tail()))
+        }
+    }
+
+    /// A property-only flash (issue #390): it must succeed and report every
+    /// written property read back.
+    fn flash_properties(&self, step: &str) -> Result<(), Stop> {
+        let run = self
+            .bussard(&["flash", DEVICE, "--yes"])
+            .map_err(infra(step))?;
+        if run.ok
+            && run
+                .stdout
+                .contains("every property it wrote reads back as written")
+        {
             Ok(())
         } else {
             Err(Stop::Fail(step.to_string(), run.tail()))

@@ -774,13 +774,21 @@ pub async fn sys7_identity<Ch: bussard_mgmt::L4Channel>(
 /// System 7 device that `assess_freshness` could only call unidentified
 /// judged by `identity` instead. The image is still shaped by `freshness`
 /// itself (its factory reset and differential download), so the written
-/// image does not depend on this verdict, only whether it is written.
+/// image does not depend on this verdict, only whether it is written. A
+/// property-only plan is always [`Freshness::Fresh`] (issue #390).
 pub fn flash_gate(
     freshness: &Freshness,
     plan: &FlashPlan,
     state: Option<&ResidentState>,
     identity: Option<&Sys7Identity>,
 ) -> Freshness {
+    // A property-only procedure (issue #390) loads no object and erases
+    // nothing: whatever the device holds, the download only rewrites the
+    // properties it names, so the freshness of its load-state machines does
+    // not decide it (the IPS 300 SREG answers no load state at all).
+    if plan.is_property_only() {
+        return Freshness::Fresh;
+    }
     match (freshness, state, identity) {
         (Freshness::Resident { resident: None, .. }, Some(state), Some(identity))
             if plan.is_sys7() =>

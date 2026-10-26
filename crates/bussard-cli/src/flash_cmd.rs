@@ -759,7 +759,14 @@ pub fn run(
     // flash plan decides on too. The image above stays shaped by `freshness`.
     let gate = bussard_download::flash_gate(&freshness, &plan, resident.as_ref(), sys7.as_ref());
     let decision = decide_freshness(target, &gateway, dir, force, &gate);
-    eprintln!("{}", decision.message);
+    if plan.is_property_only() {
+        eprintln!(
+            "\npre-flight: {target} runs a property-only load procedure: it loads no object \
+             and erases nothing; every property it writes is read back after the download."
+        );
+    } else {
+        eprintln!("{}", decision.message);
+    }
     if !decision.proceed {
         return Ok(ExitCode::FAILURE);
     }

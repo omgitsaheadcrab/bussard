@@ -17,7 +17,7 @@ use bussard_prod::{PropertyObjectRef, PropertyValues};
 use std::collections::BTreeMap;
 
 /// The mask whose property-only procedures bussard plans although it does
-/// not download the family (System 1 realisation type 0021, the Jung IPS 300
+/// not download the family (0021, the BCU2-family mask of the Jung IPS 300
 /// SREG KNX IP interface, issue #390).
 pub(super) const PROPERTY_ONLY_MASK: u16 = 0x0021;
 

@@ -1,5 +1,31 @@
 {
   "_comment": "Known failures of the knx-sim flash-then-plan loop (scripts/sim-catalog-loop.sh, issue #346): application id to the step that fails first. A listed application that fails at another step, or passes, is reported; regenerate with --update-baseline.",
   "source": "shard 0/6 of 2026-10-25, loaded machine: incomplete; the nightly (sim-catalog-nightly.yml) fills it in",
-  "known_failures": {}
+  "known_failures": {
+    "M-0002_A-A075-20-4647": {
+      "step": "flash[1] (generated 1)",
+      "reason": "parameter value from the configuration generator below the declared minimum (`Vent Dummy Prio Ende`, min 129); not a property-procedure step (#390 sim run)",
+      "issue": 390
+    },
+    "M-0007_A-A074-20-BCAC-O0002": {
+      "step": "flash[1] (generated 1)",
+      "reason": "parameter value from the configuration generator below the declared minimum (`Vent Dummy Prio Ende`, min 129); not a property-procedure step (#390 sim run)",
+      "issue": 390
+    },
+    "M-0007_A-A075-20-DEF8-O0002": {
+      "step": "flash[1] (generated 1)",
+      "reason": "parameter value from the configuration generator below the declared minimum (`Vent Dummy Prio Ende`, min 129); not a property-procedure step (#390 sim run)",
+      "issue": 390
+    },
+    "M-0083_A-0054-14-0D63": {
+      "step": "flash[0] (defaults)",
+      "reason": "knx-sim seeds object 0 PID 19 from the first LdCtrlCompareProp, the defaults take the <choose> branch that expects 01000000; the sim cannot decide which hardware variant the device is (#390 sim run)",
+      "issue": 390
+    },
+    "M-0083_A-0255-21-0ECA": {
+      "step": "flash[2] (generated 2)",
+      "reason": "label text `Scènario` is 9 octets in UTF-8 for an 8-octet TypeText property; bussard encodes TypeText as UTF-8, no capture shows ETS's encoding (#390 sim run)",
+      "issue": 390
+    }
+  }
 }

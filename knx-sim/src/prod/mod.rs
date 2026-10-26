@@ -18,5 +18,7 @@
 mod model;
 mod reader;
 
-pub use model::{LdCtrl, LoadProcedure, LoadableObject, ProductData, RelativeSegment};
+pub use model::{
+    LdCtrl, LoadProcedure, LoadableObject, ProductData, RelativeSegment, TypedProperty,
+};
 pub use reader::{ProdError, read_knxprod, read_knxprod_bytes};

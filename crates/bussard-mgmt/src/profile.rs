@@ -6,7 +6,7 @@
 //! - the **medium** in the high nibble (`0x0…` = TP1, `0x2…` = RF, `0x5…` =
 //!   KNX-IP), and
 //! - the **system generation** in the low 12 bits (`x7B0` = System B, `x705` /
-//!   `x701` = System 7, `x3xx` = System 2, `x0xx` = System 1 / BCU1).
+//!   `x701` = System 7, `x02x` / `x3xx` = System 2, `x01x` = System 1 / BCU1).
 //!
 //! Historically bussard branched on this ad hoc — `is_system_b(mask)`, exact
 //! `== 0x07B0` compares, and `match mask { … }` scattered across the mgmt,
@@ -75,10 +75,11 @@ pub enum MaskFamily {
     /// `A_Authorize` before access. Read/write support is issue #49; today
     /// bussard classifies these but does not drive them.
     System7,
-    /// System 2 (`x3xx`): the BCU2 generation. Classified but unsupported.
+    /// System 2 (`x02x`, the BCU2 masks a KNX IP interface may report — issues
+    /// #30, #390 — and `x3xx`). Classified but unsupported, except a
+    /// property-only procedure on mask 0021 (issue #390).
     System2,
-    /// System 1 / BCU1 family (`x0xx`, plus the `x02x` realisation type some IP
-    /// interfaces report — issue #30). Classified but unsupported.
+    /// System 1 / BCU1 family (`x01x`). Classified but unsupported.
     System1,
     /// A mask bussard does not recognise.
     Unknown,
@@ -137,10 +138,11 @@ impl MaskProfile {
         let family = match mask & 0x0FFF {
             0x7B0 => MaskFamily::SystemB,
             0x705 | 0x701 | 0x700 => MaskFamily::System7,
-            0x300 | 0x310 | 0x311 => MaskFamily::System2,
-            // System 1 / BCU1: the classic 0x001x masks plus the 0x002x
-            // realisation type some BCU1-based IP interfaces report (issue #30).
-            0x010..=0x013 | 0x020 | 0x021 | 0x025 => MaskFamily::System1,
+            // System 2: the BCU2 masks 0x002x (the Jung IPS 300 SREG KNX IP
+            // interface reports 0021, issues #30 and #390) and System 300.
+            0x020 | 0x021 | 0x025 | 0x300 | 0x310 | 0x311 => MaskFamily::System2,
+            // System 1 / BCU1: the classic 0x001x masks.
+            0x010..=0x013 => MaskFamily::System1,
             _ => MaskFamily::Unknown,
         };
         MaskProfile {
@@ -619,10 +621,10 @@ mod tests {
     #[test]
     fn test_from_mask_classifies_legacy_and_unknown() {
         assert_eq!(MaskProfile::from_mask(0x0012).family(), MaskFamily::System1);
-        // BCU1-family realisation type reported by a Jung IP interface (#30).
-        assert_eq!(MaskProfile::from_mask(0x0021).family(), MaskFamily::System1);
-        assert_eq!(MaskProfile::from_mask(0x0020).family(), MaskFamily::System1);
-        assert_eq!(MaskProfile::from_mask(0x0025).family(), MaskFamily::System1);
+        // The BCU2 mask a Jung IP interface reports (#30, #390).
+        assert_eq!(MaskProfile::from_mask(0x0021).family(), MaskFamily::System2);
+        assert_eq!(MaskProfile::from_mask(0x0020).family(), MaskFamily::System2);
+        assert_eq!(MaskProfile::from_mask(0x0025).family(), MaskFamily::System2);
         assert_eq!(MaskProfile::from_mask(0x0300).family(), MaskFamily::System2);
         assert_eq!(MaskProfile::from_mask(0x1234).family(), MaskFamily::Unknown);
     }

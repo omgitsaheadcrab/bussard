@@ -657,6 +657,12 @@ KEY_SIZED = 16  # octets: anything this long on the security object may be a key
 # numbers, never a key, however long (issue #384). Shown so a sender list
 # difference can be named.
 PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE = 54
+# The KNXnet/IP parameter object (type 11) and its KNXnet/IP Secure key
+# material: PID_BACKBONE_KEY (91), PID_DEVICE_AUTHENTICATION_CODE (92),
+# PID_PASSWORD_HASHES (93). ETS writes 92 and 93 when it commissions a secure
+# KNX IP interface (the 1.1.200 capture of 2026-10-26, issue #390).
+KNXNET_IP_OBJECT_TYPE = 11
+KNXNET_SECURE_KEY_PIDS = frozenset({91, 92, 93})
 
 
 def is_key_material(
@@ -667,15 +673,18 @@ def is_key_material(
     `obj_type` is set for the extended services, which name the object by
     type; `obj_index` for the plain ones, which name it by index. By type:
     the key PIDs, or anything key-sized but PID 54 (the sender table), on the
-    security object. By index (the type is unknown): a key PID on any object
-    but the device object.
+    security object, and the KNXnet/IP Secure keys (PIDs 91 to 93) on the
+    KNXnet/IP parameter object (type 11). By index (the type is unknown): a
+    key PID of either on any object but the device object.
     """
     if obj_type is not None:
+        if obj_type == KNXNET_IP_OBJECT_TYPE:
+            return pid in KNXNET_SECURE_KEY_PIDS
         return obj_type == SECURITY_OBJECT_TYPE and (
             pid in KEY_PIDS
             or (length >= KEY_SIZED and pid != PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE)
         )
-    return pid in KEY_PIDS and obj_index != 0
+    return (pid in KEY_PIDS or pid in KNXNET_SECURE_KEY_PIDS) and obj_index != 0
 
 
 def redact_keys(apdu):

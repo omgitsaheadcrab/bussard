@@ -122,7 +122,9 @@ impl KnxnetParameters {
 pub fn element_size(pid: u8) -> usize {
     match pid {
         52 | 53 | 68 => 2,
-        57..=62 | 65 | 66 => 4,
+        // 205: the Jung IPS 300 SREG's preferred tunnel IP addresses
+        // (`PID_ENX_BASICCRI_TUNNELLING_Preferred_IP`, bussard issue #390).
+        57..=62 | 65 | 66 | 205 => 4,
         64 => 6,
         _ => 1,
     }
@@ -175,6 +177,91 @@ pub fn ext_read(obj: &InterfaceObject, request: &[u8]) -> Option<Vec<u8>> {
     out.push(n);
     out.extend_from_slice(&start.to_be_bytes());
     out.extend_from_slice(&bytes);
+    Some(out)
+}
+
+/// The element size of property `pid` of an object of `object_type` reached
+/// by type: the KNXnet/IP parameter object's own sizes, else one element of
+/// the whole value.
+fn typed_element_size(object_type: u16, pid: u8, value_len: usize) -> usize {
+    if object_type == IOT_KNXNET_IP_PARAMETER {
+        element_size(pid)
+    } else {
+        value_len.max(1)
+    }
+}
+
+/// The answer to an `A_PropertyExtValue_Read` of `obj`, an object of
+/// `object_type` reached by type (bussard issue #390): the request header,
+/// the served count, the start and the elements. Instance 1 only; count 0
+/// refuses (no such property, a range past the end).
+pub fn typed_ext_read(object_type: u16, obj: &InterfaceObject, request: &[u8]) -> Option<Vec<u8>> {
+    let h = request.get(..8)?;
+    let packed = (u32::from(h[2]) << 16) | (u32::from(h[3]) << 8) | u32::from(h[4]);
+    let instance = packed >> 12;
+    let pid = u8::try_from(packed & 0x0FFF).ok();
+    let count = h[5];
+    let start = u16::from_be_bytes([h[6], h[7]]);
+    let answer = match (instance, pid) {
+        (1, Some(pid)) => obj.property(pid).and_then(|p| {
+            let size = typed_element_size(object_type, pid, p.value.len());
+            let total = p.value.len() / size;
+            if start == 0 {
+                return Some((1, u16::try_from(total).ok()?.to_be_bytes().to_vec()));
+            }
+            let first = usize::from(start);
+            let last = first + usize::from(count).max(1) - 1;
+            (count != 0 && last <= total)
+                .then(|| (count, p.value[(first - 1) * size..last * size].to_vec()))
+        }),
+        _ => None,
+    };
+    let (n, bytes) = answer.unwrap_or((0, Vec::new()));
+    let mut out = h[..5].to_vec();
+    out.push(n);
+    out.extend_from_slice(&start.to_be_bytes());
+    out.extend_from_slice(&bytes);
+    Some(out)
+}
+
+/// Applies an `A_PropertyExtValue_WriteCon` to `obj`, an object of
+/// `object_type` reached by type (bussard issue #390), and returns the
+/// confirmation: the request header, count and start, and return code 0 when
+/// a writable property of instance 1 took the elements, else 1.
+pub fn typed_ext_write(
+    object_type: u16,
+    obj: &mut InterfaceObject,
+    request: &[u8],
+) -> Option<Vec<u8>> {
+    let h = request.get(..8)?;
+    let data = request.get(8..).unwrap_or_default();
+    let packed = (u32::from(h[2]) << 16) | (u32::from(h[3]) << 8) | u32::from(h[4]);
+    let instance = packed >> 12;
+    let pid = u8::try_from(packed & 0x0FFF).ok();
+    let count = usize::from(h[5]);
+    let start = usize::from(u16::from_be_bytes([h[6], h[7]]));
+    let mut rc = 0x01;
+    if let (1, Some(pid)) = (instance, pid)
+        && count > 0
+        && start >= 1
+        && let Some(prop) = obj.property_mut(pid)
+        && !prop.read_only
+    {
+        let size = if object_type == IOT_KNXNET_IP_PARAMETER {
+            element_size(pid)
+        } else {
+            (data.len() / count).max(1)
+        };
+        let from = (start - 1) * size;
+        let end = from + data.len();
+        if prop.value.len() < end {
+            prop.value.resize(end, 0);
+        }
+        prop.value[from..end].copy_from_slice(data);
+        rc = 0x00;
+    }
+    let mut out = h.to_vec();
+    out.push(rc);
     Some(out)
 }
 

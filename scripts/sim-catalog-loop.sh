@@ -3,7 +3,8 @@
 # The flash-then-plan loop against knx-sim over the product catalog (#346).
 #
 # For every application of the product corpus that bussard flashes and knx-sim
-# simulates (masks 07B0, 0705, 0701): flash the vendor defaults and N seeded
+# simulates (masks 07B0, 0705, 0701, and a property-only 0021 procedure,
+# issue #390): flash the vendor defaults and N seeded
 # generated configurations to a fresh simulated device, each followed by a
 # plan that must be a no-op; then apply a partial change (parameters, one link
 # added, one removed), plan, flash again, plan; then flash the first
@@ -50,6 +51,7 @@ SUBSET=(
   "1409207|A-140C-14-A512"             # Theben Meteodata 140 S (0701)
   "SCN-P360D3.03|A-0072-44-49AB"       # MDT 0705
   "SCN-P360D3.03|A-0076-44-685A"       # MDT 0705
+  "IPS300SREG|A-0016-10-EBD7"          # Jung IPS 300 SREG (0021, property-only, the house's)
 )
 
 update_baseline=0
