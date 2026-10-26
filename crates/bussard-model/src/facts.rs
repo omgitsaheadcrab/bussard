@@ -85,6 +85,11 @@ pub struct DeviceFactsRecord {
     pub object_table_source: ObjectTableSource,
     /// The interface objects in index order.
     pub objects: Vec<ObjectFacts>,
+    /// What the KNXnet/IP parameter object (object type 11) of an IP interface
+    /// reported, the last time it was read (issue #391). Absent on a device
+    /// without one, or before the first read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knxnet: Option<crate::knxnet::KnxnetFacts>,
 }
 
 /// How a device answered `A_Authorize_Request`.
@@ -330,6 +335,7 @@ mod tests {
                     properties: None,
                 },
             ],
+            knxnet: None,
         })
     }
 

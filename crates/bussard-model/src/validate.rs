@@ -106,6 +106,7 @@ pub fn validate(model: &Model) -> Vec<Diagnostic> {
     check_protected_gas(model, &mut diags);
     crate::secure_links::check_secure_links(model, &mut diags);
     crate::secure_invariants::check_secure_invariants(model, &mut diags);
+    check_knxnet(model, &mut diags);
     // Opt-in topology/convention lints (issue #102). Without a `[lint]` table in
     // `bussard.toml` this contributes nothing, so existing models are unchanged.
     // The bus-current rule (L002) needs the on-disk product cache and therefore
@@ -138,6 +139,7 @@ pub fn validate_in_dir(model: &Model, dir: &Path) -> Vec<Diagnostic> {
     check_protected_gas(model, &mut diags);
     crate::secure_links::check_secure_links(model, &mut diags);
     crate::secure_invariants::check_secure_invariants(model, &mut diags);
+    check_knxnet(model, &mut diags);
 
     crate::keystore_meta::check_stale_exports(model, dir, &mut diags);
 
@@ -498,6 +500,25 @@ fn check_links(model: &Model, diags: &mut Vec<Diagnostic>) {
     check_duplicate_individual_addresses(model, diags);
 }
 
+/// E043 to E046 (issue #391): the `[knxnet]` table of every IP interface,
+/// checked by [`crate::knxnet::check_config`] against itself and the model's
+/// device addresses.
+fn check_knxnet(model: &Model, diags: &mut Vec<Diagnostic>) {
+    for (ia, loaded) in &model.devices {
+        let Some(config) = &loaded.device.knxnet else {
+            continue;
+        };
+        for issue in crate::knxnet::check_config(*ia, config, model.devices.keys()) {
+            diags.push(Diagnostic::new(
+                issue.code,
+                Severity::Error,
+                format!("devices/{ia}.toml [knxnet]"),
+                issue.message,
+            ));
+        }
+    }
+}
+
 /// E002: a device file whose name is not its address.
 fn check_duplicate_individual_addresses(model: &Model, diags: &mut Vec<Diagnostic>) {
     for (ia, loaded) in &model.devices {
@@ -781,6 +802,7 @@ mod tests {
                 com_objects: objs.into_iter().collect(),
                 security: None,
                 application_override: None,
+                knxnet: None,
                 lock: Default::default(),
             },
             file_stem: stem.to_string(),
@@ -1131,6 +1153,7 @@ mod tests {
             com_objects: BTreeMap::new(),
             security: None,
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
         };
         let mut devices = BTreeMap::new();
@@ -1327,5 +1350,60 @@ parameters:
             !diags.iter().any(|d| d.code == "W005"),
             "a group declared as main type 1 must not conflict: {diags:#?}"
         );
+    }
+
+    #[test]
+    fn test_check_knxnet_mutations_raise_e043_to_e046() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::knxnet::{IpAssignment, KnxnetConfig};
+        let model_with = |config: KnxnetConfig| {
+            let mut devices = BTreeMap::new();
+            let mut iface = device("1.1.200", "1.1.200", vec![]);
+            iface.device.knxnet = Some(config);
+            devices.insert(ia("1.1.200"), iface);
+            devices.insert(ia("1.1.5"), device("1.1.5", "1.1.5", vec![]));
+            Model {
+                config: BussardConfig::default(),
+                groups: Groups::default(),
+                links: Links::default(),
+                devices,
+            }
+        };
+        let knxnet_codes = |model: &Model| -> Vec<&'static str> {
+            validate(model)
+                .into_iter()
+                .filter(|d| d.location.contains("[knxnet]"))
+                .map(|d| d.code)
+                .collect()
+        };
+        let clean = KnxnetConfig {
+            assignment: IpAssignment::Dhcp,
+            tunnels: vec![ia("1.1.22"), ia("1.1.23")],
+            ..KnxnetConfig::default()
+        };
+        assert!(knxnet_codes(&model_with(clean.clone())).is_empty());
+
+        let mut static_bare = clean.clone();
+        static_bare.assignment = IpAssignment::Static;
+        static_bare.netmask = Some("255.255.255.0".parse()?);
+        assert_eq!(knxnet_codes(&model_with(static_bare)), ["E043"]);
+
+        let mut duplicate = clean.clone();
+        duplicate.tunnels.push(ia("1.1.22"));
+        assert_eq!(knxnet_codes(&model_with(duplicate)), ["E044"]);
+
+        let mut off_line = clean.clone();
+        off_line.tunnels.push(ia("1.2.22"));
+        assert_eq!(knxnet_codes(&model_with(off_line)), ["E045"]);
+
+        let mut taken = clean;
+        taken.tunnels.push(ia("1.1.5"));
+        let model = model_with(taken);
+        assert_eq!(knxnet_codes(&model), ["E046"]);
+        assert!(
+            validate(&model)
+                .iter()
+                .all(|d| d.code != "E046" || d.severity == Severity::Error)
+        );
+        Ok(())
     }
 }

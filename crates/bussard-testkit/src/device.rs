@@ -34,9 +34,9 @@ use crate::consts::{
     A_PROPERTY_VALUE_READ, A_PROPERTY_VALUE_RESPONSE, A_PROPERTY_VALUE_WRITE, A_RESTART,
     APCI_SELECTOR, LE_ADDITIONAL, LE_LOAD_COMPLETED, LE_START_LOADING, LE_UNLOAD, LS_LOADED,
     LS_LOADING, LS_UNLOADED, OT_ADDRESS_TABLE, OT_ASSOCIATION_TABLE, OT_DEVICE,
-    OT_GROUP_OBJECT_TABLE, PID_IO_LIST, PID_LOAD_STATE_CONTROL, PID_MANUFACTURER_ID,
-    PID_OBJECT_TYPE, PID_ORDER_INFO, PID_PROGMODE, PID_SERIAL_NUMBER, PID_TABLE,
-    PID_TABLE_REFERENCE, SUB_REL_SEGMENT,
+    OT_GROUP_OBJECT_TABLE, OT_KNXNET_IP_PARAMETER, PID_IO_LIST, PID_LOAD_STATE_CONTROL,
+    PID_MANUFACTURER_ID, PID_OBJECT_TYPE, PID_ORDER_INFO, PID_PROGMODE, PID_SERIAL_NUMBER,
+    PID_TABLE, PID_TABLE_REFERENCE, SUB_REL_SEGMENT,
 };
 
 /// The Data Secure SCF octet of an `S-A_Sync_Req` (tool access).
@@ -280,7 +280,111 @@ pub struct MockPropertyDescription {
     pub write_level: u8,
 }
 
+/// The KNXnet/IP parameter object (object type 11) a mock IP interface serves
+/// (issue #391), as raw property values. [`MockKnxnet::default`] is a DHCP
+/// interface at 1.1.200 with two tunnels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockKnxnet {
+    /// PID 52.
+    pub individual_address: IndividualAddress,
+    /// PID 53.
+    pub tunnels: Vec<IndividualAddress>,
+    /// PID 54 (method bits).
+    pub current_assignment: u8,
+    /// PID 55 (method bits).
+    pub assignment: u8,
+    /// PIDs 57, 58, 59.
+    pub current: [[u8; 4]; 3],
+    /// PIDs 60, 61, 62.
+    pub configured: [[u8; 4]; 3],
+    /// PID 64.
+    pub mac: [u8; 6],
+    /// PID 66.
+    pub routing_multicast: [u8; 4],
+    /// PID 67.
+    pub ttl: u8,
+    /// PID 68.
+    pub capabilities: u16,
+    /// PID 69.
+    pub state: u8,
+    /// PID 76, ISO 8859-1, padded to 30 octets with NUL.
+    pub friendly_name: String,
+}
+
+impl Default for MockKnxnet {
+    fn default() -> Self {
+        MockKnxnet {
+            individual_address: IndividualAddress::from_raw(0x11C8),
+            tunnels: vec![
+                IndividualAddress::from_raw(0x1116),
+                IndividualAddress::from_raw(0x1117),
+            ],
+            current_assignment: 0x04,
+            assignment: 0x04,
+            current: [[192, 168, 1, 74], [255, 255, 255, 0], [192, 168, 1, 1]],
+            configured: [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+            mac: [0x00, 0x00, 0x5E, 0x00, 0x53, 0x01],
+            routing_multicast: [224, 0, 23, 12],
+            ttl: 16,
+            capabilities: 0x0003,
+            state: 0,
+            friendly_name: "Mock IP interface".to_string(),
+        }
+    }
+}
+
+impl MockKnxnet {
+    /// The `(PID, element size, octets)` of every property.
+    fn properties(&self) -> Vec<(u8, usize, Vec<u8>)> {
+        let mut name: Vec<u8> = self
+            .friendly_name
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
+            .collect();
+        name.resize(30, 0);
+        vec![
+            (52, 2, self.individual_address.raw().to_be_bytes().to_vec()),
+            (
+                53,
+                2,
+                self.tunnels
+                    .iter()
+                    .flat_map(|t| t.raw().to_be_bytes())
+                    .collect(),
+            ),
+            (54, 1, vec![self.current_assignment]),
+            (55, 1, vec![self.assignment]),
+            (57, 4, self.current[0].to_vec()),
+            (58, 4, self.current[1].to_vec()),
+            (59, 4, self.current[2].to_vec()),
+            (60, 4, self.configured[0].to_vec()),
+            (61, 4, self.configured[1].to_vec()),
+            (62, 4, self.configured[2].to_vec()),
+            (64, 6, self.mac.to_vec()),
+            (66, 4, self.routing_multicast.to_vec()),
+            (67, 1, vec![self.ttl]),
+            (68, 2, self.capabilities.to_be_bytes().to_vec()),
+            (69, 1, vec![self.state]),
+            (76, 1, name),
+        ]
+    }
+}
+
 impl MockDevice {
+    /// Adds a KNXnet/IP parameter object (object type 11) at the next object
+    /// index and serves `knxnet` from it to `A_PropertyValue_Read` and, as
+    /// instance 1, to `A_PropertyExtValue_Read` (issue #391). Read-only.
+    pub fn with_knxnet(mut self, knxnet: &MockKnxnet) -> Self {
+        let index = u8::try_from(self.object_types.len()).unwrap_or(u8::MAX);
+        self.object_types.push(OT_KNXNET_IP_PARAMETER);
+        for (pid, size, data) in knxnet.properties() {
+            self = self
+                .with_property(index, pid, size, &data)
+                .with_property_ext(OT_KNXNET_IP_PARAMETER, u16::from(pid), size, &data);
+        }
+        self
+    }
+
     /// A device at `address` with mask `0x07B0` (System B), a device object
     /// only, not in programming mode, authorize level 0, and memory writes
     /// allowed anywhere with a `Memory_Response` echo.

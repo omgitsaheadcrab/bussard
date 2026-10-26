@@ -6,6 +6,7 @@
 
 mod assign_mock;
 mod io_list_mock;
+mod knxnet_mock;
 mod load_echo_mock;
 mod max_apdu_mock;
 mod mem_write_mock;

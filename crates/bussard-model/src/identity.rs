@@ -223,6 +223,7 @@ mod tests {
             module_bases: Default::default(),
             com_objects: Default::default(),
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
             security: None,
         })

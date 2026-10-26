@@ -382,6 +382,12 @@ pub struct Device {
     /// existing device files are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security: Option<DeviceSecurity>,
+    /// The KNXnet/IP settings of an IP interface or router, the device file's
+    /// `[knxnet]` table (issue #391). Intent only: what the device reports is a
+    /// device fact ([`crate::knxnet::KnxnetFacts`]). Absent on every other
+    /// device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knxnet: Option<crate::knxnet::KnxnetConfig>,
 }
 
 impl Device {

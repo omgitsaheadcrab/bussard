@@ -12,6 +12,7 @@ mod data_secure;
 mod group_comm;
 mod group_dispatch;
 mod interface_object;
+pub mod knxnet_object;
 mod load_state;
 mod lsm;
 mod mcb;
@@ -393,6 +394,19 @@ impl Device {
         self
     }
 
+    /// Gives the device a KNXnet/IP parameter object (interface object type
+    /// 11) at the next free object index, serving `params` read-only: the
+    /// simulated KNX IP interface of bussard issue #391.
+    pub fn with_knxnet_object(mut self, params: &knxnet_object::KnxnetParameters) -> Self {
+        let index = self
+            .objects
+            .keys()
+            .next_back()
+            .map_or(0, |last| last.saturating_add(1));
+        self.objects.insert(index, params.object());
+        self
+    }
+
     /// The device's individual address.
     pub fn address(&self) -> IndividualAddress {
         self.address
@@ -658,6 +672,47 @@ mod tests {
             .and_then(|io| io.property(PID_PROGMODE))
             .ok_or("device object has PID_PROGMODE")?;
         assert_eq!(prop.value, vec![0x01]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_knxnet_object_serves_the_ip_interface_read_side()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Bussard issue #391: a simulated IP interface answers the object-type
+        // probe with type 11 at the next index and serves its properties as
+        // arrays, read-only.
+        let params = knxnet_object::KnxnetParameters::dhcp(0x11C8, vec![0x1116, 0x1117, 0x1118]);
+        let mut dev = system_b_device()?.with_knxnet_object(&params);
+        let index = *dev.objects.keys().next_back().ok_or("objects")?;
+        connect(&mut dev)?;
+        let read = |dev: &mut Device, pid: u8, count: u8, start: u8| {
+            dev.handle_cemi(&data(dev, 0x3D5, &[index, pid, count << 4, start]))
+                .map(|r| (r.responses[0].tpdu[4] >> 4, prop_response_value(&r)))
+        };
+        assert_eq!(read(&mut dev, 1, 1, 1)?, (1, vec![0, 11]));
+        assert_eq!(read(&mut dev, 53, 1, 0)?, (1, vec![0, 3]), "three tunnels");
+        assert_eq!(
+            read(&mut dev, 53, 3, 1)?,
+            (3, vec![0x11, 0x16, 0x11, 0x17, 0x11, 0x18])
+        );
+        assert_eq!(
+            read(&mut dev, 53, 2, 3)?,
+            (0, vec![]),
+            "past the end is refused"
+        );
+        assert_eq!(read(&mut dev, 57, 1, 1)?, (1, vec![192, 168, 1, 74]));
+        assert_eq!(read(&mut dev, 55, 1, 1)?, (1, vec![0x04]), "DHCP");
+        assert_eq!(
+            read(&mut dev, 92, 1, 1)?,
+            (0, vec![]),
+            "no Secure PID is served"
+        );
+        let (n, name) = read(&mut dev, 76, 10, 1)?;
+        assert_eq!((n, &name[..7]), (10, &b"knx-sim"[..]));
+        // Read-only: a write is refused and the value stays.
+        let write = dev.handle_cemi(&data(&dev, 0x3D7, &[index, 52, 0x11, 0x01, 0x11, 0x05]));
+        assert!(write.is_err(), "an unauthorized write is refused");
+        assert_eq!(read(&mut dev, 52, 1, 1)?, (1, vec![0x11, 0xC8]));
         Ok(())
     }
 }

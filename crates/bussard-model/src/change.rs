@@ -77,6 +77,9 @@ pub enum ChangeKind {
     ChannelRenamed,
     /// The connection block of `bussard.toml` changed.
     ConnectionChanged,
+    /// The `[knxnet]` table of an IP interface changed (issue #391): the IP
+    /// assignment, a static setting, the friendly name or a tunnel address.
+    InterfaceChanged,
 }
 
 /// Which side of a com-object link a group address sits on.
@@ -877,6 +880,147 @@ fn device_field_changes(
     describe_channels(ia, a, b, out);
     describe_parameters(ia, a, b, out);
     describe_object_security(ia, a, b, out);
+    describe_knxnet(ia, a, b, out);
+}
+
+/// Renders the differences of the `[knxnet]` table of an IP interface (issue
+/// #391), one sentence each: `Interface KNX IP Interface (1.1.200): tunnel
+/// address 1.1.30 added.`
+fn describe_knxnet(ia: IndividualAddress, a: &Device, b: &Device, out: &mut Vec<Change>) {
+    use crate::knxnet::{KnxnetConfig, join_addresses};
+    if a.knxnet == b.knxnet {
+        return;
+    }
+    let head = if b.name.trim().is_empty() {
+        format!("Interface {ia}")
+    } else {
+        format!("Interface {} ({ia})", b.name.trim())
+    };
+    let change = |field: &str, sentence: String, from: Option<String>, to: Option<String>| {
+        Change::new(ChangeKind::InterfaceChanged, format!("{head}: {sentence}."))
+            .with_device(ia)
+            .with_field(
+                if field.is_empty() {
+                    "knxnet".to_string()
+                } else {
+                    format!("knxnet.{field}")
+                },
+                from,
+                to,
+            )
+    };
+    let summary = |k: &KnxnetConfig| {
+        let mut parts = vec![format!("assignment {}", k.assignment.label())];
+        if let Some(addr) = k.address {
+            parts.push(format!("address {addr}"));
+        }
+        if !k.tunnels.is_empty() {
+            parts.push(format!("tunnel addresses {}", join_addresses(&k.tunnels)));
+        }
+        parts.join(", ")
+    };
+    let (old, new) = match (&a.knxnet, &b.knxnet) {
+        (None, Some(k)) => {
+            out.push(change(
+                "",
+                format!("KNXnet/IP settings added ({})", summary(k)),
+                None,
+                Some(summary(k)),
+            ));
+            return;
+        }
+        (Some(k), None) => {
+            out.push(change(
+                "",
+                "KNXnet/IP settings removed from the model; bussard no longer manages the \
+                 interface's IP settings and tunnel addresses"
+                    .to_string(),
+                Some(summary(k)),
+                None,
+            ));
+            return;
+        }
+        (Some(old), Some(new)) => (old, new),
+        (None, None) => return,
+    };
+    if old.assignment != new.assignment {
+        out.push(change(
+            "assignment",
+            format!(
+                "IP assignment is now {} (was {})",
+                new.assignment.label(),
+                old.assignment.label()
+            ),
+            Some(old.assignment.label().to_string()),
+            Some(new.assignment.label().to_string()),
+        ));
+    }
+    for (field, label, before, after) in [
+        ("address", "static IP address", old.address, new.address),
+        ("netmask", "static netmask", old.netmask, new.netmask),
+        (
+            "gateway",
+            "static default gateway",
+            old.gateway,
+            new.gateway,
+        ),
+    ] {
+        let sentence = match (before, after) {
+            (Some(x), Some(y)) if x != y => format!("{label} is now {y} (was {x})"),
+            (None, Some(y)) => format!("{label} set to {y}"),
+            (Some(x), None) => format!("{label} {x} cleared"),
+            _ => continue,
+        };
+        out.push(change(
+            field,
+            sentence,
+            before.map(|v| v.to_string()),
+            after.map(|v| v.to_string()),
+        ));
+    }
+    if old.friendly_name != new.friendly_name {
+        let sentence = match (&old.friendly_name, &new.friendly_name) {
+            (Some(x), Some(y)) => format!("friendly name is now {y:?} (was {x:?})"),
+            (None, Some(y)) => format!("friendly name set to {y:?}"),
+            (Some(x), None) => format!("friendly name {x:?} no longer managed"),
+            (None, None) => String::new(),
+        };
+        out.push(change(
+            "friendly_name",
+            sentence,
+            old.friendly_name.clone(),
+            new.friendly_name.clone(),
+        ));
+    }
+    for added in new.tunnels.iter().filter(|t| !old.tunnels.contains(t)) {
+        out.push(change(
+            "tunnels",
+            format!("tunnel address {added} added"),
+            None,
+            Some(added.to_string()),
+        ));
+    }
+    for removed in old.tunnels.iter().filter(|t| !new.tunnels.contains(t)) {
+        out.push(change(
+            "tunnels",
+            format!("tunnel address {removed} removed"),
+            Some(removed.to_string()),
+            None,
+        ));
+    }
+    let same_set = old.tunnels.len() == new.tunnels.len()
+        && old.tunnels.iter().all(|t| new.tunnels.contains(t));
+    if same_set && old.tunnels != new.tunnels {
+        out.push(change(
+            "tunnels",
+            format!(
+                "tunnel addresses reordered to {} (slot order)",
+                join_addresses(&new.tunnels)
+            ),
+            Some(join_addresses(&old.tunnels)),
+            Some(join_addresses(&new.tunnels)),
+        ));
+    }
 }
 
 /// Renders the com-objects whose `secure` flag changed (issue #331), one
@@ -1254,6 +1398,7 @@ mod tests {
                 security: None,
                 replaced: None,
                 application_override: None,
+                knxnet: None,
                 lock: Default::default(),
             },
             file_stem: format!("{ia_str}-{name}"),
@@ -1443,5 +1588,62 @@ mod tests {
         assert_eq!(fields, ["odd", "other"]);
         let set = parameter_changes(&[("odd", "1")], &[("odd", "1")]);
         assert!(set.is_empty());
+    }
+
+    #[test]
+    fn test_describe_knxnet_sentences() {
+        use crate::knxnet::{IpAssignment, KnxnetConfig};
+        let with = |k: Option<KnxnetConfig>| {
+            let mut m = empty();
+            let mut d = device("1.1.200", "KNX IP Interface");
+            d.device.knxnet = k;
+            m.devices.insert(ia("1.1.200"), d);
+            m
+        };
+        let before = KnxnetConfig {
+            assignment: IpAssignment::Dhcp,
+            friendly_name: Some("Alpha".to_string()),
+            tunnels: vec![ia("1.1.22"), ia("1.1.23")],
+            ..KnxnetConfig::default()
+        };
+        let mut after = before.clone();
+        after.tunnels = vec![ia("1.1.22"), ia("1.1.30")];
+        after.assignment = IpAssignment::Static;
+        after.address = Some(std::net::Ipv4Addr::new(192, 168, 1, 74));
+        after.friendly_name = Some("Beta".to_string());
+        let set = describe(&with(Some(before.clone())), &with(Some(after)));
+        let sentences: Vec<&str> = set.changes.iter().map(|c| c.sentence.as_str()).collect();
+        assert_eq!(
+            sentences,
+            [
+                "Interface KNX IP Interface (1.1.200): IP assignment is now static (was dhcp).",
+                "Interface KNX IP Interface (1.1.200): static IP address set to 192.168.1.74.",
+                "Interface KNX IP Interface (1.1.200): friendly name is now \"Beta\" (was \"Alpha\").",
+                "Interface KNX IP Interface (1.1.200): tunnel address 1.1.30 added.",
+                "Interface KNX IP Interface (1.1.200): tunnel address 1.1.23 removed.",
+            ]
+        );
+        assert!(
+            set.changes
+                .iter()
+                .all(|c| c.kind == ChangeKind::InterfaceChanged)
+        );
+        assert_eq!(set.changes[3].field.as_deref(), Some("knxnet.tunnels"));
+
+        let added = describe(&with(None), &with(Some(before.clone())));
+        assert_eq!(
+            added.changes[0].sentence,
+            "Interface KNX IP Interface (1.1.200): KNXnet/IP settings added (assignment dhcp, \
+             tunnel addresses 1.1.22, 1.1.23)."
+        );
+        let mut reordered = before.clone();
+        reordered.tunnels.reverse();
+        let set = describe(&with(Some(before)), &with(Some(reordered)));
+        assert_eq!(set.len(), 1);
+        assert!(
+            set.changes[0]
+                .sentence
+                .contains("reordered to 1.1.23, 1.1.22")
+        );
     }
 }

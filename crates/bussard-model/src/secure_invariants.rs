@@ -361,6 +361,7 @@ mod tests {
                 .collect(),
                 security,
                 application_override: None,
+                knxnet: None,
                 lock: Default::default(),
             },
             file_stem: addr.to_string(),

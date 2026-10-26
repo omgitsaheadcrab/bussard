@@ -179,6 +179,7 @@ pub(crate) fn write_model(
     for d in &declared {
         println!("{}", d.sentence());
     }
+    print_knxnet_summary(&to_save);
     if !report.renamed.is_empty() {
         println!("renamed {} device file(s)", report.renamed.len());
     }
@@ -206,6 +207,40 @@ pub(crate) fn write_model(
         return Ok(report_merge(&merge, kept, choice));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// One line per IP interface whose `[knxnet]` table the model holds (issue
+/// #391): the assignment and the tunnel addresses. The project states the
+/// assignment only when it is not ETS's default, so a `dhcp` line says it is
+/// that default, and every line names the command that reads what the
+/// project does not carry (the address in use, the MAC address).
+fn print_knxnet_summary(model: &Model) {
+    for (ia, loaded) in &model.devices {
+        let Some(k) = &loaded.device.knxnet else {
+            continue;
+        };
+        let how = match k.assignment {
+            bussard_model::knxnet::IpAssignment::Dhcp => {
+                "IP assignment dhcp (ETS's default; the project names no other)".to_string()
+            }
+            bussard_model::knxnet::IpAssignment::Static => format!(
+                "static IP address {}",
+                k.address.map_or("(none)".to_string(), |a| a.to_string())
+            ),
+        };
+        let tunnels = if k.tunnels.is_empty() {
+            "no tunnel addresses".to_string()
+        } else {
+            format!(
+                "tunnel addresses {}",
+                bussard_model::knxnet::join_addresses(&k.tunnels)
+            )
+        };
+        println!(
+            "{ia}: KNXnet/IP settings: {how}, {tunnels}; `bussard status {ia}` reads the \
+             address in use and the MAC address from the device"
+        );
+    }
 }
 
 /// The download step of `import`: fetch what is missing, then say how many

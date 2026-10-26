@@ -315,6 +315,7 @@ mod tests {
             com_objects: Default::default(),
             security: None,
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
         };
         device.com_objects.insert(1, ComObject::default());

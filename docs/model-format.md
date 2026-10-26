@@ -188,6 +188,7 @@ defines one for that channel.
 | `replaced` | string | RFC 3339, set by `replace` |
 | `[location]` | `floor`, `room` | optional |
 | `[security]` | `activated`, `secure_commissioning` | intent only |
+| `[knxnet]` | see [below](#knxnet-ip-interfaces) | IP interfaces only; intent only |
 | `[parameters]` | table | device-level parameters |
 | `[links]` | table | device-level objects |
 | `[channel.<handle>]` | table | one per channel |
@@ -300,6 +301,68 @@ lock lists for one channel does not resolve in another channel's table.
 A device whose lock entry is missing cannot resolve its parameters or
 object keys; validation reports E021 with the command that creates the
 entry (`adopt`, `import`, or `import-product` plus `import`).
+
+### `[knxnet]` (IP interfaces)
+
+A KNX IP interface or router carries the settings of its KNXnet/IP parameter
+object (interface object type 11) in a `[knxnet]` table (issue #391):
+
+```toml
+[knxnet]
+assignment = "dhcp"            # or "static"
+address = "192.168.1.74"       # static only
+netmask = "255.255.255.0"      # static only
+gateway = "192.168.1.1"        # static only
+friendly_name = "Bocklisch Alpha"
+tunnels = ["1.1.22", "1.1.23", "1.1.24", "1.1.25", "1.1.26", "1.1.27", "1.1.28", "1.1.29"]
+```
+
+| Key | Type | Notes |
+|---|---|---|
+| `assignment` | `"dhcp"` or `"static"` | default `"dhcp"` |
+| `address`, `netmask`, `gateway` | IPv4 strings | with `static` only; `address` and `netmask` required there (E043) |
+| `friendly_name` | string | at most 30 ISO 8859-1 characters (E043); absent: bussard leaves the device's name alone |
+| `tunnels` | array of individual addresses | the tunnelling slots in order (`PID_ADDITIONAL_INDIVIDUAL_ADDRESSES`) |
+
+The table is what the user means. What the device reports (the address,
+netmask and gateway in use, the assignment method in effect, the MAC
+address, the capabilities and the state) are device facts, kept under
+`.bussard/facts/<address>.toml` by `bussard status <address>`, `describe`
+and `adopt` (see [reference.md](reference.md#bussardfacts)), never in this
+file or in `bussard.lock`: a read-only bus command does not change the lock,
+and an ETS re-import does not touch `.bussard/`.
+
+Where the values come from:
+
+- `import` reads the device instance's `<IPConfig>` and
+  `<AdditionalAddresses>`. `Assign="Fixed"` is `static`, with the project's
+  `IPAddress`, `SubnetMask` and `DefaultGateway`; anything else, including no
+  `Assign` (the ETS 6 export of the IPS 300 SREG states none), is `dhcp`, the
+  ETS default, and the project's `IPAddress` (the last address ETS saw) is
+  not kept. Each `<Address Address="22"/>` is a tunnel address on the
+  interface's own line, in document order. The project carries no friendly
+  name. The import summary prints one line per interface. Nothing is read
+  from the device's `<Security>` element: the device authentication code, the
+  management password and the tool key belong to the key store, never to the
+  model.
+- `adopt` of an IP interface reads the object and writes the table: the
+  configured method (`dhcp` when the device reports one the model does not
+  spell, such as BootP, with a note), the static settings when `static`, the
+  friendly name and the tunnels.
+- A re-import keeps the file's table. A project whose tunnel addresses or
+  static address differ is reported as a conflict (`knxnet.tunnels`,
+  `knxnet.address`); `--theirs` takes the project's.
+
+`validate` checks the table: E043 (it contradicts itself), E044 (a tunnel
+address twice, or the interface's own), E045 (a tunnel address off the
+interface's line), E046 (a tunnel address that is a device of the model) and,
+with the key checks, W047 (the tunnels differ from the tunnelling addresses
+the key store lists for the interface, which `admit_tunnel_senders` admits).
+`diff` and `status` describe a change as `Interface KNX IP Interface
+(1.1.200): tunnel address 1.1.30 added.`
+
+The write side (`plan` and `apply` of these settings) is not implemented yet;
+bussard reads and validates the table but does not write it to the device.
 
 ## `bussard.lock`
 
@@ -696,6 +759,11 @@ with file, line and column from `toml_edit` spans:
 | E024 | object linked to a GA whose main DPT number differs from the object's |
 | E025 | `send` on an object without the T flag; `listen` on an object without the W flag |
 | E026 | parameter values could not be checked because the product model is missing (warning) |
+| E043 | `[knxnet]` contradicts itself (static without address or netmask, static settings under dhcp, friendly name too long or not Latin-1) |
+| E044 | a `[knxnet]` tunnel address twice, or the interface's own |
+| E045 | a `[knxnet]` tunnel address off the interface's line |
+| E046 | a `[knxnet]` tunnel address that is a device of the model |
+| W047 | `[knxnet]` tunnels differ from the key store's tunnelling addresses for the interface (warning) |
 
 A GA mentioned in a device file that `groups.toml` does not define is a
 warning during `validate` and is added to `groups.toml` by `import`,

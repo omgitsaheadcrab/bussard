@@ -257,7 +257,7 @@ Introspect a device over the bus: discover its interface objects and, for each, 
 | `--keyring <FILE>` | the key store | The ETS `.knxkeys` keyring holding the target's KNX Data Secure tool key. Required for a security-activated device. A keyring that does not list the target only opens the [secure tunnel](#knxnetip-secure-tunnelling) and the device is read in the clear. The keyring password comes from `BUSSARD_KEYRING_PASSWORD`, never a flag. |
 | `--tool-key <HEX>` | | The raw 32-hex-character tool key, for a simulator or bench device with a synthetic key. Conflicts with `--keyring`. A process argument is visible to other users on the machine, so do not use it for a real installation. |
 
-The first `describe` of a device stores its interface objects and property descriptions as [device facts](#bussardfacts). A later `describe` checks the device's mask and application id (the descriptor read plus one property read) and, when both still match, prints the stored objects and descriptions instead of sending one `A_PropertyDescription_Read` per property: on a KNX Data Secure device about 4 requests instead of about 110. The report is the same either way; in text mode a note on stderr says the facts were reused. `--full` walks the descriptions again, `--refresh-facts` re-reads everything, and a changed mask or application id re-reads on its own.
+The first `describe` of a device stores its interface objects and property descriptions as [device facts](#bussardfacts). A later `describe` checks the device's mask and application id (the descriptor read plus one property read) and, when both still match, prints the stored objects and descriptions instead of sending one `A_PropertyDescription_Read` per property: on a KNX Data Secure device about 4 requests instead of about 110. The report is the same either way; in text mode a note on stderr says the facts were reused. `--full` walks the descriptions again, `--refresh-facts` re-reads everything, and a changed mask or application id re-reads on its own. A KNX IP interface's KNXnet/IP parameter object is read on every run and printed as a `KNXnet/IP` section (`knxnet` in `--json`), as `status <ADDRESS>` prints it (issue #391).
 
 A security-activated device refuses plain management access; pass its tool key with `--keyring` (or `--tool-key` for a test device) and `describe` runs over KNX Data Secure. The same two flags work on `flash`, `apply`, `plan` and `reconstruct`. See [SAFETY.md](SAFETY.md#known-limitations) for what is verified.
 
@@ -314,6 +314,8 @@ Guide a new device from programming mode into the model: product data, address a
 Product data fetches itself. Without `--product`, adopt reads the order number off the device and uses the archive `bussard.lock` pins for it in `<dir>/products/`; when there is none, it looks the order number up in bussard's pointer index (the one `import-product --order-number` uses), asks once (`--yes-download` answers yes), downloads and verifies the file, imports it and continues with it. An order number the index does not know is adopted without product data (identity and links by number), with the sentence that says where to get the file. `BUSSARD_PRODUCT_INDEX=<file.json>` points at another index of the same shape (a mirror, or a test with `file://` URLs).
 
 A device already at the target address gets no address write.
+
+**A KNX IP interface (issue #391).** When the device has a KNXnet/IP parameter object (object type 11), adopt reads it and writes the device file's `[knxnet]` table (assignment, static settings, friendly name, tunnel addresses) and stores the rest with the device facts; a table the model already holds stays. Read-only.
 
 **A Data Secure-activated device (issue #201).** When the keyring (`--keyring`, else `BUSSARD_KEYRING`, else `connection.keyring` in `bussard.toml`) lists the device in programming mode (password in `BUSSARD_KEYRING_PASSWORD`), adopt treats it as a device ETS has commissioned and only reads it:
 
@@ -520,14 +522,16 @@ The summary table lists each device as `commissioned`, `present` or `failed: <re
 | `--json` | off | Emit the summary as JSON; label lines then go to stderr and into each device's `label` field. |
 | `--keyring <FILE>` / `--tool-key <HEX>` | | KNX Data Secure tool key for `--flash` and `--apply`. |
 
-### `bussard status`
+### `bussard status [ADDRESS]`
 
 Show what has changed in the model since the last history snapshot, as plain sentences ("Rocker 1 on Hallway push button (1.1.5) now switches Porch light (0/0/4)."). Nothing here has reached a device: `status` reads files only. Always exits 0. With no snapshot yet it says so and stops.
 
+With an `ADDRESS`, `status` reads that device over the bus instead (issue #391): its mask and identity against `bussard.lock`, and for a KNX IP interface or router its KNXnet/IP parameter object (object type 11): the IP address in use and how it was assigned, the configured method and static settings, the MAC address, the friendly name, the KNX address, the tunnelling addresses, the routing multicast address, the capabilities and the device state (`ok`, `KNX fault`, `IP fault`). What it read is stored with the [device facts](#bussardfacts) and compared with the device file's `[knxnet]` table; each difference is one line. Read-only: descriptor and property reads, never a KNXnet/IP Secure property (PID 91 and up). A device without the object says so. A KNX Data Secure-activated device needs its tool key, as for `describe`.
+
 | Flag | Default | Meaning |
 |---|---|---|
-| `--json` | off | Emit the change set as JSON (`{"schema", "base": <snapshot id>, "changes": [...]}`). |
-| `--raw` | off | Print the file-level diff instead of the sentences. |
+| `--json` | off | Emit the change set as JSON (`{"schema", "base": <snapshot id>, "changes": [...]}`). With `ADDRESS`: `{"schema", "address", "name", "mask", "system_type", "identity", "knxnet", "model_knxnet", "knxnet_drift"}`. |
+| `--raw` | off | Print the file-level diff instead of the sentences. Not with `ADDRESS`. |
 
 ### `bussard history`
 
@@ -1053,6 +1057,27 @@ Every bus command that uses the facts first reads the device descriptor and the 
 
 `authorize = "unsupported"` lets `describe`, `plan`, `reconstruct`, the read phase of `apply` and the `flash` pre-flight skip `A_Authorize_Request`, which such a device leaves unanswered for the full response timeout (3 s per session). When the facts turn out stale on that connection the key is presented after all. The write phase of `apply` and `flash` then relies on the verdict its own read phase established. A device recorded as `granted` or `denied` (it answers, possibly asking for a key) is always asked, and `flash --bcu-key` always presents the key. The written frames of `apply` and `flash` do not change.
 
+For a KNX IP interface, `status <ADDRESS>`, `describe` and `adopt` add what its KNXnet/IP parameter object reported, re-read on every such command because the address in use can change under DHCP (issue #391):
+
+```toml
+[device_facts.knxnet]
+read_at = "2026-10-26T10:00:00Z"
+object_index = 4
+individual_address = "1.1.200"
+tunnels = ["1.1.22", "1.1.23"]
+current_assignment = ["dhcp"]
+assignment = ["dhcp"]
+assignment_mode = "dhcp"
+current_address = "192.168.1.74"
+current_netmask = "255.255.255.0"
+current_gateway = "192.168.1.1"
+mac = "00:22:D1:04:62:7D"
+routing_multicast = "224.0.23.12"
+capabilities = ["device management", "tunnelling"]
+state = "ok"
+friendly_name = "Bocklisch Alpha"
+```
+
 The facts live here, not in `devices/*.toml` or `bussard.lock`, because an ETS re-import rewrites those and never touches `.bussard/`, because the device files hold intent to review while the facts are observations, and because the lock is written by `import` and `adopt` only and is covered by snapshots and the model fingerprint, which a read-only bus command must not change. They are not part of a [bundle](#the-bundle-format). Without a model directory no facts are stored and every command reads the device as before.
 
 #### `.bussard/products`
@@ -1213,6 +1238,7 @@ status-position.send = "0/1/4"          # a status object: sends
 | `replaced` | string, optional | RFC 3339, written by `bussard replace`. |
 | `[location]` | `floor`, `room` | Physical location. |
 | `[security]` | `activated`, `secure_commissioning` | Intent only. What the device and project generated (`secure_capable`, `has_fdsk_certificate`, `sequence_number`) lives in the lock; key material never appears in either. |
+| `[knxnet]` | `assignment`, `address`, `netmask`, `gateway`, `friendly_name`, `tunnels` | An IP interface's KNXnet/IP settings (issue #391), intent only; what the device reports is a device fact. See [model-format.md](model-format.md#knxnet-ip-interfaces). |
 | `[parameters]`, `[links]` | tables | Device-level parameters and objects. |
 | `[channel.<handle>]` | table | `name` (your label), parameters (`key = value`), objects (`key.send = "GA"`, `key.listen = ["GA", …]`, `key.name`) and parameter pages (`[channel.<handle>.<page>]`) where the lock defines them. An object is named by its key or its number. |
 
@@ -1299,6 +1325,11 @@ One file per application program, generated from the archives in `products/` by 
 | W039 | a Secure-activated device sends on a secured GA, but `bussard.lock` records no `sequence_number` for it, so its receivers' sender tables (PID 54) can only be seeded from the keyring or with 0 | warning |
 | W040 | a keyring export `bussard keys export` wrote is older than the key store's last change, or `[home_assistant]` is configured and no export is newer than that change (`bussard.keys.meta.toml`) | warning |
 | W041 | a GA's `secure` flag and the `secure` flags of the Secure-capable objects linked to it disagree; the message names `bussard groups secure <ga> on\|off`, which sets the flag, the key store entry and the object flags together | warning |
+| E043 | an IP interface's `[knxnet]` table contradicts itself: `assignment = "static"` without `address` or `netmask`, `address`, `netmask` or `gateway` under `dhcp`, or a `friendly_name` longer than 30 characters or outside ISO 8859-1 | error |
+| E044 | a `[knxnet]` tunnel address is listed twice, or is the interface's own address | error |
+| E045 | a `[knxnet]` tunnel address is not on the interface's line | error |
+| E046 | a `[knxnet]` tunnel address is the address of a device in the model | error |
+| W047 | the `[knxnet]` tunnel addresses of an IP interface differ from the tunnelling addresses the key store (or keyring) lists for it (its `Host` entries), the addresses `admit_tunnel_senders` admits on the Secure devices; the message names both lists. Runs with the key checks, and only for an interface the store lists tunnelling addresses for | warning |
 | W042 | import time only: `bussard import` secures again a GA the model ran plain, or `bussard keys import` puts back the group key of one; it names the devices the next apply secures | warning |
 
 `validate` runs E027 to I031 and W034 with `BUSSARD_KEYRING`, else the key store `bussard.keys`, else `connection.keyring` (the same codes for a store and an export); `knx_validate` runs them with the server's keyring. The rules see addresses only, never a key.
@@ -1412,7 +1443,7 @@ Bus operations share one rate limiter (minimum 250 ms between operations, at mos
 | `knx_model_lookup` | `query` (substring), `limit` (default 50, max 500) | Case-insensitive matches across GA names/addresses, device names/IAs, room names, com objects and channels, grouped by kind (`groups`, `devices`, `objects`, `channels`), plus `capabilities`. An object matches on the name the device file gives a linked object and, for every object the device has, linked or not, on the vendor text, function and key; each hit carries `device_ia`, `device_name`, `channel` (the handle), `object` (the number), `key`, `text`, `function` and `linked_gas`. A channel matches on its vendor text, name or handle and lists its object numbers. `capabilities` searches what the installed devices could do: the parameter texts and enum choice texts of their product models, every word of the query in the page title, parameter text and choice text together (case and umlaut spelling do not matter: `Dämmerung` finds `daemmerung`). One entry per device page or channel: `device_ia`, `block_or_channel`, `handle` (for `knx_show_device`), the best match's `parameter`, `key` and `choice`, `active`, `selected` (the device has it now), `status` and up to five `more` matches. `provides` entries come first, then `could provide` ones on inactive pages (spare capacity, with `enable` and `needs` as `knx_show_device` gives them), then active pages set to another choice. The parsed product models are cached as JSON under `.bussard/model-cache/<application>.json`, rebuilt when the model file changes. `limit` bounds each kind. |
 | `knx_get_group` | `ga` | The GA's definition, every link sending to or listening on it, and the last telegram seen on it. |
 | `knx_get_device` | `address` | One device's identity, product, location, channels, com-object table, and links: the configured state. For what the device can do (inactive channels and pages, functions, choices) use `knx_show_device`. |
-| `knx_show_device` | `address`, `channel` (optional; a handle, a page handle, or `device`), `toml` (optional), `inactive` (optional) | What [`bussard device`](#bussard-device-address-channel) shows, as JSON: what the device can do. The channels; for an application without channels of its own the ETS pages (`blocks`), for one with channels the `inactive_channels`, each inactive one with `inactive` (`enable`, `would_show`, `needs`); a `summary` of what is inactive; and for `channel` its parameters (also the ones at their vendor default, `at_default: true`) and objects, or for an inactive page the ones it would show; with `toml: true` also the paste-ready snippet; `how_to_change` says which tool edits and pushes what. Unscoped, an inactive page whose `enable` chain repeats an earlier page's keeps only its own steps and names the earlier pages in `also_needs` (Theben's C10 behind C5 .. C9). With `channel` the response stays small (issue #304): `blocks` and `inactive_channels` are one line each (handle, text, state, parameter and object counts), the scope keeps its full `inactive` detail, `inactive: true` adds the other inactive pages in full as `inactive_pages`, and `how_to_change` is left out (the tool description carries it). Files only. |
+| `knx_show_device` | `address`, `channel` (optional; a handle, a page handle, or `device`), `toml` (optional), `inactive` (optional) | What [`bussard device`](#bussard-device-address-channel) shows, as JSON: what the device can do. The channels; for an application without channels of its own the ETS pages (`blocks`), for one with channels the `inactive_channels`, each inactive one with `inactive` (`enable`, `would_show`, `needs`); a `summary` of what is inactive; and for `channel` its parameters (also the ones at their vendor default, `at_default: true`) and objects, or for an inactive page the ones it would show; with `toml: true` also the paste-ready snippet; `how_to_change` says which tool edits and pushes what. Unscoped, an inactive page whose `enable` chain repeats an earlier page's keeps only its own steps and names the earlier pages in `also_needs` (Theben's C10 behind C5 .. C9). With `channel` the response stays small (issue #304): `blocks` and `inactive_channels` are one line each (handle, text, state, parameter and object counts), the scope keeps its full `inactive` detail, `inactive: true` adds the other inactive pages in full as `inactive_pages`, and `how_to_change` is left out (the tool description carries it). For a KNX IP interface, `knxnet` holds the device file's `[knxnet]` table (`model`), what the device last reported (`device`, from the device facts `status <ADDRESS>` and `describe` keep), where they differ (`drift`) and `how_to_change`; `knx_set_parameter` does not edit it (issue #391). Files only. |
 | `knx_recent_telegrams` | `limit` (default 50, max 1000), `ga` (GA or prefix), `source` (IA), `since` (RFC3339), all optional | Recent decoded telegrams, oldest first. With `--capture-db`, windows that predate the in-memory ring are topped up from the capture database. |
 | `knx_wait_for_telegram` | `timeout_seconds` (max 300), `ga`, `source` (optional) | Blocks until a matching telegram arrives or the timeout elapses. A timeout is a normal result, not an error. Enables "press the button now" debugging. With the server's keyring a secured group telegram arrives decrypted, with `secured: true`; without its group key it keeps the ciphertext and says `secure_status: "no_key"`. |
 | `knx_validate` | `severity` (optional: `error`, `warning` (default) or `info`), `address` (optional: `1.1.4`, or `1.1.` for a line), `group` (optional: `3/2/0`, or `3/` for a range) | The diagnostics (code, severity, message, location) at or above `severity`, about the device or group when given (matched on the location, else the message), including the keyring rules (E027 to I031) against the server's keyring. `counts` always counts every error, warning and info in the model, `shown` how many are returned, and `note` what the filter left out. |

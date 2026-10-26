@@ -67,6 +67,8 @@ pub mod schema {
     pub const SHOW: u32 = 1;
     /// `bussard status --json`.
     pub const STATUS: u32 = 1;
+    /// `bussard status <ADDRESS> --json`: one device's live state (issue #391).
+    pub const STATUS_DEVICE: u32 = 1;
     /// `bussard test --json`.
     pub const TEST: u32 = 1;
     /// `bussard test --secure-idle --json`.

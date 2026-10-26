@@ -629,6 +629,7 @@ mod tests {
                         com_objects: BTreeMap::new(),
                         security: None,
                         application_override: None,
+                        knxnet: None,
                         lock: Default::default(),
                     },
                     file_stem: a.to_string(),

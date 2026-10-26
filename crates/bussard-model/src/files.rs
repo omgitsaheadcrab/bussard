@@ -240,6 +240,8 @@ pub(crate) struct DeviceFileTop {
     pub replaced: Option<String>,
     pub location: Option<Location>,
     pub security: Option<SecurityIntent>,
+    /// The `[knxnet]` table of an IP interface (issue #391).
+    pub knxnet: Option<crate::knxnet::KnxnetConfig>,
     #[serde(default)]
     #[allow(dead_code)] // Classified from the document, see `scope_entries`.
     pub parameters: toml::Table,
@@ -1084,6 +1086,7 @@ pub(crate) fn join_device(
         com_objects,
         security,
         application_override: top.application,
+        knxnet: top.knxnet,
         lock: extras,
     };
     // A hidden value of a ref the configuration reaches under the current

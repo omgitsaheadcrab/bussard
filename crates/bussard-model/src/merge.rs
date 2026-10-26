@@ -526,6 +526,34 @@ fn overlay_device(
     // theirs (see `overlay_product`).
     overlay_product(&path, ours, theirs, report);
 
+    // The `[knxnet]` table of an IP interface (issue #391) is the user's: kept
+    // from ours. The project owns the tunnel addresses and a static address,
+    // so a difference there is reported; the friendly name and the
+    // assignment the project may not state are not compared.
+    if let Some(our_k) = &ours.knxnet {
+        if let Some(their_k) = &theirs.knxnet {
+            let list = |k: &crate::knxnet::KnxnetConfig| crate::knxnet::join_addresses(&k.tunnels);
+            let (a, b) = (list(our_k), list(their_k));
+            report_opt(
+                report,
+                &path,
+                "knxnet.tunnels",
+                Some(a.as_str()).filter(|s| !s.is_empty()),
+                Some(b.as_str()).filter(|s| !s.is_empty()),
+            );
+            if let (Some(a), Some(b)) = (our_k.address, their_k.address) {
+                report_opt(
+                    report,
+                    &path,
+                    "knxnet.address",
+                    Some(&a.to_string()),
+                    Some(&b.to_string()),
+                );
+            }
+        }
+        theirs.knxnet = Some(our_k.clone());
+    }
+
     // Channel names: matched by channel key (the handle), else by channel id.
     // A hand-set name (a label parameter value, or a name that differs from
     // the vendor text) is kept, with a differing fresh value reported; an
@@ -807,6 +835,7 @@ mod tests {
             com_objects: BTreeMap::new(),
             security: None,
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
         }
     }
@@ -1069,6 +1098,52 @@ mod tests {
                 .conflicts
                 .iter()
                 .any(|c| c.field == "name" && c.path == "links/1.1.4#0")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_keeps_our_knxnet_and_reports_tunnel_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::knxnet::KnxnetConfig;
+        let mut our_dev = device("1.1.200", "IP");
+        our_dev.knxnet = Some(KnxnetConfig {
+            friendly_name: Some("Alpha".to_string()),
+            tunnels: vec![ia("1.1.22")],
+            ..KnxnetConfig::default()
+        });
+        let mut their_dev = device("1.1.200", "IP");
+        their_dev.knxnet = Some(KnxnetConfig {
+            tunnels: vec![ia("1.1.22"), ia("1.1.23")],
+            ..KnxnetConfig::default()
+        });
+        let ours = model_with(vec![our_dev.clone()], Groups::default(), Links::default());
+        let theirs = model_with(vec![their_dev], Groups::default(), Links::default());
+        let (merged, report) = merge(&ours, &theirs);
+        assert_eq!(
+            merged.devices[&ia("1.1.200")].device.knxnet,
+            our_dev.knxnet,
+            "the device file's table is kept"
+        );
+        let fields: Vec<&str> = report.conflicts.iter().map(|c| c.field.as_str()).collect();
+        assert_eq!(fields, ["knxnet.tunnels"]);
+        assert_eq!(report.conflicts[0].theirs, "1.1.22, 1.1.23");
+
+        // A model without the table takes the project's.
+        let bare = model_with(
+            vec![device("1.1.200", "IP")],
+            Groups::default(),
+            Links::default(),
+        );
+        let (merged, report) = merge(&bare, &theirs);
+        assert!(report.conflicts.is_empty());
+        assert_eq!(
+            merged.devices[&ia("1.1.200")]
+                .device
+                .knxnet
+                .as_ref()
+                .map(|k| k.tunnels.len()),
+            Some(2)
         );
         Ok(())
     }

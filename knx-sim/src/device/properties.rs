@@ -111,6 +111,32 @@ impl Device {
         apdu: &Apdu,
     ) -> Result<DeviceReaction, DeviceError> {
         let (object, pid, count, start, _) = Self::property_header(apdu)?;
+        // The KNXnet/IP parameter object of an IP interface (bussard issue
+        // #391) serves its properties as arrays: start 0 is the element count,
+        // a range past the end is refused whole.
+        if pid != super::interface_object::PID_OBJECT_TYPE
+            && let Some(obj) = self.objects.get(&object)
+            && obj
+                .property(super::interface_object::PID_OBJECT_TYPE)
+                .map(|p| p.value.as_slice())
+                == Some(&super::knxnet_object::IOT_KNXNET_IP_PARAMETER.to_be_bytes()[..])
+        {
+            let answer = obj
+                .property(pid)
+                .and_then(|p| super::knxnet_object::array_read(pid, &p.value, count, start));
+            let (n, bytes) = answer.unwrap_or((0, Vec::new()));
+            let mut data = vec![
+                object,
+                pid,
+                (n << 4) | ((start >> 8) as u8 & 0x0F),
+                (start & 0xFF) as u8,
+            ];
+            data.extend_from_slice(&bytes);
+            return Ok(DeviceReaction {
+                responses: vec![self.respond(tool, 0x3D6, &data)],
+                did_master_reset: false,
+            });
+        }
         // PID_LOAD_STATE_CONTROL read-back returns the LIVE load state as a
         // single octet (the 10-octet load-event value is write-only). The state
         // lives in the load-state machine, not the seeded property, so a read

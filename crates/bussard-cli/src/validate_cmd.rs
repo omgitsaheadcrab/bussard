@@ -54,6 +54,11 @@ fn keyring_diagnostics(model: &Model, dir: &Path) -> Vec<Diagnostic> {
         model,
         facts.as_ref(),
     ));
+    // W047 (issue #391): an IP interface's [knxnet] tunnels against the
+    // tunnelling addresses the key store lists for it.
+    diags.extend(
+        bussard_service::admission::knxnet_tunnel_keyring_diagnostics(model, facts.as_ref()),
+    );
     diags
 }
 

@@ -375,7 +375,10 @@ impl BussardMcp {
         handle>.<key>`, `key@reference` or the bare reference), and the unscoped response's \
         `how_to_change` says how to edit and push them (parameters with knx_set_parameter; \
         push with knx_plan_device then knx_apply_device). Without product data it says so, \
-        says what to run, and lists what the lock has."
+        says what to run, and lists what the lock has. For a KNX IP interface, `knxnet` holds \
+        its [knxnet] table (`model`: IP assignment, static settings, friendly name, tunnel \
+        addresses), what the device last reported (`device`: address in use, MAC, tunnels, \
+        state) and where they differ (`drift`)."
     )]
     async fn knx_show_device(
         &self,
@@ -398,7 +401,7 @@ impl BussardMcp {
         let view =
             bussard_model::device_view::device_view(&model, &products, ia, args.channel.as_deref())
                 .map_err(|e| invalid(e.to_string()))?;
-        let value = tools::show_device_result(
+        let mut value = tools::show_device_result(
             view,
             args.inactive,
             args.toml,
@@ -407,6 +410,13 @@ impl BussardMcp {
         .map_err(|e| {
             ErrorData::internal_error(format!("serializing the device view: {e}"), None)
         })?;
+        // An IP interface's KNXnet/IP settings and facts (issue #391).
+        if let (Some(map), Some(knxnet)) = (
+            value.as_object_mut(),
+            crate::tools_model::knxnet_section(&self.state.dir, &model, ia),
+        ) {
+            map.insert("knxnet".to_string(), knxnet);
+        }
         ok(value)
     }
 
@@ -605,6 +615,11 @@ impl BussardMcp {
             &model,
             facts.as_ref(),
         ));
+        // W047 (issue #391): an IP interface's [knxnet] tunnels against the
+        // tunnelling addresses the key store lists for it.
+        extra.extend(
+            bussard_service::admission::knxnet_tunnel_keyring_diagnostics(&model, facts.as_ref()),
+        );
         // W040 (issue #348): keyring exports older than the key store.
         extra.extend(bussard_model::keystore_meta::stale_export_diagnostics(
             &model,

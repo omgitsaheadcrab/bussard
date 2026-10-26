@@ -28,6 +28,7 @@ fn fresh_device() -> Result<Device, Box<dyn std::error::Error>> {
         module_bases: BTreeMap::new(),
         com_objects: BTreeMap::new(),
         application_override: None,
+        knxnet: None,
         lock: Default::default(),
         security: None,
     })

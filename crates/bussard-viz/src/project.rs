@@ -537,6 +537,7 @@ mod tests {
             com_objects,
             security: None,
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
         };
 
@@ -554,6 +555,7 @@ mod tests {
             com_objects: BTreeMap::new(),
             security: None,
             application_override: None,
+            knxnet: None,
             lock: Default::default(),
         };
 
