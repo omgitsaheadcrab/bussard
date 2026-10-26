@@ -356,11 +356,13 @@ def cmd_image(args) -> int:
     ops = resolve_device(load_ops(args.capture, load_keyring(args)), args.device)
     index = memimage.compose(ops, args.out, source=args.capture)
     print(
-        "%s: %d region(s), %d octet(s) written, %d allocation(s), %d property write(s) -> %s"
+        "%s: %d region(s), %d octet(s) written, %d read-confirmed, %d allocation(s), "
+        "%d property write(s) -> %s"
         % (
             ops.device,
             len(index["regions"]),
             sum(r["length"] for r in index["regions"]),
+            sum(r["length"] for r in index["confirmed"]),
             len(index["allocations"]),
             index["property_writes"],
             args.out,

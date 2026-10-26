@@ -869,6 +869,113 @@ class TestImage(unittest.TestCase):
         self.assertEqual(memimage.region_short("app segment 0x4800"), "seg0x4800")
 
 
+def mem_read(addr: int, count: int, seq: int = 0) -> bytes:
+    return numbered(seq, 0x200 | count, struct.pack("!H", addr))
+
+
+def mem_response(addr: int, data: bytes, seq: int = 0) -> bytes:
+    return numbered(seq, 0x240 | len(data), struct.pack("!H", addr) + data)
+
+
+class TestReadConfirmed(unittest.TestCase):
+    """Issue #384: octets ETS read and did not write are read-confirmed."""
+
+    def capture(self) -> str:
+        """A read-compare download (mask 0701 style) of 1.1.5: ETS reads
+        0x4000..0x4003, writes the one octet that differs (0x4001) and an
+        octet it never read (0x4010), then reads 0x4001 back and gets a value
+        other than the one it wrote (the Meteodata marker case)."""
+        path = tempfile.mkstemp(suffix=".pcapng")[1]
+        self.addCleanup(os.unlink, path)
+        tool, dev = "0.0.0", "1.1.5"
+        frames = [
+            cemi_ldata(tool, dev, t_connect()),
+            cemi_ldata(tool, dev, mem_read(0x4000, 4, seq=0)),
+            cemi_ldata(dev, tool, mem_response(0x4000, b"\xaa\xbb\xcc\xdd", seq=0), mc=0x29),
+            cemi_ldata(tool, dev, mem_write(0x4001, b"\x11", seq=1)),
+            cemi_ldata(tool, dev, mem_write(0x4010, b"\x22", seq=2)),
+            cemi_ldata(tool, dev, mem_read(0x4001, 1, seq=3)),
+            cemi_ldata(dev, tool, mem_response(0x4001, b"\x00", seq=1), mc=0x29),
+            cemi_ldata(tool, dev, t_disconnect()),
+        ]
+        udp_capture(path, [(tunneling_request(f, seq=n), True) for n, f in enumerate(frames)])
+        return path
+
+    def tmpdir(self) -> str:
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        return path
+
+    def image(self) -> str:
+        out = self.tmpdir()
+        self.assertEqual(main(["image", self.capture(), "--device", "1.1.5", "--out", out]), 0)
+        return out
+
+    def plan(self, data: bytes) -> str:
+        plan_dir = self.tmpdir()
+        with open(os.path.join(plan_dir, "p.bin"), "wb") as fh:
+            fh.write(data)
+        step = {"index": 1, "label": "", "image": {
+            "image_kind": "parameters", "object": None, "offset": 0, "address": 0x4000,
+            "file": "p.bin", "length": len(data), "mask_file": None}}
+        with open(os.path.join(plan_dir, "plan.json"), "w") as fh:
+            json.dump({"device": "1.1.5", "system": "7", "application": {"id": "M-00FA_A-1"},
+                       "steps": [step], "tables": []}, fh)
+        return plan_dir
+
+    def test_compose_confirmed_read_not_written_read_then_written_written_only(self):
+        out = self.image()
+        with open(os.path.join(out, "regions.json")) as fh:
+            index = json.load(fh)
+        # Written: 0x4001 (read first, then written) and 0x4010 (written only).
+        self.assertEqual([(r["start"], r["length"]) for r in index["regions"]],
+                         [(0x4001, 1), (0x4010, 1)])
+        # Confirmed: read and never written. 0x4001 is not, though ETS read
+        # it before and after its write; 0x4010 is not, never read.
+        self.assertEqual([(r["start"], r["file"]) for r in index["confirmed"]],
+                         [(0x4000, "confirmed/0x004000.bin"), (0x4002, "confirmed/0x004002.bin")])
+        with open(os.path.join(out, "confirmed", "0x004002.bin"), "rb") as fh:
+            self.assertEqual(fh.read(), b"\xcc\xdd")
+        ets = memimage.EtsMemory(out)
+        self.assertEqual(ets.confirmed, {0x4000: 0xAA, 0x4002: 0xCC, 0x4003: 0xDD})
+        self.assertEqual(ets.get(0x4001), 0x11)
+
+    def test_compare_confirmed_identical_while_written_is_thin(self):
+        report = memimage.compare(self.plan(b"\xaa\x11\xcc\xdd"), self.image())
+        self.assertEqual(report["verdict"], memimage.NOT_COMPARABLE)  # 1 of 4 written
+        conf = report["confirmed"]
+        self.assertEqual((conf["verdict"], conf["octets"], conf["compared"], conf["placed"]),
+                         (memimage.IDENTICAL, 3, 3, 4))
+        self.assertEqual(conf["percent"], 75.0)
+        text = "\n".join(memimage.render(report))
+        self.assertIn("written: not-comparable, confirmed: identical (3 octets)", text)
+        self.assertIn("confirmed coverage 75.0 %", text)
+
+    def test_compare_confirmed_mismatch_is_reported_separately(self):
+        report = memimage.compare(self.plan(b"\xaa\x11\xcc\x00"), self.image())
+        par = report["regions"][0]
+        # The written octet matches; the confirmed side names the mismatch.
+        self.assertEqual(par["verdict"], memimage.IDENTICAL)
+        conf = report["confirmed"]
+        self.assertEqual(conf["verdict"], memimage.DIFFERS)
+        self.assertEqual(conf["mismatches"], [{"address": 0x4003, "offset": 3, "bussard": "00",
+                                               "ets": "dd", "region": "parameters"}])
+        self.assertEqual(memimage.confirmed_text(report),
+                         "written: not-comparable, confirmed: 1 of 3 octets differ at 0x4000+3")
+        self.assertIn("confirmed mismatch 0x004003 (par+0x3): bussard 00, device/ETS dd",
+                      "\n".join(memimage.render(report)))
+
+    def test_compare_without_confirmed_index_still_works(self):
+        out = self.image()
+        with open(os.path.join(out, "regions.json")) as fh:
+            index = json.load(fh)
+        del index["confirmed"]
+        with open(os.path.join(out, "regions.json"), "w") as fh:
+            json.dump(index, fh)
+        conf = memimage.compare(self.plan(b"\xaa\x11\xcc\xdd"), out)["confirmed"]
+        self.assertEqual((conf["verdict"], conf["octets"]), (memimage.NOT_COMPARABLE, 0))
+
+
 def ext_write(obj_type: int, pid: int, count: int, index: int, data: bytes, seq: int = 0) -> bytes:
     """A_PropertyExtValue_WriteCon on instance 1 of an object type."""
     head = struct.pack("!H", obj_type) + ((1 << 12) | pid).to_bytes(3, "big")
@@ -954,6 +1061,61 @@ class TestPropertyWrites(unittest.TestCase):
         self.assertFalse(ds.is_key_material(4, None, 56, 32))  # not the security object
         self.assertTrue(ds.is_key_material(None, 4, 56, 16))
         self.assertFalse(ds.is_key_material(None, 0, 56, 2))  # PID_MAX_APDU_LENGTH
+        # PID 54 (sender table) is never a key, however long (#384); PID 53
+        # and the tool key stay hashed.
+        self.assertFalse(ds.is_key_material(17, None, 54, 16))
+        self.assertFalse(ds.is_key_material(17, None, 54, 64))
+        self.assertTrue(ds.is_key_material(17, None, 53, 18))
+        self.assertTrue(ds.is_key_material(17, None, 56, 16))
+
+    def test_compose_shows_a_key_sized_pid54_write(self):
+        path = tempfile.mkstemp(suffix=".pcapng")[1]
+        self.addCleanup(os.unlink, path)
+        senders = bytes.fromhex("1105" + "0040ab845d7b" + "1107" + "004000000002")
+        frames = [
+            cemi_ldata("0.0.0", "1.1.5", t_connect()),
+            cemi_ldata("0.0.0", "1.1.5", ext_write(17, 54, 2, 1, senders, seq=0)),
+            cemi_ldata("0.0.0", "1.1.5", ext_write(17, 56, 1, 1, bytes(range(16)), seq=1)),
+            cemi_ldata("0.0.0", "1.1.5", t_disconnect()),
+        ]
+        udp_capture(path, [(tunneling_request(f, seq=n), True) for n, f in enumerate(frames)])
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        self.assertEqual(main(["image", path, "--device", "1.1.5", "--out", out]), 0)
+        with open(os.path.join(out, "properties.json")) as fh:
+            props = json.load(fh)
+        self.assertEqual(props[0]["data"], senders.hex())
+        self.assertEqual(props[1]["data"], self.redacted(bytes(range(16))))
+        # The decrypted-APDU path (trace, ops) applies the same rule.
+        from knxip import decode_apdu
+        payload = (struct.pack("!H", 17) + ((1 << 12) | 54).to_bytes(3, "big") + bytes([2])
+                   + struct.pack("!H", 1) + senders)
+        apdu = ds.redact_keys(decode_apdu(0x1CE, payload, 0x0E))
+        self.assertEqual(apdu.fields.get("data"), senders.hex())
+
+    def test_sender_table_names_both_lists_across_lengths(self):
+        """bussard admits 1.1.5 and 1.1.7, ETS only 1.1.5: the writes differ in
+        length, so the per-write alignment shows them one-sided; the sender
+        table line names both lists with their sequence numbers."""
+        ours = [self.sec(54, "1105" + "000000000010" + "1107" + "000000000020", length=16,
+                         step=24)]
+        ets = [self.sec(54, "1105" + "000000000011", length=8, seq=5,
+                        service="A_PropertyExtValue_WriteCon")]
+        table = memimage._sender_table(ours, ets)
+        self.assertEqual(table, {"value": "differs",
+                                 "bussard": "1.1.5 (seq 16), 1.1.7 (seq 32)",
+                                 "ets": "1.1.5 (seq 17)"})
+        props = {"verdict": memimage.DIFFERS, "bussard_writes": 1, "ets_writes": 1,
+                 "value_counts": {}, "matched": [], "sender_table": table,
+                 "bussard_only": [{"step": 24, "key": ["type17.1", 54, 16]}],
+                 "ets_only": [{"ets_seq": 5, "service": "A_PropertyExtValue_WriteCon",
+                               "key": ["type17.1", 54, 8], "data": ""}]}
+        lines = memimage.render_properties(props)
+        self.assertIn("      sender table (PID 54): ETS 1.1.5 (seq 17)", lines)
+        self.assertIn("      sender table (PID 54): bussard 1.1.5 (seq 16), 1.1.7 (seq 32)", lines)
+        # Equal sets: no sender table line; a redacted side: no table at all.
+        self.assertEqual(memimage._sender_table(ours, ours)["value"], "equal")
+        self.assertIsNone(memimage._sender_table(ours, [self.sec(54, "redacted:00", length=8)]))
 
     def test_compare_properties_aligns_plan_steps(self):
         ets = self.image_dir()
@@ -1034,11 +1196,14 @@ class TestPropertyWrites(unittest.TestCase):
         ets = self.sec(54, "1105" + "0040ab845d77")
         self.assertEqual(
             memimage._value_check(ours, ets),
-            ("equal", "sequence numbers differ: ETS 0040ab845d77, bussard 0040102ea9ce"),
+            ("equal", "sequence numbers differ: ETS 1.1.5 (seq %d); bussard 1.1.5 (seq %d)"
+             % (0x0040AB845D77, 0x0040102EA9CE)),
         )
         self.assertEqual(memimage._value_check(ours, dict(ets, data=ours["data"])), ("equal", ""))
         outcome, why = memimage._value_check(ours, self.sec(54, "1106" + "0040ab845d77"))
-        self.assertEqual((outcome, why), ("differs", "senders differ: ETS 1.1.6, bussard 1.1.5"))
+        self.assertEqual((outcome, why), (
+            "differs", "senders differ: ETS 1.1.6 (seq %d); bussard 1.1.5 (seq %d)"
+            % (0x0040AB845D77, 0x0040102EA9CE)))
         two = "1105" + "000000000001" + "1106" + "000000000001"
         swapped = "1106" + "000000000001" + "1105" + "000000000001"
         outcome, why = memimage._value_check(self.sec(54, two), self.sec(54, swapped))

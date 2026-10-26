@@ -27,6 +27,19 @@ values where both sides carry one (bytes, or the hash when redacted). That
 parity gets its own verdict next to the image verdict. This is the offline
 conformance oracle of the physical campaign (issue #89).
 
+Read-compare downloads (issue #384): a mask 0701 device that ETS already
+programmed is not loaded again. ETS reads its memory, writes only the octets
+that differ from its image, and restarts, so the capture holds few written
+octets. Every octet ETS read (`A_Memory_Response`, a successful
+`A_MemoryExtended_Read_Response`) and did not write anywhere in the capture is
+*read-confirmed*: ETS's image equals what the device answered. `compose` writes
+those as `confirmed/0x<addr>.bin` next to the written regions (the last read
+wins), and `compare` checks bussard's planned octets against them separately
+from the written ones, with its own coverage and verdict. An octet ETS wrote
+is a written octet only, even when ETS read it before or after the write: the
+written value is ETS's image, and a read-back may differ from it (the
+Meteodata 1.1.202 clears its `0x4800+0` marker after ETS writes `0xAA`).
+
 A diff is only as strong as what it compared. `compare` also reports the
 coverage (issue #347): of the octets bussard places, how many the capture
 holds a value for. A region's placed octets are the ones a parameter placement
@@ -50,7 +63,7 @@ import re
 import struct
 from typing import Dict, List, Optional, Tuple
 
-from datasecure import SECURITY_OBJECT_TYPE, is_key_material
+from datasecure import PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE, SECURITY_OBJECT_TYPE, is_key_material
 from normalize import KIND_ALLOC, KIND_MEM_WRITE, DeviceOps, coalesce
 
 # LdCtrl subtypes of an `AdditionalLoadControls` (event 3) record.
@@ -177,6 +190,49 @@ def table_refs(ops: DeviceOps) -> Dict[int, int]:
     return out
 
 
+# Responses that carry memory the device holds (an extended write response
+# carries a return code and maybe a CRC, never memory).
+MEMORY_READ_RESPONSES = ("A_Memory_Response", "A_MemoryExtended_Read_Response")
+
+
+def memory_reads(ops: DeviceOps) -> List[Tuple[int, bytes]]:
+    """Every memory read response the device sent the tool, in order."""
+    reads = []
+    for op in ops.ops:
+        apdu = op.apdu
+        if op.direction != "res" or apdu is None or apdu.name not in MEMORY_READ_RESPONSES:
+            continue
+        if apdu.name == "A_MemoryExtended_Read_Response" and apdu.fields.get("rc") != "0x00":
+            continue
+        addr = op.detail.get("addr_int")
+        if isinstance(addr, int) and op.data:
+            reads.append((addr, op.data))
+    return reads
+
+
+def confirmed_octets(ops: DeviceOps) -> Dict[int, int]:
+    """The read-confirmed octets (see the module doc): address -> the value
+    the device answered last, for every octet read and never written."""
+    written = {addr + i for addr, data in memory_writes(ops) for i in range(len(data))}
+    out: Dict[int, int] = {}
+    for addr, data in memory_reads(ops):
+        for i, b in enumerate(data):
+            if addr + i not in written:
+                out[addr + i] = b
+    return out
+
+
+def _runs(octets: Dict[int, int]) -> List[Tuple[int, bytes]]:
+    """Contiguous runs of an address -> octet map."""
+    runs: List[Tuple[int, bytearray]] = []
+    for addr in sorted(octets):
+        if runs and runs[-1][0] + len(runs[-1][1]) == addr:
+            runs[-1][1].append(octets[addr])
+        else:
+            runs.append((addr, bytearray([octets[addr]])))
+    return [(start, bytes(data)) for start, data in runs]
+
+
 def memory_writes(ops: DeviceOps) -> List[Tuple[int, bytes]]:
     writes = []
     for op in ops.ops:
@@ -204,7 +260,6 @@ PID_LOAD_STATE_CONTROL = 5
 # --dry-run --dump-images` through the environment and never written to disk.
 ORACLE_SALT_ENV = "BUSSARD_ORACLE_SALT"
 PID_GRP_KEY_TABLE = 53
-PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE = 54
 GROUP_KEY_ENTRY_LEN = 18  # group address (2) + key (16)
 SENDER_ENTRY_LEN = 8  # individual address (2) + sequence number (6)
 
@@ -289,11 +344,15 @@ def property_writes(ops: DeviceOps) -> List[Dict[str, object]]:
     return out
 
 
+CONFIRMED_DIR = "confirmed"
+
+
 def compose(ops: DeviceOps, out_dir: str, source: str = "") -> Dict[str, object]:
     """Writes the composed image of one device's download into `out_dir`.
 
     Returns (and writes as `regions.json`) the index: one entry per contiguous
-    written region, the allocation records, and the object bases read back.
+    written region, one per contiguous run of read-confirmed octets (under
+    `confirmed/`), the allocation records, and the object bases read back.
     """
     os.makedirs(out_dir, exist_ok=True)
     writes = memory_writes(ops)
@@ -334,6 +393,18 @@ def compose(ops: DeviceOps, out_dir: str, source: str = "") -> Dict[str, object]
                 fh.write(bytes(buf))
             rec["composed_file"] = name
 
+    confirmed = []
+    runs = _runs(confirmed_octets(ops))
+    if runs:
+        os.makedirs(os.path.join(out_dir, CONFIRMED_DIR), exist_ok=True)
+    for start, data in runs:
+        name = "%s/0x%06X.bin" % (CONFIRMED_DIR, start)
+        with open(os.path.join(out_dir, name), "wb") as fh:
+            fh.write(data)
+        confirmed.append(
+            {"start": start, "length": len(data), "sha256": sha256(data), "file": name}
+        )
+
     props = property_writes(ops)
     with open(os.path.join(out_dir, "properties.json"), "w", encoding="utf-8") as fh:
         json.dump(props, fh, indent=2)
@@ -343,6 +414,7 @@ def compose(ops: DeviceOps, out_dir: str, source: str = "") -> Dict[str, object]
         "device": ops.device,
         "source": os.path.basename(source),
         "regions": regions,
+        "confirmed": confirmed,
         "allocations": allocs,
         "table_refs": {str(k): v for k, v in sorted(table_refs(ops).items())},
         "property_writes": len(props),
@@ -378,6 +450,14 @@ class EtsMemory:
             ):
                 for i in range(int(rec["size"])):
                     self.filled[rec["base"] + i] = int(rec.get("fill_byte", 0))
+        # Read-confirmed octets (never written in the capture).
+        self.confirmed: Dict[int, int] = {}
+        for region in self.index.get("confirmed", []):
+            with open(os.path.join(image_dir, region["file"]), "rb") as fh:
+                data = fh.read()
+            for i, b in enumerate(data):
+                if region["start"] + i not in self.written:
+                    self.confirmed[region["start"] + i] = b
         self.bases = {int(k): v for k, v in self.index.get("table_refs", {}).items()}
         # The base read back right after each object's allocation wins over a
         # stale read taken before the download.
@@ -509,10 +589,19 @@ def compare(
         compared = diffs = fill_diffs = 0
         first = None
         fill_offsets: List[int] = []
+        conf_compared = 0
+        conf_mismatches: List[Dict[str, object]] = []
         for i, b in enumerate(ours):
             if mask is not None and i < len(mask) and mask[i] != 0xFF:
                 continue
             covered_addrs.add(addr + i)
+            read = ets.confirmed.get(addr + i)
+            if read is not None:
+                conf_compared += 1
+                if read != b:
+                    conf_mismatches.append(
+                        {"address": addr + i, "offset": i, "bussard": "%02x" % b, "ets": "%02x" % read}
+                    )
             theirs = ets.get(addr + i)
             if theirs is None:
                 continue
@@ -531,6 +620,19 @@ def compare(
         rec["compared"] = compared
         known = {i for i in placed_offsets if ets.get(addr + i) is not None}
         _add_coverage(rec, placed_offsets, known, addr, None, page_size)
+        conf_known = {i for i in placed_offsets if (addr + i) in ets.confirmed}
+        conf_rec: Dict[str, object] = {}
+        _add_coverage(conf_rec, placed_offsets, conf_known, addr, None, page_size)
+        conf_rec.update(
+            {
+                "verdict": DIFFERS if conf_mismatches else IDENTICAL if conf_compared
+                else NOT_COMPARABLE,
+                "compared": conf_compared,
+                "diff_octets": len(conf_mismatches),
+                "mismatches": conf_mismatches[:MAX_MISMATCHES],
+            }
+        )
+        rec["confirmed"] = conf_rec
         if compared == 0:
             rec["verdict"] = NOT_COMPARABLE
             rec["reason"] = "ETS wrote nothing in 0x%06X..0x%06X" % (addr, addr + len(ours))
@@ -565,6 +667,7 @@ def compare(
     verdicts = {r["verdict"] for r in judged}
     cov = coverage(judged, min_coverage)
     cov["scope"] = list(scope) if scope is not None else None
+    confirmed = _confirmed_summary(judged, min_coverage, len(ets.confirmed))
     reason = ""
     if DIFFERS in verdicts:
         overall = DIFFERS
@@ -581,11 +684,51 @@ def compare(
         "verdict": overall,
         "reason": reason,
         "coverage": cov,
+        "confirmed": confirmed,
         "regions": results,
         "ets_only_octets": len(ets_only),
         "ets_only_ranges": _ranges(ets_only)[:20],
         "properties": props,
     }
+
+
+MAX_MISMATCHES = 256  # confirmed mismatches kept per region and per row
+
+
+def _confirmed_summary(
+    judged: List[dict], min_coverage: float, total: int
+) -> Dict[str, object]:
+    """The row's read-confirmed comparison: coverage, verdict and mismatches.
+
+    The coverage is counted like the written one, on the placed octets that
+    have a read-confirmed value. The verdict is `differs` on any mismatch,
+    else `identical` when the confirmed coverage is not thin, else
+    `not-comparable`.
+    """
+    regions = [dict(r["confirmed"], region=r["region"]) for r in judged if r.get("confirmed")]
+    cov = coverage(regions, min_coverage)
+    compared = sum(int(r["compared"]) for r in regions)
+    diffs = sum(int(r["diff_octets"]) for r in regions)
+    mismatches = []
+    for r in regions:
+        for m in r["mismatches"]:
+            mismatches.append(dict(m, region=r["region"]))
+    if diffs:
+        verdict, reason = DIFFERS, ""
+    elif compared and not cov["thin"]:
+        verdict, reason = IDENTICAL, ""
+    else:
+        verdict = NOT_COMPARABLE
+        reason = "thin: " + cov["reason"] if compared else "no read-confirmed octet in the images"
+    return dict(
+        cov,
+        verdict=verdict,
+        reason=reason,
+        octets=compared,
+        diff_octets=diffs,
+        mismatches=mismatches[:MAX_MISMATCHES],
+        capture_octets=total,
+    )
 
 
 def _ets_groups(plan: dict, results: List[dict], ets: "EtsMemory") -> Dict[int, str]:
@@ -770,22 +913,65 @@ def _sender_check(ours_hex: str, ets_hex: str) -> Optional[Tuple[str, str]]:
     except ValueError:
         return None
 
-    def split(b: bytes) -> Tuple[List[str], List[str]]:
-        rows = [b[i:i + SENDER_ENTRY_LEN] for i in range(0, len(b), SENDER_ENTRY_LEN)]
-        return [_ia_text(struct.unpack(">H", r[:2])[0]) for r in rows], [r[2:].hex() for r in rows]
-
-    ours_ia, ours_seq = split(ours_b)
-    ets_ia, ets_seq = split(ets_b)
+    ours_ia, ours_seq = _senders(ours_b)
+    ets_ia, ets_seq = _senders(ets_b)
     if ours_ia != ets_ia:
-        if sorted(ours_ia) == sorted(ets_ia):
-            return "differs", "sender order differs: ETS %s, bussard %s" % (
-                " ".join(ets_ia), " ".join(ours_ia))
-        return "differs", "senders differ: ETS %s, bussard %s" % (
-            " ".join(ets_ia) or "none", " ".join(ours_ia) or "none")
+        what = "sender order differs" if sorted(ours_ia) == sorted(ets_ia) else "senders differ"
+        return "differs", "%s: ETS %s; bussard %s" % (
+            what, _sender_list(ets_ia, ets_seq), _sender_list(ours_ia, ours_seq))
     if ours_seq != ets_seq:
-        return "equal", "sequence numbers differ: ETS %s, bussard %s" % (
-            " ".join(ets_seq), " ".join(ours_seq))
+        return "equal", "sequence numbers differ: ETS %s; bussard %s" % (
+            _sender_list(ets_ia, ets_seq), _sender_list(ours_ia, ours_seq))
     return "equal", ""
+
+
+def _senders(b: bytes) -> Tuple[List[str], List[int]]:
+    """A PID 54 value as its individual addresses and sequence numbers."""
+    rows = [b[i:i + SENDER_ENTRY_LEN] for i in range(0, len(b), SENDER_ENTRY_LEN)]
+    return (
+        [_ia_text(struct.unpack(">H", r[:2])[0]) for r in rows],
+        [int.from_bytes(r[2:], "big") for r in rows],
+    )
+
+
+def _sender_list(ias: List[str], seqs: List[int]) -> str:
+    """`1.1.5 (seq 12345), 1.1.7 (seq 0)`, or `none`."""
+    return ", ".join("%s (seq %d)" % (ia, seq) for ia, seq in zip(ias, seqs)) or "none"
+
+
+def _sender_table(ours: list, ets: list) -> Optional[Dict[str, object]]:
+    """The whole PID 54 sender table (every non-empty PID 54 write on the
+    security object, in order) of each side, or None when a side has no such
+    write or one without a readable value. Lists both sides' senders with
+    their sequence numbers, so a difference names who ETS admitted, also when
+    the two sides wrote tables of different lengths (which the per-write
+    alignment shows only as one-sided writes).
+    """
+    def table(side: list) -> Optional[bytes]:
+        writes = [e for e in side if _is_security_object(e)
+                  and int(e["pid"]) == PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE
+                  and int(e["length"]) > 0]
+        out = b""
+        for e in writes:
+            data = e.get("data")
+            if not isinstance(data, str) or data.startswith("redacted:"):
+                return None
+            try:
+                out += bytes.fromhex(data)
+            except ValueError:
+                return None
+        return out if writes and len(out) % SENDER_ENTRY_LEN == 0 else None
+
+    ours_b, ets_b = table(ours), table(ets)
+    if ours_b is None or ets_b is None:
+        return None
+    ours_ia, ours_seq = _senders(ours_b)
+    ets_ia, ets_seq = _senders(ets_b)
+    return {
+        "value": "equal" if ours_ia == ets_ia else "differs",
+        "bussard": _sender_list(ours_ia, ours_seq),
+        "ets": _sender_list(ets_ia, ets_seq),
+    }
 
 
 def _group_key_check(ours: list, theirs: list) -> Tuple[str, str]:
@@ -927,6 +1113,7 @@ def compare_properties(
             ets_only.append({"ets_seq": b["seq"], "service": b["service"], "key": list(_prop_key(b)),
                              "data": b["data"]})
     group_keys = _group_key_table(ours, ets)
+    senders = _sender_table(ours, ets)
     counts: Dict[str, int] = {}
     for m in matched:
         counts[m["value"]] = counts.get(m["value"], 0) + 1
@@ -946,6 +1133,7 @@ def compare_properties(
         "bussard_only": bussard_only,
         "ets_only": ets_only,
         "group_key_table": group_keys,
+        "sender_table": senders,
     }
 
 
@@ -1039,6 +1227,30 @@ def render(report: Dict[str, object]) -> List[str]:
                 ": THIN (needs %.0f %% and every page)" % cov["min_percent"] if cov["thin"] else "",
             )
         )
+    conf = report.get("confirmed")
+    if conf:
+        lines.append("  " + confirmed_text(report))
+        if conf["octets"]:
+            blind = conf["blind_pages"]
+            lines.append(
+                "  confirmed coverage %.1f %% (%d of %d placed octets read-confirmed; %d of %d "
+                "page(s) without one%s)%s"
+                % (
+                    conf["percent"],
+                    conf["compared"],
+                    conf["placed"],
+                    len(blind),
+                    conf["pages"],
+                    ": " + ", ".join(blind[:8]) + (", ..." if len(blind) > 8 else "")
+                    if blind else "",
+                    ": THIN" if conf["thin"] else "",
+                )
+            )
+        for m in conf["mismatches"]:
+            lines.append(
+                "      confirmed mismatch 0x%06X (%s+0x%X): bussard %s, device/ETS %s"
+                % (m["address"], region_short(m["region"]), m["offset"], m["bussard"], m["ets"])
+            )
     if cov and cov.get("scope") is not None:
         lines.append("  scope: %s (other regions are shown, not judged)" % ",".join(cov["scope"]))
     for r in report["regions"]:
@@ -1047,6 +1259,11 @@ def render(report: Dict[str, object]) -> List[str]:
             head += "(out of scope) "
         if "placed" in r:
             head += "[%d/%d placed] " % (r["placed_compared"], r["placed"])
+        conf = r.get("confirmed")
+        if conf and conf["compared"]:
+            head += "[%d confirmed%s] " % (
+                conf["compared"],
+                ", %d differ" % conf["diff_octets"] if conf["diff_octets"] else "")
         if r["verdict"] == IDENTICAL:
             lines.append(head + "identical (%d compared)" % r["compared"])
         elif r["verdict"] == DIFFERS:
@@ -1077,6 +1294,23 @@ def render(report: Dict[str, object]) -> List[str]:
         )
     lines.extend(render_properties(report.get("properties")))
     return lines
+
+
+def confirmed_text(report: Dict[str, object]) -> str:
+    """`written: identical, confirmed: 1 of 2328 octets differ at 0x4800+0`."""
+    conf = report.get("confirmed") or {}
+    head = "written: %s, confirmed: " % report["verdict"]
+    if not conf.get("octets"):
+        return head + "none (%d read-confirmed octet(s) in the capture)" % conf.get(
+            "capture_octets", 0)
+    if conf["diff_octets"]:
+        first = conf["mismatches"][0]
+        return head + "%d of %d octets differ at 0x%04X+%d" % (
+            conf["diff_octets"], conf["octets"], first["address"] - first["offset"],
+            first["offset"])
+    if conf["verdict"] == IDENTICAL:
+        return head + "identical (%d octets)" % conf["octets"]
+    return head + "not comparable (%d octets; %s)" % (conf["octets"], conf["reason"])
 
 
 def _key_text(key) -> str:
@@ -1115,6 +1349,10 @@ def render_properties(props: Optional[Dict[str, object]]) -> List[str]:
             "      group key table (PID 53, bussard %d, ETS %d entries): %s"
             % (gk["bussard_entries"], gk["ets_entries"], gk["why"])
         )
+    st = props.get("sender_table")
+    if st and st["value"] == "differs":
+        lines.append("      sender table (PID 54): ETS %s" % st["ets"])
+        lines.append("      sender table (PID 54): bussard %s" % st["bussard"])
     for b in props["bussard_only"]:
         lines.append("      bussard only: step %3s %s" % (b["step"], _key_text(b["key"])))
     for e in props["ets_only"]:

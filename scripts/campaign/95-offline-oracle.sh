@@ -34,9 +34,14 @@
 #                below); a later run below it is a coverage drop
 #   options      optional, space-separated:
 #                expect=VERDICT  the verdict the row is known to give
-#                                (identical, differs or not-comparable; default
-#                                identical), e.g. for a capture that predates a
-#                                model change
+#                                on the written octets (identical, differs or
+#                                not-comparable; default identical), e.g. for a
+#                                capture that predates a model change
+#                confirmed=VERDICT  the verdict the row must give on the
+#                                read-confirmed octets (identical, differs or
+#                                not-comparable); unchecked when absent. For a
+#                                read-compare download (mask 0701) whose
+#                                written octets are thin by design
 #                scope=R1,R2     the regions the verdict and coverage judge
 #                                (addr, assoc, gobj, par, seg0x4800, ...), for a
 #                                capture that by design downloads only part of
@@ -55,9 +60,18 @@
 # compared, is "not comparable" (thin), never "identical". The summary shows
 # the figure per row.
 #
+# Read-confirmed octets (issue #384): on a mask 0701 device that already holds
+# an image, ETS reads the memory and writes only the octets that differ, so
+# the written coverage stays thin however the download is recorded. An octet
+# ETS read and never wrote in the capture equals ETS's image; knxtrace compares
+# bussard's planned octets against those separately and reports their own
+# coverage and verdict (`confirmed` column; same thin rule). A written octet is
+# never a confirmed one, even when ETS read it first.
+#
 # --check turns the run into a gate (the corpus-gated CI test uses it): every
-# row whose capture and product exist must give its expected verdict and at
-# least its recorded coverage, else the script exits 1. Rows without a capture
+# row whose capture and product exist must give its expected verdict, its
+# confirmed= verdict when the row names one, and at least its recorded
+# coverage, else the script exits 1. Rows without a capture
 # or product data are skipped.
 #
 # --keyring FILE names the ETS .knxkeys export for KNX Data Secure captures. It
@@ -278,12 +292,13 @@ run_row() {
   product="$(trim "${product:-}")"; application="$(trim "${application:-}")"
   note_text="$(trim "${note_text:-}")"; recorded="$(trim "${recorded:-}")"
   options="$(trim "${options:-}")"
-  local expect="" scope="" word
+  local expect="" confirmed="" scope="" word
   for word in $options; do
     case "$word" in
-      expect=*) expect="${word#expect=}" ;;
-      scope=*)  scope="${word#scope=}" ;;
-      *)        die "$device: unknown row option: $word (expect=..., scope=...)" ;;
+      expect=*)    expect="${word#expect=}" ;;
+      confirmed=*) confirmed="${word#confirmed=}" ;;
+      scope=*)     scope="${word#scope=}" ;;
+      *)           die "$device: unknown row option: $word (expect=..., confirmed=..., scope=...)" ;;
     esac
   done
   local scope_args=()
@@ -295,12 +310,13 @@ run_row() {
 
   # The row's recorded coverage and expected verdict, for the summary and
   # --check (written next to the result, whatever the result is).
-  "$PYTHON" - "$dir/row.json" "$recorded" "$expect" <<'PY'
+  "$PYTHON" - "$dir/row.json" "$recorded" "$expect" "$confirmed" <<'PY'
 import json, sys
-path, recorded, expect = sys.argv[1:4]
+path, recorded, expect, confirmed = sys.argv[1:5]
 with open(path, "w", encoding="utf-8") as fh:
     json.dump({"recorded_coverage": float(recorded.rstrip("% ")) if recorded else None,
-               "expect": expect or "identical", "skipped": None}, fh)
+               "expect": expect or "identical", "expect_confirmed": confirmed or None,
+               "skipped": None}, fh)
 PY
   if [ -z "$product" ] || [ "$product" = "-" ]; then
     not_comparable "$dir" "$device" "no product data${note_text:+: $note_text}"
@@ -392,14 +408,15 @@ out, check, devices = sys.argv[1], sys.argv[2] == "1", sys.argv[3:]
 failures = []
 short = {"address table": "addr", "association table": "assoc",
          "group-object table": "gobj", "parameters": "par"}
-print("%-9s %-6s %-15s %-16s %s" % (
-    "device", "system", "verdict", "coverage", "regions (differing/compared octets)"))
+FMT = "%-9s %-6s %-15s %-16s %-24s %s"
+print(FMT % ("device", "system", "verdict", "coverage", "confirmed",
+             "regions (differing/compared octets)"))
 for dev in devices:
     try:
         with open(os.path.join(out, dev, "diff.json"), encoding="utf-8") as fh:
             r = json.load(fh)
     except (OSError, ValueError):
-        print("%-9s %-6s %-15s %-16s %s" % (dev, "?", "error", "-", "no result"))
+        print(FMT % (dev, "?", "error", "-", "-", "no result"))
         failures.append("%s: no result" % dev)
         continue
     try:
@@ -412,6 +429,13 @@ for dev in devices:
     recorded = row.get("recorded_coverage")
     if recorded is not None:
         cov_text += " (%g)" % recorded
+    conf = r.get("confirmed") or {}
+    if conf.get("octets"):
+        conf_text = "%.1f%% %s" % (conf["percent"], {
+            "identical": "ok", "differs": "%d differ" % conf["diff_octets"],
+        }.get(conf["verdict"], "thin" if conf.get("thin") else "n/c"))
+    else:
+        conf_text = "-"
     parts = []
     for reg in r.get("regions", []):
         name = short.get(reg["region"], reg["region"].replace("app segment ", "seg").replace("application ", "app"))
@@ -435,11 +459,24 @@ for dev in devices:
             props.get("value_counts", {}).get("differs", 0))
     if r.get("verdict") == "not-comparable" and parts and not r.get("reason", "").startswith("thin"):
         detail += "  (%s)" % (r.get("reason") or "nothing compared")
-    print("%-9s %-6s %-15s %-16s %s" % (dev, r.get("system") or "-", r["verdict"], cov_text, detail))
+    print(FMT % (dev, r.get("system") or "-", r["verdict"], cov_text, conf_text, detail))
+    shown = conf.get("mismatches", [])
+    for m in shown[:20]:
+        print("%-9s   confirmed mismatch 0x%06X (%s+0x%X): bussard %s, ETS/device %s" % (
+            "", m["address"], short.get(m["region"], m["region"].replace("app segment ", "seg")
+                                        .replace("application ", "app")),
+            m["offset"], m["bussard"], m["ets"]))
+    if len(shown) > 20:
+        print("%-9s   ... %d more in %s" % ("", conf["diff_octets"] - 20,
+                                            os.path.join(out, dev, "diff.txt")))
     if row.get("skipped"):
         continue
     if r["verdict"] != row.get("expect", "identical"):
         failures.append("%s: %s, expected %s" % (dev, r["verdict"], row.get("expect")))
+    want = row.get("expect_confirmed")
+    if want and conf.get("verdict", "not-comparable") != want:
+        failures.append("%s: confirmed %s, expected %s" % (
+            dev, conf.get("verdict", "not-comparable"), want))
     if recorded is not None and cov.get("percent", 0.0) + 0.05 < recorded:
         failures.append("%s: coverage %.1f %% dropped below the recorded %g %%" % (
             dev, cov.get("percent", 0.0), recorded))

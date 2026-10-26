@@ -212,8 +212,22 @@ With `$BUSSARD_ORACLE_SALT` set (the oracle script draws one per run and
 passes it to both sides), a group key table write (PID 53) also lists its
 entries: the address table index and `sha256(salt || key)[:8]`. `imgdiff`
 names each entry's group from the address table ETS wrote, so it can say
-`0/0/6: key differs`. PID 54 is compared by sender address; differing
-sequence numbers are a note on an `equal` match.
+`0/0/6: key differs`. PID 54 is shown, not redacted (it holds individual
+addresses and sequence numbers), and compared by sender address; differing
+sequence numbers are a note on an `equal` match, and a sender difference
+prints both lists, `1.1.5 (seq N), 1.1.7 (seq M)`, also when the two sides
+wrote tables of different lengths.
+
+`image` also records every memory read response the device sent (issue
+#384). An octet ETS read and never wrote in the capture is *read-confirmed*:
+on a read-compare download (mask 0701) ETS writes only the octets that differ
+from its image, so every other octet it read equals its image. They go to
+`confirmed/0x<addr>.bin` next to the written regions. `imgdiff` compares
+bussard's planned octets against them separately, with their own coverage and
+verdict: `written: not-comparable, confirmed: 32 of 8169 octets differ at
+0x43FE+5`, then one line per mismatch with the address and both values. An
+octet ETS wrote is never read-confirmed, even when ETS read it before or after
+(the Meteodata clears the `0x4800` marker ETS writes).
 
 AES is pure Python so the tool keeps its empty dependency list. That is slow
 per block and fine for a capture's few hundred secure frames.
@@ -231,7 +245,7 @@ not to print anything that should not leave it:
   except that key material inside it is reported as `redacted:<hash>`: the
   key PIDs (P2P, group and zone key tables, tool key), anything key-sized (16 bytes
   or more) addressed to the security object (type 17) by the extended
-  services, and any undecoded service with a key-sized payload. Keyring keys are never printed: output names them only as
+  services except PID 54 (the sender table), and any undecoded service with a key-sized payload. Keyring keys are never printed: output names them only as
   `tool`, `fdsk` or `group`, and the keyring password is read from
   `$BUSSARD_KEYRING_PASSWORD`, never the command line.
 - KNXnet/IP Secure frames are named, sized and hashed. Nothing is decrypted, and
