@@ -28,7 +28,7 @@ architecture.
   load-state machines, both LSM realisations (`lsm_access: memory | property`),
   the object-0/PID78 preflight, and System 7 wire strictness (standard frame
   only, ≤12 memory octets — the trap for a tool wrongly sending 63-byte chunks).
-  See `DESIGN.md` and `docs/system7-spec.md`.
+  See `DESIGN.md` and `dev/system7-spec.md`.
 - Product-derived device identity: the properties and memory an application's
   own `LdCtrlCompareProp`/`LdCtrlCompareMem` preflights expect (hardware type,
   order info, hardware ids) are seeded from the product, because a real device

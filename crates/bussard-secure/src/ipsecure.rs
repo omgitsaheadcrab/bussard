@@ -853,7 +853,7 @@ mod tests {
     }
 
     /// Independent vectors, computed with Python's `cryptography` package from
-    /// spec §7.4/§7.5/§8.2 (a 30-line script, reproduced in docs/knx-secure-spec.md §12.1), so a divergence of
+    /// spec §7.4/§7.5/§8.2 (a 30-line script, reproduced in dev/knx-secure-spec.md §12.1), so a divergence of
     /// the Rust decomposition shows up here.
     #[test]
     fn test_handshake_macs_match_independent_vectors() -> TestResult {

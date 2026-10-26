@@ -4,7 +4,7 @@
 //!
 //! A KNX Data Secure device accepts a secured group telegram only from an
 //! individual address in its security individual address table (PID 54,
-//! `docs/knx-secure-spec.md` §5.7.1 and §11.1). ETS fills that table with the
+//! `dev/knx-secure-spec.md` §5.7.1 and §11.1). ETS fills that table with the
 //! devices that send on the secured group addresses the device listens to,
 //! and with an interface's tunnelling address only when group addresses are
 //! assigned to it. A tunnel address the table does not list is dropped

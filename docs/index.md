@@ -99,11 +99,11 @@ langzeitbetrieb.listen = ["3/1/20"]
 rueckmeldung-lueftungsklappen-dachfensterposition.send = "3/1/23"
 ```
 
-[The model format](model-format.md) specifies every file and key.
+[The model format](reference/model-format.md) specifies every file and key.
 
 ## Before your first write
 
-bussard writes to real building hardware. Read [Safety](SAFETY.md) once before
+bussard writes to real building hardware. Read [Safety](explanation/safety.md) once before
 you use `write`, `apply` or `flash` against a live installation. The short
 version: writes to a gateway that is not on localhost are refused until you
 pass `--allow-remote-gateway`, every device write is plan-before-apply with a
@@ -112,12 +112,29 @@ and cannot be changed over MCP at all.
 
 ## Where next
 
-- [The first weekend](getting-started-owner.md): the owner's guide, from install to a backup on a USB stick.
-- [Handover checklist](handover-checklist.md): what an owner demands and an integrator delivers.
-- [Working with an integrator](collaboration.md): exchanging changes by bundle or by repository.
-- [How do I ...](howto.md): recipes, from watching the bus to flashing a device.
-- [Reference](reference.md): every command, flag and MCP tool.
-- [The model format](model-format.md): every file in `knx/`, its keys and its errors.
-- [Home Assistant](ha-config.md): how `ha-config` derives entities from the model.
-- [Product data](product-data.md): `.knxprod` handling and what you may and may not commit.
-- [Design](DESIGN.md): architecture, feasibility and roadmap.
+The documentation has four kinds of pages, after the
+[Divio system](https://docs.divio.com/documentation-system/): tutorials to
+learn by doing, how-to guides for one task each, reference for every command
+and file, and explanation for the ideas behind them.
+
+**Tutorials**
+
+- [The first weekend](tutorials/first-weekend.md): an owner's path from install to a backup on a USB stick.
+
+**How-to guides**
+
+- [How do I ...](how-to/recipes.md): recipes, from watching the bus to flashing a device.
+- [Working with an integrator](how-to/work-with-an-integrator.md): exchanging changes by bundle or by repository.
+- [Handover checklist](how-to/handover-checklist.md): what an owner demands and an integrator delivers.
+
+**Reference**
+
+- [Commands](reference/cli.md): every command, flag, environment variable and MCP tool.
+- [The model format](reference/model-format.md): every file in the model directory, its keys and its errors.
+- [Home Assistant](reference/home-assistant.md): how `ha-config` derives entities from the model.
+- [Product data](reference/product-data.md): `.knxprod` handling and what you may and may not commit.
+
+**Explanation**
+
+- [How bussard works](explanation/how-it-works.md): the model, the product data, the bus and what a write does.
+- [Safety](explanation/safety.md): the rails around every write, and what each write command does.

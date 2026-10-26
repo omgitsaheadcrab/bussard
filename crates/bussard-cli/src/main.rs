@@ -655,7 +655,7 @@ enum InterfaceCommand {
     /// (`bussard.keys`); missing ones are generated and saved there before
     /// the first write. `off` undoes it under the tool key, then again under
     /// the FDSK. Both end with a read-back after the restart. The model never
-    /// holds a credential. See docs/SAFETY.md for the recovery.
+    /// holds a credential. See https://bussard.tmbo.dev/docs/explanation/safety/ for the recovery.
     Secure {
         /// `on` or `off`.
         #[arg(value_name = "on|off")]
@@ -1007,7 +1007,7 @@ enum Command {
         /// (PID 54) the security object is reprogrammed with, so the device
         /// accepts `bussard write --keyring` to its secured group addresses.
         /// Off by default: without it the device drops bussard's secured group
-        /// telegrams silently. See docs/SAFETY.md.
+        /// telegrams silently. See https://bussard.tmbo.dev/docs/explanation/safety/.
         #[arg(long, value_name = "IA")]
         secure_sender: Option<bussard_model::IndividualAddress>,
         /// Plan offline and stop: no gateway is resolved and no connection is
@@ -1099,7 +1099,7 @@ enum Command {
         /// (PID 54) the security object is reprogrammed with, so the device
         /// accepts `bussard write --keyring` to its secured group addresses.
         /// Off by default: without it the device drops bussard's secured group
-        /// telegrams silently. See docs/SAFETY.md.
+        /// telegrams silently. See https://bussard.tmbo.dev/docs/explanation/safety/.
         #[arg(long, value_name = "IA", conflicts_with = "line")]
         secure_sender: Option<bussard_model::IndividualAddress>,
         /// For a KNX IP interface (a device file with a `[knxnet]` table):

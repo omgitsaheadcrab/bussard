@@ -21,7 +21,7 @@
 //!     the key the ETS keyring export derives;
 //!   - `PID_DEVICE_AUTHENTICATION_CODE`: the 16-octet key of the code, salt
 //!     `device-authentication-code.1.secure.ip.knx.org` (same derivation;
-//!     docs/knx-secure-spec.md §3.4);
+//!     dev/knx-secure-spec.md §3.4);
 //!   - `PID_TUNNELLING_USERS`: element 0 the count, then one 2-octet entry per
 //!     user, `user id, tunnelling address index` (the index into
 //!     `PID_ADDITIONAL_INDIVIDUAL_ADDRESSES`, 1-based), sorted by user id;

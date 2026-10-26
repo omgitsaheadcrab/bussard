@@ -1,7 +1,7 @@
 //! Calibration/replay: the real ETS -> Theben Meteodata System 7 (mask 0701)
 //! MEMORY-MAPPED flash.
 //!
-//! The knx-sim System 7 device is the executable spec (`docs/system7-spec.md`
+//! The knx-sim System 7 device is the executable spec (`dev/system7-spec.md`
 //! §5/§9). This is the 0701-family, memory-mapped counterpart of
 //! `sys7_jung_m2_replay.rs` (which replays the Jung 0705 *property* flash): it
 //! replays the request-direction TPDU stream ETS sent to a real Theben Meteodata

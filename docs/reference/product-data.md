@@ -4,8 +4,8 @@
 and how to download a configuration into it. This document covers the `.knxprod` format,
 what `bussard import-product` does with it, the model files it generates, and the
 licensing and versioning caveats. The command's flags are in
-[reference.md](reference.md#bussard-import-product-file); a worked adopt-a-device recipe
-is in [howto.md](howto.md#-add-a-brand-new-device).
+[reference.md](cli.md#bussard-import-product-file); a worked adopt-a-device recipe
+is in [howto.md](../how-to/recipes.md#-add-a-brand-new-device).
 
 ## Where product data comes from
 
@@ -39,7 +39,7 @@ export again. `bussard flash <ia> --product <project>.knxproj` still reads an ex
 the program is the one the lock pins for the device, and `--application
 <application-id>` is needed only when the lock pins none. The generated models are byte-for-byte the same as from the
 vendor `.knxprod` when the versions match: two ETS3-era Jung devices were flashed from
-their project export and verified against ETS captures (issue #135).
+their project export and verified against ETS captures.
 
 The export itself is never copied into the model: it is the owner's project, and large.
 The extracted archive holds only `knx_master.xml`, the manufacturer's `Hardware.xml`
@@ -65,7 +65,7 @@ The table of contents and each parsed program are cached as JSON under
 `<dir>/.bussard/products/`, keyed by the SHA-256 of the archive and the bussard build, so
 the next command reads them back instead of inflating and parsing the XML. A cached
 program is the same value a fresh parse returns (floats travel as their bit pattern), so
-the images are byte-identical. See [reference.md](reference.md#bussardproducts) for the
+the images are byte-identical. See [reference.md](cli.md#bussardproducts) for the
 layout and `BUSSARD_PRODUCT_CACHE=off`.
 
 ## What is inside a `.knxprod`
@@ -103,7 +103,7 @@ normal), so bussard streams them with `quick-xml` and never builds a DOM. It ext
   program declares in `<Options TextParameterEncoding>` (`iso-8859-15`, `utf-8`, ...),
   padded with NUL to its field; a character outside that code page, or a text longer
   than the field, is refused. A program that declares no encoding takes ASCII text
-  only, because no capture shows ETS's choice for one (issue #401).
+  only, because no capture shows ETS's choice for one.
 - Parameters and parameter refs: name, text, type ref, default value, access, and the
   memory location (`CodeSegment` + `Offset` + `BitOffset`). A parameter-ref
   `Value`/`Access` overrides the parameter's own.
@@ -243,197 +243,22 @@ and `.` distinguish real KNX order numbers.
 
 ### What is in the index
 
-The index seeds a flashability corpus: ~26 bare `.knxprod` databases across five
-manufacturers and a range of device types, each verified by downloading it and
-computing the checksum. It exists both to help you fetch a device you scanned and to
-back the repeatable flashability sweep in `tests-support/product-corpus/` (see
-[the corpus findings in DESIGN.md](DESIGN.md#the-flashability-corpus-and-sweep-findings)).
+The index covers about 26 product databases from MDT, Zennio, Lingg & Janke,
+Theben and Elsner, each verified by downloading it and computing its checksum.
+`import-product --list` prints it. The index points only at bare `.knxprod`
+downloads, so the checksum covers the exact file ETS would read.
+`BUSSARD_PRODUCT_INDEX` replaces the built-in index with your own, for a
+private mirror.
 
-Coverage by manufacturer:
+## The generated model files
 
-- **MDT** (`M-0083`): switch actuators (AKK, AKS/AKI), blind/shutter (JAL), dimming /
-  LED controller (AKD), heating (AKH), binary input (BE), glass push button (BE-GT),
-  weather station (SCN-WS), DALI gateway (SCN-DA64x), presence detector (SCN-x360). All
-  bare `.knxprod` files hosted directly at mdt.de.
-- **Zennio** (`M-0071`): push button (Flat 1), switch/multifunction actuators (MAXinBOX,
-  ALLinBOX), dimmer (DIMinBOX), binary input (BIN 44), fan-coil thermostat, presence
-  sensor (EyeZen), RGB LED controller (Lumento), A/C gateway (KLIC-DI). Hosted on
-  Zennio's CDN (`assets.zennio.com/application_program/`).
-- **Lingg & Janke** (`M-00E1`): switch, blind, binary-input and push-button KNX Secure
-  devices (mask `0021`). Hosted on the vendor's own domain; the URL path contains a
-  literal `&`, which the fetcher passes through verbatim.
-- **Theben** (`M-0048`) and **Elsner** (`M-00C9`): heating/dimming actuators and a
-  temperature/humidity sensor, hosted on `siblik.com` (an official distributor mirror
-  with stable static paths, since theben.de and elsner-elektronik.de themselves ship
-  only zips or gate downloads behind a shop/catalogue).
-
-Mixed masks are deliberate. One MDT switch-actuator `.knxprod` commonly bundles a 07B0
-(System B) app alongside several 0705 (System 7) ones, and the corpus spans 07B0, 0705,
-0701, 0021, 0020 and 0012 families on purpose so the flashability sweep shows real
-family coverage: the System B (07B0) and System 7 (0705, 0701, 0700) apps produce an
-executable flash plan; the older masks are parsed but not flashable.
-
-The fetch path deliberately handles only bare `.knxprod` files: the index points at
-direct `.knxprod` downloads, and the fetched bytes are imported as-is. This keeps the
-download path simple and the checksum meaningful (it covers the exact file ETS would
-read).
-
-### Testing against the corpus
-
-The index also backs a repeatable flashability check and a wider one-off 220-file sweep
-(384 application programs, 0 parse failures; the sweep predates System 7 flashing,
-which now plans too, while the older masks stay parse-only). The
-corpus mechanics, sweep findings, and per-op refusal analysis are maintainer material:
-see [the corpus findings in DESIGN.md](DESIGN.md#the-flashability-corpus-and-sweep-findings).
-
-## The model file format
-
-A model file describes one application program. It is machine-generated and carries a
-banner saying so; do not hand-edit it. It lives under `<dir>/.bussard/models/`, which
-holds only data bussard regenerates: when the directory is missing, the next command
-rebuilds it from the archives in `products/`, one model per application a device in the
-lock pins (issue #356). Product models stay YAML: they are
-generated files that nobody edits, so the reasons that moved the user's model files to
-TOML do not apply to them. Example (abridged):
-
-```yaml
-# Product model (generated by `bussard import-product`).
-# … banner …
-model_format: 5
-identity:
-  id: M-00FA_A-0001-11-ABCD-O000A
-  name: Fixture App
-  application_number: 1
-  application_version: 17
-  mask_version: 07B0
-  load_procedure_style: MergedProcedure
-  schema_version: '23'
-order_numbers:
-- TEST-1
-com_objects:
-  0:
-    text: Switch
-    function_text: On/Off
-    dpt: '1.001'
-    flags: CRWT
-    ref_id: M-00FA_A-0001-11-ABCD-O000A_O-0_R-1
-  1:
-    text: Value
-    dpt: '9.001'
-    flags: CRT
-    ref_id: M-00FA_A-0001-11-ABCD-O000A_O-1_R-1
-parameters:
-- id: M-00FA_A-0001-11-ABCD-O000A_P-1
-  name: Threshold
-  text: Threshold
-  type: !int
-    min: 0
-    max: 100
-    size: 8
-  default: '75'
-  memory:
-    segment: M-00FA_A-0001-11-ABCD-O000A_RS-4
-    offset: 3
-    bit_offset: 0
-  bits: 8
-  refs:
-    P-1_R-1: {}
-    P-1_R-2:
-      value: '50'
-load_procedure:
-- connect
-- unload lsm=1
-- load lsm=1
-- write_rel_mem obj=5 offset=0 size=10 applies_to=full,par
-- load_completed lsm=1
-- restart
-- disconnect
-unions:
-- size_bits: 8
-  members:
-  - param: P-20
-  - param: P-21
-    bit_offset: 4
-dynamic:
-- {"channel":{"id":"CH-0","text":"Generic","number":0,"nodes":[{"block":{"id":"PB-10","name":"ChannelA","param_ref":"P-1_R-1","nodes":[{"p":"P-11_R-11"},{"choose":{"ref":"P-11_R-11","when":[{"test":"1","nodes":[{"p":"P-12_R-12"}]},{"default":true,"nodes":[{"o":"O-1_R-1"}]}]}}]}}]}}
-module_dynamics:
-  MD-1:
-  - {"p":"MD-1_P-1_R-1"}
-```
-
-Field notes:
-
-- `model_format`: the format of the file. A model of an older format regenerates from
-  its archive on the next command, like a missing one; when the archive is not at hand
-  the old model keeps serving, without a warning.
-
-- `identity`: the application program's stable identity.
-- `order_numbers`: the catalogue part numbers that map to this program (via
-  `Hardware.xml`). This is the join key: a device's `product` (the order number in its
-  device file) and its `application` (pinned in `bussard.lock`) both point here.
-- `com_objects`: keyed by com-object number, in the same field style as the `objects`
-  of `bussard.lock`. `dpt` and `flags` (compact `CRWTUI` string) are the effective, ref-resolved
-  values. `size` appears only when there is no DPT to imply it. `ref_id` is the
-  application ref the value was resolved through.
-- `parameters`: each with its resolved `type`, `default`, and `memory` location. The
-  `type` is a tagged union: `!int {min, max, size, signed}`,
-  `!enum {values: [{value, text}]}`, `!text {size}`, `!float {encoding, min, max}`,
-  `!none`, or `!other {kind, size}`. `memory` (`segment` + `offset` + `bit_offset`) is
-  what the parameter phase needs to place the value into the device's parameter memory.
-- `load_procedure`: the ordered op summary, a faithful view of the download script.
-  `bussard flash` executes the supported subset
-  ([reference.md](reference.md#bussard-flash-address)).
-- `com_object_refs`: the com-object refs of the Dynamic section whose number
-  `com_objects` describes through another ref, with their own text, function and DPT
-  (a "Switch" object that becomes a "Value" object under another setting).
-
-Format 5 (issue #345) adds what the Dynamic evaluator needs, so it can run over the
-model as it runs over the application XML (`bussard_model::dynamic::DynamicSource`):
-
-- `refs` under each parameter: every `ParameterRef` of it, keyed by app-relative ref
-  id. `value` is the ref's `Value` where it differs from the parameter's `Value` (or
-  where the parameter's `default` above would not give it, an empty `Value` the model
-  leaves out): the value a ref has when nothing is stored, the one ETS shows and a
-  download writes (issue #326). `internal: true` marks a ref whose effective `Access`
-  is `None`, which ETS never shows. `text` is the ref's own `Text` where it differs
-  from the parameter's (it titles a page whose `ParamRefId` names the ref).
-- `base_value` on a module parameter: the `BaseValue` argument whose per-instance
-  value is added to its default (issue #126). `bits` (and `signed: true`) on an
-  integer or plain enumeration parameter: the width a shared union memory is read
-  back with.
-- `unions`: each `<Union>`'s `size_bits` and its members' parameter (app-relative)
-  and position (`offset`, `bit_offset`) within it. A reached member's value fills the
-  shared memory; the other members read it back.
-- `dynamic` and `module_dynamics`: the application's Dynamic section and each module
-  definition's, as a tree of one-key maps. `p` and `o` are a `<ParameterRefRef>` and
-  a `<ComObjectRefRef>`; `choose` has the controlling `ref` and its `when` branches,
-  each with the `test` as ETS writes it (`1`, `1 2`, `!=0`, `<5`) or `default: true`,
-  and the branch's `nodes`; `channel` and `block` are a `<Channel>` and a
-  `<ParameterBlock>` with their `id`, `name`, `text`, `number` (channel), `text_ref`
-  (`TextParameterRefId`), `param_ref` (block) and `nodes`; `module` is a `<Module>`
-  with its `id`, `def` and `args`; `assign` an `<Assign>` with `target` and `source`
-  or `value`. All ids are app-relative; absent attributes are left out.
-
-Format 6 (issue #345) drops `blocks`, `parameter_when` and `ref_values`, and a
-parameter's `default` is its own `Value` (format 5 and older gave a parameter with one
-ref that ref's `Value`; the ref's `value` carries it now). The ETS pages `bussard
-device` and `knx_show_device` list are derived from `dynamic` when the model loads:
-one per `<ParameterBlock>` and `<Channel>` of the application's own section, in the
-order ETS lists them, titled by the block's text, else the text of the ref that titles
-it, else its `Name`, with `{{…}}` placeholders removed. Which of them a device shows,
-and every value, is the Dynamic evaluator's answer over the tree, the same one the
-download runs.
-
-The trees are written one top-level node per line in flow style (JSON, which YAML
-reads as is): in block style the indentation of the deep trees is three quarters of
-their bytes. Measured on the reference installation's 24 models, the directory grows
-from 37.3 MB (format 4) to 59.9 MB: 17.0 MB of trees, 1.6 MB of unions and 4.0 MB of
-refs, bits and base values. The largest, the ABB `M-0002_A-A0ED-10-9B4E`, goes from
-6.4 MB to 9.6 MB (tree 1.6 MB, unions 0.6 MB); the Jung `M-0004_A-D144-22-14F8-O000A`
-from 2.6 MB to 5.6 MB (tree 2.8 MB, most of it the argument maps of its 529 module
-instances). Format 6 drops `blocks`, `parameter_when` and `ref_values` (12.4 MB on the
-same models), so the directory settles near 47 MB. The JSON cache under `.bussard/model-cache/`
-grows by about the same amount.
+`import-product` turns each application program into a model file under
+`<dir>/.bussard/models/`: the com-object table, the parameters with their
+types, defaults and memory locations, the download procedure and the ETS
+dialog structure. The files are generated and carry a banner saying so; do not
+edit them. The directory holds only data bussard regenerates: when it is
+missing or a file is of an older format, the next command rebuilds it from the
+archives in `products/`.
 
 ## The never-redistribute rule
 

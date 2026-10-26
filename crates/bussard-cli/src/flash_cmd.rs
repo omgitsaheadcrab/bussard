@@ -1544,7 +1544,7 @@ struct FreshnessDecision {
 ///   backup (there is nothing to save).
 /// - [`Freshness::SameApplication`] — proceed **without** `--force`: re-flashing
 ///   the same application is the documented recovery path for an interrupted
-///   flash (see `docs/SAFETY.md`). The notice still says what a re-flash resets.
+///   flash (see `docs/explanation/safety.md`). The notice still says what a re-flash resets.
 /// - [`Freshness::Resident`] — a *different* (or unidentifiable) application is
 ///   loaded (on System 7: a driven load-state machine is not `Loaded`, or the
 ///   code differs from the product's; a healthy System 7 device arrives as

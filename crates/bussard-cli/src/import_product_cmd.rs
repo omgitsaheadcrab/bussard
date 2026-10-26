@@ -108,7 +108,7 @@ fn run_order_number(
     println!(
         "This downloads copyrighted vendor product data over the network. It is \
          stored under {}/products/; whether that directory is committed is your \
-         decision (see docs/product-data.md).",
+         decision (see docs/reference/product-data.md).",
         dir.display()
     );
 

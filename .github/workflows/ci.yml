@@ -14,7 +14,7 @@ on:
         description: >-
           Path to a cached vendor product corpus on the runner. Set it to run
           every corpus-gated test, the full 500-product conformance sweep
-          included (docs/testing.md); empty (the default) runs only the
+          included (dev/testing.md); empty (the default) runs only the
           committed-fixture sweep. The corpus is large and copyrighted, so
           it is never committed and a normal push/PR never has one.
         required: false
@@ -211,7 +211,7 @@ jobs:
           cargo nextest run -p bussard-download --profile ci \
             -E '(kind(lib) & (test(sweep) + test(golden) + test(corpus))) + (kind(test) & test(/^[a-z0-9_]+::.*(sweep|golden|corpus)/))'
 
-      # Every corpus-gated test (docs/testing.md), the full 500-product sweep
+      # Every corpus-gated test (dev/testing.md), the full 500-product sweep
       # included, only when a corpus is available. The job-level `env` above
       # sets BUSSARD_PRODUCT_CORPUS from the workflow_dispatch input or the
       # repository variable; on a normal push/PR both are empty, so this step

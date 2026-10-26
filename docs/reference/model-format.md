@@ -2,9 +2,8 @@
 
 This is the contract for the files bussard reads and writes in the model
 directory (`knx/` by default): which files exist, their shapes, how keys are
-derived, and the errors bussard reports. The reasons behind the format are in
-[DESIGN.md](DESIGN.md#52-the-model-files); the commands that read and write
-these files are in [reference.md](reference.md).
+derived, and the errors bussard reports. The commands that read and write these files are in
+[the command reference](cli.md).
 
 ## Files
 
@@ -65,7 +64,7 @@ gateway = "192.168.1.74:3671"
 # multicast = "224.0.23.12:3671"
 # keyring = "house.knxkeys"   # deprecated: use the key store bussard.keys
 # admit_tunnel_senders = true   # Data Secure: admit the key store's tunnelling
-                                # addresses as secure senders (PID 54), issue #297
+                                # addresses as secure senders (PID 54)
 
 [lint]
 [lint.topology]
@@ -94,19 +93,19 @@ table when one is missing. `[lint]` configures the topology limits and the
 group-address convention that `validate` checks. `[import]` is optional;
 `language` overrides the language `import` derives texts and keys in.
 
-`admit_tunnel_senders` (issue #297, off by default) makes `plan`, `apply`,
+`admit_tunnel_senders` (off by default) makes `plan`, `apply`,
 `flash` and `knx_apply_device` on a KNX Data Secure device add every
 tunnelling address of the key store to the device's security individual
 address table (PID 54), so a secured `write` or `read` from bussard is
-accepted. See [SAFETY.md](SAFETY.md#secured-group-writes-from-bussard).
+accepted. See [SAFETY.md](../explanation/safety.md#secured-group-writes-from-bussard).
 
-`[home_assistant]` is optional (issue #280). It names the Home Assistant
+`[home_assistant]` is optional. It names the Home Assistant
 instance (`url`), the environment variable that holds a long-lived access
 token (`token_env`, default `BUSSARD_HA_TOKEN`; a `.env` supplies it only for
 a `BUSSARD_*` name) and the KNX YAML file Home Assistant reads (`config_path`,
 relative to the model directory unless absolute). With it, `bussard mcp
 --allow-home-assistant` registers the Home Assistant tools; without it the flag
-does nothing. See [reference.md](reference.md#the-home-assistant-tier).
+does nothing. See [reference.md](cli.md#the-home-assistant-tier).
 
 ## `groups.toml`
 
@@ -263,7 +262,7 @@ The file stores the value the user means. The reader accepts:
 
 - a string: an enum label (`"Jalousie"`), an enum code (`"2"`), a number
   with unit (`"21 °C"`, `"15 min"`), or free text for text parameters
-  (it must fit the field in the program's text code page, issue #401);
+  (it must fit the field in the program's text code page);
 - an integer or a bool, which are converted to their string form.
 
 A float is rejected with a fix-it hint, because `1.10` and `1.1` cannot be
@@ -306,7 +305,7 @@ entry (`adopt`, `import`, or `import-product` plus `import`).
 ### `[knxnet]` (IP interfaces)
 
 A KNX IP interface or router carries the settings of its KNXnet/IP parameter
-object (interface object type 11) in a `[knxnet]` table (issue #391):
+object (interface object type 11) in a `[knxnet]` table:
 
 ```toml
 [knxnet]
@@ -329,7 +328,7 @@ The table is what the user means. What the device reports (the address,
 netmask and gateway in use, the assignment method in effect, the MAC
 address, the capabilities and the state) are device facts, kept under
 `.bussard/facts/<address>.toml` by `bussard status <address>`, `describe`
-and `adopt` (see [reference.md](reference.md#bussardfacts)), never in this
+and `adopt` (see [reference.md](cli.md#bussardfacts)), never in this
 file or in `bussard.lock`: a read-only bus command does not change the lock,
 and an ETS re-import does not touch `.bussard/`.
 
@@ -370,7 +369,7 @@ field the table leaves out, and an empty `tunnels`, stays as the device holds
 it. Changing the assignment, the static address or the tunnel addresses of the
 interface the command tunnels through needs `apply --allow-self-reconfigure`. Over MCP,
 `knx_set_interface` edits the table and `knx_plan_device` / `knx_apply_device`
-write it. See [reference.md](reference.md#bussard-plan-address).
+write it. See [reference.md](cli.md#bussard-plan-address).
 
 ## `bussard.lock`
 
@@ -508,10 +507,10 @@ the join between the user's words and the vendor's ids:
   row. The index alone is not reachability: it was built under whatever
   configuration the lock was last refreshed with, so a row of an indexed
   ref the configuration does not reach stays hidden (written by the flash,
-  never an ignored override or a key; issue #380). When the device file
+  never an ignored override or a key). When the device file
   stores the ref as well, the file's value wins. `diff` and the checklist
   compare parameters by ref, so a key spelled differently on the two sides
-  is no change (issue #375).
+  is no change.
 - The product facts (program, manufacturer, hardware, mask) and the device
   state of KNX Secure (`secure_capable`, `has_fdsk_certificate`,
   `sequence_number`, `secure_senders`) live here; the device file keeps only
@@ -525,7 +524,7 @@ the join between the user's words and the vendor's ids:
   the model does not describe. An import never writes it. Not key material.
 - An object's `secure` is set by the import (the project's group keys) and
   by `bussard adopt` (the device's PID 61), changed with its group address by
-  `bussard groups secure` / `knx_set_group` with `secure` (issue #331), and
+  `bussard groups secure` / `knx_set_group` with `secure`, and
   rewritten for the linked objects after a verified secured `apply` or
   `flash` to the flags the security object received.
 
@@ -622,13 +621,12 @@ without it loads. A version refusal quotes it ("lock format version 2,
 written by bussard 0.1.0 8d6e18f, is not supported").
 
 Version history: 2 added the `[[product]]` entries and the per-device
-product hash and application id (#228); 3 indexes the parameters at their
-vendor default in `parameters[]`, adds their `default` and `written_by`
-(#276).
+product hash and application id; 3 indexes the parameters at their
+vendor default in `parameters[]`, adds their `default` and `written_by`.
 
 ## `bussard.keys`
 
-The KNX Secure key store (issue #241), written by `bussard keys import` and
+The KNX Secure key store, written by `bussard keys import` and
 by `import`/`init` when a `.knxkeys` sits next to the project and
 `BUSSARD_KEYRING_PASSWORD` is set. Every bus command reads its keys from it
 unless `--keyring` or `BUSSARD_KEYRING` names an explicit file, and it wins
@@ -644,7 +642,7 @@ edit fails the load. Do not edit it by hand.
 
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
-<!-- bussard key store (issue #241). ... -->
+<!-- bussard key store. ... -->
 <Keyring Signature="..." Project="House" CreatedBy="bussard 0.1.0" Created="2026-09-25T10:11:12" Format="bussard.keys/1" xmlns="https://github.com/tmbo/bussard/xml/keys/1">
   <Backbone MulticastAddress="224.0.23.12" Latency="1000" Key="..." />
   <Interface Type="Tunneling" Host="1.1.200" IndividualAddress="1.1.22" UserID="2" Password="..." Authentication="..." />
@@ -729,7 +727,7 @@ address = "3/1/5"
 merge = ["3/1/6"]    # extra listening GAs
 ```
 
-[ha-config.md](ha-config.md) explains how the overrides combine with the
+[ha-config.md](home-assistant.md) explains how the overrides combine with the
 derivation.
 
 ## Errors

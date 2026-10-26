@@ -30,7 +30,7 @@ All the configuration for your KNX setup is stored in TOML files, ready for your
 
 ## Quickstart
 
-New to KNX ownership? Read [the first weekend guide](https://bussard.tmbo.dev/docs/getting-started-owner/).
+New to KNX ownership? Read [the first weekend guide](https://bussard.tmbo.dev/docs/tutorials/first-weekend/).
 
 Have an ETS export? Import it and watch your bus decode itself:
 
@@ -100,7 +100,7 @@ See [the install docs](https://bussard.tmbo.dev/docs/#install) on how to get bus
 ## Safety
 
 `bussard` writes to physical building infrastructure. **Read
-[docs/SAFETY.md](https://bussard.tmbo.dev/docs/SAFETY/) before your first write**. It is the single
+[the safety page](https://bussard.tmbo.dev/docs/explanation/safety/) before your first write**. It is the single
 read-before-your-first-write guide. In case you like living dangerously, TL;DR:
 
 - Every device write is plan-before-apply: bussard reads the live state, shows the diff, asks for confirmation, backs up, writes, and verifies.

@@ -4,7 +4,7 @@
 # then point a KNX Data Secure tool at 127.0.0.1:3671.
 #
 # This is the conformance peer for a tool's KNX Data Secure Phase A tool-access
-# path (docs/knx-secure-spec.md §12.2). With the `security` block the device is
+# path (dev/knx-secure-spec.md §12.2). With the `security` block the device is
 # security-activated: every management access must ride A_SecureData (APCI
 # 0x3F1), wrong-MAC / replayed / stale-sequence frames are refused, and a PLAIN
 # (unwrapped) access to a protected function is refused exactly as a real

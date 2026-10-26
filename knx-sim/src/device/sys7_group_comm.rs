@@ -4,7 +4,7 @@
 //! address / association / group-object tables from their absolute memory
 //! locations (0x4000 region for LSM 1, 0x4201 region for LSM 2) and participates
 //! on the bus. The byte formats differ from System B (spec
-//! `docs/system7-spec.md` §7), so this module parses them and produces the same
+//! `dev/system7-spec.md` §7), so this module parses them and produces the same
 //! [`crate::device::GroupComm`] runtime the System B path uses, so the bus
 //! runtime is shared.
 //!

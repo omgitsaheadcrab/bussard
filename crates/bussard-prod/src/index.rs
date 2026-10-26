@@ -5,7 +5,7 @@
 //! are copyrighted and large, so bussard stores just enough to fetch and verify
 //! them on demand: the download URL, a SHA-256 checksum, the byte size, and the
 //! filename to cache under. See [`fetch`](crate::fetch) for the download side
-//! and `docs/product-data.md` for the schema.
+//! and `docs/reference/product-data.md` for the schema.
 //!
 //! Order numbers are matched with [`normalize_order_number`], which strips
 //! surrounding whitespace and upper-cases so that a scanned `akk-0216.03` finds

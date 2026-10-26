@@ -73,21 +73,17 @@ hooks:
 
 nav:
   - Getting started: index.md
-  - Safety: SAFETY.md
-  - How do I ...: howto.md
-  - Reference: reference.md
-  - Model format: model-format.md
-  - Home Assistant: ha-config.md
-  - Product data: product-data.md
-  - Project:
-      - Design: DESIGN.md
-      - Test campaign: testing-campaign.md
-      - Personas:
-          - Overview: personas/README.md
-          - Nadia, the new owner: personas/homeowner.md
-          - Jonas, the integrator: personas/integrator.md
-          - Issue drafts: personas/issues.md
-  - Specs:
-      - System 7 download: system7-spec.md
-      - KNX Secure: knx-secure-spec.md
-      - flash op coverage: flash-op-coverage.md
+  - Tutorials:
+      - The first weekend: tutorials/first-weekend.md
+  - How-to guides:
+      - How do I ...: how-to/recipes.md
+      - Working with an integrator: how-to/work-with-an-integrator.md
+      - Handover checklist: how-to/handover-checklist.md
+  - Reference:
+      - Commands: reference/cli.md
+      - Model format: reference/model-format.md
+      - Home Assistant: reference/home-assistant.md
+      - Product data: reference/product-data.md
+  - Explanation:
+      - How bussard works: explanation/how-it-works.md
+      - Safety: explanation/safety.md

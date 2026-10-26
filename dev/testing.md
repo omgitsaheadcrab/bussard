@@ -228,3 +228,21 @@ repository variable `BUSSARD_PRODUCT_CORPUS`) set to a corpus path on the runner
 also runs every corpus-gated test above. A GitHub-hosted runner has no corpus
 (CI never downloads vendor data), so that path is for a self-hosted runner; the
 owner otherwise runs the command above locally before a release.
+
+## Test knobs
+
+The CLI reads these environment variables only to shorten its waits in the
+test suites and the simulator loops. They are not documented for users and
+stay unset in normal use.
+
+| Variable | Meaning |
+|---|---|
+| `BUSSARD_SECURE_ALGORITHM` | `auth` wraps KNX Data Secure management APDUs authentication-only (in the clear under a MAC) instead of the default authentication + encryption. For the conformance loop against the simulator; a real flash never sets it. |
+| `BUSSARD_FLASH_SYS7_LSM` | `memory` or `property` overrides the product-driven System 7 load-state-machine realisation (memory-mapped record or PID 5). For conformance tests against knx-sim; unset in normal use. |
+| `BUSSARD_ASSIGN_WAIT_MS` | shrinks the programming-mode wait budget of `assign` and `adopt`. Unset in normal use. |
+| `BUSSARD_SCAN_DISCOVERY_MS` | shrinks the per-address probe timeout of `scan`, `reconstruct --line`, `commission`, `backup` and `replace`. Unset in normal use. |
+| `BUSSARD_ADDRESS_PROBE_MS` | shrinks the per-attempt timeout of the source-address check (default 600 ms). Unset in normal use. |
+| `BUSSARD_CONNECT_WAIT_MS` | shrinks how long a command waits for the first tunnel connect (default 10 s). Unset in normal use. |
+| `BUSSARD_MGMT_TIMEOUT_MS` | shrinks the management ACK and response timeouts (default 3 s each) and caps the KNX Data Secure sync retry backoff (default 1 s doubling to 4 s, or 8 s after a restart). Repetitions and attempts are unchanged. Unset in normal use. |
+| `BUSSARD_BUS_BACKOFF_MS` | shrinks the first reconnect backoff of the bus connection (default 1 s, doubling to 30 s). Unset in normal use. |
+| `BUSSARD_READ_TIMEOUT_MS` | shrinks how long `read` waits for a group response (default 3 s). Unset in normal use. |

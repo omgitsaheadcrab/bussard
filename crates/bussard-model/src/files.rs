@@ -1,7 +1,7 @@
 //! The on-disk shapes of the model files and the join/split between a device
 //! file, its `bussard.lock` entry and the in-memory [`Device`].
 //!
-//! See `docs/model-format.md` for the contract. In short: a device file holds
+//! See `docs/reference/model-format.md` for the contract. In short: a device file holds
 //! what the user means (name, location, parameter values, links) under keys
 //! the lock assigns; the lock holds the vendor facts (product identity, channel
 //! ids, the com-object table, the parameter refs). [`join_device`] rebuilds the

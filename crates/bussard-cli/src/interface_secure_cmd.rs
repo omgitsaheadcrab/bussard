@@ -256,7 +256,7 @@ fn recovery(plan: &SwitchPlan) -> String {
          Retry the command, or factory-reset {} (the device's reset button; it returns to its \
          FDSK and plain tunnelling) and run `bussard interface secure on {}` again. The previous \
          key store is in bussard.keys.bak; an ETS keyring export restores it with `bussard keys \
-         import`. See docs/SAFETY.md.",
+         import`. See docs/explanation/safety.md.",
         plan.target, plan.target
     )
 }

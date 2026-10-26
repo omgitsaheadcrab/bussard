@@ -265,7 +265,7 @@ impl MaskProfile {
     /// This is the **single source of truth** for mask support: `plan`, `apply`,
     /// `flash` and `reconstruct` all refuse through it, `bussard audit` renders
     /// it as a column, and [`capability_table`] renders it as the table in
-    /// `docs/SAFETY.md` (a test asserts the doc matches this function).
+    /// `docs/explanation/safety.md` (a test asserts the doc matches this function).
     pub fn capabilities(self) -> MaskCapabilities {
         match self.family {
             MaskFamily::SystemB => MaskCapabilities {
@@ -310,7 +310,7 @@ impl MaskProfile {
 }
 
 /// What bussard can do with one mask version: the capability row behind every
-/// mask refusal and the `docs/SAFETY.md` support table.
+/// mask refusal and the `docs/explanation/safety.md` support table.
 ///
 /// Build one with [`MaskProfile::capabilities`]. `describe` is `true` for every
 /// mask because `bussard describe` enumerates interface objects and property
@@ -360,7 +360,7 @@ impl MaskCapabilities {
 /// Every mask version bussard classifies, in ascending order, with its
 /// capabilities.
 ///
-/// This is what `docs/SAFETY.md`'s "Supported device masks" table is rendered
+/// This is what `docs/explanation/safety.md`'s "Supported device masks" table is rendered
 /// from and what `bussard audit` groups devices by. Adding a mask to
 /// [`MaskProfile::from_mask`] means adding it here too, or the doc test fails.
 pub fn capability_table() -> Vec<(u16, MaskCapabilities)> {

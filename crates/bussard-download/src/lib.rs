@@ -1,7 +1,7 @@
 //! The downloader: computes device tables from the model, plans differential
 //! changes against the live device state, and applies them over the bus.
 //!
-//! This is the phase-2 core (docs/DESIGN.md §1-2, §6). It splits into three
+//! This is the phase-2 core (dev/DESIGN.md §1-2, §6). It splits into three
 //! layers of increasing side-effect:
 //!
 //! - [`compute`]: pure functions turning one device's links (the object entries of its device file) into

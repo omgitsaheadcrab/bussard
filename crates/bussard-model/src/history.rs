@@ -28,7 +28,7 @@
 //!
 //! Only the model files above. `models/`, `vendor/`, `captures/`,
 //! keyrings, `.knxproj` and `.knxprod` files are vendor-derived, local or
-//! secret (see `docs/product-data.md`), and never enter a snapshot.
+//! secret (see `docs/reference/product-data.md`), and never enter a snapshot.
 //!
 //! # What undo does not do
 //!

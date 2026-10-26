@@ -10,7 +10,7 @@
 //! the key store no longer keys, linked to an object that loses its flag, is
 //! the key that leaves the table, and a keyed group address linked to an
 //! object that gains its flag is the key that joins it. ETS secures a group
-//! object exactly when it links a keyed group address (docs/knx-secure-spec.md
+//! object exactly when it links a keyed group address (dev/knx-secure-spec.md
 //! §11), so the two sides move together.
 //!
 //! The change is one plan line naming the group addresses and the objects.

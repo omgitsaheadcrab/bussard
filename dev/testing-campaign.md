@@ -10,7 +10,7 @@ This page is the runbook: which script runs which phase, where the data lands,
 how to compare a `bussard` download against ETS's, and what must never be
 committed.
 
-Read [SAFETY.md](SAFETY.md) first. Nothing here replaces it.
+Read [SAFETY.md](../docs/explanation/safety.md) first. Nothing here replaces it.
 
 ## Before anything
 
@@ -321,7 +321,7 @@ what changed, so compare against a capture made from the same model state.
 ## Private data
 
 The repository must never describe a real installation. See
-[SAFETY.md](SAFETY.md#private-data-the-maintainers-installation-and-yours) for
+[SAFETY.md](README.md#private-data) for
 the full rule; for this campaign specifically:
 
 - Everything the scripts write goes under `captures/`, which is gitignored.
@@ -409,7 +409,7 @@ where to put them.
 
 ## See also
 
-- [SAFETY.md](SAFETY.md): the write path and its rails.
+- [SAFETY.md](../docs/explanation/safety.md): the write path and its rails.
 - [`tools/knxtrace/README.md`](../tools/knxtrace/README.md): decoder coverage
   and the diff rules in detail.
 - [`docs/flash-op-coverage.md`](flash-op-coverage.md): which load operations

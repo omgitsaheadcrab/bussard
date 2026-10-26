@@ -1,6 +1,6 @@
 //! Loading and saving the model directory.
 //!
-//! The files and their shapes are specified in `docs/model-format.md`:
+//! The files and their shapes are specified in `docs/reference/model-format.md`:
 //! `bussard.toml`, `groups.toml`, `devices/<address>.toml`, the generated
 //! `bussard.lock`, plus the optional `tests.toml` and `ha.toml` (read by their
 //! own modules). [`Model::load`] joins each device file with its lock entry;
@@ -95,7 +95,7 @@ pub enum LoadError {
     #[error(
         "{dir} holds a YAML model (groups.yaml, links.yaml, devices/*.yaml); bussard now \
          reads TOML (bussard.toml, groups.toml, devices/<address>.toml, bussard.lock, see \
-         docs/model-format.md). Re-import the project into an empty directory."
+         docs/reference/model-format.md). Re-import the project into an empty directory."
     )]
     LegacyYaml {
         /// The model directory.

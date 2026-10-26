@@ -141,7 +141,7 @@ impl BussardMcp {
                 "error": err.to_string(),
                 "recovery": format!(
                     "the key store holds the credentials {target} was given and its FDSK; retry, \
-                     or factory-reset {target} and switch it on again (docs/SAFETY.md)"
+                     or factory-reset {target} and switch it on again (docs/explanation/safety.md)"
                 ),
             })),
         }

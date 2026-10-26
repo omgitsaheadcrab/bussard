@@ -41,7 +41,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 quick-xml = "0.41"
 # base64 decoder for the RelativeSegment <Data> application image. MIT/Apache-2.0.
 base64 = "0.22"
-# KNX Data Secure crypto, per docs/knx-secure-spec.md §3: AES-CCM is decomposed
+# KNX Data Secure crypto, per dev/knx-secure-spec.md §3: AES-CCM is decomposed
 # into AES-CBC-MAC (the tag) + AES-CTR (encrypt tag+payload), so NO `ccm` crate
 # is needed. All three are RustCrypto cipher-0.4 generation, MIT/Apache-2.0.
 # `aes` is the AES-128 block cipher; `cbc` supplies CBC mode for the CBC-MAC;

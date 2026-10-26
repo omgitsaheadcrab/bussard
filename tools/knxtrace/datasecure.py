@@ -40,7 +40,7 @@ MAC_LEN = 4
 A_SECURE_DATA = 0x3F1
 KEYRING_SALT = b"1.keyring.ets.knx.org"
 PBKDF2_ITERATIONS = 65536
-# KNXnet/IP Secure password derivations (docs/knx-secure-spec.md §3.4, after
+# KNXnet/IP Secure password derivations (dev/knx-secure-spec.md §3.4, after
 # the KNX standard 3/8/9 "KNXnet/IP Secure" and the MIT XKNX reference): the
 # 16-octet key is PBKDF2-HMAC-SHA256 over the Latin-1 password, 65536
 # iterations, with these salts. What ETS writes to PID_DEVICE_AUTHENTICATION_CODE
@@ -587,7 +587,7 @@ def parse_keyring(xml_text: str, password: str) -> Keyring:
         return aes_cbc_decrypt(kk, iv, ct)
 
     def password_attr(el: ET.Element, name: str) -> Optional[bytes]:
-        """An encrypted password (docs/knx-secure-spec.md §4.3): an 8-octet
+        """An encrypted password (dev/knx-secure-spec.md §4.3): an 8-octet
         prefix, the password, PKCS#7 padding."""
         value = el.get(name)
         if not value:

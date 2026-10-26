@@ -302,7 +302,7 @@ fn test_read_knxprod_selected_matches_full_read_on_the_corpus() -> TestResult {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(6);
-    // The corpus root, its `cache/`, or the vendor directory (docs/testing.md).
+    // The corpus root, its `cache/`, or the vendor directory (dev/testing.md).
     let dir = std::path::PathBuf::from(dir);
     let dir = [dir.join("cache/vendor"), dir.join("vendor")]
         .into_iter()

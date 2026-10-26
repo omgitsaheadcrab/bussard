@@ -440,7 +440,7 @@ fn corpus_extended_memory_apps_lower_to_executable_plans() {
 
 /// The corpus's vendor directory: `BUSSARD_PRODUCT_CORPUS` may name the
 /// product-corpus root (`tests-support/product-corpus`), its `cache/`, or the
-/// vendor directory itself (`docs/testing.md`).
+/// vendor directory itself (`dev/testing.md`).
 fn vendor_dir(dir: PathBuf) -> PathBuf {
     [dir.join("cache/vendor"), dir.join("vendor")]
         .into_iter()

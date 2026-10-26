@@ -1,6 +1,6 @@
 //! M2 calibration/replay: the real ETS 6 -> Jung 3361-1M System 7 flash.
 //!
-//! The knx-sim System 7 device is the executable spec (`docs/system7-spec.md`
+//! The knx-sim System 7 device is the executable spec (`dev/system7-spec.md`
 //! §9). This test replays the *exact* request-direction TPDU stream ETS 6 sent to
 //! a real Jung 3361-1M (mask 0705, app `M-0004_A-A011`) — captured in the M2
 //! session (issue #70) and distilled to `tests/fixtures/sys7_jung_flash_requests.txt`

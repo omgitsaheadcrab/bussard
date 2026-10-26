@@ -595,7 +595,7 @@ fn derive_climate(
         // the sole anchor, and it is the only *command* wired. Setpoint-shift and
         // target-temperature are deliberately NOT wired (no HA key invites a
         // temperature change); the room temperature and the valve position stay
-        // as read-only telemetry. See docs/ha-config.md for the rationale and how
+        // as read-only telemetry. See docs/reference/home-assistant.md for the rationale and how
         // an ha.toml override could re-enable setpoint wiring for a different
         // installation.
         let operation_mode_address = slot(ClimateRole::ModeCommand);

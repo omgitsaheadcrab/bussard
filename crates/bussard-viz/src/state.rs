@@ -78,7 +78,7 @@ impl BusStatus {
     /// The gateway is reported as the operator would read it
     /// (`192.0.2.10:3671`, or `multicast 224.0.23.12:3671` for routing) together
     /// with whether it is a loopback address, in `/api/state`, so the page can
-    /// name the bus it is about to write to, which `docs/SAFETY.md` promises of
+    /// name the bus it is about to write to, which `docs/explanation/safety.md` promises of
     /// every write path.
     pub fn connected(service: BusService) -> Self {
         BusStatus {

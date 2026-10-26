@@ -53,7 +53,7 @@ Regenerate either baseline by re-running its test with
 `BUSSARD_PRODUCT_CORPUS` set), then review and commit the diff.
 
 The pointer index the corpus draws from is `data/product-index.json` (schema:
-`docs/product-data.md`). `corpus.txt` and the index are kept in step: one order
+`docs/reference/product-data.md`). `corpus.txt` and the index are kept in step: one order
 number per entry is enough, because a single `.knxprod` usually serves a whole
 product family.
 

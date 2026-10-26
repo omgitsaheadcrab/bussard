@@ -4,7 +4,7 @@
 YAML (the `knx:` platform schema) straight from the bussard model, so the KNX-as-code
 repo stays the single source of truth for Home Assistant too. This document explains how
 entities are derived and how to tune the result with `ha.toml`; the command's flags are
-in [reference.md](reference.md#bussard-ha-config).
+in [reference.md](cli.md#bussard-ha-config).
 
 The output is a complete `knx:` document with a generated-by header and a summary
 footer:

@@ -194,7 +194,7 @@ pub struct TransitionError {
 /// A System 7 load-state machine for one of the three parallel LSMs.
 ///
 /// It mirrors [`LoadStateMachine`] but applies the System 7 event model (spec
-/// `docs/system7-spec.md` §4.1): `Unloaded --StartLoading--> Loading
+/// `dev/system7-spec.md` §4.1): `Unloaded --StartLoading--> Loading
 /// --(AbsSegment alloc / TaskSegment)*--> Loading --LoadCompleted--> Loaded`.
 /// A `TaskSegment` must be accepted in `Loading` (it commits the segment
 /// descriptor) and is a precondition for the following `LoadCompleted`; the

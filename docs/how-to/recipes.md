@@ -1,6 +1,6 @@
 # How do I ...
 
-Recipes for everyday bussard work. Each assumes a model directory (default `knx/`; every command takes `--dir`). Flags and fields are in the [reference](reference.md); install and first steps are in the [README](../README.md).
+Recipes for everyday bussard work. Each assumes a model directory (default `knx/`; every command takes `--dir`). Flags and fields are in the [reference](../reference/cli.md); install and first steps are in the [README](../../README.md).
 
 Three KNX terms the recipes rely on:
 
@@ -8,7 +8,7 @@ Three KNX terms the recipes rely on:
 - An individual address (IA, `1.1.4`, area.line.device) is a device's unique bus address, used for commissioning and diagnosis.
 - A com object is one input or output slot of a device, such as "channel A: move up/down" on a blind actuator. Linking it to a GA in the device's file (`devices/<address>.toml`) makes the device send on or listen to that address. In the compact `CRWTUI` flag string, W means the object accepts writes (a command input) and T means it transmits (a status output).
 
-A word on safety before the writing recipes: every bus-writing command reads the live state first, shows a plan, confirms on a terminal (`y/N`), writes, then verifies by reading back. `apply` also backs up first. `plan`, `apply`, `reconstruct` and `flash` support the System B (`07B0`, `27B0`, `57B0`) and System 7 (`0705`, `0701`, `0700`) masks and refuse anything else before writing; [SAFETY.md](SAFETY.md#supported-device-masks) has the table, and `bussard audit` shows it per device. A write to a non-loopback gateway is refused unless you opt in with `--allow-remote-gateway`. Do the first real writes against a spare device or the simulator, not a live installation. Read [SAFETY.md](SAFETY.md) once before you start writing.
+A word on safety before the writing recipes: every bus-writing command reads the live state first, shows a plan, confirms on a terminal (`y/N`), writes, then verifies by reading back. `apply` also backs up first. `plan`, `apply`, `reconstruct` and `flash` support the System B (`07B0`, `27B0`, `57B0`) and System 7 (`0705`, `0701`, `0700`) masks and refuse anything else before writing; [SAFETY.md](../explanation/safety.md#supported-device-masks) has the table, and `bussard audit` shows it per device. A write to a non-loopback gateway is refused unless you opt in with `--allow-remote-gateway`. Do the first real writes against a spare device or the simulator, not a live installation. Read [SAFETY.md](../explanation/safety.md) once before you start writing.
 
 ## ... watch and decode the bus?
 
@@ -29,7 +29,7 @@ bussard viz serving on http://127.0.0.1:8080 (Ctrl-C to stop)
 read-only: group writes return 403 (pass --allow-writes to enable them)
 ```
 
-Open the address to get a bus-spine diagram of every device by floor and room, the group-address tree, and live telegrams pulsing along the spine as they happen. Select a device or GA to see its links, senders, and listeners. With no reachable gateway the page still shows the model, just without live traffic. See [the viz server](reference.md#the-viz-server) for the endpoints.
+Open the address to get a bus-spine diagram of every device by floor and room, the group-address tree, and live telegrams pulsing along the spine as they happen. Select a device or GA to see its links, senders, and listeners. With no reachable gateway the page still shows the model, just without live traffic. See [the viz server](../reference/cli.md#the-viz-server) for the endpoints.
 
 A bare `bussard viz` is a viewer: it never transmits, so it is safe to point at the live installation. Add `--allow-writes` to arm the per-DPT test-write widgets, and then the same real-gateway gate as `bussard write` applies; against a non-loopback gateway the server refuses to start without `--allow-remote-gateway`. Every armed write asks for an explicit confirmation naming the GA and the gateway, and a `protected` GA needs the force checkbox on top of that.
 
@@ -56,7 +56,7 @@ Unlinked com-objects and unused GAs are counted, not flagged. Actuators ship far
 
 ## ... get past "no free tunnelling connection"?
 
-A KNXnet/IP interface has a fixed number of tunnel slots, often one to five, and every connected client holds one: Home Assistant's KNX integration, an open ETS project, `bussard viz`, `bussard mcp`, or another bussard command still running. When all are taken the interface answers a connect with `E_NO_MORE_CONNECTIONS`, and bussard says so and exits with code `4` instead of timing out. `bussard init --gateway <ip>` and `bussard audit --live` print `N tunnels, M in use` when the interface reports it. Stop one of the other clients, or switch a long-running one to routing (`--routing`) if your interface supports multicast. More in [SAFETY.md](SAFETY.md#the-tunnel-budget).
+A KNXnet/IP interface has a fixed number of tunnel slots, often one to five, and every connected client holds one: Home Assistant's KNX integration, an open ETS project, `bussard viz`, `bussard mcp`, or another bussard command still running. When all are taken the interface answers a connect with `E_NO_MORE_CONNECTIONS`, and bussard says so and exits with code `4` instead of timing out. `bussard init --gateway <ip>` and `bussard audit --live` print `N tunnels, M in use` when the interface reports it. Stop one of the other clients, or switch a long-running one to routing (`--routing`) if your interface supports multicast. More in [SAFETY.md](../explanation/safety.md#the-tunnel-budget).
 
 ## ... find out what devices are on my line?
 
@@ -293,7 +293,7 @@ replaced 1.1.4 via 192.0.2.10:3671
 $ bussard ha-config --out ha-knx.yaml
 ```
 
-The output is a complete `knx:` document; `!include` it or paste it into your Home Assistant configuration. Read the footer: it counts the derived entities and lists every unmapped GA by DPT, so nothing is silently dropped. Tune the result with an `ha.toml` next to the model (rename entities, promote a switch to a light, exclude GAs, merge extra state addresses). Derivation rules and `ha.toml` fields are in [ha-config.md](ha-config.md).
+The output is a complete `knx:` document; `!include` it or paste it into your Home Assistant configuration. Read the footer: it counts the derived entities and lists every unmapped GA by DPT, so nothing is silently dropped. Tune the result with an `ha.toml` next to the model (rename entities, promote a switch to a light, exclude GAs, merge extra state addresses). Derivation rules and `ha.toml` fields are in [ha-config.md](../reference/home-assistant.md).
 
 ## ... generate the handover documentation?
 
@@ -302,7 +302,7 @@ $ bussard doc --out docs/installation
 $ bussard doc --format html --out handover/
 ```
 
-`doc` writes the folder the KNX guidelines ask for: a device list, a group-address list with senders and listeners, one sheet per room in plain language, the connection details (never credentials), and a change log from git. Give devices a `location:` (floor and room) to get room sheets. The output is deterministic, so commit it and regenerate after every change; the diff then shows what moved. `--json` prints the same content as one structured document. Details in the [reference](reference.md#bussard-doc).
+`doc` writes the folder the KNX guidelines ask for: a device list, a group-address list with senders and listeners, one sheet per room in plain language, the connection details (never credentials), and a change log from git. Give devices a `location:` (floor and room) to get room sheets. The output is deterministic, so commit it and regenerate after every change; the diff then shows what moved. `--json` prints the same content as one structured document. Details in the [reference](../reference/cli.md#bussard-doc).
 
 ## ... bootstrap without any ETS project?
 
@@ -386,7 +386,7 @@ flash M-0083_A-000D-23-5BFD (2 memory write(s)) to 1.1.5? [y/N] y
 flash verified: application program M-0083_A-000D-23-5BFD is Loaded on 1.1.5, and its parameters match the model
 ```
 
-The safety story is the pre-flight plan: `flash` refuses before any write when the device is not System B, the application's mask does not match, or the load procedure contains an operation it cannot execute (see [the supported-operations list](reference.md#bussard-flash-address)). Unlike `apply` there is no backup, because a fresh device has no prior application to save; recovery from a failed flash is re-running it, or falling back to ETS. For the same reason the pre-flight also checks the device really is fresh: a device already carrying a different application is refused unless you pass `--force`, while re-flashing the same application (the recovery path above) needs no flag. [SAFETY.md](SAFETY.md) has the full table. After writing, `flash` verifies the application reads back as `Loaded`, spot-checks the written segments byte-for-byte, and reads the parameter memory back to compare it with the model the way `bussard plan` does; a parameter that still differs is named and the command exits non-zero.
+The safety story is the pre-flight plan: `flash` refuses before any write when the device is not System B, the application's mask does not match, or the load procedure contains an operation it cannot execute (see [the supported-operations list](../reference/cli.md#bussard-flash-address)). Unlike `apply` there is no backup, because a fresh device has no prior application to save; recovery from a failed flash is re-running it, or falling back to ETS. For the same reason the pre-flight also checks the device really is fresh: a device already carrying a different application is refused unless you pass `--force`, while re-flashing the same application (the recovery path above) needs no flag. [SAFETY.md](../explanation/safety.md) has the full table. After writing, `flash` verifies the application reads back as `Loaded`, spot-checks the written segments byte-for-byte, and reads the parameter memory back to compare it with the model the way `bussard plan` does; a parameter that still differs is named and the command exits non-zero.
 
 One special case: a device with a BCU access key set needs `--bcu-key <HEX>`; without it bussard presents the free-access key, which is correct for an unkeyed device. The download runs over a single management connection for its whole duration, exactly as ETS does; if that connection genuinely dies mid-flash, re-run `flash`; the download is idempotent (it re-unloads and rewrites the application wholesale).
 
@@ -430,7 +430,7 @@ parameter backup written to knx/captures/backups/parameters/1.1.12-1790182579.js
 parameters verified: 1 changed octet(s) read back from 1.1.12; the application is Loaded
 ```
 
-It refuses when the device runs another application or is not `Loaded`, and when a changed parameter shows or hides a com-object: that changes the group-object table, which needs the full `flash`. [SAFETY.md](SAFETY.md#what-each-write-command-does-and-its-rails) has the table.
+It refuses when the device runs another application or is not `Loaded`, and when a changed parameter shows or hides a com-object: that changes the group-object table, which needs the full `flash`. [SAFETY.md](../explanation/safety.md#what-each-write-command-does-and-its-rails) has the table.
 
 To see what a device holds before you change anything, give `plan` or `reconstruct` the product file. Both read the parameter memory back (read-only), decode it, and list the values that differ from the vendor default and from the model:
 
@@ -503,7 +503,7 @@ Register the MCP server once:
 $ claude mcp add knx -- bussard mcp --dir knx
 ```
 
-Then ask in plain language: "What devices are on my bus?", "Watch for telegrams while I press the kitchen switch", "Read the wind speed". The server exposes the model, live telegrams, a "press the button now" wait tool, and rate-limited bus reads ([the full tool list](reference.md#the-mcp-server)). Add `--passive` for a server that never transmits, or `--allow-writes` to let Claude write group values. `--allow-writes` goes through the same real-gateway gate as `bussard write`: against a non-loopback gateway the server refuses to start without `--allow-remote-gateway`. Protected GAs are refused over MCP with no override either way, and a `dpt` that contradicts the model is refused too.
+Then ask in plain language: "What devices are on my bus?", "Watch for telegrams while I press the kitchen switch", "Read the wind speed". The server exposes the model, live telegrams, a "press the button now" wait tool, and rate-limited bus reads ([the full tool list](../reference/cli.md#the-mcp-server)). Add `--passive` for a server that never transmits, or `--allow-writes` to let Claude write group values. `--allow-writes` goes through the same real-gateway gate as `bussard write`: against a non-loopback gateway the server refuses to start without `--allow-remote-gateway`. Protected GAs are refused over MCP with no override either way, and a `dpt` that contradicts the model is refused too.
 
 The payoff is closing the loop between an intent and a reviewed change. "I added a presence detector in the hall, it should switch the hall light": Claude finds the detector's GA from recent telegrams, reads the light state, checks the model, and proposes the device-file edit. You review the diff, then run `plan` and `apply` yourself.
 
@@ -526,7 +526,7 @@ $ bussard groups reserve "OG Schlafen" light blind heating --dir knx
 
 The room is one argument, floor first. Each function reserves a fixed block (five addresses for a light, ten for a blind or heating zone) and fills only the roles it needs, so the unused slots are there when the plain light later becomes a dimmer. For the other scheme (trade on the main group, floor on the middle), pass `--scheme function-floor` on the first reservation, or set `[lint.groups] scheme` in `bussard.toml`. Re-running for a room that already has its block adds nothing; existing addresses and names are kept verbatim.
 
-The written `[lint]` table makes `bussard validate` check the convention from then on: a GA outside its block, a switch with no feedback address, a DPT that contradicts its role ([codes L005-L008](reference.md#validation-diagnostics)).
+The written `[lint]` table makes `bussard validate` check the convention from then on: a GA outside its block, a switch with no feedback address, a DPT that contradicts its role ([codes L005-L008](../reference/cli.md#validation-diagnostics)).
 
 An assistant driving `bussard mcp` can do the same over `knx_reserve_groups` (one room) or `knx_scaffold_groups` (a JSON room list), drafting the rooms from a conversation. Confirm the floors, rooms and functions before it writes.
 
@@ -550,7 +550,7 @@ Names, descriptions and DPTs cross over as they are. ETS has no equivalent of bu
 $ bussard capture --to knx/captures/bus.db --filter 3/
 ```
 
-Capture stores raw cEMI bytes plus a decoded snapshot in SQLite, so telegrams can be re-decoded after model fixes. Query it directly ([schema](reference.md#the-capture-database)):
+Capture stores raw cEMI bytes plus a decoded snapshot in SQLite, so telegrams can be re-decoded after model fixes. Query it directly ([schema](../reference/cli.md#the-capture-database)):
 
 ```console
 $ sqlite3 knx/captures/bus.db \

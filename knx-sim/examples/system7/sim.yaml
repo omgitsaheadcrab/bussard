@@ -14,7 +14,7 @@
 #
 # The two MDT devices serve the same product with the two LSM realisations so a
 # tool's realisation switch is exercised against each (a real device is one or
-# the other; this is a test convenience — see docs/system7-spec.md §5). The M2
+# the other; this is a test convenience — see dev/system7-spec.md §5). The M2
 # Jung 0705 capture (issue #70) proved the real device drives load control over
 # PID 5, so property is bussard's default now: 1.1.6 (MDT) and 1.1.7 (Jung) are
 # flashed with the default and no env override, and 1.1.5 is pointed at the

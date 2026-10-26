@@ -126,7 +126,7 @@ pictures copied "1:1 from ETS", and dread redoing it after every change.
 | Generate the documentation from the model | `bussard doc` writes the device list, GA list with DPTs, per-room sheets with one sentence per com object, and connection details, deterministically, in Markdown or HTML. | None. | D5 |
 | Deliver the configuration as a file | `bussard export house.bussard` writes the model, its history and a manifest with the model's SHA-256; `bussard import` takes it back byte for byte (pending merge). | None. | D19 |
 | Export for the customer's ETS | `bussard export-groups --format ets-csv` or `ets-xml`. | None. | D12 |
-| Handover checklist | [handover-checklist.md](../handover-checklist.md), one page, with the bundle checksum, `doc` output and `test` report as the bussard-managed delivery. | None. | D2 |
+| Handover checklist | [handover-checklist.md](../../docs/how-to/handover-checklist.md), one page, with the bundle checksum, `doc` output and `test` report as the bussard-managed delivery. | None. | D2 |
 
 ### Stage 8. After-sales: change requests and remote support
 
@@ -139,7 +139,7 @@ password, and screenshots of the delivered state.
 
 | Need | bussard today | Gap | Issue |
 |---|---|---|---|
-| Absorb small changes without a visit | The customer's assistant sends a bundle or describes the wish. He runs `bussard diff` against the delivered bundle, makes the change in ETS or bussard, and sends a file back; the customer's assistant previews it with `knx_diff_project` and her `import` keeps her names (pending merge). [collaboration.md](../collaboration.md) documents this and the optional repository track. | `plan` needs a live device, so the repository track's CI runs `validate` and `diff` only. | D16, D19, D7 |
+| Absorb small changes without a visit | The customer's assistant sends a bundle or describes the wish. He runs `bussard diff` against the delivered bundle, makes the change in ETS or bussard, and sends a file back; the customer's assistant previews it with `knx_diff_project` and her `import` keeps her names (pending merge). [collaboration.md](../../docs/how-to/work-with-an-integrator.md) documents this and the optional repository track. | `plan` needs a live device, so the repository track's CI runs `validate` and `diff` only. | D16, D19, D7 |
 | Know the delivered state | The handover bundle and its checksum on the acceptance protocol (pending merge). `bussard history` on either side shows who changed what, when, and through which gateway. `bussard test` reruns after every change. | None. | D19, D18, D9 |
 | Real-gateway gate | Every write to a non-loopback gateway needs `--allow-remote-gateway` or `BUSSARD_ALLOW_REAL_GATEWAY=1`. SAFETY.md's section for professionals says to set the variable in the service laptop's shell profile, and why it is per machine. | None. | D2 |
 

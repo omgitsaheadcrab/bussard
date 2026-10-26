@@ -1,5 +1,5 @@
 //! The simulator's KNXnet/IP Secure gateway (issue #71 Phase B) driven by a
-//! client written here from docs/knx-secure-spec.md §7-§8, over real sockets.
+//! client written here from dev/knx-secure-spec.md §7-§8, over real sockets.
 //!
 //! Checks the secure-only behaviour bussard issue #182 describes (plain UDP
 //! CONNECT refused with 0x22, secured families in the extended search), the

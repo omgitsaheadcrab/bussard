@@ -1,4 +1,4 @@
-//! Channel labels and enum labels in device files (docs/model-format.md,
+//! Channel labels and enum labels in device files (docs/reference/model-format.md,
 //! "Parameter values" and the lock's `label_ref`): the file's channel `name`
 //! is the label parameter's value in memory, an enum label becomes its code
 //! when the product model is there, and a save writes both back as the user

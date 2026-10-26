@@ -444,7 +444,7 @@ fn real_abb_ieee754_single_parameters_are_four_bytes_wide() -> Result<(), Box<dy
 
 /// The corpus's vendor directory: `BUSSARD_PRODUCT_CORPUS` may name the
 /// product-corpus root, its `cache/`, or the vendor directory itself
-/// (`docs/testing.md`).
+/// (`dev/testing.md`).
 fn vendor_dir(dir: std::path::PathBuf) -> std::path::PathBuf {
     [dir.join("cache/vendor"), dir.join("vendor")]
         .into_iter()

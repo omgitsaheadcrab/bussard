@@ -86,7 +86,7 @@ session goes to linking and to waiting on the bus, so:
   The same for pull requests: `scripts/dev/wait-pr.sh <n>` as a background
   command exits when the checks finish and auto-merge lands the PR (or when
   it needs a hand), so no timer-driven merge check is needed.
-- Subagents: point every implementation agent at `docs/agent-brief.md` and
+- Subagents: point every implementation agent at `dev/agent-brief.md` and
   keep the prompt to the task. The brief carries the current test commands,
   the changelog rule, the PR steps and the report format.
 - Filter command output before it reaches the transcript: `--json` piped

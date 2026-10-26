@@ -1,9 +1,9 @@
 //! Documentation consistency checks (issue #107).
 //!
-//! - `docs/SAFETY.md`'s "Supported device masks" table is rendered from
+//! - `docs/explanation/safety.md`'s "Supported device masks" table is rendered from
 //!   [`bussard_mgmt::capability_table`], the same source `plan`, `apply`,
 //!   `flash`, `reconstruct` and `audit` use, and must match byte-for-byte.
-//! - `docs/reference.md` documents every long flag any subcommand's `--help`
+//! - `docs/reference/cli.md` documents every long flag any subcommand's `--help`
 //!   prints.
 
 use std::path::{Path, PathBuf};
@@ -13,9 +13,9 @@ use bussard_mgmt::{MaskProfile, capability_table};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// Marks the start of the generated table in `docs/SAFETY.md`.
+/// Marks the start of the generated table in `docs/explanation/safety.md`.
 const TABLE_START: &str = "<!-- mask-table:start -->";
-/// Marks the end of the generated table in `docs/SAFETY.md`.
+/// Marks the end of the generated table in `docs/explanation/safety.md`.
 const TABLE_END: &str = "<!-- mask-table:end -->";
 
 fn docs() -> PathBuf {
@@ -26,7 +26,7 @@ fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
 
-/// Renders the capability table as the Markdown that lives in SAFETY.md.
+/// Renders the capability table as the Markdown that lives in safety.md.
 fn render_mask_table() -> String {
     let mut out = String::from(
         "| Mask | Family | Medium | `plan` / `apply` | `flash` | `reconstruct` | `describe` | Notes |\n\
@@ -50,10 +50,10 @@ fn render_mask_table() -> String {
 
 #[test]
 fn test_safety_mask_table_matches_capability_table() -> TestResult {
-    let safety = std::fs::read_to_string(docs().join("SAFETY.md"))?;
+    let safety = std::fs::read_to_string(docs().join("explanation/safety.md"))?;
     let section = safety
         .find("## Supported device masks")
-        .ok_or("SAFETY.md has no \"Supported device masks\" section")?;
+        .ok_or("safety.md has no \"Supported device masks\" section")?;
     let rest = &safety[section..];
     let start = rest.find(TABLE_START).ok_or("no mask-table start marker")?;
     let end = rest.find(TABLE_END).ok_or("no mask-table end marker")?;
@@ -66,7 +66,7 @@ fn test_safety_mask_table_matches_capability_table() -> TestResult {
     let expected = render_mask_table();
     assert_eq!(
         body, expected,
-        "docs/SAFETY.md's mask table is stale; replace the block between the markers with:\n{expected}"
+        "docs/explanation/safety.md's mask table is stale; replace the block between the markers with:\n{expected}"
     );
     Ok(())
 }
@@ -128,7 +128,7 @@ fn mentions(doc: &str, flag: &str) -> bool {
     })
 }
 
-/// The text of `reference.md`'s `### \`bussard <command>...` section, up to the
+/// The text of `reference/cli.md`'s `### \`bussard <command>...` section, up to the
 /// next heading of the same or a higher level.
 fn command_section<'a>(doc: &'a str, command: &str) -> Option<&'a str> {
     let heading = format!("### `bussard {command}");
@@ -147,7 +147,7 @@ fn command_section<'a>(doc: &'a str, command: &str) -> Option<&'a str> {
 
 #[test]
 fn test_reference_documents_every_help_flag() -> TestResult {
-    let reference = std::fs::read_to_string(docs().join("reference.md"))?;
+    let reference = std::fs::read_to_string(docs().join("reference/cli.md"))?;
     let top = help(&[])?;
     let commands = subcommands(&top);
     assert!(
@@ -180,7 +180,7 @@ fn test_reference_documents_every_help_flag() -> TestResult {
     }
     assert!(
         missing.is_empty(),
-        "docs/reference.md does not document:\n  {}",
+        "docs/reference/cli.md does not document:\n  {}",
         missing.join("\n  ")
     );
     Ok(())

@@ -1215,7 +1215,7 @@ keys). Neither changes for the 1.1.5 case, which keeps 15 keys. The oracle
 is an ETS download of 1.1.5 with 1/0/4 set to security Off, compared with
 `scripts/campaign/95-offline-oracle.sh --keyring` (the property-write parity
 covers PID 53, PID 54 and PID 61) against a model where `bussard groups
-secure 1/0/4 off` ran; see [SAFETY.md](SAFETY.md#switching-data-secure-off-for-one-group-address).
+secure 1/0/4 off` ran; see [SAFETY.md](../docs/explanation/safety.md#switching-data-secure-off-for-one-group-address).
 
 After a verified write, bussard records the flags it wrote in the lock's
 com-objects (`secure`), as it records PID 54 in `secure_senders`. A keyring
