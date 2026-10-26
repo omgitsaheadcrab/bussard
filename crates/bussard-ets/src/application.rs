@@ -792,6 +792,11 @@ pub struct ApplicationProgram {
     /// `false` for `BigEndian` or no declaration, the KNX default.
     #[serde(default)]
     pub parameters_little_endian: bool,
+    /// The `<Options TextParameterEncoding>` value (`iso-8859-15`, `utf-8`,
+    /// ...): the code page a `TypeText` parameter is converted to octets with
+    /// (issue #401). `None` when the program declares none.
+    #[serde(default)]
+    pub text_parameter_encoding: Option<String>,
     /// Where `<Static><ComObjectTable CodeSegment Offset>` places the
     /// group-object table inside a code segment, when the program declares
     /// it. A System 7 (mask 07xx) program keeps its descriptor table there.
@@ -1291,6 +1296,7 @@ fn handle_start(
                 .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
             app.parameters_little_endian = get(m, b"ParameterByteOrder")
                 .is_some_and(|v| v.eq_ignore_ascii_case("LittleEndian"));
+            app.text_parameter_encoding = get(m, b"TextParameterEncoding").map(str::to_string);
         }
         b"ComObjectTable" => insert_com_object_table(app, m),
         b"Language" => translations.enter_language(get(m, b"Identifier")),
@@ -1445,6 +1451,7 @@ fn handle_empty(
                 .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
             app.parameters_little_endian = get(m, b"ParameterByteOrder")
                 .is_some_and(|v| v.eq_ignore_ascii_case("LittleEndian"));
+            app.text_parameter_encoding = get(m, b"TextParameterEncoding").map(str::to_string);
         }
         b"ComObjectTable" => insert_com_object_table(app, m),
         b"NumericArg" => {
@@ -2566,6 +2573,25 @@ mod tests {
     /// `<Options>` decides whether a download writes hidden parameters
     /// (issue #89): only when it declares neither `DownloadInvisibleParameters`
     /// nor a preferred partial download.
+    /// `<Options TextParameterEncoding>` names the code page of the text
+    /// parameters (issue #401).
+    #[test]
+    fn test_parse_application_program_text_parameter_encoding() -> Result<()> {
+        let xml = |options: &str| {
+            format!(
+                r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t"><Static>{options}</Static></ApplicationProgram></KNX>"#
+            )
+        };
+        let app = parse_application_program_str(
+            "M-1_A-1",
+            &xml(r#"<Options TextParameterEncoding="iso-8859-15" />"#),
+        )?;
+        assert_eq!(app.text_parameter_encoding.as_deref(), Some("iso-8859-15"));
+        let app = parse_application_program_str("M-1_A-1", &xml(r#"<Options />"#))?;
+        assert_eq!(app.text_parameter_encoding, None);
+        Ok(())
+    }
+
     #[test]
     fn test_parse_application_program_download_invisible_parameters() -> Result<()> {
         let xml = |options: &str| {

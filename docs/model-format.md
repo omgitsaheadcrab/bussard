@@ -262,7 +262,8 @@ objects and parameters that belong to no channel.
 The file stores the value the user means. The reader accepts:
 
 - a string: an enum label (`"Jalousie"`), an enum code (`"2"`), a number
-  with unit (`"21 °C"`, `"15 min"`), or free text for text parameters;
+  with unit (`"21 °C"`, `"15 min"`), or free text for text parameters
+  (it must fit the field in the program's text code page, issue #401);
 - an integer or a bool, which are converted to their string form.
 
 A float is rejected with a fix-it hint, because `1.10` and `1.1` cannot be

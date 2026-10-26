@@ -49,6 +49,7 @@ pub mod schema;
 pub mod secure_invariants;
 pub mod secure_links;
 pub mod tests_schema;
+pub mod text_codec;
 pub mod toml_io;
 pub mod validate;
 

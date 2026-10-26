@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 use bussard_download::sweep::knxprod_files;
 use bussard_download::{GroupObjectDescriptor, dynamic_group_object_descriptors, plan_flash};
 use bussard_model::Flags;
+use bussard_model::text_codec::TextCodec;
 use bussard_prod::application::LoadOp;
 use bussard_prod::dynamic::{DynamicConfig, evaluate_dynamic, visible_parameter_refs};
 use bussard_prod::{AppSelection, ApplicationProgram, ParameterType};
@@ -764,18 +765,23 @@ fn random_value(app: &ApplicationProgram, param_ref: &str, rng: &mut SplitMix64)
         .parameter_types
         .get(param.parameter_type.as_deref()?)?
         .kind;
-    draw_value(kind, rng)
+    let codec = TextCodec::from_declaration(app.text_parameter_encoding.as_deref());
+    draw_value(kind, codec, rng)
 }
 
 /// A random value inside a parameter type's declared range: an enumeration
-/// member, or an integer between the type's `minInclusive` and
-/// `maxInclusive` (both bounds declared, the span computed wide so a full
-/// 64-bit signed range cannot overflow). `None` for a type with no declared
-/// range to draw from (text, float, time, an integer missing a bound): the
-/// parameter keeps its vendor default. A vendor default outside its own type
-/// is the vendor's, not the generator's (#399).
-fn draw_value(kind: &ParameterType, rng: &mut SplitMix64) -> Option<String> {
+/// member, an integer between the type's `minInclusive` and `maxInclusive`
+/// (both bounds declared, the span computed wide so a full 64-bit signed
+/// range cannot overflow), or a text that fits its field in the program's
+/// code page (`codec`, #401). `None` for a type with no declared range to
+/// draw from (float, time, an integer missing a bound): the parameter keeps
+/// its vendor default. A vendor default outside its own type is the
+/// vendor's, not the generator's (#399).
+fn draw_value(kind: &ParameterType, codec: TextCodec, rng: &mut SplitMix64) -> Option<String> {
     match kind {
+        ParameterType::Text {
+            size_bits: Some(bits),
+        } => draw_text((*bits / 8) as usize, codec, rng),
         ParameterType::Enum { values, .. } if !values.is_empty() => {
             let i = usize::try_from(rng.below(values.len() as u64)).ok()?;
             values.get(i).map(|v| v.value.to_string())
@@ -796,6 +802,41 @@ fn draw_value(kind: &ParameterType, rng: &mut SplitMix64) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// A label of 1 to 12 characters that fits `len` octets in `codec`: ASCII
+/// letters and digits, plus accented letters when the code page holds them
+/// (#401). `None` for a field with no octets.
+fn draw_text(len: usize, codec: TextCodec, rng: &mut SplitMix64) -> Option<String> {
+    const ASCII: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const ACCENTED: &str = "äöüÄÖÜßéèçñ";
+    if len == 0 {
+        return None;
+    }
+    let mut pool: Vec<char> = ASCII.chars().collect();
+    pool.extend(
+        ACCENTED
+            .chars()
+            .filter(|c| codec.encode(&c.to_string(), 4).is_ok()),
+    );
+    let want = 1 + rng.below(12);
+    let mut text = String::new();
+    for _ in 0..want {
+        let i = usize::try_from(rng.below(pool.len() as u64)).ok()?;
+        let mut next = text.clone();
+        next.push(*pool.get(i)?);
+        // A character that would overflow the field is skipped.
+        if codec.encode(&next, len).is_ok() {
+            text = next;
+        }
+    }
+    if text.is_empty() {
+        // Every draw overflowed (an accented letter in one UTF-8 octet): one
+        // ASCII letter fits any field.
+        let i = usize::try_from(rng.below(26)).ok()?;
+        text.push(*pool.get(i)?);
+    }
+    Some(text)
 }
 
 impl Configuration {
@@ -1584,8 +1625,13 @@ mod tests {
         };
         let mut rng = SplitMix64::new(346);
         for _ in 0..500 {
-            assert_eq!(draw_value(&pinned, &mut rng).as_deref(), Some("129"));
-            let v: i64 = draw_value(&range, &mut rng).ok_or("no value")?.parse()?;
+            assert_eq!(
+                draw_value(&pinned, TextCodec::Utf8, &mut rng).as_deref(),
+                Some("129")
+            );
+            let v: i64 = draw_value(&range, TextCodec::Utf8, &mut rng)
+                .ok_or("no value")?
+                .parse()?;
             assert!((129..=140).contains(&v), "{v} outside 129..=140");
         }
         Ok(())
@@ -1601,7 +1647,7 @@ mod tests {
         };
         let mut rng = SplitMix64::new(7);
         for _ in 0..100 {
-            draw_value(&full, &mut rng)
+            draw_value(&full, TextCodec::Utf8, &mut rng)
                 .ok_or("no value")?
                 .parse::<i64>()?;
         }
@@ -1611,16 +1657,41 @@ mod tests {
             max: None,
             signed: false,
         };
-        assert_eq!(draw_value(&open, &mut rng), None);
+        assert_eq!(draw_value(&open, TextCodec::Utf8, &mut rng), None);
         assert_eq!(
             draw_value(
-                &ParameterType::Text {
-                    size_bits: Some(64)
-                },
+                &ParameterType::Text { size_bits: Some(0) },
+                TextCodec::Utf8,
                 &mut rng
             ),
             None
         );
+        Ok(())
+    }
+
+    /// A drawn text fits its field in the program's code page (#401): MDT's
+    /// eight-octet labels in ISO 8859-15, UTF-8, and ASCII when undeclared.
+    #[test]
+    fn test_draw_value_text_fits_the_field_and_the_code_page() -> TestResult {
+        let mut rng = SplitMix64::new(401);
+        let mut accented = 0;
+        for codec in [TextCodec::Latin9, TextCodec::Utf8, TextCodec::Undeclared] {
+            for bits in [8, 64, 160] {
+                let kind = ParameterType::Text {
+                    size_bits: Some(bits),
+                };
+                for _ in 0..300 {
+                    let text = draw_value(&kind, codec, &mut rng).ok_or("no text")?;
+                    let octets = codec.encode(&text, (bits / 8) as usize)?;
+                    assert_eq!(codec.decode(&octets), text, "{codec:?}");
+                    accented += usize::from(!text.is_ascii());
+                    if codec == TextCodec::Undeclared {
+                        assert!(text.is_ascii(), "{text}");
+                    }
+                }
+            }
+        }
+        assert!(accented > 0, "no accented text drawn");
         Ok(())
     }
 }

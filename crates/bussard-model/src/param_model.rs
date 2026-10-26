@@ -103,8 +103,9 @@ pub struct ObjectDef {
 /// `module_dynamics:`, `unions:` and each parameter's `refs:`, `base_value`
 /// and integer width, issue #345; format 6 drops `blocks:`,
 /// `parameter_when:` and `ref_values:`, which the tree gives, and writes a
-/// parameter's own default, issue #345).
-pub const MODEL_FORMAT: u32 = 6;
+/// parameter's own default, issue #345; format 7 a text type's
+/// `encoding:`, issue #401).
+pub const MODEL_FORMAT: u32 = 7;
 
 /// Whether the model file at `path` is of the current [`MODEL_FORMAT`]. Reads
 /// only the head of the file, where the emitter puts the key.
@@ -176,6 +177,10 @@ pub enum ParamKind {
     Text {
         /// The field length in bytes, if declared (`size_bits / 8`).
         len: Option<usize>,
+        /// The program's `TextParameterEncoding`, the code page the text is
+        /// written in (issue #401); `None` when undeclared.
+        #[serde(default)]
+        encoding: Option<String>,
     },
     /// A float (`float`).
     Float,
@@ -273,6 +278,8 @@ enum RawType {
     Text {
         #[serde(default)]
         size: Option<u32>,
+        #[serde(default)]
+        encoding: Option<String>,
     },
     Float {
         #[serde(default)]
@@ -540,8 +547,9 @@ impl RawType {
             RawType::Enum { values } => ParamKind::Enum {
                 values: values.into_iter().map(|v| v.value).collect(),
             },
-            RawType::Text { size } => ParamKind::Text {
+            RawType::Text { size, encoding } => ParamKind::Text {
                 len: size.map(|b| (b / 8) as usize),
+                encoding,
             },
             RawType::Float { .. } => ParamKind::Float,
             RawType::None => ParamKind::None,

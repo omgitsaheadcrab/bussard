@@ -492,7 +492,13 @@ fn param_row(
                 b.map(|v| v.to_string()).unwrap_or_default()
             )),
         },
-        ParamKind::Text { len: Some(n) } => Some(format!("text, up to {n} bytes")),
+        ParamKind::Text {
+            len: Some(n),
+            encoding,
+        } => Some(format!(
+            "text, up to {n} bytes in {}",
+            crate::text_codec::TextCodec::from_declaration(encoding.as_deref()).name()
+        )),
         _ => None,
     });
     ParamRow {
