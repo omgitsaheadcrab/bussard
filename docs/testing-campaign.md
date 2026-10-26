@@ -270,14 +270,26 @@ never `identical`. `--scope addr,assoc` judges only the named regions, for a
 capture that by design rewrites part of the device (a security change); the
 others are still shown.
 
+A read-compare download (mask 0701, issue #384) stays thin by design: ETS
+reads the device memory and writes only the octets that differ from its
+image. `image` therefore also keeps every octet ETS read and never wrote, as
+read-confirmed (`confirmed/`), and `imgdiff` compares bussard's planned octets
+against them with their own coverage and verdict, next to the written ones:
+`written: not-comparable, confirmed: 32 of 8169 octets differ at 0x43FE+5`,
+then each mismatch with its address and both values. An octet ETS wrote is
+never read-confirmed, even when ETS read it first.
+
 `95-offline-oracle.sh` runs all three for a list of devices and prints one
 summary table with a coverage column. A row is
 `device|capture|product|application|note|coverage|options`; the last two are
-optional: the coverage recorded for the row, and `expect=<verdict>` or
-`scope=<regions>`. A `#@ <options>` line sets `--keyring`, `--dir`,
+optional: the coverage recorded for the row, and `expect=<verdict>`,
+`confirmed=<verdict>` (the verdict on the read-confirmed octets) or
+`scope=<regions>`. The summary's `confirmed` column shows the read-confirmed
+coverage and verdict, and each confirmed mismatch gets its own line. A `#@ <options>` line sets `--keyring`, `--dir`,
 `--no-admit` or `--min-coverage` for the whole file. `--check` exits 1 when a
 row with its capture present gives another verdict than expected (identical by
-default) or less than its recorded coverage; the corpus-gated test
+default), another confirmed verdict than its `confirmed=`, or less than its
+recorded coverage; the corpus-gated test
 `offline_oracle.rs` runs it (see [testing.md](testing.md)). The product
 may be a `.knxprod`, a `.knxproj` project export (name the application, the
 export holds every device's), `wrapper.zip!inner/file.knxprod` to pick one file

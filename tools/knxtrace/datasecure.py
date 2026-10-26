@@ -653,6 +653,10 @@ def unwrap_frames(frames: Iterable, ring: Keyring) -> None:
 KEY_PIDS = frozenset({52, 53, 56, 60})
 SECURITY_OBJECT_TYPE = 17
 KEY_SIZED = 16  # octets: anything this long on the security object may be a key
+# PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE: individual addresses and sequence
+# numbers, never a key, however long (issue #384). Shown so a sender list
+# difference can be named.
+PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE = 54
 
 
 def is_key_material(
@@ -662,11 +666,15 @@ def is_key_material(
 
     `obj_type` is set for the extended services, which name the object by
     type; `obj_index` for the plain ones, which name it by index. By type:
-    the key PIDs, or anything key-sized, on the security object. By index
-    (the type is unknown): a key PID on any object but the device object.
+    the key PIDs, or anything key-sized but PID 54 (the sender table), on the
+    security object. By index (the type is unknown): a key PID on any object
+    but the device object.
     """
     if obj_type is not None:
-        return obj_type == SECURITY_OBJECT_TYPE and (pid in KEY_PIDS or length >= KEY_SIZED)
+        return obj_type == SECURITY_OBJECT_TYPE and (
+            pid in KEY_PIDS
+            or (length >= KEY_SIZED and pid != PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE)
+        )
     return pid in KEY_PIDS and obj_index != 0
 
 
