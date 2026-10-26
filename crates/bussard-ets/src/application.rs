@@ -1558,6 +1558,18 @@ fn handle_empty(
                 });
             }
         }
+        b"when" if state.lp.is_some() => {
+            // A self-closed `<when …/>` in a load procedure holds no op, but
+            // its test still counts: a `<when default="true">` sibling is
+            // taken only when no test matches (issue #402).
+            if let (Some(lp), Some(frame)) = (state.lp.as_mut(), state.lp_frames.last())
+                && let Some(choose) = lp.chooses.get_mut(frame.0)
+            {
+                choose
+                    .tests
+                    .push(WhenTest::parse(get(m, b"test"), get(m, b"default")));
+            }
+        }
         b"RelativeSegment" => insert_segment(app, m, SegmentKind::Relative),
         b"AbsoluteSegment" => insert_segment(app, m, SegmentKind::Absolute),
         name if name.starts_with(b"Type") => {
