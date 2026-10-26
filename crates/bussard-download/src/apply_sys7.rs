@@ -198,12 +198,26 @@ pub fn sys7_table_images(
     }
 
     let association_image = sys7_association_table(desired);
-    if association_image.len() > SYS7_ASSOCIATION_REGION_LEN {
+    // A packed product (`DynamicTableManagement`, issue #383) keeps the
+    // association table directly behind the address table, as ETS writes it:
+    // it moves with the new address table's length and must end before the
+    // product's LSM 2 segment does.
+    let (association_base, association_capacity) = match live.packed_end {
+        Some(end) => {
+            let base = usize::from(live.address_base) + address_region.len();
+            (
+                u16::try_from(base).unwrap_or(u16::MAX),
+                usize::from(end).saturating_sub(base),
+            )
+        }
+        None => (live.association_base, SYS7_ASSOCIATION_REGION_LEN),
+    };
+    if association_image.len() > association_capacity {
         return Err(Sys7ApplyError::RegionOverflow {
             table: "association",
-            base: live.association_base,
+            base: association_base,
             len: association_image.len(),
-            capacity: SYS7_ASSOCIATION_REGION_LEN,
+            capacity: association_capacity,
         });
     }
 
@@ -214,7 +228,7 @@ pub fn sys7_table_images(
 
     Ok(Sys7TableImages {
         address_base: live.address_base,
-        association_base: live.association_base,
+        association_base,
         address_region,
         address_table_len,
         association_image,
@@ -404,6 +418,7 @@ mod tests {
             own_ia,
             address_base: SYS7_ADDRESS_TABLE_ADDR,
             association_base: SYS7_ASSOCIATION_TABLE_ADDR,
+            packed_end: None,
             group_object_base: go_base,
             group_object_image: go_image,
             group_objects: Vec::new(),
@@ -457,6 +472,44 @@ mod tests {
                 }
             ),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn test_sys7_table_images_packs_the_association_table() -> Result<(), Sys7ApplyError> {
+        // The Jung A-2088 (DynamicTableManagement, issue #383): the device's
+        // association table sits right behind a 31-octet address table at
+        // 0x401F; the model has one GA, so the address table is 5 octets and
+        // the association table moves to 0x4005, inside 0x4000..0x43FE.
+        let mut live = live(0x1131, Vec::new(), 0x401F);
+        live.association_base = 0x401F;
+        live.packed_end = Some(0x43FE);
+        let images = sys7_table_images(&live, &desired_one_link(), 0x1131)?;
+        assert_eq!(images.address_base, 0x4000);
+        assert_eq!(images.address_region.len(), 5);
+        assert_eq!(images.association_base, 0x4005);
+        assert_eq!(images.association_image, vec![0x01, 0x01, 0x01]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_sys7_table_images_refuses_a_packed_table_past_the_segment() {
+        // Both tables must end before the product's LSM 2 segment does
+        // (M-00E1_A-A00D: 0x4000/23 + 0x4017/21, so they end at 0x402C).
+        let mut live = live(0x1131, Vec::new(), 0x4005);
+        live.packed_end = Some(0x4007);
+        let err = sys7_table_images(&live, &desired_one_link(), 0x1131);
+        assert!(
+            matches!(
+                err,
+                Err(Sys7ApplyError::RegionOverflow {
+                    table: "association",
+                    base: 0x4005,
+                    capacity: 2,
+                    ..
+                })
+            ),
+            "{err:?}"
         );
     }
 

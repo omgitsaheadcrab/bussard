@@ -2360,6 +2360,7 @@ async fn test_read_sys7_tables_at_reads_the_product_association_base()
     let bases = bussard_download::Sys7TableBases {
         address: Some(0x4000),
         association: Some(0x41FF),
+        packed_end: None,
     };
     let live = bussard_download::read_sys7_tables_at(&mut l4, bases).await?;
     assert_eq!(live.association_base, 0x41FF);
@@ -2368,6 +2369,40 @@ async fn test_read_sys7_tables_at_reads_the_product_association_base()
     let fallback = read_sys7_tables(&mut l4).await?;
     assert_eq!(fallback.association_base, 0x4201);
     assert_ne!(fallback.tables.associations, live.tables.associations);
+    drop(l4);
+    drop(handle);
+    Ok(())
+}
+
+/// A product with `DynamicTableManagement` (the Jung A-2088, the Theben
+/// Meteodata, issue #383) keeps its association table directly behind the
+/// address table: a device that does not answer `PID_TABLE_REFERENCE` is read
+/// there, and no group-object table is decoded out of the association table.
+#[tokio::test]
+async fn test_read_sys7_tables_at_reads_a_packed_association_table()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut bus, state, handle) = setup(LsmMode::Property, Fault::None).await?;
+    let target: bussard_model::IndividualAddress = "1.1.99".parse()?;
+    // The address table is [CNT=3][own IA][0x0801][0x0802]: 7 octets.
+    seed_tables(&state, target.raw(), &[0x0801, 0x0802], &[], &[]);
+    {
+        let mut s = lock(&state);
+        for (i, b) in [0x02u8, 0x01, 0x01, 0x02, 0x02].iter().enumerate() {
+            s.memory.insert(0x4007 + i as u16, *b);
+        }
+    }
+    let mut l4 = authed_connection(&mut bus, target).await?;
+    let bases = bussard_download::Sys7TableBases {
+        address: Some(0x4000),
+        association: Some(0x41FF),
+        packed_end: Some(0x43FE),
+    };
+    let live = bussard_download::read_sys7_tables_at(&mut l4, bases).await?;
+    assert_eq!(live.association_base, 0x4007);
+    assert_eq!(live.packed_end, Some(0x43FE));
+    assert_eq!(live.tables.associations, vec![(1, 1), (2, 2)]);
+    assert_eq!(live.tables.resolved.len(), 2);
+    assert!(live.group_object_image.is_empty());
     drop(l4);
     drop(handle);
     Ok(())

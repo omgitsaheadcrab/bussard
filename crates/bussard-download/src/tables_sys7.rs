@@ -39,6 +39,12 @@
 //! not fit the region is refused and an unwritten region reads back as
 //! `CNT = 0`, but it does read the wrong octets as the table (#369).
 //!
+//! A product with `DynamicTableManagement` (the Jung `A-2088`, the Theben
+//! Meteodata) has no fixed association base: ETS writes the association table
+//! directly behind the address table (#383), so without the device's answer
+//! it is read where the address table ends, and the LSM 1 region holds no
+//! group-object table.
+//!
 //! The result is a [`bussard_mgmt::tables::DeviceTables`] — the same shape the
 //! System B reader produces — so `plan`, the `reconstruct` report and the
 //! `apply` backup all work on System 7 unchanged.
@@ -101,10 +107,16 @@ pub struct Sys7LiveTables {
     /// `PID_TABLE_REFERENCE` of object 1, else [`SYS7_ADDRESS_TABLE_ADDR`].
     pub address_base: u16,
     /// Where the LSM 2 region (association table) starts: the device's
-    /// `PID_TABLE_REFERENCE` of object 2, else [`SYS7_ASSOCIATION_TABLE_ADDR`].
+    /// `PID_TABLE_REFERENCE` of object 2, else the product's base, the end of
+    /// the address table for a packed product, or [`SYS7_ASSOCIATION_TABLE_ADDR`].
     /// The Jung 0705 products place it at `0x41FF`, right after a 511-octet
     /// address segment; the constant assumed 513 (issue #89, 1.1.32).
     pub association_base: u16,
+    /// Set when the product packs the association table directly behind the
+    /// address table (`DynamicTableManagement`,
+    /// [`Sys7TableBases::packed_end`]): a write moves it with the address
+    /// table's length, and both tables end before this address.
+    pub packed_end: Option<u16>,
     /// The device's own individual address, from address-table entry 0 (TSAP 0).
     pub own_ia: u16,
     /// Where the group-object descriptor table starts: immediately after the
@@ -160,13 +172,22 @@ pub async fn read_sys7_tables_at<Ch: L4Channel>(
         &mut notes,
     )
     .await;
-    let association_base = table_base(
-        l4,
-        2,
-        bases.association.unwrap_or(SYS7_ASSOCIATION_TABLE_ADDR),
-        &mut notes,
-    )
-    .await;
+    // A product with `DynamicTableManagement` keeps its association table
+    // directly behind the address table (issue #383), so without the device's
+    // answer its base follows from the address table read below.
+    let association_reported = if bases.packed_end.is_some() {
+        device_table_base(l4, 2, "the address table's end", &mut notes).await
+    } else {
+        Some(
+            table_base(
+                l4,
+                2,
+                bases.association.unwrap_or(SYS7_ASSOCIATION_TABLE_ADDR),
+                &mut notes,
+            )
+            .await,
+        )
+    };
 
     // --- LSM 1 region: address table, then the group-object table ---
     let addr_image = read_counted_table(
@@ -201,7 +222,17 @@ pub async fn read_sys7_tables_at<Ch: L4Channel>(
     // region (co-located after the GrAT vs a fixed sub-address) against a live
     // 0705 read-back.`
     let group_object_base = address_base.wrapping_add(addr_image.len() as u16);
-    let go_capacity = SYS7_ADDRESS_REGION_LEN.saturating_sub(addr_image.len());
+    let association_base = association_reported.unwrap_or(group_object_base);
+    // A packed product's LSM 1 segment is the address table alone: the
+    // association table follows it directly, and the group-object table lives
+    // in an application segment (`ComObjectTable` in `AS-43FF` on the A-2088,
+    // `AS-4400` on the Meteodata). Reading descriptors there would decode the
+    // association table as group objects.
+    let go_capacity = if bases.packed_end.is_some() {
+        0
+    } else {
+        SYS7_ADDRESS_REGION_LEN.saturating_sub(addr_image.len())
+    };
     let (group_object_image, group_objects) = if go_capacity >= SYS7_GROUP_OBJECT_HEADER_LEN {
         match read_counted_table(
             l4,
@@ -231,10 +262,12 @@ pub async fn read_sys7_tables_at<Ch: L4Channel>(
             Err(err) => return Err(err),
         }
     } else {
-        notes.push(format!(
-            "no room for a group-object table after the {}-octet address table",
-            addr_image.len()
-        ));
+        if bases.packed_end.is_none() {
+            notes.push(format!(
+                "no room for a group-object table after the {}-octet address table",
+                addr_image.len()
+            ));
+        }
         (Vec::new(), Vec::new())
     };
 
@@ -318,6 +351,7 @@ pub async fn read_sys7_tables_at<Ch: L4Channel>(
         own_ia,
         address_base,
         association_base,
+        packed_end: bases.packed_end,
         group_object_base,
         group_object_image,
         group_objects,
@@ -385,19 +419,33 @@ async fn table_base<Ch: L4Channel>(
     default: u16,
     notes: &mut Vec<String>,
 ) -> u16 {
+    let fallback = format!("{default:#06X}");
+    device_table_base(l4, object_index, &fallback, notes)
+        .await
+        .unwrap_or(default)
+}
+
+/// The start of a table object's segment as the device reports it through
+/// `PID_TABLE_REFERENCE`, or `None` when the property is not readable (the
+/// normal shape for a device or mock without PID 7 on its table objects,
+/// silently) or names an address outside the System 7 table window (with a
+/// note naming `fallback`, what the caller uses instead).
+async fn device_table_base<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    object_index: u8,
+    fallback: &str,
+    notes: &mut Vec<String>,
+) -> Option<u16> {
     match read_table_reference(l4, object_index).await {
-        Ok(base) if (0x4000..0x8000).contains(&base) => base as u16,
+        Ok(base) if (0x4000..0x8000).contains(&base) => Some(base as u16),
         Ok(base) => {
             notes.push(format!(
                 "object {object_index} reports table reference {base:#06X}, outside the \
-                 System 7 table window; using {default:#06X}"
+                 System 7 table window; using {fallback}"
             ));
-            default
+            None
         }
-        // No readable PID_TABLE_REFERENCE: the spec default, silently. This is
-        // the normal shape for a device (or mock) that does not expose PID 7 on
-        // its table objects, not a finding worth a note.
-        Err(_) => default,
+        Err(_) => None,
     }
 }
 
