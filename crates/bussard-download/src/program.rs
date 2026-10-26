@@ -159,6 +159,27 @@ pub fn desired_tables_for(
     Ok(compute_tables(links))
 }
 
+/// [`desired_tables_for`] knowing the device's application `app`: a program
+/// with no group objects (the Jung IPS 300 SREG KNX IP interface, whose load
+/// procedure only writes properties, issue #390) has nothing to link, so its
+/// empty table set is its correct state and is not refused. Every program
+/// with group objects, or an unknown one (`None`), keeps the refusal.
+pub fn desired_tables_for_app(
+    model: &Model,
+    target: IndividualAddress,
+    app: Option<&bussard_prod::ApplicationProgram>,
+) -> Result<DesiredTables, NoLinks> {
+    match desired_tables_for(model, target) {
+        Err(NoLinks(_)) if app.is_some_and(has_no_group_objects) => Ok(compute_tables(&[])),
+        other => other,
+    }
+}
+
+/// Whether `app` declares no group object at all.
+pub fn has_no_group_objects(app: &bussard_prod::ApplicationProgram) -> bool {
+    app.com_objects.is_empty() && app.resolved_com_objects().is_empty()
+}
+
 /// [`render_plan_text`] for a full application download (`method: flash`,
 /// issue #326): the tables are rewritten with the image even when their
 /// contents stay, so the plan says what the download writes instead of

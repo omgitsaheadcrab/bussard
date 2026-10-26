@@ -85,7 +85,7 @@ use crate::args::Parameters;
 use bussard_bus::BusHandle;
 use bussard_download::{
     DesiredTables, LiveRead, LiveTables, PlanReport, SecureSenderEntry, SecurityInputs,
-    Sys7TableImages, desired_tables_for, plan, render_full_image_plan_text, render_plan_text,
+    Sys7TableImages, desired_tables_for_app, plan, render_full_image_plan_text, render_plan_text,
     sys7_table_images, write_pre_write_backup, write_tables_secured,
 };
 use bussard_mgmt::{Layer4Connection, LeaseChannel, MaskProfile, Timeouts, system_type};
@@ -590,15 +590,42 @@ impl BussardMcp {
         refuse_insecure_links(&model, target)?;
         let (tier, service, gateway) = self.programming_preflight()?;
         let dir = self.state().dir.clone();
-        let desired = desired_tables_for(&model, target).map_err(|e| e.to_string())?;
+        // The product data the parameter half decodes with (issue #274): the
+        // archive the lock pins for the device, as `bussard apply` resolves it.
+        let product = product_for(&dir, &model, target);
+        let app = product.source.as_ref().and_then(|p| p.app());
+        let desired = desired_tables_for_app(&model, target, app).map_err(|e| e.to_string())?;
 
         let material = self.plan_material(target, &model)?;
         let tool_key = material.tool_key.clone();
         let tunnel = self.admitted_tunnel(&model, tool_key.is_some())?;
-        // The product data the parameter half decodes with (issue #274): the
-        // archive the lock pins for the device, as `bussard apply` resolves it.
-        let product = product_for(&dir, &model, target);
         let _guard = tier.bus_lock.lock().await;
+        // A property-only load procedure (issue #390): no tables, the plan is
+        // the properties the procedure writes.
+        if let (Some(app), Some(props)) = (
+            app,
+            app.and_then(|a| {
+                bussard_service::property_plan::property_plan(a, Some(&model), target)
+            }),
+        ) {
+            let mut warm = self.warm().lock().await;
+            warm.release().await;
+            let rows = read_property_rows(&service, target, &tool_key, &props).await?;
+            drop(warm);
+            let noop = !rows.iter().any(|r| r.differs());
+            return Ok(json!({
+                "ok": true,
+                "method": "flash",
+                "address": target.to_string(),
+                "gateway": gateway,
+                "mask": format!("{:04X}", props.device_mask),
+                "system_type": system_type(props.device_mask),
+                "secured": tool_key.is_some(),
+                "noop": noop,
+                "plan": bussard_service::property_plan::render_text(target, &app.id, &rows),
+                "property_procedure": rows,
+            }));
+        }
         // Management calls are sequential (issue #215): this read opens its own
         // lease, so the warm connection is released first.
         let mut warm = self.warm().lock().await;
@@ -1023,8 +1050,13 @@ impl BussardMcp {
         let model = self.state().model.reload();
         // The model may have changed since the plan (issue #330).
         refuse_insecure_links(&model, target)?;
-        let desired = desired_tables_for(&model, target).map_err(|e| e.to_string())?;
         let mut product = product_for(&dir, &model, target);
+        let desired = desired_tables_for_app(
+            &model,
+            target,
+            product.source.as_ref().and_then(|p| p.app()),
+        )
+        .map_err(|e| e.to_string())?;
         // KNX Data Secure: the same material the plan resolved, one
         // high-water mark for the read and the write so the send sequence
         // stays monotonic across both connections (spec §5.9).
@@ -2034,6 +2066,41 @@ async fn read_device(
             MaskProfile::from_mask(mask).capabilities().summary()
         )),
     }
+}
+
+/// Reads the properties a property-only load procedure writes (issue #390)
+/// in one read-only session to `target`.
+async fn read_property_rows(
+    service: &BusService,
+    target: IndividualAddress,
+    tool_key: &Option<Key16>,
+    plan: &bussard_download::FlashPlan,
+) -> Result<Vec<bussard_service::property_plan::PropertyRow>, String> {
+    let source = service.checked_source(false).await.map_err(|e| chain(&e))?;
+    let lease = service
+        .handle()
+        .lease()
+        .await
+        .map_err(|e| format!("could not lease the bus: {e}"))?;
+    let secure = bussard_service::secure::layer(tool_key, &SequenceHighWater::new());
+    let mut l4 = Layer4Connection::connect_with_secure(
+        LeaseChannel::new(lease),
+        target,
+        source,
+        Timeouts::default(),
+        secure,
+    )
+    .await
+    .map_err(|e| format!("connecting to {target}: {e}"))?;
+    if let Err(err) = l4
+        .authorize_or_fail(bussard_mgmt::apci::FREE_ACCESS_KEY)
+        .await
+    {
+        tracing::debug!("{target} authorize (free access) did not grant: {err}");
+    }
+    let rows = bussard_service::property_plan::read_property_rows(&mut l4, plan).await;
+    let _ = l4.disconnect().await;
+    Ok(rows)
 }
 
 /// The reads of [`read_device`] on its open session; `secured` says the

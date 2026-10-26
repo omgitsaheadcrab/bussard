@@ -105,9 +105,10 @@ pub use preflight::{
 };
 pub use program::{
     LiveRead, LiveReadError, LiveTables, NoLinks, TableWriteSummary, desired_tables_for,
-    read_live_tables, read_live_tables_at, render_full_image_plan_text, render_plan_text,
-    write_pre_write_backup, write_sys7, write_system_b, write_system_b_secured,
-    write_system_b_seeded, write_tables, write_tables_secured, write_tables_seeded,
+    desired_tables_for_app, has_no_group_objects, read_live_tables, read_live_tables_at,
+    render_full_image_plan_text, render_plan_text, write_pre_write_backup, write_sys7,
+    write_system_b, write_system_b_secured, write_system_b_seeded, write_tables,
+    write_tables_secured, write_tables_seeded,
 };
 pub use security::{
     DeviceSecurityView, GO_FLAGS_SECURE, GroupKeyEntry, MAX_SEQUENCE, SecureSenderEntry,
