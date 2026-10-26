@@ -373,11 +373,13 @@ fn test_view_shows_what_the_download_writes_on_the_corpus() -> TestResult {
 /// Issue #375: the flash takes every stored value by ref, so the parameter
 /// image is the same whether a value is keyed `hidden@<ref>` (the lock's
 /// `hidden[]`) or `<label>@<ref>` (the device file), in memory and after a
-/// save and reload. Re-keying a value never changes what a download writes.
+/// save and reload, and once the evaluation moved the reached values to the
+/// lock's keys (issue #380). Re-keying a value never changes what a download
+/// writes.
 #[test]
 fn test_parameter_image_is_the_same_under_hidden_and_visible_keys() -> TestResult {
     let address: IndividualAddress = ADDRESS.parse()?;
-    let mut compared = 0;
+    let (mut compared, mut moved, mut kept) = (0, 0, 0);
     for (id, xml) in FIXTURES {
         let app = parse_application_program(id, xml)?;
         let candidates = candidates(&app);
@@ -415,8 +417,33 @@ fn test_parameter_image_is_the_same_under_hidden_and_visible_keys() -> TestResul
                     },
                 );
             }
+            // The evaluation moves the reached values to the lock's keys
+            // (issue #380: the lock's index alone is not reachability); the
+            // unreached ones stay hidden, and the save writes the moved ones
+            // into the device file.
+            let product = bussard_prod::ProductData {
+                applications: vec![app.clone()],
+                ..ProductData::default()
+            };
+            let yaml = bussard_prod::product_model::model_yaml(&app, &product)?;
+            let product = ProductModel::from_yaml(&yaml, &app.id)?;
+            let mut products = ProductModels::default();
+            products.insert(app.id.clone(), product.clone());
+            let visibility = parameter_visibility(&indexed, &products, address)?;
+            let device = &mut indexed.devices.get_mut(&address).ok_or("no device")?.device;
+            moved += bussard_model::device_view::show_reached_hidden(device, &product);
+            for reference in values.keys() {
+                let shown = visibility.get(reference).is_some_and(|v| v.shown);
+                kept += usize::from(!shown);
+                assert_eq!(
+                    device
+                        .parameters
+                        .contains_key(&format!("hidden@{reference}")),
+                    !shown,
+                    "{id} {reference}"
+                );
+            }
             let texts = indexed.to_texts()?;
-            assert!(!texts["bussard.lock"].contains("hidden"), "{id}");
             let moved = Model::from_texts(&texts)?;
             let (expected, _) = parameter_overrides(Some(&visible), address);
             let image = compute_parameter_image(&app, &expected, &BTreeMap::new())?;
@@ -433,5 +460,6 @@ fn test_parameter_image_is_the_same_under_hidden_and_visible_keys() -> TestResul
         }
     }
     assert!(compared > 0);
+    assert!(moved > 0 && kept > 0, "moved {moved}, kept {kept}");
     Ok(())
 }

@@ -1023,6 +1023,114 @@ async fn test_set_parameter_rekeys_a_hidden_value_of_a_shown_ref() -> TestResult
     Ok(())
 }
 
+/// Issue #380: the lock keeps a hidden value for two refs it indexes on the
+/// C4 page. Under "Helligkeit" the configuration reaches the threshold in
+/// lx (`P-1041_R-1041`) and not the wind speed (`P-1048_R-1048`, behind
+/// "Wind"). The reached one is read under its visible key and shown; the
+/// unreached one stays hidden: written by the flash, never an ignored
+/// override, never a view row, and `knx_set_parameter` refuses it as
+/// unreached. A save moves the reached one into the device file and keeps
+/// the unreached one in the lock.
+#[tokio::test]
+async fn test_hidden_value_of_an_unreached_ref_stays_hidden() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    write_meteo(dir.path())?;
+    let page = "universalkanal-c4-funktion";
+    let lock_path = dir.path().join("bussard.lock");
+    let lock = std::fs::read_to_string(&lock_path)?.replacen(
+        "parameters = [\n",
+        &format!(
+            "parameters = [\n  {{ key = \"{page}.windgeschwindigkeit\", channel = \"generic-0\", ref = \"P-1048_R-1048\", param = \"P-1048\" }},\n"
+        ),
+        1,
+    );
+    std::fs::write(
+        &lock_path,
+        format!(
+            "{lock}hidden = [\n  {{ ref = \"P-1041_R-1041\", value = \"150\" }},\n  \
+             {{ ref = \"P-1048_R-1048\", value = \"9\" }},\n]\n"
+        ),
+    )?;
+    let ia = "1.1.202";
+    let address: bussard_model::IndividualAddress = ia.parse()?;
+
+    let model = bussard_model::Model::load(dir.path())?;
+    let device = &model.devices[&address].device;
+    let keys: Vec<&str> = device
+        .parameters
+        .keys()
+        .filter(|k| k.ends_with("@P-1041_R-1041") || k.ends_with("@P-1048_R-1048"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "hidden@P-1048_R-1048",
+            "universalkanal-c4-funktion-schwellwert-in-lx@P-1041_R-1041",
+        ]
+    );
+    // The flash takes both values by ref.
+    let (overrides, _) = bussard_model::device_view::device_overrides(device);
+    assert_eq!(
+        overrides.get("P-1041_R-1041").map(String::as_str),
+        Some("150")
+    );
+    assert_eq!(
+        overrides.get("P-1048_R-1048").map(String::as_str),
+        Some("9")
+    );
+    assert_eq!(ignored_notes(dir.path(), ia)?, Vec::<String>::new());
+
+    let (client, task) = serve(dir.path()).await?;
+    let row = shown_row(&client, ia, page, "P-1041_R-1041").await?;
+    assert_eq!(row["value"], "150", "{row}");
+    assert!(row.get("ignored").is_none(), "{row}");
+    assert!(
+        shown_row(&client, ia, page, "P-1048_R-1048").await.is_err(),
+        "the unreached hidden value is listed"
+    );
+
+    for parameter in [
+        format!("{page}.windgeschwindigkeit"),
+        "P-1048_R-1048".to_string(),
+    ] {
+        let body = call(
+            &client,
+            "knx_set_parameter",
+            json!({"address": ia, "parameter": parameter, "value": "10"}),
+        )
+        .await?;
+        assert_eq!(body["refused"], true, "{parameter}: {body}");
+        let reason = body["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("Funktion des Kanals = Wind"),
+            "{parameter}: {reason}"
+        );
+        assert!(!reason.contains("hidden@"), "{parameter}: {reason}");
+    }
+
+    // A save (any edit) moves the reached value into the device file and
+    // keeps the unreached one in the lock.
+    let body = call(
+        &client,
+        "knx_set_parameter",
+        json!({"address": ia, "parameter": "helligkeitsschwelle-c4", "value": "300"}),
+    )
+    .await?;
+    assert_ne!(body["refused"], true, "{body}");
+    let file = std::fs::read_to_string(dir.path().join("devices/1.1.202.toml"))?;
+    assert!(file.contains("schwellwert-in-lx = \"150\""), "{file}");
+    let lock = std::fs::read_to_string(&lock_path)?;
+    assert!(
+        lock.contains("hidden = [\n  { ref = \"P-1048_R-1048\", value = \"9\" },\n]\n"),
+        "{lock}"
+    );
+    assert_eq!(ignored_notes(dir.path(), ia)?, Vec::<String>::new());
+    client.cancel().await?;
+    task.abort();
+    Ok(())
+}
+
 /// The reference in the `field` of a `knx_set_parameter` result's change.
 fn field_ref(body: &Value) -> Option<&str> {
     body["detail"]
