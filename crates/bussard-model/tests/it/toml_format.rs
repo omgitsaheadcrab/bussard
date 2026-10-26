@@ -732,13 +732,14 @@ fn test_hidden_values_round_trip_through_the_lock_only() -> TestResult {
     Ok(())
 }
 
-/// Issue #375: a `hidden[]` row of a ref the lock indexes under a visible key
-/// (the configuration shows it now) is read under that key, and the next save
-/// writes it into the device file and drops the row. Where the file stores the
-/// ref too, the file's value wins.
+/// Issues #375, #380: a `hidden[]` row of a ref the lock indexes stays a
+/// hidden value when the loader has no product model to evaluate: the lock's
+/// index is not reachability (it is built under whatever configuration the
+/// lock was last refreshed with). A save keeps the row. Where the file stores
+/// the ref too, the file's value wins and the row is dropped.
 #[test]
-fn test_hidden_value_of_an_indexed_ref_moves_into_the_device_file() -> TestResult {
-    let dir = tmp("hidden-shown")?;
+fn test_hidden_value_of_an_indexed_ref_stays_hidden_without_the_evaluation() -> TestResult {
+    let dir = tmp("hidden-indexed")?;
     write(&dir, "groups.toml", GROUPS)?;
     let lock = LOCK.replacen(
         "  { key = \"sollwerte.komfort\"",
@@ -756,7 +757,7 @@ fn test_hidden_value_of_an_indexed_ref_moves_into_the_device_file() -> TestResul
     let d = &model.devices[&ia("1.1.47")?].device;
     assert_eq!(
         d.parameters
-            .get("nachlauf@MD-3_M-18_MI-1_P-50_R-70")
+            .get("hidden@MD-3_M-18_MI-1_P-50_R-70")
             .map(String::as_str),
         Some("5")
     );
@@ -769,14 +770,20 @@ fn test_hidden_value_of_an_indexed_ref_moves_into_the_device_file() -> TestResul
         .keys()
         .filter(|k| bussard_model::is_hidden_mem_key(k))
         .collect();
-    assert_eq!(hidden, ["hidden@P-19_R-39"]);
+    assert_eq!(
+        hidden,
+        ["hidden@MD-3_M-18_MI-1_P-50_R-70", "hidden@P-19_R-39"]
+    );
 
     let texts = model.to_texts()?;
     let dev = &texts["devices/1.1.47.toml"];
-    assert!(dev.contains("nachlauf = \"5\""), "{dev}");
+    assert!(!dev.contains("nachlauf"), "{dev}");
     let lock = &texts["bussard.lock"];
     assert!(
-        lock.contains("hidden = [\n  { ref = \"P-19_R-39\", value = \"0\" },\n]\n"),
+        lock.contains(
+            "hidden = [\n  { ref = \"MD-3_M-18_MI-1_P-50_R-70\", value = \"5\" },\n  \
+             { ref = \"P-19_R-39\", value = \"0\" },\n]\n"
+        ),
         "{lock}"
     );
     assert_eq!(Model::from_texts(&texts)?, model);
@@ -784,11 +791,11 @@ fn test_hidden_value_of_an_indexed_ref_moves_into_the_device_file() -> TestResul
     Ok(())
 }
 
-/// Issue #375: an in-memory `hidden@<ref>` value of a ref the lock indexes
-/// (an edit or an import put it there) is saved under the lock's key; a
-/// visible key of the same ref wins over it.
+/// Issues #375, #380: a save has no product model, so an in-memory
+/// `hidden@<ref>` value stays in the lock's `hidden[]` even when the lock
+/// indexes the ref; a visible key of the same ref wins over it.
 #[test]
-fn test_save_writes_a_hidden_value_of_an_indexed_ref_under_its_key() -> TestResult {
+fn test_save_keeps_a_hidden_value_of_an_indexed_ref_hidden() -> TestResult {
     let dir = keyed_model("hidden-save")?;
     let mut model = Model::load(&dir)?;
     let address = ia("1.1.47")?;
@@ -813,26 +820,22 @@ fn test_save_writes_a_hidden_value_of_an_indexed_ref_under_its_key() -> TestResu
         .insert("hidden@P-19_R-38".to_string(), "0".to_string());
     let texts = model.to_texts()?;
     let dev = &texts["devices/1.1.47.toml"];
-    assert!(dev.contains("nachlauf = \"5\""), "{dev}");
+    assert!(!dev.contains("nachlauf"), "{dev}");
     assert!(dev.contains("regenalarm = \"Ja\""), "{dev}");
+    let lock = &texts["bussard.lock"];
     assert!(
-        !texts["bussard.lock"].contains("hidden"),
-        "{}",
-        texts["bussard.lock"]
+        lock.contains("hidden = [\n  { ref = \"MD-3_M-18_MI-1_P-50_R-70\", value = \"5\" },\n]\n"),
+        "{lock}"
     );
     let back = Model::from_texts(&texts)?;
     let d = &back.devices[&address].device;
     assert_eq!(
         d.parameters
-            .get("nachlauf@MD-3_M-18_MI-1_P-50_R-70")
+            .get("hidden@MD-3_M-18_MI-1_P-50_R-70")
             .map(String::as_str),
         Some("5")
     );
-    assert!(
-        !d.parameters
-            .keys()
-            .any(|k| bussard_model::is_hidden_mem_key(k))
-    );
+    assert!(!d.parameters.contains_key("hidden@P-19_R-38"));
     fs::remove_dir_all(&dir)?;
     Ok(())
 }

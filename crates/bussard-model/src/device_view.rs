@@ -717,10 +717,28 @@ impl<'a> Pages<'a> {
             .filter_map(|(r, id)| pages.block_of(&id).map(|i| (r, i)))
             .collect();
         // A stored value of a parameter the configuration hides (`hidden@…`)
-        // is not one of the device's parameters to list.
+        // is not one of the device's parameters to list, nor is a ref the
+        // lock indexes whose only value is such a hidden one while the
+        // configuration does not reach it (issue #380): the flash writes it,
+        // but it is no setting of the current configuration.
+        let hidden_only: HashSet<&str> = device
+            .parameters
+            .keys()
+            .filter(|k| crate::files::is_hidden_mem_key(k))
+            .filter_map(|k| k.split_once('@').map(|(_, r)| r))
+            .filter(|r| {
+                !device.parameters.keys().any(|k| {
+                    !crate::files::is_hidden_mem_key(k)
+                        && k.split_once('@').is_some_and(|(_, other)| other == *r)
+                })
+            })
+            .collect();
         pages.entries = params
             .iter()
             .filter(|p| !crate::files::is_hidden_mem_key(&p.key))
+            .filter(|p| {
+                !hidden_only.contains(p.reference.as_str()) || pages.reached.contains(&p.reference)
+            })
             .map(|p| (p.reference.as_str(), p))
             .collect();
         // A reached ref sits where the evaluator reached it; any other on the
@@ -2088,6 +2106,65 @@ pub fn parameter_visibility(
     let evaluated = Evaluated::new(product, &overrides);
     let pg = Pages::new(device, &evaluated, &overrides, &params);
     Ok(pg.visibility())
+}
+
+/// Moves every `hidden@<ref>` value of `device` that the configuration
+/// reaches under its current values to the visible key the lock indexes the
+/// ref under (issues #375, #380). "Reached" is the evaluation's answer
+/// ([`RefVisibility::shown`] of [`parameter_visibility`]), never the lock's
+/// index: the lock indexes a ref under whatever configuration it was last
+/// refreshed with, so a ref it indexes can be unreached now. An unreached
+/// value stays `hidden@<ref>`: the flash writes it, and it is never an
+/// override, a view row or a key. A ref the lock does not index, a channel
+/// label, and a ref the device also stores under a visible key keep their
+/// keys. The values by ref ([`device_overrides`]) do not change, so neither
+/// does the parameter image. Returns how many values moved; none without
+/// pages in `product`.
+pub fn show_reached_hidden(device: &mut Device, product: &ProductModel) -> usize {
+    let candidates: Vec<(String, String)> = device
+        .parameters
+        .keys()
+        .filter(|k| crate::files::is_hidden_mem_key(k))
+        .filter_map(|k| {
+            let reference = k.split_once('@').map(|(_, r)| r)?;
+            let locked = device.lock.parameters.get(reference)?;
+            let labelled = device.lock.channel_labels.values().any(|l| l == reference);
+            let visible = device.parameters.keys().any(|v| {
+                !crate::files::is_hidden_mem_key(v)
+                    && v.split_once('@').is_some_and(|(_, r)| r == reference)
+            });
+            (!labelled && !visible).then(|| {
+                (
+                    k.clone(),
+                    crate::files::param_mem_key(&locked.key, reference),
+                )
+            })
+        })
+        .collect();
+    if candidates.is_empty() || !has_pages(product) {
+        return 0;
+    }
+    let visibility = {
+        let params = parameter_entries(device);
+        let (overrides, _) = device_overrides(device);
+        let evaluated = Evaluated::new(product, &overrides);
+        Pages::new(device, &evaluated, &overrides, &params).visibility()
+    };
+    let mut moved = 0;
+    for (hidden, visible) in candidates {
+        let shown = hidden
+            .split_once('@')
+            .and_then(|(_, r)| visibility.get(r))
+            .is_some_and(|v| v.shown);
+        if !shown {
+            continue;
+        }
+        if let Some(value) = device.parameters.remove(&hidden) {
+            device.parameters.insert(visible, value);
+            moved += 1;
+        }
+    }
+    moved
 }
 
 /// The application-level com-object refs the configuration of device

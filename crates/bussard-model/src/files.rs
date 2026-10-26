@@ -954,26 +954,20 @@ pub(crate) fn join_device(
             }
         }
     }
-    // The values of refs the configuration does not show come from the lock.
-    // One the lock indexes under a visible key (the configuration shows the
-    // ref now: a re-import or `knx_set_parameter` indexed it) is read under
-    // that key, unless the file stores the ref itself, so every reader sees
-    // one key per ref and the next save writes it into the device file
-    // (issue #375).
+    // The values of refs the configuration does not show come from the lock,
+    // under `hidden@<ref>`: the lock's index is not reachability, so whether
+    // the configuration reaches the ref now is the evaluation's call, made
+    // once the device is built (issue #380). Where the file stores the ref
+    // too, the file's value wins: one key per ref (issue #375).
     if let Some(lock) = lock {
         for h in &lock.hidden {
-            let key = match lock.parameters.iter().find(|p| p.reference == h.reference) {
-                Some(p) => param_mem_key(&p.key, &h.reference),
-                None => hidden_mem_key(&h.reference),
-            };
-            if !is_hidden_mem_key(&key)
-                && parameters
-                    .keys()
-                    .any(|k| ref_of(k) == Some(h.reference.as_str()))
+            if parameters
+                .keys()
+                .any(|k| ref_of(k) == Some(h.reference.as_str()))
             {
                 continue;
             }
-            parameters.insert(key, h.value.clone());
+            parameters.insert(hidden_mem_key(&h.reference), h.value.clone());
         }
     }
     links.sort_by_key(|l| l.object);
@@ -1077,7 +1071,7 @@ pub(crate) fn join_device(
     }
     extras.parameters.extend(via_model);
 
-    let device = Device {
+    let mut device = Device {
         address: top.address,
         name: top.name,
         description: top.description,
@@ -1092,6 +1086,18 @@ pub(crate) fn join_device(
         application_override: top.application,
         lock: extras,
     };
+    // A hidden value of a ref the configuration reaches under the current
+    // values is the visible parameter's: read under the lock's key, so the
+    // next save writes it into the device file (issues #375, #380). Without
+    // the product model the value stays hidden; the flash takes it by ref
+    // either way.
+    let app = device
+        .product
+        .as_ref()
+        .and_then(|p| p.application_ref.clone());
+    if let Some(product) = models.zip(app.as_deref()).and_then(|(m, a)| m.get(a)) {
+        crate::device_view::show_reached_hidden(&mut device, product);
+    }
     Ok((device, links))
 }
 
@@ -1322,7 +1328,7 @@ pub(crate) fn lock_entry(device: &Device) -> Option<LockDevice> {
             continue;
         };
         if is_hidden_mem_key(key) {
-            if hidden_save(device, key) == HiddenSave::Hidden {
+            if !superseded(device, key) {
                 hidden.push(LockHidden {
                     reference: reference.to_string(),
                     value: value.clone(),
@@ -1483,20 +1489,9 @@ pub(crate) fn device_entries(
 ) -> Vec<(Placement, EntryValue)> {
     let mut out: Vec<(Placement, EntryValue)> = Vec::new();
     for (key, value) in &device.parameters {
-        // A hidden value of a ref the lock indexes under a visible key is
-        // written under that key (issue #375).
-        let shown;
-        let key = match hidden_save(device, key) {
-            HiddenSave::Shown(k) => {
-                shown = k;
-                &shown
-            }
-            HiddenSave::Hidden | HiddenSave::Superseded => continue,
-            HiddenSave::NotHidden => key,
-        };
         // A channel's label parameter is written as the channel `name`; a
         // hidden value lives in the lock.
-        if ref_of(key).is_some_and(|r| is_label_ref(device, r)) {
+        if is_hidden_mem_key(key) || ref_of(key).is_some_and(|r| is_label_ref(device, r)) {
             continue;
         }
         let mut placement = existing
@@ -1551,48 +1546,21 @@ pub(crate) fn device_entries(
     out
 }
 
-/// Where a save puts the value stored under in-memory key `key` when that
-/// key is a [`hidden_mem_key`] (issue #375).
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum HiddenSave {
-    /// Not a hidden key: saved as it is.
-    NotHidden,
-    /// In the lock's `hidden[]`: the lock does not index the ref.
-    Hidden,
-    /// In the device file under this in-memory key: the lock indexes the
-    /// ref (the configuration shows it), so the value is the visible
-    /// parameter's.
-    Shown(String),
-    /// Nowhere: the lock indexes the ref and the device stores it under a
-    /// visible key too, which wins.
-    Superseded,
-}
-
-/// [`HiddenSave`] of in-memory key `key` on `device`. One spelling per ref
-/// on disk: a `hidden@<ref>` value of a ref the lock indexes is re-keyed to
-/// the lock's key on the next save, whoever saves.
-fn hidden_save(device: &Device, key: &str) -> HiddenSave {
-    if !is_hidden_mem_key(key) {
-        return HiddenSave::NotHidden;
-    }
+/// Whether the `hidden@<ref>` value under in-memory key `key` is left out
+/// of a save because the device stores the same ref under a visible key,
+/// which wins: one spelling per ref on disk (issue #375). A save has no
+/// product model, so it never moves a hidden value to a visible key: a
+/// reached one is moved when it is loaded with its product model
+/// ([`crate::device_view::show_reached_hidden`]) or edited, and the lock's
+/// index alone is not reachability (issue #380).
+fn superseded(device: &Device, key: &str) -> bool {
     let Some(reference) = ref_of(key) else {
-        return HiddenSave::Hidden;
+        return false;
     };
-    let Some(locked) = device.lock.parameters.get(reference) else {
-        return HiddenSave::Hidden;
-    };
-    if is_label_ref(device, reference) {
-        return HiddenSave::Hidden;
-    }
-    let visible = device
+    device
         .parameters
         .keys()
-        .any(|k| !is_hidden_mem_key(k) && ref_of(k) == Some(reference));
-    if visible {
-        HiddenSave::Superseded
-    } else {
-        HiddenSave::Shown(param_mem_key(&locked.key, reference))
-    }
+        .any(|k| !is_hidden_mem_key(k) && ref_of(k) == Some(reference))
 }
 
 /// Whether `reference` is the label parameter of one of the device's channels.

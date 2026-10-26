@@ -612,10 +612,12 @@ pub fn index_parameter(device: &mut Device, ctx: &KeyContext, mem_key: &str) -> 
 }
 
 /// The visible key `reference` is stored under, else the one the loader
-/// derives. A value stored under `hidden@<ref>` for a ref the configuration
-/// shows (or the lock indexes) takes the derived key: one key per ref, the
+/// derives. A value stored under `hidden@<ref>` for a ref the lock or the
+/// product model's pages know takes the derived key: one key per ref, the
 /// visible one, so the edit replaces that value instead of adding a second
-/// key for the ref (issue #375). [`replace_parameter`] drops the old key.
+/// key for the ref (issue #375), and an unreached ref is refused by
+/// [`unreached_refusal`] like any other (issue #380) instead of updating the
+/// hidden value. [`replace_parameter`] drops the old key.
 fn mem_key(device: &Device, ctx: &KeyContext, reference: &str) -> String {
     let stored = || {
         device
@@ -629,7 +631,7 @@ fn mem_key(device: &Device, ctx: &KeyContext, reference: &str) -> String {
     let hidden = stored().next();
     let found = candidate(device, ctx, reference);
     if let Some(hidden) = hidden
-        && !found.is_some_and(|c| c.indexed || ctx.shown(reference))
+        && found.is_none()
     {
         return hidden.clone();
     }
