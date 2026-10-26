@@ -197,8 +197,11 @@ impl SecurityConfig {
 pub struct DeviceConfig {
     /// The device's individual address (e.g. `1.1.2`).
     pub address: String,
-    /// Path to the device's `.knxprod` product file.
-    pub knxprod: PathBuf,
+    /// Path to the device's `.knxprod` product file. Omitted: a synthetic
+    /// System B product with an empty application, for a device that needs
+    /// no download (a simulated KNX IP interface with a `knxnet` block).
+    #[serde(default)]
+    pub knxprod: Option<PathBuf>,
     /// The application-program id to select from the product (optional; the
     /// first is used if omitted).
     #[serde(default)]
@@ -274,6 +277,10 @@ pub struct KnxnetSimConfig {
     /// The tunnelling addresses, e.g. `["1.1.22", "1.1.23"]`.
     #[serde(default)]
     pub tunnels: Vec<String>,
+    /// How many tunnelling addresses PID 53 holds at most (its description's
+    /// maximum element count; default: as many as `tunnels` lists).
+    #[serde(default)]
+    pub tunnel_slots: Option<u16>,
     /// Whether the object appears in the object-index walk (default `true`).
     /// `false` serves it by object type and instance only, through the
     /// extended property services, as the Jung IPS 300 SREG does.
@@ -318,6 +325,9 @@ impl KnxnetSimConfig {
         }
         if let Some(name) = &self.friendly_name {
             p.friendly_name = name.clone();
+        }
+        if let Some(slots) = self.tunnel_slots {
+            p.tunnel_slots = p.tunnel_slots.max(slots);
         }
         Ok(p)
     }
@@ -503,18 +513,22 @@ impl SimConfig {
                         addr: dc.address.clone(),
                         reason,
                     })?;
-            let prod_path = if dc.knxprod.is_absolute() {
-                dc.knxprod.clone()
-            } else {
-                base_dir.join(&dc.knxprod)
+            let product = match &dc.knxprod {
+                Some(knxprod) => {
+                    let prod_path = if knxprod.is_absolute() {
+                        knxprod.clone()
+                    } else {
+                        base_dir.join(knxprod)
+                    };
+                    read_knxprod(&prod_path, dc.application.as_deref()).map_err(|source| {
+                        ConfigError::Product {
+                            path: prod_path.display().to_string(),
+                            source,
+                        }
+                    })?
+                }
+                None => crate::testfixtures::synthetic_system_b_product(),
             };
-            let product =
-                read_knxprod(&prod_path, dc.application.as_deref()).map_err(|source| {
-                    ConfigError::Product {
-                        path: prod_path.display().to_string(),
-                        source,
-                    }
-                })?;
             let bcu_key = match &dc.bcu_key {
                 Some(s) => Some(
                     parse_bcu_key(s).ok_or_else(|| ConfigError::BadDeviceOption {
@@ -826,6 +840,32 @@ devices:
         assert_eq!(p.friendly_name, "Haus");
         let bad: KnxnetSimConfig = serde_norway::from_str("assignment: bootp\n")?;
         assert!(bad.parameters("1.1.200".parse()?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_ip_interface_without_knxprod_builds() -> Result<(), Box<dyn std::error::Error>> {
+        // Bussard issue #391: a simulated IP interface needs no product file;
+        // its PID 53 holds up to `tunnel_slots` addresses.
+        let yaml = r#"
+gateway:
+  host: "127.0.0.1"
+  port: 3671
+devices:
+  - address: "1.1.200"
+    initial_state: loaded
+    knxnet:
+      friendly_name: "Sim"
+      tunnels: ["1.1.22", "1.1.23"]
+      tunnel_slots: 8
+"#;
+        let cfg = SimConfig::from_yaml(yaml)?;
+        assert!(cfg.devices[0].knxprod.is_none());
+        let knxnet = cfg.devices[0].knxnet.as_ref().ok_or("knxnet")?;
+        assert_eq!(knxnet.parameters("1.1.200".parse()?)?.tunnel_slots, 8);
+        let sink = Arc::new(RecordingSink::new());
+        let bus = cfg.build_bus(Path::new("."), sink)?;
+        assert_eq!(bus.device_count(), 1);
         Ok(())
     }
 }

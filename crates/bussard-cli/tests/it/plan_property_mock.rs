@@ -10,7 +10,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 use bussard_model::IndividualAddress;
-use bussard_testkit::{MockDevice, MockGateway};
+use bussard_testkit::{MockDevice, MockGateway, MockKnxnet};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -70,6 +70,13 @@ struct Bench {
 
 impl Bench {
     fn start(com_object: bool) -> Result<Bench, Box<dyn std::error::Error>> {
+        Bench::start_with(com_object, false)
+    }
+
+    /// With `knxnet`, the device is also a KNX IP interface (a KNXnet/IP
+    /// parameter object reached by type) and its file has a `[knxnet]` table
+    /// (issue #391).
+    fn start_with(com_object: bool, knxnet: bool) -> Result<Bench, Box<dyn std::error::Error>> {
         let rt = tokio::runtime::Runtime::new()?;
         // The device holds the timeout the model asks for and another rate.
         let device = MockDevice::new(device_ia()?)
@@ -77,6 +84,16 @@ impl Bench {
             .with_manufacturer(0x0004)
             .with_property_ext(11, 204, 1, &[10])
             .with_property_ext(50001, 211, 1, &[5]);
+        let device = if knxnet {
+            let interface = MockKnxnet {
+                tunnels: vec!["1.1.22".parse()?, "1.1.23".parse()?],
+                friendly_name: "Bocklisch Alpha".to_string(),
+                ..MockKnxnet::default()
+            };
+            device.with_knxnet_unlisted_writable(&interface, 8)
+        } else {
+            device
+        };
         let gateway = rt.block_on(
             MockGateway::builder()
                 .keep_serving()
@@ -99,7 +116,7 @@ impl Bench {
         )?;
         writer.write_all(app_xml(com_object).as_bytes())?;
         writer.finish()?;
-        write_model(&dir.join("knx"))?;
+        write_model(&dir.join("knx"), knxnet)?;
         Ok(Bench {
             gateway,
             dir,
@@ -141,8 +158,9 @@ impl Drop for Bench {
     }
 }
 
-/// A model whose device file has no links.
-fn write_model(dir: &Path) -> TestResult {
+/// A model whose device file has no links (and with `knxnet`, a `[knxnet]`
+/// table whose friendly name differs from the device's).
+fn write_model(dir: &Path, knxnet: bool) -> TestResult {
     std::fs::create_dir_all(dir.join("devices"))?;
     std::fs::write(
         dir.join("bussard.toml"),
@@ -157,7 +175,13 @@ fn write_model(dir: &Path) -> TestResult {
     )?;
     std::fs::write(
         dir.join("devices").join("1.1.200.toml"),
-        "address = \"1.1.200\"\nname = \"KNX IP Interface\"\n",
+        if knxnet {
+            "address = \"1.1.200\"\nname = \"KNX IP Interface\"\n\n[knxnet]\n\
+             assignment = \"dhcp\"\nfriendly_name = \"Bocklisch Beta\"\n\
+             tunnels = [\"1.1.22\", \"1.1.23\"]\n"
+        } else {
+            "address = \"1.1.200\"\nname = \"KNX IP Interface\"\n"
+        },
     )?;
     Ok(())
 }
@@ -210,5 +234,37 @@ fn test_plan_keeps_the_empty_table_guard_for_a_program_with_group_objects() -> T
         stderr.contains("refusing to plan an empty table set"),
         "{stderr}"
     );
+    Ok(())
+}
+
+#[test]
+fn test_plan_interface_with_a_property_procedure_shows_both() -> TestResult {
+    // The real 1.1.200 (issue #391): a `[knxnet]` table and a property-only
+    // load procedure, planned in one output.
+    let bench = Bench::start_with(false, true)?;
+    let out = bench.plan(false)?;
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("~ friendly name = \"Bocklisch Beta\", was \"Bocklisch Alpha\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("writes: KNXnet/IP parameter object (PID 76)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("object type 50001 PID 211: holds 05, the model asks for 32"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("bussard flash 1.1.200"), "{stdout}");
+    assert!(stdout.contains("run `bussard apply 1.1.200`"), "{stdout}");
+
+    let out = bench.plan(true)?;
+    let (stdout, _) = text(&out);
+    let plan: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert_eq!(plan["noop"], false);
+    assert_eq!(plan["changes"].as_array().map(Vec::len), Some(1));
+    assert_eq!(plan["property_procedure"].as_array().map(Vec::len), Some(2));
     Ok(())
 }

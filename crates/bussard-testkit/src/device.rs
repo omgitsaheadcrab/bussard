@@ -30,7 +30,8 @@ use crate::consts::{
     A_INDIVIDUAL_ADDRESS_SERIAL_WRITE, A_INDIVIDUAL_ADDRESS_WRITE, A_MEMORY_EXTENDED_READ,
     A_MEMORY_EXTENDED_READ_RESPONSE, A_MEMORY_EXTENDED_WRITE, A_MEMORY_EXTENDED_WRITE_RESPONSE,
     A_MEMORY_READ, A_MEMORY_RESPONSE, A_MEMORY_WRITE, A_PROPERTY_DESCRIPTION_READ,
-    A_PROPERTY_DESCRIPTION_RESPONSE, A_PROPERTY_EXT_VALUE_READ, A_PROPERTY_EXT_VALUE_RESPONSE,
+    A_PROPERTY_DESCRIPTION_RESPONSE, A_PROPERTY_EXT_DESCRIPTION_READ,
+    A_PROPERTY_EXT_DESCRIPTION_RESPONSE, A_PROPERTY_EXT_VALUE_READ, A_PROPERTY_EXT_VALUE_RESPONSE,
     A_PROPERTY_EXT_VALUE_WRITE_CON, A_PROPERTY_EXT_VALUE_WRITE_CON_RESPONSE, A_PROPERTY_VALUE_READ,
     A_PROPERTY_VALUE_RESPONSE, A_PROPERTY_VALUE_WRITE, A_RESTART, APCI_SELECTOR, LE_ADDITIONAL,
     LE_LOAD_COMPLETED, LE_START_LOADING, LE_UNLOAD, LS_LOADED, LS_LOADING, LS_UNLOADED,
@@ -123,6 +124,30 @@ struct Property {
     writable: bool,
 }
 
+impl Property {
+    /// Writes `value` from element `start`: elements 1 and up replace (and
+    /// extend) the data; element 0 sets the element count (two octets, or
+    /// one), truncating or zero-filling. `false` for a malformed write.
+    fn write_elements(&mut self, start: u16, value: &[u8]) -> bool {
+        if start == 0 {
+            let count = match value {
+                [hi, lo] => usize::from(u16::from_be_bytes([*hi, *lo])),
+                [n] => usize::from(*n),
+                _ => return false,
+            };
+            self.data.resize(count * self.elem_size, 0);
+            return true;
+        }
+        let from = (usize::from(start) - 1) * self.elem_size;
+        let end = from + value.len();
+        if self.data.len() < end {
+            self.data.resize(end, 0);
+        }
+        self.data[from..end].copy_from_slice(value);
+        true
+    }
+}
+
 /// A scripted KNX device. Build one with [`MockDevice::new`] and the `with_*`
 /// methods, put it on a gateway line, and read its state back afterwards.
 #[derive(Clone)]
@@ -207,6 +232,13 @@ pub struct MockDevice {
     /// `(object type, property id)` of instance 1 (the security object of a
     /// Data Secure device, issue #201).
     ext_properties: HashMap<(u16, u16), Property>,
+    /// The object index of a listed KNXnet/IP parameter object whose
+    /// properties the extended services of object type 11 share with the
+    /// plain ones (one store, so a write by type reads back by index).
+    knxnet_index: Option<u8>,
+    /// The property descriptions served to `A_PropertyExtDescription_Read`,
+    /// per object type (instance 1).
+    pub ext_descriptions: HashMap<u16, Vec<MockPropertyDescription>>,
     /// Refuse (answer count 0) an `A_PropertyExtValue_Read` of more elements
     /// than this, as a device with a smaller read budget would.
     pub ext_read_limit: Option<u8>,
@@ -371,6 +403,42 @@ impl MockKnxnet {
     }
 }
 
+/// The PIDs of the KNXnet/IP parameter object a writable mock interface
+/// takes writes on: the tunnelling addresses, the assignment method, the
+/// static address set and the friendly name.
+const KNXNET_WRITABLE: [u8; 6] = [53, 55, 60, 61, 62, 76];
+
+/// The property descriptions of a mock KNXnet/IP parameter object, in
+/// property order: the values of `knxnet`, PID 53 with `tunnel_slots`
+/// elements at most, writable as [`KNXNET_WRITABLE`] lists.
+fn knxnet_descriptions(knxnet: &MockKnxnet, tunnel_slots: u16) -> Vec<MockPropertyDescription> {
+    knxnet
+        .properties()
+        .into_iter()
+        .map(|(pid, size, data)| {
+            let writable = KNXNET_WRITABLE.contains(&pid);
+            let elements = u16::try_from(data.len() / size.max(1)).unwrap_or(u16::MAX);
+            MockPropertyDescription {
+                pid,
+                pdt: match size {
+                    2 => 0x04,
+                    4 => 0x09,
+                    6 => 0x16,
+                    _ => 0x02,
+                },
+                writable,
+                max_elements: if pid == 53 {
+                    tunnel_slots.max(elements)
+                } else {
+                    elements.max(1)
+                },
+                read_level: 3,
+                write_level: if writable { 2 } else { 15 },
+            }
+        })
+        .collect()
+}
+
 impl MockDevice {
     /// Adds a KNXnet/IP parameter object (object type 11) at the next object
     /// index and serves `knxnet` from it to `A_PropertyValue_Read` and, as
@@ -396,6 +464,63 @@ impl MockDevice {
             self = self.with_property_ext(OT_KNXNET_IP_PARAMETER, u16::from(pid), size, &data);
         }
         self
+    }
+
+    /// [`MockDevice::with_knxnet`] that takes writes (issue #391, the write
+    /// side): PIDs 53 (tunnelling addresses), 55 (assignment method), 60 to 62
+    /// (static address, netmask, gateway) and 76 (friendly name) are writable
+    /// through the plain services on the object's index and, sharing the same
+    /// store, through the extended services on object type 11. Both
+    /// description services describe them, PID 53 with `tunnel_slots`
+    /// elements at most; a write of element 0 of an array sets its element
+    /// count.
+    pub fn with_knxnet_writable(self, knxnet: &MockKnxnet, tunnel_slots: u16) -> Self {
+        let index = u8::try_from(self.object_types.len()).unwrap_or(u8::MAX);
+        let mut dev = self.with_knxnet(knxnet);
+        dev.knxnet_index = Some(index);
+        for pid in KNXNET_WRITABLE {
+            if let Some(prop) = dev.properties.get_mut(&(index, pid)) {
+                prop.writable = true;
+            }
+        }
+        let descriptions = knxnet_descriptions(knxnet, tunnel_slots);
+        dev.descriptions.insert(index, descriptions.clone());
+        dev.ext_descriptions
+            .insert(OT_KNXNET_IP_PARAMETER, descriptions);
+        dev
+    }
+
+    /// [`MockDevice::with_knxnet_unlisted`] that takes writes through the
+    /// extended services, as [`MockDevice::with_knxnet_writable`] describes,
+    /// and describes its properties to `A_PropertyExtDescription_Read` only:
+    /// the Jung IPS 300 SREG shape.
+    pub fn with_knxnet_unlisted_writable(self, knxnet: &MockKnxnet, tunnel_slots: u16) -> Self {
+        let mut dev = self.with_knxnet_unlisted(knxnet);
+        for pid in KNXNET_WRITABLE {
+            if let Some(prop) = dev
+                .ext_properties
+                .get_mut(&(OT_KNXNET_IP_PARAMETER, u16::from(pid)))
+            {
+                prop.writable = true;
+            }
+        }
+        dev.ext_descriptions.insert(
+            OT_KNXNET_IP_PARAMETER,
+            knxnet_descriptions(knxnet, tunnel_slots),
+        );
+        dev
+    }
+
+    /// The value of PID `pid` of the KNXnet/IP parameter object, wherever the
+    /// device serves it (the listed object's index, else object type 11).
+    pub fn knxnet_property(&self, pid: u8) -> Option<&[u8]> {
+        match self.knxnet_index {
+            Some(index) => self.properties.get(&(index, pid)),
+            None => self
+                .ext_properties
+                .get(&(OT_KNXNET_IP_PARAMETER, u16::from(pid))),
+        }
+        .map(|p| p.data.as_slice())
     }
 
     /// A device at `address` with mask `0x07B0` (System B), a device object
@@ -435,6 +560,8 @@ impl MockDevice {
             descriptions: HashMap::new(),
             properties: HashMap::new(),
             ext_properties: HashMap::new(),
+            knxnet_index: None,
+            ext_descriptions: HashMap::new(),
             ext_read_limit: None,
             ext_reads: Vec::new(),
             hook: None,
@@ -946,6 +1073,7 @@ impl MockDevice {
             A_PROPERTY_EXT_VALUE_READ => self.property_ext_read(data),
             A_PROPERTY_EXT_VALUE_WRITE_CON => self.property_ext_write(data),
             A_PROPERTY_VALUE_WRITE => self.property_write(data),
+            A_PROPERTY_EXT_DESCRIPTION_READ => self.property_ext_description(data),
             A_PROPERTY_DESCRIPTION_READ => {
                 if let Some(payload) = self.description(data) {
                     return Reaction::Answer(A_PROPERTY_DESCRIPTION_RESPONSE, payload);
@@ -1040,6 +1168,74 @@ impl MockDevice {
         )
     }
 
+    /// The extended property `object_type`/`pid` of instance 1: the shared
+    /// store of a listed KNXnet/IP parameter object, else the extended map.
+    fn ext_property(&self, object_type: u16, pid: u16) -> Option<&Property> {
+        match (object_type, self.knxnet_index, u8::try_from(pid)) {
+            (OT_KNXNET_IP_PARAMETER, Some(index), Ok(pid)) => self.properties.get(&(index, pid)),
+            _ => self.ext_properties.get(&(object_type, pid)),
+        }
+    }
+
+    /// [`Self::ext_property`], mutable.
+    fn ext_property_mut(&mut self, object_type: u16, pid: u16) -> Option<&mut Property> {
+        match (object_type, self.knxnet_index, u8::try_from(pid)) {
+            (OT_KNXNET_IP_PARAMETER, Some(index), Ok(pid)) => {
+                self.properties.get_mut(&(index, pid))
+            }
+            _ => self.ext_properties.get_mut(&(object_type, pid)),
+        }
+    }
+
+    /// `A_PropertyExtDescription_Read`: `[type:16][instance:12|pid:12]
+    /// [type:4|index:12]`, answered from [`Self::ext_descriptions`] by PID
+    /// (or by index when the PID is 0), else with zero elements.
+    fn property_ext_description(&self, data: &[u8]) -> Reaction {
+        let Some(h) = data.get(..7) else {
+            return Reaction::Nak;
+        };
+        let object_type = u16::from_be_bytes([h[0], h[1]]);
+        let packed = (u32::from(h[2]) << 16) | (u32::from(h[3]) << 8) | u32::from(h[4]);
+        let instance = (packed >> 12) as u16;
+        let pid = (packed & 0x0FFF) as u16;
+        let index = u16::from_be_bytes([h[5], h[6]]) & 0x0FFF;
+        let list = self
+            .ext_descriptions
+            .get(&object_type)
+            .filter(|_| instance == 1);
+        let found = list.and_then(|list| {
+            if pid == 0 {
+                let i = usize::from(index).checked_sub(1)?;
+                list.get(i).map(|d| (i, *d))
+            } else {
+                list.iter()
+                    .enumerate()
+                    .find(|(_, d)| u16::from(d.pid) == pid)
+                    .map(|(i, d)| (i, *d))
+            }
+        });
+        // [type:16][instance:12|pid:12][desc type:4|index:12][dpt:16][dpt:16]
+        // [write:1|pdt:6][max:12][read:4|write:4]
+        let (pid, index, type_octet, max, access) = match found {
+            Some((i, d)) => (
+                u16::from(d.pid),
+                u16::try_from(i + 1).unwrap_or(0),
+                if d.writable { 0x80 } else { 0 } | (d.pdt & 0x3F),
+                d.max_elements & 0x0FFF,
+                ((d.read_level & 0x0F) << 4) | (d.write_level & 0x0F),
+            ),
+            None => (pid, index, 0, 0, 0),
+        };
+        let packed = (u32::from(instance) << 12) | u32::from(pid);
+        let mut out = object_type.to_be_bytes().to_vec();
+        out.extend_from_slice(&packed.to_be_bytes()[1..]);
+        out.extend_from_slice(&index.to_be_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0, type_octet]);
+        out.extend_from_slice(&max.to_be_bytes());
+        out.push(access);
+        Reaction::Answer(A_PROPERTY_EXT_DESCRIPTION_RESPONSE, out)
+    }
+
     /// `A_PropertyExtValue_Read`: `[type:16][instance:12|pid:12][count][start:16]`,
     /// answered with the same header, the served count, the start and the
     /// elements; count 0 refuses (unknown property, a range past the end, or
@@ -1062,7 +1258,7 @@ impl MockDevice {
             out.extend_from_slice(bytes);
             Reaction::Answer(A_PROPERTY_EXT_VALUE_RESPONSE, out)
         };
-        let Some(prop) = self.ext_properties.get(&(object_type, pid)) else {
+        let Some(prop) = self.ext_property(object_type, pid) else {
             return answer(0, &[]);
         };
         if instance != 1 || count == 0 {
@@ -1102,15 +1298,13 @@ impl MockDevice {
             out.push(rc);
             Reaction::Answer(A_PROPERTY_EXT_VALUE_WRITE_CON_RESPONSE, out)
         };
-        match self.ext_properties.get_mut(&(object_type, pid)) {
-            Some(prop) if prop.writable && instance == 1 && start >= 1 => {
-                let from = (usize::from(start) - 1) * prop.elem_size;
-                let end = from + value.len();
-                if prop.data.len() < end {
-                    prop.data.resize(end, 0);
+        match self.ext_property_mut(object_type, pid) {
+            Some(prop) if prop.writable && instance == 1 => {
+                if prop.write_elements(start, value) {
+                    confirm(0)
+                } else {
+                    confirm(0x01)
                 }
-                prop.data[from..end].copy_from_slice(value);
-                confirm(0)
             }
             _ => confirm(0x01),
         }
@@ -1244,14 +1438,8 @@ impl MockDevice {
         }
         if let Some(prop) = self.properties.get_mut(&(oi, pid))
             && prop.writable
-            && start >= 1
+            && prop.write_elements(start, &value)
         {
-            let from = (usize::from(start) - 1) * prop.elem_size;
-            let end = from + value.len();
-            if prop.data.len() < end {
-                prop.data.resize(end, 0);
-            }
-            prop.data[from..end].copy_from_slice(&value);
             return answer(count, &value);
         }
         // Anything else (including a PID_TABLE write) is refused with a

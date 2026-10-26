@@ -379,6 +379,29 @@ pub fn run(
     let model_ref = &model;
     let product_ref = product.as_ref();
     let app = product_ref.and_then(|p| p.app());
+    // A KNX IP interface (a `[knxnet]` table, no links): its KNXnet/IP
+    // parameter object, plus the properties its property-only load
+    // procedure writes when it has one, in one plan (issue #391).
+    if crate::interface_cmd::interface_only(&model, target).is_some() {
+        return crate::interface_cmd::plan(
+            target,
+            dir,
+            json,
+            &model,
+            config,
+            &overrides,
+            tool_key_source,
+            verbose,
+            crate::interface_cmd::Procedure {
+                app_id: app.map(|a| a.id.as_str()),
+                plan: app
+                    .and_then(|a| {
+                        bussard_service::property_plan::property_plan(a, Some(model_ref), target)
+                    })
+                    .as_ref(),
+            },
+        );
+    }
     let desired = compute_desired(&model, target, app)?;
     // A property-only load procedure (issue #390): what `plan` reads instead
     // of tables.

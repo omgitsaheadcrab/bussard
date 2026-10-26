@@ -404,6 +404,17 @@ jobs:
             --test group_runtime \
             --test knxnetip_server
 
+      # The KNX IP interface loop (issue #391): bussard applies a [knxnet]
+      # table to a simulated interface (no product file needed) as property
+      # writes, and the plan after it is a no-op. knx-sim runs as its own
+      # process; the test skips without BUSSARD_KNX_SIM_BIN.
+      - name: knx-sim interface loop
+        run: |
+          cargo build --manifest-path knx-sim/Cargo.toml --bin serve
+          BUSSARD_KNX_SIM_BIN="$PWD/knx-sim/target/debug/serve" \
+            cargo nextest run -p bussard-cli --profile ci \
+            -E 'binary(it) & test(/^sim_interface_loop::/)'
+
       # The bussard side: the mock-gateway flash suites that the example scripts
       # exercise for real against the simulator. Named explicitly (rather than
       # relying on the `test` job's whole-workspace run) so the pairing with the

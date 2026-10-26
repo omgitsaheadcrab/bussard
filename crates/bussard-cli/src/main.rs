@@ -30,6 +30,7 @@ mod import_bundle;
 mod import_cmd;
 mod import_product_cmd;
 mod init_cmd;
+mod interface_cmd;
 mod keys_cmd;
 mod learn_cmd;
 mod line_cmd;
@@ -1057,6 +1058,14 @@ enum Command {
         /// telegrams silently. See docs/SAFETY.md.
         #[arg(long, value_name = "IA", conflicts_with = "line")]
         secure_sender: Option<bussard_model::IndividualAddress>,
+        /// For a KNX IP interface (a device file with a `[knxnet]` table):
+        /// write a change of its IP assignment, static address set or tunnel
+        /// addresses (PID 53) although bussard tunnels through that
+        /// interface. The tunnel drops (for PID 53: may drop) when the
+        /// interface applies it, so the read-back may not reach the device;
+        /// without this flag such a plan is refused.
+        #[arg(long, conflicts_with = "line")]
+        allow_self_reconfigure: bool,
     },
     /// Bench mode: walk the model's devices on a line, prompt for each device's
     /// programming button, verify its order number, assign its address, and
@@ -1413,7 +1422,7 @@ enum Command {
         plan_ttl_minutes: u64,
         /// Refuse model edits: omits the `knx_set_group`, `knx_remove_group`,
         /// `knx_add_link`, `knx_remove_link`, `knx_set_device`,
-        /// `knx_set_parameter`, `knx_undo`, `knx_discard_edits`,
+        /// `knx_set_parameter`, `knx_set_interface`, `knx_undo`, `knx_discard_edits`,
         /// `knx_scaffold_groups` and `knx_reserve_groups` tools. The read tools
         /// stay available. Model edits only
         /// touch the model files (never the bus), so they are on by default.
@@ -1768,6 +1777,7 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
             application,
             tool_key,
             secure_sender,
+            allow_self_reconfigure,
         } => {
             let overrides = g.mgmt_with_facts();
             let tool_key_source = g.tool_keys(tool_key.as_deref());
@@ -1806,6 +1816,7 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
                             },
                             plan_hash: plan_hash.as_deref(),
                             force,
+                            allow_self_reconfigure,
                         },
                     )
                 }

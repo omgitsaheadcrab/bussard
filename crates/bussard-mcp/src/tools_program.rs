@@ -114,6 +114,7 @@ use crate::server::BussardMcp;
 use crate::state::ConnState;
 
 mod flash;
+mod interface;
 mod restore;
 
 /// The tools of the programming tier, in registration order.
@@ -587,6 +588,11 @@ impl BussardMcp {
         // A link the model itself shows cannot work refuses before the bus is
         // touched (issue #330).
         let model = self.state().model.reload();
+        // A KNX IP interface (a `[knxnet]` table, no links) is planned as its
+        // KNXnet/IP parameter object (issue #391).
+        if bussard_service::knxnet::interface_config(&model, target).is_some() {
+            return self.plan_interface_body(target).await;
+        }
         refuse_insecure_links(&model, target)?;
         let (tier, service, gateway) = self.programming_preflight()?;
         let dir = self.state().dir.clone();
@@ -989,6 +995,15 @@ impl BussardMcp {
         // this one leases the bus itself (issue #215).
         let mut warm = self.warm().lock().await;
         warm.release().await;
+        // A KNX IP interface: the plan was its KNXnet/IP parameter object
+        // (issue #391), and so is the write.
+        if bussard_service::knxnet::interface_config(&self.state().model.reload(), target).is_some()
+        {
+            self.apply_interface_job(tier, job, target, digest, plan_hash, started)
+                .await;
+            drop(warm);
+            return;
+        }
         let prepared = match self.apply_preflight(tier, target, digest, plan_hash).await {
             Ok(prepared) => prepared,
             Err(reason) => {

@@ -269,6 +269,9 @@ pub struct Device {
     /// property-only device (bussard issue #390, the IPS 300 SREG's object
     /// type 50001). Empty on every other device.
     typed_objects: BTreeMap<u16, InterfaceObject>,
+    /// How many tunnelling addresses (PID 53) the KNXnet/IP parameter object
+    /// holds at most, as its property description says.
+    knxnet_slots: u16,
     /// The process time (seconds) reported in the `A_Restart_Response` to a
     /// factory reset (erase code 7).
     restart_process_time_s: u16,
@@ -415,8 +418,8 @@ impl Device {
     }
 
     /// Gives the device a KNXnet/IP parameter object (interface object type
-    /// 11) at the next free object index, serving `params` read-only: the
-    /// simulated KNX IP interface of bussard issue #391.
+    /// 11) at the next free object index, serving `params`: the simulated KNX
+    /// IP interface of bussard issue #391.
     pub fn with_knxnet_object(self, params: &knxnet_object::KnxnetParameters) -> Self {
         self.with_knxnet(params, true)
     }
@@ -436,8 +439,70 @@ impl Device {
                 .map_or(0, |last| last.saturating_add(1));
             self.objects.insert(index, params.object());
         }
-        self.knxnet_by_type = Some(params.object());
+        // A property-only device (bussard issue #390) already has the object
+        // with the properties its procedure writes: those stay, next to the
+        // configured KNXnet/IP values.
+        let mut object = params.object();
+        if let Some(existing) = &self.knxnet_by_type {
+            for pid in existing.pids() {
+                if !object.has_property(pid)
+                    && let Some(prop) = existing.property(pid)
+                {
+                    object.set_property(pid, prop.clone());
+                }
+            }
+        }
+        self.knxnet_by_type = Some(object);
+        self.knxnet_slots = params.tunnel_slots;
         self
+    }
+
+    /// The object index of the listed KNXnet/IP parameter object, if any.
+    pub(super) fn knxnet_index(&self) -> Option<u8> {
+        self.objects
+            .iter()
+            .find(|(_, o)| knxnet_object::is_knxnet(o))
+            .map(|(i, _)| *i)
+    }
+
+    /// Copies PID `pid` of the KNXnet/IP parameter object from the copy just
+    /// written (`from_listed`: the listed object, else the one reached by
+    /// type) to the other, so both services see one store.
+    pub(super) fn knxnet_sync(&mut self, pid: u8, from_listed: bool) {
+        let Some(index) = self.knxnet_index() else {
+            return;
+        };
+        let value = if from_listed {
+            self.objects
+                .get(&index)
+                .and_then(|o| o.property(pid))
+                .map(|p| p.value.clone())
+        } else {
+            self.knxnet_by_type
+                .as_ref()
+                .and_then(|o| o.property(pid))
+                .map(|p| p.value.clone())
+        };
+        let Some(value) = value else {
+            return;
+        };
+        let target = if from_listed {
+            self.knxnet_by_type.as_mut()
+        } else {
+            self.objects.get_mut(&index)
+        };
+        if let Some(prop) = target.and_then(|o| o.property_mut(pid)) {
+            prop.value = value;
+        }
+    }
+
+    /// The value of PID `pid` of the KNXnet/IP parameter object (for tests and
+    /// observability).
+    pub fn knxnet_property(&self, pid: u8) -> Option<&[u8]> {
+        self.knxnet_by_type
+            .as_ref()
+            .and_then(|o| o.property(pid))
+            .map(|p| p.value.as_slice())
     }
 
     /// The device's individual address.
@@ -746,6 +811,63 @@ mod tests {
         let write = dev.handle_cemi(&data(&dev, 0x3D7, &[index, 52, 0x11, 0x01, 0x11, 0x05]));
         assert!(write.is_err(), "an unauthorized write is refused");
         assert_eq!(read(&mut dev, 52, 1, 1)?, (1, vec![0x11, 0xC8]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_knxnet_object_takes_writes_on_both_services() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Bussard issue #391, the write side: the writable PIDs take plain and
+        // extended writes into one store, PID 53 grows up to its tunnel slots,
+        // and both description services say so.
+        let mut params = knxnet_object::KnxnetParameters::dhcp(0x11C8, vec![0x1116, 0x1117]);
+        params.tunnel_slots = 4;
+        let mut dev = system_b_device()?.with_knxnet_object(&params);
+        let index = *dev.objects.keys().next_back().ok_or("objects")?;
+        connect(&mut dev)?;
+        dev.handle_cemi(&data(&dev, 0x3D1, &[0x00, 0xFF, 0xFF, 0xFF, 0xFF]))?;
+        // A_PropertyValue_Write PID 53: the count to 3, then element 3.
+        let r = dev.handle_cemi(&data(&dev, 0x3D7, &[index, 53, 0x10, 0x00, 0x00, 0x03]))?;
+        assert_eq!(r.responses[0].tpdu[4] >> 4, 1, "count taken");
+        let r = dev.handle_cemi(&data(&dev, 0x3D7, &[index, 53, 0x10, 0x03, 0x11, 0x1E]))?;
+        assert_eq!(r.responses[0].tpdu[4] >> 4, 1, "element 3 taken");
+        assert_eq!(
+            dev.knxnet_property(53),
+            Some(&[0x11, 0x16, 0x11, 0x17, 0x11, 0x1E][..]),
+            "the extended services see the plain write"
+        );
+        // Five elements do not fit four slots: refused with count 0.
+        let r = dev.handle_cemi(&data(&dev, 0x3D7, &[index, 53, 0x10, 0x00, 0x00, 0x05]))?;
+        assert_eq!(r.responses[0].tpdu[4] >> 4, 0);
+        // A_PropertyExtValue_WriteCon PID 76 "Beta", elements 1 to 4.
+        let r = dev.handle_cemi(&data(
+            &dev,
+            0x1CE,
+            &[0x00, 0x0B, 0x00, 0x10, 76, 4, 0, 1, b'B', b'e', b't', b'a'],
+        ))?;
+        assert_eq!(r.responses[0].tpdu[1], 0xCF);
+        assert_eq!(r.responses[0].tpdu.last(), Some(&0), "return code 0");
+        let r = dev.handle_cemi(&data(&dev, 0x3D5, &[index, 76, 0x40, 0x01]))?;
+        assert_eq!(prop_response_value(&r), b"Beta", "the plain read sees it");
+        // PID 52 is read-only: return code 1.
+        let r = dev.handle_cemi(&data(
+            &dev,
+            0x1CE,
+            &[0x00, 0x0B, 0x00, 0x10, 52, 1, 0, 1, 0x11, 0x05],
+        ))?;
+        assert_eq!(r.responses[0].tpdu.last(), Some(&1));
+        // A_PropertyDescription_Read PID 53: writable, four elements.
+        let r = dev.handle_cemi(&data(&dev, 0x3D8, &[index, 53, 0]))?;
+        let d = &r.responses[0].tpdu;
+        assert_eq!(d[1], 0xD9);
+        assert_eq!(d[5] & 0x80, 0x80, "writable");
+        assert_eq!(u16::from_be_bytes([d[6], d[7]]), 4);
+        // A_PropertyExtDescription_Read PID 53, the same.
+        let r = dev.handle_cemi(&data(&dev, 0x1D2, &[0x00, 0x0B, 0x00, 0x10, 53, 0, 0]))?;
+        let d = &r.responses[0].tpdu;
+        assert_eq!(d[1], 0xD3);
+        assert_eq!(d[13] & 0x80, 0x80, "writable");
+        assert_eq!(u16::from_be_bytes([d[14], d[15]]), 4);
         Ok(())
     }
 

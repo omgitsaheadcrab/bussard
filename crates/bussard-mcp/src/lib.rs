@@ -41,6 +41,7 @@
 //! | `knx_add_link` / `knx_remove_link` | Bind or unbind a com object and a GA (refuses protected GAs). |
 //! | `knx_set_device` | Rename a device or change its floor/room. |
 //! | `knx_set_parameter` | Set one device parameter, checked against the product model. |
+//! | `knx_set_interface` | Edit a KNX IP interface's `[knxnet]` table (IP assignment, static settings, friendly name, tunnels), validated before it is saved. |
 //! | `knx_undo` | Restore the model files to a history snapshot. |
 //! | `knx_discard_edits` | Drop one device's or group address's unapplied edits, leaving the rest. |
 //! | `knx_export_bundle` | Write the model and history as one `.bussard` handover file. |

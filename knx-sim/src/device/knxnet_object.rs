@@ -13,13 +13,17 @@
 //! (`knx_master.xml`, `OT-11`); the encodings from the KNX standard volume
 //! 3/8/3 (KNXnet/IP Device Management).
 //!
-//! The simulator serves the properties read-only with array semantics: a read
-//! of start index 0 answers the element count, a read of `count` elements
-//! from `start` answers those elements, and anything past the end is refused
-//! with the zero-count response. KNXnet/IP Secure PIDs (91 and up) are not
-//! modelled.
+//! The simulator serves the properties with array semantics: a read of start
+//! index 0 answers the element count, a read of `count` elements from `start`
+//! answers those elements, and anything past the end is refused with the
+//! zero-count response. The write side (bussard issue #391, sub-task b): PIDs
+//! 53, 55, 60 to 62 and 76 take `A_PropertyValue_Write` and
+//! `A_PropertyExtValue_WriteCon` element by element (element 0 of PID 53 sets
+//! the element count, up to the tunnel slots its description declares), and
+//! both description services describe every property with its real element
+//! count. KNXnet/IP Secure PIDs (91 and up) are not modelled.
 
-use super::interface_object::{InterfaceObject, PID_OBJECT_TYPE, Property};
+use super::interface_object::{InterfaceObject, PID_OBJECT_TYPE, Property, PropertyDescription};
 
 /// The interface-object type of the KNXnet/IP parameter object.
 pub const IOT_KNXNET_IP_PARAMETER: u16 = 11;
@@ -53,12 +57,27 @@ pub struct KnxnetParameters {
     pub state: u8,
     /// PID 76.
     pub friendly_name: String,
+    /// How many tunnelling addresses PID 53 holds at most (its description's
+    /// maximum element count).
+    pub tunnel_slots: u16,
 }
+
+/// The PIDs a simulated interface takes writes on: the tunnelling addresses,
+/// the assignment method, the static address set and the friendly name.
+pub const WRITABLE: [u8; 6] = [53, 55, 60, 61, 62, 76];
+
+/// The `A_PropertyExtValue_WriteConResponse` APCI.
+pub const EXT_WRITE_CON_RESPONSE: u16 = 0x1CF;
+
+/// The `A_PropertyExtDescription_Response` APCI.
+pub const EXT_DESCRIPTION_RESPONSE: u16 = 0x1D3;
 
 impl KnxnetParameters {
     /// A DHCP interface at `individual_address` with `tunnels`.
     pub fn dhcp(individual_address: u16, tunnels: Vec<u16>) -> Self {
+        let tunnel_slots = u16::try_from(tunnels.len()).unwrap_or(u16::MAX);
         KnxnetParameters {
+            tunnel_slots,
             individual_address,
             tunnels,
             current_assignment: 0x04,
@@ -112,10 +131,171 @@ impl KnxnetParameters {
             (76, name),
         ];
         for (pid, value) in values {
-            obj.set_property(pid, Property::read_only(value));
+            let prop = if WRITABLE.contains(&pid) {
+                Property::writable(value)
+            } else {
+                Property::read_only(value)
+            };
+            obj.set_property(pid, prop);
         }
         obj
     }
+}
+
+/// Whether `obj` is a KNXnet/IP parameter object.
+pub fn is_knxnet(obj: &InterfaceObject) -> bool {
+    obj.property(PID_OBJECT_TYPE).map(|p| p.value.as_slice())
+        == Some(&IOT_KNXNET_IP_PARAMETER.to_be_bytes()[..])
+}
+
+/// `desc` (the generic description of PID `desc.pid` of `obj`) with the
+/// property's real data type and element count: PID 53 holds up to `slots`
+/// elements, every other property the elements it has.
+pub fn refine(desc: PropertyDescription, obj: &InterfaceObject, slots: u16) -> PropertyDescription {
+    let size = element_size(desc.pid);
+    let count = obj.property(desc.pid).map_or(0, |p| {
+        u16::try_from(p.value.len() / size).unwrap_or(u16::MAX)
+    });
+    PropertyDescription {
+        pdt: match size {
+            2 => 0x04,
+            4 => 0x09,
+            6 => 0x16,
+            _ => 0x02,
+        },
+        max_elements: if desc.pid == 53 {
+            slots.max(count)
+        } else {
+            count.max(1)
+        },
+        write_level: if desc.writable { 2 } else { 15 },
+        ..desc
+    }
+}
+
+/// Writes `data` from element `start` into `value`, the property `pid`
+/// (element sizes as [`element_size`]): element 0 sets the element count of
+/// PID 53 (at most `slots`); elements 1 and up replace elements in place, and
+/// on PID 53 may extend the array up to `slots`. `false` refuses the write
+/// (malformed, past the end) and leaves `value` as it was.
+pub fn array_write(pid: u8, value: &mut Vec<u8>, start: u16, data: &[u8], slots: u16) -> bool {
+    let size = element_size(pid);
+    if data.is_empty() || (start != 0 && !data.len().is_multiple_of(size)) {
+        return false;
+    }
+    let capacity = if pid == 53 {
+        usize::from(slots).max(value.len() / size)
+    } else {
+        value.len() / size
+    };
+    if start == 0 {
+        if pid != 53 {
+            return false;
+        }
+        let count = match data {
+            [hi, lo] => usize::from(u16::from_be_bytes([*hi, *lo])),
+            [n] => usize::from(*n),
+            _ => return false,
+        };
+        if count > capacity {
+            return false;
+        }
+        value.resize(count * size, 0);
+        return true;
+    }
+    let first = usize::from(start) - 1;
+    let n = data.len() / size;
+    if first + n > capacity || first * size > value.len() {
+        return false;
+    }
+    let end = (first + n) * size;
+    if value.len() < end {
+        value.resize(end, 0);
+    }
+    value[first * size..end].copy_from_slice(data);
+    true
+}
+
+/// The PID an extended request (`[type:16][instance:12|pid:12]…`) names.
+pub fn ext_pid(request: &[u8]) -> Option<u8> {
+    let h = request.get(..5)?;
+    u8::try_from(ext_header(h).2).ok()
+}
+
+/// The header fields of an extended request: `(object type, instance, pid)`.
+fn ext_header(h: &[u8]) -> (u16, u32, u16) {
+    let object_type = u16::from_be_bytes([h[0], h[1]]);
+    let packed = (u32::from(h[2]) << 16) | (u32::from(h[3]) << 8) | u32::from(h[4]);
+    (object_type, packed >> 12, (packed & 0x0FFF) as u16)
+}
+
+/// The `A_PropertyExtValue_WriteConResponse` payload for an
+/// `A_PropertyExtValue_WriteCon` (`[type:16][instance:12|pid:12][count]
+/// [start:16][data]`) of the KNXnet/IP parameter object `obj`, and the PID
+/// written when the write took: the echoed header, count and start and a
+/// return code (0 taken, 1 refused). `None` for another object type.
+pub fn ext_write(
+    obj: &mut InterfaceObject,
+    request: &[u8],
+    slots: u16,
+) -> Option<(Vec<u8>, Option<u8>)> {
+    let h = request.get(..8)?;
+    let (object_type, instance, pid) = ext_header(h);
+    if object_type != IOT_KNXNET_IP_PARAMETER {
+        return None;
+    }
+    let start = u16::from_be_bytes([h[6], h[7]]);
+    let data = &request[8..];
+    let written = match (instance, u8::try_from(pid)) {
+        (1, Ok(pid)) if pid != PID_OBJECT_TYPE => obj
+            .property_mut(pid)
+            .filter(|p| !p.read_only)
+            .is_some_and(|p| array_write(pid, &mut p.value, start, data, slots))
+            .then_some(pid),
+        _ => None,
+    };
+    let mut out = h.to_vec();
+    out.push(if written.is_some() { 0 } else { 1 });
+    Some((out, written))
+}
+
+/// The `A_PropertyExtDescription_Response` payload for an
+/// `A_PropertyExtDescription_Read` (`[type:16][instance:12|pid:12]
+/// [type:4|index:12]`) of the KNXnet/IP parameter object `obj`: the
+/// [`refine`]d description, or zero elements for an unknown property. `None`
+/// for another object type.
+pub fn ext_description(obj: &InterfaceObject, request: &[u8], slots: u16) -> Option<Vec<u8>> {
+    let h = request.get(..7)?;
+    let (object_type, instance, pid) = ext_header(h);
+    if object_type != IOT_KNXNET_IP_PARAMETER {
+        return None;
+    }
+    let index = u16::from_be_bytes([h[5], h[6]]) & 0x0FFF;
+    let desc = match (instance, u8::try_from(pid)) {
+        (1, Ok(0)) => u8::try_from(index)
+            .ok()
+            .and_then(|i| obj.describe_at_index(i)),
+        (1, Ok(pid)) => obj.describe_pid(pid),
+        _ => None,
+    }
+    .map(|d| refine(d, obj, slots));
+    let (pid, type_octet, max, access) = match desc {
+        Some(d) => (
+            u16::from(d.pid),
+            if d.writable { 0x80 } else { 0 } | (d.pdt & 0x3F),
+            d.max_elements & 0x0FFF,
+            ((d.read_level & 0x0F) << 4) | (d.write_level & 0x0F),
+        ),
+        None => (pid, 0, 0, 0),
+    };
+    let packed = (instance << 12) | u32::from(pid);
+    let mut out = object_type.to_be_bytes().to_vec();
+    out.extend_from_slice(&packed.to_be_bytes()[1..]);
+    out.extend_from_slice(&index.to_be_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0, type_octet]);
+    out.extend_from_slice(&max.to_be_bytes());
+    out.push(access);
+    Some(out)
 }
 
 /// The element size in octets of a KNXnet/IP parameter object property.
@@ -268,6 +448,36 @@ pub fn typed_ext_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_array_write_elements_count_and_capacity() {
+        let mut tunnels = vec![0x11, 0x16, 0x11, 0x17];
+        assert!(array_write(53, &mut tunnels, 2, &[0x11, 0x1E], 3));
+        assert_eq!(tunnels, [0x11, 0x16, 0x11, 0x1E]);
+        assert!(
+            array_write(53, &mut tunnels, 0, &[0, 3], 3),
+            "grow to the slots"
+        );
+        assert_eq!(tunnels.len(), 6);
+        assert!(
+            !array_write(53, &mut tunnels, 0, &[0, 4], 3),
+            "past the slots"
+        );
+        assert!(!array_write(53, &mut tunnels, 4, &[0x11, 0x20], 3));
+        assert!(array_write(53, &mut tunnels, 0, &[0, 1], 3), "shrink");
+        assert_eq!(tunnels, [0x11, 0x16]);
+        let mut name = vec![0; 30];
+        assert!(array_write(76, &mut name, 1, b"Beta", 0));
+        assert!(
+            !array_write(76, &mut name, 28, b"long", 0),
+            "past 30 octets"
+        );
+        assert!(
+            !array_write(76, &mut name, 0, &[0, 4], 0),
+            "a fixed-size count"
+        );
+        assert_eq!(&name[..5], b"Beta\0");
+    }
 
     #[test]
     fn test_array_read_count_elements_and_refusal() {
