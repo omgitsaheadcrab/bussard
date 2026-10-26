@@ -428,6 +428,15 @@ the join between the user's words and the vendor's ids:
   a value but never presents them as editable). The user never sees them in
   ETS, so they are generated data: a flash writes them as ETS would, the
   device file does not show them, and every import replaces them.
+- One spelling per ref: a ref has one value, in the device file under its
+  `parameters[]` key or in `hidden[]`, never both. A `hidden[]` row whose
+  ref `parameters[]` also indexes (the configuration shows the ref now: a
+  re-import or `knx_set_parameter` indexed it) is read as the value of that
+  visible key, and whoever saves next (an import, an MCP edit) writes it
+  into the device file and drops the row. When the device file stores the
+  ref as well, the file's value wins. `diff` and the checklist compare
+  parameters by ref, so a key spelled differently on the two sides is no
+  change (issue #375).
 - The product facts (program, manufacturer, hardware, mask) and the device
   state of KNX Secure (`secure_capable`, `has_fdsk_certificate`,
   `sequence_number`, `secure_senders`) live here; the device file keeps only

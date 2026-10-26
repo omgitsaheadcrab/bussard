@@ -731,3 +731,108 @@ fn test_hidden_values_round_trip_through_the_lock_only() -> TestResult {
     fs::remove_dir_all(&dir)?;
     Ok(())
 }
+
+/// Issue #375: a `hidden[]` row of a ref the lock indexes under a visible key
+/// (the configuration shows it now) is read under that key, and the next save
+/// writes it into the device file and drops the row. Where the file stores the
+/// ref too, the file's value wins.
+#[test]
+fn test_hidden_value_of_an_indexed_ref_moves_into_the_device_file() -> TestResult {
+    let dir = tmp("hidden-shown")?;
+    write(&dir, "groups.toml", GROUPS)?;
+    let lock = LOCK.replacen(
+        "  { key = \"sollwerte.komfort\"",
+        "  { key = \"nachlauf\", channel = \"a-1\", ref = \"MD-3_M-18_MI-1_P-50_R-70\", param = \"MD-3_P-50\" },\n  { key = \"sollwerte.komfort\"",
+        1,
+    );
+    let lock = format!(
+        "{lock}hidden = [\n  {{ ref = \"MD-3_M-18_MI-1_P-50_R-70\", value = \"5\" }},\n  \
+         {{ ref = \"P-19_R-38\", value = \"0\" }},\n  \
+         {{ ref = \"P-19_R-39\", value = \"0\" }},\n]\n"
+    );
+    write(&dir, "bussard.lock", &lock)?;
+    write(&dir, "devices/1.1.47.toml", DEVICE)?;
+    let model = Model::load(&dir)?;
+    let d = &model.devices[&ia("1.1.47")?].device;
+    assert_eq!(
+        d.parameters
+            .get("nachlauf@MD-3_M-18_MI-1_P-50_R-70")
+            .map(String::as_str),
+        Some("5")
+    );
+    assert_eq!(
+        d.parameters.get("regenalarm@P-19_R-38").map(String::as_str),
+        Some("Ja")
+    );
+    let hidden: Vec<&String> = d
+        .parameters
+        .keys()
+        .filter(|k| bussard_model::is_hidden_mem_key(k))
+        .collect();
+    assert_eq!(hidden, ["hidden@P-19_R-39"]);
+
+    let texts = model.to_texts()?;
+    let dev = &texts["devices/1.1.47.toml"];
+    assert!(dev.contains("nachlauf = \"5\""), "{dev}");
+    let lock = &texts["bussard.lock"];
+    assert!(
+        lock.contains("hidden = [\n  { ref = \"P-19_R-39\", value = \"0\" },\n]\n"),
+        "{lock}"
+    );
+    assert_eq!(Model::from_texts(&texts)?, model);
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// Issue #375: an in-memory `hidden@<ref>` value of a ref the lock indexes
+/// (an edit or an import put it there) is saved under the lock's key; a
+/// visible key of the same ref wins over it.
+#[test]
+fn test_save_writes_a_hidden_value_of_an_indexed_ref_under_its_key() -> TestResult {
+    let dir = keyed_model("hidden-save")?;
+    let mut model = Model::load(&dir)?;
+    let address = ia("1.1.47")?;
+    let Some(loaded) = model.devices.get_mut(&address) else {
+        return Err("no 1.1.47".into());
+    };
+    let d = &mut loaded.device;
+    d.lock.parameters.insert(
+        "MD-3_M-18_MI-1_P-50_R-70".to_string(),
+        bussard_model::schema::LockedParameter {
+            key: "nachlauf".to_string(),
+            channel: Some("MD-3_M-18_MI-1_CH-25".to_string()),
+            param: Some("MD-3_P-50".to_string()),
+            default: None,
+        },
+    );
+    d.parameters.insert(
+        "hidden@MD-3_M-18_MI-1_P-50_R-70".to_string(),
+        "5".to_string(),
+    );
+    d.parameters
+        .insert("hidden@P-19_R-38".to_string(), "0".to_string());
+    let texts = model.to_texts()?;
+    let dev = &texts["devices/1.1.47.toml"];
+    assert!(dev.contains("nachlauf = \"5\""), "{dev}");
+    assert!(dev.contains("regenalarm = \"Ja\""), "{dev}");
+    assert!(
+        !texts["bussard.lock"].contains("hidden"),
+        "{}",
+        texts["bussard.lock"]
+    );
+    let back = Model::from_texts(&texts)?;
+    let d = &back.devices[&address].device;
+    assert_eq!(
+        d.parameters
+            .get("nachlauf@MD-3_M-18_MI-1_P-50_R-70")
+            .map(String::as_str),
+        Some("5")
+    );
+    assert!(
+        !d.parameters
+            .keys()
+            .any(|k| bussard_model::is_hidden_mem_key(k))
+    );
+    fs::remove_dir_all(&dir)?;
+    Ok(())
+}

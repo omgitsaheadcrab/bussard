@@ -34,7 +34,9 @@ use rmcp::{tool, tool_router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::param_keys::{KeyContext, index_parameter, resolve_parameter_key, unreached_refusal};
+use crate::param_keys::{
+    KeyContext, index_parameter, replace_parameter, resolve_parameter_key, unreached_refusal,
+};
 use crate::server::BussardMcp;
 use crate::session_edits::Subject;
 
@@ -662,7 +664,7 @@ impl BussardMcp {
             // A parameter on a page that was inactive at import gets its lock
             // entry now, saved with the device file below.
             index_parameter(&mut loaded.device, &keys, &key);
-            loaded.device.parameters.insert(key, value);
+            replace_parameter(&mut loaded.device, &key, value);
             Ok(refresh_device_facts(&dir, model, ia, tiers))
         })
     }
