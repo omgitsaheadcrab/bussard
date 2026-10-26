@@ -1361,6 +1361,40 @@ fn value_of<S: DynamicSource + ?Sized>(
     }
 }
 
+/// The `<when>` branches of a `<choose>` the walk takes when the controlling
+/// parameter has `value`, as indices into `tests` (the branches' tests in
+/// document order): every branch whose test matches, or, when none does,
+/// every `<when default="true">` branch. `value` is the parameter's value as
+/// a number, `None` when it has none or it does not parse as one; it then
+/// matches no test, so the default branches are taken. A
+/// [`WhenTest::Unknown`] test never matches. Whether the controlling
+/// parameter is active (issue #159) is the caller's to check.
+///
+/// This is the one definition of `<choose>` semantics: the Dynamic walk and
+/// the `<choose>` blocks of a load procedure (issue #402) both decide their
+/// branches with it.
+pub fn taken_branches<'a, I>(tests: I, value: Option<f64>) -> Vec<usize>
+where
+    I: IntoIterator<Item = &'a WhenTest>,
+    I::IntoIter: Clone,
+{
+    let tests = tests.into_iter();
+    let hits: Vec<usize> = tests
+        .clone()
+        .enumerate()
+        .filter(|(_, t)| when_matches(t, value))
+        .map(|(i, _)| i)
+        .collect();
+    if !hits.is_empty() {
+        return hits;
+    }
+    tests
+        .enumerate()
+        .filter(|(_, t)| **t == WhenTest::Default)
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Whether a `<when>` test (other than `default`) matches a value.
 fn when_matches(test: &WhenTest, value: Option<f64>) -> bool {
     let Some(v) = value else { return false };
@@ -1714,20 +1748,10 @@ impl Walk {
                             value_of(app, values, instance, self.module_args(scope), param_ref_id)
                         })
                         .and_then(|v| v.trim().parse::<f64>().ok());
-                    let hits: Vec<_> = whens
-                        .iter()
-                        .filter(|w| when_matches(&w.test, value))
-                        .collect();
-                    let taken: Vec<_> = if hits.is_empty() {
-                        whens
-                            .iter()
-                            .filter(|w| w.test == WhenTest::Default)
-                            .collect()
-                    } else {
-                        hits
-                    };
-                    for w in taken {
-                        self.run(app, values, &w.children, module, depth);
+                    for i in taken_branches(whens.iter().map(|w| &w.test), value) {
+                        if let Some(w) = whens.get(i) {
+                            self.run(app, values, &w.children, module, depth);
+                        }
                     }
                 }
                 DynamicNode::Module {
@@ -2308,5 +2332,31 @@ mod tests {
         let default = gate(WhenTest::Default, vec![WhenTest::Values(vec![1])]);
         assert!(default.holds(Some(0.0)));
         assert!(!default.holds(Some(1.0)));
+    }
+
+    #[test]
+    fn test_taken_branches_matches_else_defaults() {
+        let tests = [
+            WhenTest::Values(vec![0]),
+            WhenTest::Compare {
+                op: CompareOp::Ge,
+                value: 2,
+            },
+            WhenTest::Default,
+            WhenTest::Values(vec![3]),
+        ];
+        // Every matching branch is taken, the default one is not.
+        assert_eq!(taken_branches(&tests, Some(3.0)), vec![1, 3]);
+        assert_eq!(taken_branches(&tests, Some(0.0)), vec![0]);
+        // No match: the default branch.
+        assert_eq!(taken_branches(&tests, Some(1.0)), vec![2]);
+        // A fractional value matches no exact test.
+        assert_eq!(taken_branches(&tests[..1], Some(0.5)), Vec::<usize>::new());
+        // No value: only the default branch.
+        assert_eq!(taken_branches(&tests, None), vec![2]);
+        assert_eq!(
+            taken_branches(&[WhenTest::Unknown("x".to_string())], Some(1.0)),
+            Vec::<usize>::new()
+        );
     }
 }

@@ -324,7 +324,8 @@ pub fn plan_flash_with_memo(
     //    concatenated in MergeId order so the whole download lowers, not just the
     //    richest single block. A single-style app has one block, used as-is.
     //    Empty apps are refused.
-    let (ops, spliced_from_template) = assemble_ops(app, template_ops);
+    let config = memo.evaluate_for(app, overrides);
+    let (ops, spliced_from_template) = assemble_ops(app, template_ops, &config)?;
     if ops.is_empty() {
         return Err(PlanError::NoProcedure(app.id.clone()));
     }
@@ -1121,10 +1122,28 @@ pub(super) fn plan_segments(
     std::borrow::Cow::Owned(all)
 }
 
+/// The op sequence a download of `app` runs, with every `<choose>` of its
+/// load procedures decided under `config`, and whether it was spliced into
+/// the master template (`template_ops`).
+///
+/// Only the branches `config` takes contribute their ops
+/// ([`super::plan_props::taken_ops`]), on every path: the System B lowering
+/// used to concatenate every branch, so a program choosing its hardware
+/// variant by parameter (the MDT 07B0 programs: one `LdCtrlCompareProp` on
+/// PID 78 per variant) planned every variant's check and could not pass
+/// the second one (issue #402).
+///
+/// # Errors
+///
+/// [`PlanError::UndecidableCondition`] when a `<choose>` cannot be decided,
+/// or when a companion program's block holds one (its parameters are not
+/// the application's).
 pub(super) fn assemble_ops(
     app: &ApplicationProgram,
     template_ops: Option<&[LoadOp]>,
-) -> (Vec<LoadOp>, bool) {
+    config: &bussard_prod::dynamic::DynamicConfig,
+) -> std::result::Result<(Vec<LoadOp>, bool), PlanError> {
+    use super::plan_props::taken_ops;
     let non_empty: Vec<&LoadProcedure> = app
         .load_procedures
         .iter()
@@ -1140,7 +1159,17 @@ pub(super) fn assemble_ops(
         .filter(|p| !p.ops.is_empty() && p.merge_id.is_some())
         .collect();
     if non_empty.is_empty() {
-        return (Vec::new(), false);
+        return Ok((Vec::new(), false));
+    }
+    if let Some(p) = companion_blocks.iter().find(|p| !p.chooses.is_empty()) {
+        return Err(PlanError::UndecidableCondition {
+            step: 0,
+            reason: format!(
+                "a companion program's load procedure (MergeId {}) holds a <choose>; \
+                 its parameters are not the application's",
+                p.merge_id.as_deref().unwrap_or("?")
+            ),
+        });
     }
     let all_merged = non_empty.iter().all(|p| p.merge_id.is_some());
 
@@ -1151,7 +1180,17 @@ pub(super) fn assemble_ops(
         // App blocks keyed by parsed MergeId. A block whose id is not numeric
         // cannot match a numeric `<LdCtrlMerge MergeId=N>` and is ignored.
         let mut blocks: BTreeMap<u32, Vec<LoadOp>> = BTreeMap::new();
-        for p in non_empty.iter().chain(companion_blocks.iter()) {
+        let (mut every_branch, mut taken) = (Vec::new(), Vec::new());
+        for p in &non_empty {
+            if let Some(id) = p.merge_id.as_deref().and_then(|m| m.parse::<u32>().ok()) {
+                let ops = taken_ops(app, p, config)?;
+                every_branch.extend(p.ops.iter());
+                taken.extend(ops.iter().cloned());
+                blocks.entry(id).or_default().extend(ops);
+            }
+        }
+        super::plan_props::refuse_partial_rel_mem(every_branch.into_iter(), &taken)?;
+        for p in &companion_blocks {
             if let Some(id) = p.merge_id.as_deref().and_then(|m| m.parse::<u32>().ok()) {
                 blocks.entry(id).or_default().extend(p.ops.clone());
             }
@@ -1172,16 +1211,16 @@ pub(super) fn assemble_ops(
                 other => out.push(other.clone()),
             }
         }
-        return (out, true);
+        return Ok((out, true));
     }
 
-    (
-        self_contained_blocks(app)
-            .into_iter()
-            .flat_map(|p| p.ops.clone())
-            .collect(),
-        false,
-    )
+    let blocks = self_contained_blocks(app);
+    let mut out = Vec::new();
+    for p in &blocks {
+        out.extend(taken_ops(app, p, config)?);
+    }
+    super::plan_props::refuse_partial_rel_mem(blocks.iter().flat_map(|p| p.ops.iter()), &out)?;
+    Ok((out, false))
 }
 
 /// The blocks a self-contained download (no master-template splice) runs, in
@@ -1382,6 +1421,8 @@ mod tests {
     use crate::flash::labels::trace;
     use bussard_prod::application::ApplicationProgram;
     use std::collections::BTreeMap;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
     fn test_same_program_ignores_the_build_hash() {
@@ -2141,6 +2182,182 @@ mod tests {
         ));
         // The trace names the verify-property step.
         assert!(trace(&plan).iter().any(|l| l.contains("verify property")));
+        Ok(())
+    }
+
+    /// The MDT 07B0 shape (BWM-xxxxx-03S, `M-0083_A-047A-11-B6E0`): the
+    /// hardware variant is a parameter, and a `<choose>` on it picks the one
+    /// PID 78 compare that variant must pass.
+    fn hardware_variant_app() -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
+        let xml = r#"<KNX xmlns="http://knx.org/xml/project/23">
+         <ApplicationProgram Id="M-1_A-5" ApplicationNumber="9" ApplicationVersion="1"
+            MaskVersion="MV-07B0" Name="BWM" LoadProcedureStyle="MergedProcedure">
+          <Static>
+           <Code><RelativeSegment Id="M-1_A-5_RS-1" Size="4" LoadStateMachine="4" Offset="0"><Data>AAECAw==</Data></RelativeSegment></Code>
+           <ParameterTypes>
+            <ParameterType Id="M-1_A-5_PT-v" Name="v"><TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="3" /></ParameterType>
+           </ParameterTypes>
+           <Parameters>
+            <Parameter Id="M-1_A-5_P-579" Name="variant" ParameterType="M-1_A-5_PT-v" Value="0" />
+           </Parameters>
+           <ParameterRefs>
+            <ParameterRef Id="M-1_A-5_P-579_R-1032" RefId="M-1_A-5_P-579" />
+           </ParameterRefs>
+           <LoadProcedures>
+            <LoadProcedure MergeId="2">
+             <choose ParamRefId="M-1_A-5_P-579_R-1032">
+              <when test="0"><LdCtrlCompareProp InlineData="008300000000" ObjIdx="0" PropId="78" /></when>
+              <when test="1"><LdCtrlCompareProp InlineData="008300000407" ObjIdx="0" PropId="78" /></when>
+              <when test="2"><LdCtrlCompareProp InlineData="008300000406" ObjIdx="0" PropId="78" /></when>
+             </choose>
+             <LdCtrlRelSegment AppliesTo="full" LsmIdx="4" Size="4" Mode="1" Fill="0" />
+            </LoadProcedure>
+            <LoadProcedure MergeId="4">
+             <LdCtrlWriteRelMem AppliesTo="full" ObjIdx="4" Offset="0" Size="4" Verify="true" />
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+         </ApplicationProgram></KNX>"#;
+        Ok(parse_application_program("M-1_A-5", xml.as_bytes())?)
+    }
+
+    /// The PID 78 compares a System B plan of [`hardware_variant_app`] runs
+    /// for `variant`, as their expected bytes.
+    fn variant_compares(variant: Option<&str>) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+        let app = hardware_variant_app()?;
+        let mut overrides = BTreeMap::new();
+        if let Some(v) = variant {
+            overrides.insert("P-579_R-1032".to_string(), v.to_string());
+        }
+        let plan = plan_flash(
+            &app,
+            "1.1.4",
+            0x07B0,
+            &overrides,
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        Ok(plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                FlashStep::CompareProp {
+                    prop_id: 78,
+                    expected,
+                    ..
+                } => expected.clone(),
+                _ => None,
+            })
+            .collect())
+    }
+
+    #[test]
+    fn test_plan_flash_runs_only_the_taken_hardware_variant_compare() -> TestResult {
+        // Issue #402: the System B lowering used to concatenate every branch,
+        // planning three mutually exclusive PID 78 compares.
+        assert_eq!(
+            variant_compares(Some("2"))?,
+            vec![vec![0x00, 0x83, 0x00, 0x00, 0x04, 0x06]]
+        );
+        assert_eq!(
+            variant_compares(None)?,
+            vec![vec![0x00, 0x83, 0x00, 0x00, 0x00, 0x00]]
+        );
+        // A value no branch tests (and no default branch): no compare at all.
+        assert!(variant_compares(Some("3"))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_flash_splices_only_the_taken_branch_into_the_template() -> TestResult {
+        let app = hardware_variant_app()?;
+        let template = [
+            LoadOp::Connect,
+            LoadOp::Merge {
+                merge_id: Some("2".to_string()),
+            },
+            LoadOp::Merge {
+                merge_id: Some("4".to_string()),
+            },
+            LoadOp::Disconnect,
+        ];
+        let memo = bussard_prod::dynamic::DynamicMemo::new(&app);
+        let overrides = BTreeMap::from([("P-579_R-1032".to_string(), "1".to_string())]);
+        let (ops, spliced) =
+            assemble_ops(&app, Some(&template), &memo.evaluate_for(&app, &overrides))?;
+        assert!(spliced);
+        let compares: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match op {
+                LoadOp::CompareProp { inline_data, .. } => inline_data.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(compares, vec![vec![0x00, 0x83, 0x00, 0x00, 0x04, 0x07]]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_flash_refuses_a_choose_that_writes_a_segment_in_part() -> TestResult {
+        // The MDT JTA-01 shape (`M-0083_A-00A2-10-6169`): parameter P-324
+        // picks a full write of the segment or one that skips octets 4..6,
+        // which ETS leaves as the device holds them.
+        let xml = r#"<KNX xmlns="http://knx.org/xml/project/23">
+         <ApplicationProgram Id="M-1_A-6" ApplicationNumber="9" ApplicationVersion="1"
+            MaskVersion="MV-07B0" Name="JTA" LoadProcedureStyle="MergedProcedure">
+          <Static>
+           <Code><RelativeSegment Id="M-1_A-6_RS-1" Size="8" LoadStateMachine="4" Offset="0"><Data>AAECAwQFBgc=</Data></RelativeSegment></Code>
+           <ParameterTypes>
+            <ParameterType Id="M-1_A-6_PT-v" Name="v"><TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="1" /></ParameterType>
+           </ParameterTypes>
+           <Parameters>
+            <Parameter Id="M-1_A-6_P-324" Name="keep" ParameterType="M-1_A-6_PT-v" Value="0" />
+           </Parameters>
+           <ParameterRefs>
+            <ParameterRef Id="M-1_A-6_P-324_R-1539" RefId="M-1_A-6_P-324" />
+           </ParameterRefs>
+           <LoadProcedures>
+            <LoadProcedure MergeId="2">
+             <LdCtrlRelSegment AppliesTo="full" LsmIdx="4" Size="8" Mode="0" Fill="0" />
+            </LoadProcedure>
+            <LoadProcedure MergeId="4">
+             <choose ParamRefId="M-1_A-6_P-324_R-1539">
+              <when test="0">
+               <LdCtrlWriteRelMem AppliesTo="full,par" ObjIdx="4" Offset="0" Size="8" Verify="true" />
+              </when>
+              <when test="1">
+               <LdCtrlWriteRelMem AppliesTo="full,par" ObjIdx="4" Offset="0" Size="4" Verify="true" />
+               <LdCtrlWriteRelMem AppliesTo="full,par" ObjIdx="4" Offset="6" Size="2" Verify="true" />
+              </when>
+             </choose>
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+         </ApplicationProgram></KNX>"#;
+        let app = parse_application_program("M-1_A-6", xml.as_bytes())?;
+        let plan_for = |keep: &str| {
+            plan_flash(
+                &app,
+                "1.1.4",
+                0x07B0,
+                &BTreeMap::from([("P-324_R-1539".to_string(), keep.to_string())]),
+                &BTreeMap::new(),
+                None,
+                &BTreeMap::new(),
+            )
+        };
+        let full = plan_for("0")?;
+        let writes = full
+            .steps
+            .iter()
+            .filter(|s| matches!(s, FlashStep::WriteRelMem { .. }))
+            .count();
+        assert_eq!(writes, 1, "one full write, not three");
+        match plan_for("1") {
+            Err(PlanError::UnsupportedOp { op }) => assert!(op.contains("octets 4..6 of object 4")),
+            other => return Err(format!("expected a refusal, got {other:?}").into()),
+        }
         Ok(())
     }
 

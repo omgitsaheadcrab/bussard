@@ -11,8 +11,8 @@
 //! guessed.
 
 use super::{AppIdentity, FlashPlan, FlashStep, PlanError, PropObject};
-use bussard_prod::application::{ApplicationProgram, LoadOp, LoadProcedure};
-use bussard_prod::dynamic::{DynamicConfig, WhenTest};
+use bussard_prod::application::{ApplicationProgram, LoadGuard, LoadOp, LoadProcedure};
+use bussard_prod::dynamic::{DynamicConfig, WhenTest, taken_branches};
 use bussard_prod::{PropertyObjectRef, PropertyValues};
 use std::collections::BTreeMap;
 
@@ -50,11 +50,17 @@ pub(crate) fn is_property_only(app: &ApplicationProgram) -> bool {
         && ops().any(|op| matches!(op, LoadOp::WriteProp { .. } | LoadOp::CompareProp { .. }))
 }
 
-/// Whether the branch `guard` names is taken under `config`.
+/// Whether the branch `guard` names is taken under `config`, by the Dynamic
+/// evaluator's `<choose>` semantics ([`taken_branches`]): every `<when>`
+/// whose test matches the controlling parameter's value, else the
+/// `<when default="true">` branches. A load procedure is a device write, so
+/// where the Dynamic walk would quietly fall back to the default branch this
+/// refuses instead: a controlling parameter without a value, a value that is
+/// not a number, and a test bussard does not understand.
 fn branch_taken(
     app: &ApplicationProgram,
     lp: &LoadProcedure,
-    guard: &bussard_prod::application::LoadGuard,
+    guard: &LoadGuard,
     config: &DynamicConfig,
     step: usize,
 ) -> Result<bool, PlanError> {
@@ -71,7 +77,7 @@ fn branch_taken(
             step,
             reason: format!("parameter ref {} has no value", choose.param_ref_id),
         })?;
-    let value: i64 = raw
+    let value: f64 = raw
         .trim()
         .parse()
         .map_err(|_| PlanError::UndecidableCondition {
@@ -94,18 +100,24 @@ fn branch_taken(
             ),
         });
     }
-    let Some(test) = choose.tests.get(guard.branch) else {
-        return Ok(false);
-    };
-    Ok(match test {
-        WhenTest::Default => !choose.tests.iter().any(|t| t.matches(value)),
-        other => other.matches(value),
-    })
+    Ok(taken_branches(&choose.tests, Some(value)).contains(&guard.branch))
 }
 
 /// The ops of `lp` whose `<choose>` branches `config` takes, in order. A
 /// procedure without `<choose>` returns all of its ops.
-fn taken_ops(
+///
+/// The evaluation is recursive, as the Dynamic walk's: an op inside nested
+/// `<choose>` blocks carries its branches outermost first
+/// ([`LoadProcedure::guards_of`]), and runs only when every one of them is
+/// taken. An inner `<choose>` is decided only once its enclosing branch is
+/// taken, so an inner one behind a branch not taken never refuses (issue
+/// #402).
+///
+/// # Errors
+///
+/// [`PlanError::UndecidableCondition`] when a `<choose>` the op depends on
+/// cannot be decided.
+pub(super) fn taken_ops(
     app: &ApplicationProgram,
     lp: &LoadProcedure,
     config: &DynamicConfig,
@@ -126,6 +138,96 @@ fn taken_ops(
     Ok(out)
 }
 
+/// The octet ranges each object's `LdCtrlWriteRelMem` ops write, merged and
+/// sorted, keyed by object index.
+fn rel_mem_coverage<'a>(ops: impl Iterator<Item = &'a LoadOp>) -> BTreeMap<u32, Vec<(u32, u32)>> {
+    let mut out: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
+    for op in ops {
+        if let LoadOp::WriteRelMem {
+            obj_idx,
+            offset,
+            size,
+            ..
+        } = op
+        {
+            let start = offset.unwrap_or(0);
+            let end = start.saturating_add(size.unwrap_or(0));
+            if end > start {
+                out.entry(obj_idx.unwrap_or(0))
+                    .or_default()
+                    .push((start, end));
+            }
+        }
+    }
+    for ranges in out.values_mut() {
+        ranges.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+        for &(start, end) in ranges.iter() {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        *ranges = merged;
+    }
+    out
+}
+
+/// The first octet range `every` covers and `taken` does not (both merged
+/// and sorted).
+fn first_gap(every: &[(u32, u32)], taken: &[(u32, u32)]) -> Option<(u32, u32)> {
+    for &(start, end) in every {
+        let mut at = start;
+        for &(t_start, t_end) in taken {
+            if t_end <= at || t_start >= end {
+                continue;
+            }
+            if t_start > at {
+                return Some((at, t_start));
+            }
+            at = at.max(t_end);
+        }
+        if at < end {
+            return Some((at, end));
+        }
+    }
+    None
+}
+
+/// Refuses a procedure whose `<choose>` leaves part of an object's memory
+/// unwritten: the octets some branch of the procedure writes and the taken
+/// branches do not.
+///
+/// ETS keeps the device's own octets there (the MDT JTA-01 blind push button,
+/// `M-0083_A-00A2-10-6169`, skips octets 835..904 of object 4 when parameter
+/// `P-324` is 1). bussard verifies a written segment by the device's MCB CRC
+/// over the whole segment and by the read-back against the model, and neither
+/// holds while the device keeps octets bussard does not know, so the plan
+/// refuses rather than reporting a mismatch after the write (issue #402).
+///
+/// # Errors
+///
+/// [`PlanError::UnsupportedOp`] naming the object and the octet range.
+pub(super) fn refuse_partial_rel_mem<'a>(
+    every_branch: impl Iterator<Item = &'a LoadOp>,
+    taken: &[LoadOp],
+) -> Result<(), PlanError> {
+    let taken_cov = rel_mem_coverage(taken.iter());
+    for (obj, every) in rel_mem_coverage(every_branch) {
+        let taken = taken_cov.get(&obj).map(Vec::as_slice).unwrap_or(&[]);
+        if let Some((start, end)) = first_gap(&every, taken) {
+            return Err(PlanError::UnsupportedOp {
+                op: format!(
+                    "LdCtrlWriteRelMem in a <choose> whose taken branches leave octets \
+                     {start}..{end} of object {obj} unwritten (ETS keeps the device's octets \
+                     there; bussard cannot verify a segment it writes only in part)"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The self-contained op sequence of `app` (no master-template splice) with
 /// each `<choose>` decided under `config`: [`super::plan::assemble_ops`]'s
 /// block selection (merged blocks in `MergeId` order, else the richest block),
@@ -138,11 +240,7 @@ pub(super) fn guarded_ops(
     app: &ApplicationProgram,
     config: &DynamicConfig,
 ) -> Result<Vec<LoadOp>, PlanError> {
-    let mut out = Vec::new();
-    for lp in super::plan::self_contained_blocks(app) {
-        out.extend(taken_ops(app, lp, config)?);
-    }
-    Ok(out)
+    super::plan::assemble_ops(app, None, config).map(|(ops, _)| ops)
 }
 
 /// How an op names its object: by index when it carries `ObjIdx`, else by
@@ -400,6 +498,7 @@ pub(super) fn plan_flash_properties(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bussard_prod::application::LoadGuard;
     use bussard_prod::application::parse_application_program;
     use bussard_prod::dynamic::DynamicMemo;
 
@@ -583,6 +682,230 @@ mod tests {
                 .retain(|op| matches!(op, LoadOp::Connect | LoadOp::Disconnect));
         }
         assert!(!is_property_only(&connect_only));
+        Ok(())
+    }
+
+    /// A procedure with a `<choose>` nested in a `<when>`: the outer one on
+    /// `P-18` (`>=3` or default), the inner one on `P-20` inside the `>=3`
+    /// branch (`0` writes PID 60, `1` PID 61, default PID 62; a self-closed `<when test="2"/>` takes no op).
+    fn nested_app() -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
+        let xml = r#"<KNX xmlns="http://knx.org/xml/project/20">
+         <ApplicationProgram Id="M-0083_A-2" ApplicationNumber="2" ApplicationVersion="1"
+            MaskVersion="MV-0705" Name="N">
+          <Static>
+           <ParameterTypes>
+            <ParameterType Id="M-0083_A-2_PT-u8" Name="u8"><TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="9" /></ParameterType>
+            <ParameterType Id="M-0083_A-2_PT-t" Name="t"><TypeText SizeInBit="32" /></ParameterType>
+           </ParameterTypes>
+           <Parameters>
+            <Parameter Id="M-0083_A-2_P-18" Name="mode" ParameterType="M-0083_A-2_PT-u8" Value="1" />
+            <Parameter Id="M-0083_A-2_P-20" Name="label" ParameterType="M-0083_A-2_PT-u8" Value="0" />
+           </Parameters>
+           <ParameterRefs>
+            <ParameterRef Id="M-0083_A-2_P-18_R-8" RefId="M-0083_A-2_P-18" />
+            <ParameterRef Id="M-0083_A-2_P-20_R-9" RefId="M-0083_A-2_P-20" />
+           </ParameterRefs>
+           <LoadProcedures>
+            <LoadProcedure>
+             <LdCtrlConnect />
+             <choose ParamRefId="M-0083_A-2_P-18_R-8">
+              <when test="&gt;=3">
+               <LdCtrlWriteProp ObjIdx="6" PropId="59" InlineData="01" Verify="false" />
+               <choose ParamRefId="M-0083_A-2_P-20_R-9">
+                <when test="0">
+                 <LdCtrlWriteProp ObjIdx="6" PropId="60" InlineData="00" Verify="false" />
+                </when>
+                <when test="1">
+                 <LdCtrlWriteProp ObjIdx="6" PropId="61" InlineData="01" Verify="false" />
+                </when>
+                <when test="2" />
+                <when default="true">
+                 <LdCtrlWriteProp ObjIdx="6" PropId="62" InlineData="02" Verify="false" />
+                </when>
+               </choose>
+               <LdCtrlWriteProp ObjIdx="6" PropId="63" InlineData="03" Verify="false" />
+              </when>
+              <when default="true">
+               <LdCtrlCompareProp InlineData="01" ObjIdx="0" PropId="19" />
+              </when>
+             </choose>
+             <LdCtrlDisconnect />
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+         </ApplicationProgram></KNX>"#;
+        Ok(parse_application_program("M-0083_A-2", xml.as_bytes())?)
+    }
+
+    /// The property ids the taken ops of [`nested_app`] write or compare.
+    fn nested_props(mode: &str, label: &str) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+        let app = nested_app()?;
+        let memo = DynamicMemo::new(&app);
+        let overrides = BTreeMap::from([
+            ("P-18_R-8".to_string(), mode.to_string()),
+            ("P-20_R-9".to_string(), label.to_string()),
+        ]);
+        Ok(guarded_ops(&app, &memo.evaluate_for(&app, &overrides))?
+            .iter()
+            .filter_map(|op| match op {
+                LoadOp::WriteProp { prop_id, .. } | LoadOp::CompareProp { prop_id, .. } => *prop_id,
+                _ => None,
+            })
+            .collect())
+    }
+
+    #[test]
+    fn test_guarded_ops_decides_a_nested_choose_by_the_inner_parameter() -> TestResult {
+        // Outer branch taken: the inner choose picks by P-20, the ops around
+        // it run in document order.
+        assert_eq!(nested_props("3", "0")?, vec![59, 60, 63]);
+        assert_eq!(nested_props("4", "1")?, vec![59, 61, 63]);
+        // No inner test matches: the inner default branch.
+        assert_eq!(nested_props("3", "7")?, vec![59, 62, 63]);
+        // A self-closed `<when>` matches and holds nothing, so the default
+        // branch is not taken.
+        assert_eq!(nested_props("3", "2")?, vec![59, 63]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_guarded_ops_skips_a_nested_choose_behind_a_branch_not_taken() -> TestResult {
+        assert_eq!(nested_props("1", "1")?, vec![19]);
+        // The inner choose is never decided, so its undecidable value does
+        // not refuse.
+        assert_eq!(nested_props("1", "x")?, vec![19]);
+        // Behind the taken branch it does.
+        let app = nested_app()?;
+        let memo = DynamicMemo::new(&app);
+        let overrides = BTreeMap::from([
+            ("P-18_R-8".to_string(), "3".to_string()),
+            ("P-20_R-9".to_string(), "x".to_string()),
+        ]);
+        assert!(matches!(
+            guarded_ops(&app, &memo.evaluate_for(&app, &overrides)),
+            Err(PlanError::UndecidableCondition { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_records_nested_load_guards_outermost_first() -> TestResult {
+        let app = nested_app()?;
+        let lp = app.load_procedures.first().ok_or("one procedure")?;
+        assert_eq!(lp.chooses.len(), 2);
+        // The self-closed `<when test="2"/>` keeps its place among the tests.
+        assert_eq!(lp.chooses[1].tests.len(), 4);
+        let inner = lp.guards_of(3);
+        assert_eq!(
+            inner,
+            [
+                LoadGuard {
+                    choose: 0,
+                    branch: 0
+                },
+                LoadGuard {
+                    choose: 1,
+                    branch: 1
+                }
+            ]
+        );
+        Ok(())
+    }
+
+    /// Corpus conformance for load-procedure `<choose>` blocks (issue #402,
+    /// env-gated on `BUSSARD_PRODUCT_CORPUS`): every program whose load
+    /// procedure holds a `<choose>` decides it under the product defaults and
+    /// plans without an undecidable-condition refusal. Prints one
+    /// `LOAD-CHOOSE` line per program (mask, family, nesting depth, op count
+    /// with every branch and with the taken ones) and marks with `changed`
+    /// the System B programs, whose lowering concatenated every branch
+    /// before #402.
+    #[test]
+    fn test_guarded_ops_decides_every_load_procedure_choose_on_the_corpus() -> TestResult {
+        let Some(dir) = std::env::var_os("BUSSARD_PRODUCT_CORPUS") else {
+            return Ok(());
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let dir = [dir.join("cache/vendor"), dir.join("vendor")]
+            .into_iter()
+            .find(|d| d.is_dir())
+            .unwrap_or(dir);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut failures = Vec::new();
+        let (mut with_choose, mut nested, mut changed) = (0, 0, 0);
+        for path in crate::sweep::knxprod_files(&dir) {
+            let Ok(product) = bussard_prod::read_knxprod(&path) else {
+                continue;
+            };
+            for app in &product.applications {
+                if !seen.insert(app.id.clone())
+                    || app.load_procedures.iter().all(|p| p.chooses.is_empty())
+                {
+                    continue;
+                }
+                with_choose += 1;
+                let depth = app
+                    .load_procedures
+                    .iter()
+                    .flat_map(|p| (0..p.ops.len()).map(move |i| p.guards_of(i).len()))
+                    .max()
+                    .unwrap_or(0);
+                if depth > 1 {
+                    nested += 1;
+                }
+                let mask = app.mask_version.as_deref().unwrap_or("");
+                let device_mask = u16::from_str_radix(mask.trim(), 16).unwrap_or(0);
+                let profile = bussard_mgmt::MaskProfile::from_mask(device_mask);
+                let every_branch = super::super::plan::self_contained_blocks(app)
+                    .iter()
+                    .map(|p| p.ops.len())
+                    .sum::<usize>();
+                let memo = DynamicMemo::new(app);
+                let taken = match guarded_ops(app, &memo.evaluate_for(app, &BTreeMap::new())) {
+                    Ok(ops) => ops.len(),
+                    Err(e) => {
+                        failures.push(format!("{}: {e}", app.id));
+                        continue;
+                    }
+                };
+                let plan = crate::flash::plan_flash(
+                    app,
+                    "1.1.1",
+                    device_mask,
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    None,
+                    &BTreeMap::new(),
+                );
+                let plan = match plan {
+                    Ok(plan) => format!("plan {} steps", plan.steps.len()),
+                    Err(e @ PlanError::UndecidableCondition { .. }) => {
+                        failures.push(format!("{}: {e}", app.id));
+                        continue;
+                    }
+                    Err(e) => format!("refused {}", crate::sweep::normalize_plan_error(&e)),
+                };
+                let system_b = profile.capabilities().flash && !profile.is_system_7();
+                let differs = taken != every_branch;
+                if system_b && differs {
+                    changed += 1;
+                }
+                println!(
+                    "LOAD-CHOOSE|{}|{mask}|{}|depth {depth}|ops {every_branch}->{taken}|{plan}|{}",
+                    app.id,
+                    crate::sweep::family_label(app.mask_version.as_deref()),
+                    if system_b && differs {
+                        "changed"
+                    } else {
+                        "unchanged"
+                    },
+                );
+            }
+        }
+        println!(
+            "LOAD-CHOOSE-SUMMARY|programs {with_choose}|nested {nested}|System B changed {changed}"
+        );
+        assert!(failures.is_empty(), "undecidable: {failures:#?}");
         Ok(())
     }
 }

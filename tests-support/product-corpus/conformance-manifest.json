@@ -748,7 +748,7 @@
           },
           "plan": {
             "plan": "executable",
-            "steps": 11
+            "steps": 8
           }
         }
       ]
@@ -1564,7 +1564,7 @@
           },
           "plan": {
             "plan": "executable",
-            "steps": 11
+            "steps": 8
           }
         }
       ]
@@ -15550,7 +15550,7 @@
           },
           "plan": {
             "plan": "executable",
-            "steps": 9
+            "steps": 6
           }
         }
       ]
@@ -18869,7 +18869,7 @@
           },
           "plan": {
             "plan": "executable",
-            "steps": 16
+            "steps": 8
           }
         }
       ]

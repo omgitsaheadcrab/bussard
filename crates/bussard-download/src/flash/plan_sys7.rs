@@ -7,7 +7,6 @@
 //! group-object descriptor post-pass that sets each object's communication flag
 //! from the association table.
 
-use super::plan::assemble_ops;
 use super::{AppIdentity, FlashPlan, FlashStep, ImageKind, ImageRef, PlanError, Sys7Context};
 use bussard_prod::application::{ApplicationProgram, LoadOp, SegmentKind, TableLocation};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1222,9 +1221,13 @@ pub struct Sys7TableBases {
 /// The first `LdCtrlAbsSegment` (address, size) `app`'s procedure allocates on
 /// LSM 1 and on LSM 2.
 fn table_allocations(app: &ApplicationProgram) -> [Option<(u32, u32)>; 2] {
-    let (ops, _) = assemble_ops(app, None);
+    // Every branch of every block, read without a configuration: no corpus
+    // program allocates inside a `<choose>` (issue #402).
+    let ops = super::plan::self_contained_blocks(app)
+        .into_iter()
+        .flat_map(|p| p.ops.iter());
     let alloc = |lsm: u32| {
-        ops.iter().find_map(|op| match op {
+        ops.clone().find_map(|op| match op {
             LoadOp::AbsSegment {
                 lsm_idx: Some(l),
                 address: Some(a),
