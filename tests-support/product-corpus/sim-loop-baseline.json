@@ -18,24 +18,19 @@
       "issue": 405
     },
     "M-0083_A-0054-14-0D63": {
-      "step": "flash[1] (generated 1)",
-      "reason": "the generator sets `Hardware revision` to `to R1.9`, the procedure then compares object 0 PID 19 with 00000000; knx-sim is the R2.0 device the vendor default selects (01000000) and refuses, as the hardware would (#400)",
-      "issue": 407
+      "step": "flash[2] (generated 2)",
+      "reason": "`Switching times in the device` = 1 selects a <choose> that splits the 0x47E4 AbsSegment into three; the System 7 path allocates the branch's 899 octets but streams the whole 5406-octet code segment, knx-sim rejects the writes past 0x4B67 and the flash runs into the command timeout; System 7 twin of #411 (#407 sim run)",
+      "issue": 413
+    },
+    "M-0083_A-00A2-10-6169": {
+      "step": "flash[2] (generated 2)",
+      "reason": "the generator sets keep-data P-324 to 1; the System B <choose> branch then writes only part of a segment, which bussard refuses since #410 (\"a <choose> branch writes only part of a segment\")",
+      "issue": 411
     },
     "M-0083_A-0255-21-0ECA": {
       "step": "flash[2] (generated 2)",
       "reason": "label text `Scènario` is 9 octets in UTF-8 for an 8-octet TypeText property; bussard encodes TypeText as UTF-8, no capture shows ETS's encoding (#390 sim run)",
       "issue": 401
-    },
-    "M-0083_A-047A-11-B6E0": {
-      "step": "flash[1] (generated 1)",
-      "reason": "the generator sets `Device selection` to another variant, the procedure then compares PID 78 with that variant's hardware type; knx-sim is the variant the vendor default selects and refuses, as the hardware would (#400 sim run)",
-      "issue": 407
-    },
-    "M-0083_A-04C0-10-7517": {
-      "step": "flash[1] (generated 1)",
-      "reason": "the generator sets `Device selection` to another variant, the procedure then compares PID 78 with that variant's hardware type; knx-sim is the variant the vendor default selects and refuses, as the hardware would (#400 sim run)",
-      "issue": 407
     }
   }
 }
