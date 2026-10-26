@@ -42,7 +42,14 @@ pub mod service {
     pub const SEARCH_REQUEST_EXTENDED: u16 = 0x020B;
     /// SEARCH_RESPONSE_EXTENDED.
     pub const SEARCH_RESPONSE_EXTENDED: u16 = 0x020C;
+    /// DEVICE_CONFIGURATION_REQUEST (device management, bussard issue #398).
+    pub const DEVICE_CONFIGURATION_REQUEST: u16 = 0x0310;
+    /// DEVICE_CONFIGURATION_ACK.
+    pub const DEVICE_CONFIGURATION_ACK: u16 = 0x0311;
 }
+
+/// The device management connection type identifier in CONNECT_REQUEST.
+pub const DEVICE_MGMT_CONNECTION: u8 = 0x03;
 
 /// The tunnelling connection type identifier used in CONNECT_REQUEST.
 pub const TUNNEL_CONNECTION: u8 = 0x04;

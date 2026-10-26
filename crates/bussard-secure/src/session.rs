@@ -97,6 +97,19 @@ impl DataSecureSession {
         self
     }
 
+    /// Replaces the tool key mid-session, keeping the send sequence, the
+    /// per-source freshness table and the sync state.
+    ///
+    /// The step after a `PID_TOOL_KEY` write (issue #398): the device answers
+    /// that write already under the key it was given (CONFIRMED by the ETS
+    /// activation capture of 1.1.200, 2026-10-26: the request verifies with
+    /// the FDSK, the `A_PropertyExtValue_WriteConResponse` with the new tool
+    /// key), and every later frame of the same connection, both ways, uses
+    /// the new key with the sequences continuing.
+    pub fn set_tool_key(&mut self, tool_key: Key16) {
+        self.tool_key = tool_key;
+    }
+
     /// The next sequence this session would send.
     pub fn send_sequence(&self) -> Sequence {
         self.send_seq

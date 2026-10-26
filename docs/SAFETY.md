@@ -642,6 +642,50 @@ back: change the group address in ETS too. Both now say so (W042, issue #348): `
 and `bussard keys import` print a warning that names the group address and
 the devices the next apply would secure again.
 
+### Switching KNXnet/IP Secure of an IP interface
+
+**Status: oracle verified on 2026-10-26 (offline), not run live.**
+`bussard interface secure on|off <ia>` (and `knx_interface_secure` over MCP)
+switches a KNX IP interface between plain tunnelling and KNXnet/IP Secure the
+way ETS does. The ETS captures of 1.1.200 (`26-10-ipinterface/`) are the
+oracle: `interface secure on --dry-run` against the activation is identical
+(11 of 11 writes: the security mode, the send sequence's length, the three
+secured-family commands and the tunnelling users equal, the tool key, the
+device authentication code and both password-hash writes hash-equal); `off`
+against the decoded half of the deactivation (`phase=fdsk`) is identical (3 of
+3). The other half ran inside a KNXnet/IP Secure session, which a capture
+cannot decrypt (its key comes from an ephemeral X25519 exchange); its frame
+lengths show the families, the security mode, a 16-octet write and a master
+reset under the tool key, which is what `off` sends.
+
+The rails:
+
+- Every credential comes from the key store and new ones go there; the model
+  never holds one. `on` takes the device's FDSK (required), its tool key,
+  device authentication code, management password and one tunnelling user per
+  `[knxnet] tunnels` address from the store; a missing one is generated and
+  **saved before the first write**.
+- `on` runs over a plain tunnel to a device in factory state; it is refused
+  when the interface already reports secure-only tunnelling. Through the
+  interface itself, the session after the restart is a KNXnet/IP Secure
+  session with the store's credentials.
+- `off` needs the tool key. Through a secure session with the interface
+  itself it needs `--allow-self-reconfigure`; MCP refuses it then. The store
+  drops the tool key only after the device verified on its FDSK.
+- Each switch ends with a read-back on a fresh connection under the key the
+  device should now hold (the security mode, and after `on` the tunnelling
+  users), and, through the interface itself, its description's secured
+  service families.
+
+**Recovery.** If a switch stops half way, the device holds every step before
+the one named in the error, and the key store holds the credentials it was
+given and its FDSK (the previous store is `bussard.keys.bak`). Retry the
+command. If the device is unreachable with every credential the store holds,
+factory-reset it (its reset button): it returns to its FDSK and plain
+tunnelling, and `bussard interface secure on <ia>` sets it up again from the
+store. `bussard keys import` of an ETS keyring export restores the ETS
+credentials; the ETS project remains the fallback for the interface.
+
 ## The key store
 
 `knx/bussard.keys` is bussard's own copy of the KNX Secure key material

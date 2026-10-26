@@ -287,6 +287,11 @@ pub struct SecurityObject {
     go_flags: Table,
     tool_key_writes: u32,
     seq_sending: [u8; SEQ_LEN],
+    /// A tool key written and not yet taken by the device's Data Secure
+    /// session (bussard issue #398): the device answers the write under it.
+    pending_tool_key: Option<[u8; TOOL_KEY_LEN]>,
+    /// A send sequence written and not yet taken by the session.
+    pending_seq: Option<u64>,
 }
 
 impl std::fmt::Debug for SecurityObject {
@@ -321,7 +326,29 @@ impl SecurityObject {
             go_flags: Table::new(GO_FLAG),
             tool_key_writes: 0,
             seq_sending: [0; SEQ_LEN],
+            pending_tool_key: None,
+            pending_seq: None,
         }
+    }
+
+    /// A security object in factory state for a device that takes Data Secure
+    /// tool access under its FDSK (a KNX IP interface before IP Secure is
+    /// switched on, bussard issue #398): security mode off.
+    pub fn new_factory() -> Self {
+        SecurityObject {
+            security_mode: 0,
+            ..Self::new_activated()
+        }
+    }
+
+    /// Takes the tool key written since the last call, if any.
+    pub fn take_pending_tool_key(&mut self) -> Option<[u8; TOOL_KEY_LEN]> {
+        self.pending_tool_key.take()
+    }
+
+    /// Takes the send sequence written since the last call, if any.
+    pub fn take_pending_seq(&mut self) -> Option<u64> {
+        self.pending_seq.take()
     }
 
     /// The current load state.

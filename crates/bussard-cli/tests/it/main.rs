@@ -51,6 +51,7 @@ mod secure_capture_oracle;
 mod secure_group_mock;
 mod sim_catalog_loop;
 mod sim_interface_loop;
+mod sim_interface_secure;
 mod status_device_mock;
 mod test_runner_mock;
 mod validate_invariants_cli;

@@ -417,6 +417,18 @@ impl DataSecureSession {
         self.tx_seq
     }
 
+    /// Replaces the tool key (a `PID_TOOL_KEY` write, bussard issue #398):
+    /// the answer to that write and everything after it goes under the new
+    /// key, the sequences continue (the ETS activation capture of 1.1.200).
+    pub fn set_tool_key(&mut self, tool_key: Key16) {
+        self.tool_key = tool_key;
+    }
+
+    /// Sets the device's own next send sequence (`PID_SEQUENCE_NUMBER_SENDING`).
+    pub fn set_tx_seq(&mut self, seq: u64) {
+        self.tx_seq = seq & 0xFFFF_FFFF_FFFF;
+    }
+
     /// The last accepted receive sequence for a source IA (for tests).
     pub fn rx_last(&self, source: u16) -> Option<u64> {
         self.rx_last.get(&source).copied()

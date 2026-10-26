@@ -31,6 +31,7 @@ mod import_cmd;
 mod import_product_cmd;
 mod init_cmd;
 mod interface_cmd;
+mod interface_secure_cmd;
 mod keys_cmd;
 mod learn_cmd;
 mod line_cmd;
@@ -215,6 +216,7 @@ impl Command {
             | Command::Flash { .. }
             | Command::Plan { .. }
             | Command::Apply { .. }
+            | Command::Interface { .. }
             | Command::Commission { .. }
             | Command::Backup { .. }
             | Command::Restore { .. }
@@ -305,6 +307,7 @@ impl Command {
                 | Command::Backup { .. }
                 | Command::Validate { .. }
                 | Command::Groups { .. }
+                | Command::Interface { .. }
                 | Command::Doc { .. }
                 | Command::Monitor { .. }
                 | Command::Test { .. }
@@ -636,6 +639,47 @@ enum KeysCommand {
     /// Summarize the key store: devices, interfaces and group addresses,
     /// never a key.
     Show,
+}
+
+/// The `bussard interface` subcommands (issue #398).
+#[derive(Debug, Subcommand)]
+enum InterfaceCommand {
+    /// Switch KNXnet/IP Secure of a KNX IP interface on or off, the way ETS
+    /// does (issue #398).
+    ///
+    /// `on` takes a device in factory state over a plain tunnel: under its
+    /// FDSK the security mode and a tool key, then under the tool key the
+    /// device authentication code, the password hashes of the management and
+    /// tunnelling users, the tunnelling users and the secured service
+    /// families, and a master reset. Credentials come from the key store
+    /// (`bussard.keys`); missing ones are generated and saved there before
+    /// the first write. `off` undoes it under the tool key, then again under
+    /// the FDSK. Both end with a read-back after the restart. The model never
+    /// holds a credential. See docs/SAFETY.md for the recovery.
+    Secure {
+        /// `on` or `off`.
+        #[arg(value_name = "on|off")]
+        state: String,
+        /// The interface's individual address, e.g. `1.1.200`.
+        #[arg(value_name = "ADDRESS")]
+        address: String,
+        /// Print the steps and send nothing (no connection, the key store
+        /// unchanged).
+        #[arg(long)]
+        dry_run: bool,
+        /// With --dry-run: write the steps' property writes to DIR/plan.json
+        /// for `knxtrace imgdiff` (key material as SHA-256 only).
+        #[arg(long, value_name = "DIR", requires = "dry_run")]
+        dump_images: Option<PathBuf>,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Switch the interface bussard tunnels through over a KNXnet/IP
+        /// Secure session with that same interface (the session ends at the
+        /// restart).
+        #[arg(long)]
+        allow_self_reconfigure: bool,
+    },
 }
 
 /// The top-level subcommands.
@@ -1241,6 +1285,11 @@ enum Command {
     Groups {
         #[command(subcommand)]
         command: GroupsCommand,
+    },
+    /// KNX IP interface commands: `interface secure on|off <address>`.
+    Interface {
+        #[command(subcommand)]
+        command: InterfaceCommand,
     },
     /// Export the group-address plan in a format ETS can import.
     ExportGroups {
@@ -1943,6 +1992,29 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
                 scheme,
             } => groups_cmd::run_reserve(dir, &room, &functions, scheme.map(Into::into), json),
             GroupsCommand::Secure { ga, state } => groups_cmd::run_secure(dir, &ga, &state, json),
+        },
+        Command::Interface { command } => match command {
+            InterfaceCommand::Secure {
+                state,
+                address,
+                dry_run,
+                dump_images,
+                yes,
+                allow_self_reconfigure,
+            } => interface_secure_cmd::run(
+                dir,
+                interface_secure_cmd::SecureInputs {
+                    state: &state,
+                    address: &address,
+                    dry_run,
+                    dump_images: dump_images.as_deref(),
+                    yes,
+                    allow_remote_gateway: g.allow_remote_gateway,
+                    allow_self_reconfigure,
+                    json,
+                },
+                &g.mgmt(),
+            ),
         },
         Command::ExportGroups { format, out } => export_groups_cmd::run(dir, format, &out),
         Command::Doc { out, format } => doc_cmd::run(dir, &out, format.into(), json),

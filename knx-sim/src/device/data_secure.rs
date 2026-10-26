@@ -77,6 +77,21 @@ impl Device {
         // interception, which would otherwise refuse the now-authenticated
         // protected function).
         let reaction = self.dispatch_apdu(cemi, &inner)?;
+        // A tool key or send sequence written by this APDU (bussard issue
+        // #398): the answer already goes under the new key, with the new
+        // sequence, as the IP interface in the ETS activation capture does.
+        if let Some(obj) = self.security_object.as_mut() {
+            let key = obj.take_pending_tool_key();
+            let seq = obj.take_pending_seq();
+            if let Some(session) = self.secure.as_mut() {
+                if let Some(key) = key {
+                    session.set_tool_key(crate::secure::Key16::new(key));
+                }
+                if let Some(seq) = seq {
+                    session.set_tx_seq(seq);
+                }
+            }
+        }
 
         // Re-wrap each response's inner APDU into A_SecureData. A response is a
         // connected data telegram whose TPDU is [TPCI/APCI][APCI][data]; we take
@@ -224,6 +239,28 @@ impl Device {
         // #390). Read and confirmed write; the security object keeps its own
         // handler below.
         let object_type = apdu.data.get(..2).map(|t| u16::from_be_bytes([t[0], t[1]]));
+        // The KNXnet/IP Secure properties of a KNX IP interface (bussard issue
+        // #398): PIDs 91 to 97 of object type 11.
+        if let Some(ip) = self.ip_secure.as_mut() {
+            let answer = match apdu.apci {
+                Apci::PropertyExtValueWriteCon => ip.write(&apdu.data).map(|d| (0x1CF, d)),
+                Apci::PropertyExtValueRead => ip.read(&apdu.data).map(|d| (0x1CD, d)),
+                Apci::FunctionPropertyExtCommand => {
+                    ip.function(&apdu.data, true).map(|d| (0x1D6, d))
+                }
+                Apci::FunctionPropertyExtStateRead => {
+                    ip.function(&apdu.data, false).map(|d| (0x1D6, d))
+                }
+                _ => None,
+            };
+            if let Some((apci, data)) = answer {
+                let resp = self.respond(tool, apci, &data);
+                return Ok(DeviceReaction {
+                    responses: vec![resp],
+                    did_master_reset: false,
+                });
+            }
+        }
         // The PIDs the `[knxnet]` table sets (bussard issue #391) are written
         // with array semantics below (element counts, both copies in step).
         let knxnet_write = apdu.apci == Apci::PropertyExtValueWriteCon

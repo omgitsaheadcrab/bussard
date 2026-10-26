@@ -257,6 +257,16 @@ value.
 AES is pure Python so the tool keeps its empty dependency list. That is slow
 per block and fine for a capture's few hundred secure frames.
 
+## `interface secure` plans
+
+`imgdiff` also compares a `bussard interface secure on|off --dry-run
+--dump-images DIR` plan (`system: "ip-secure"`, issue #398) against an
+`image` directory: only the KNXnet/IP Secure properties (type 17 PIDs 51,
+56, 59 and type 11 PIDs 91 to 97) on both sides, key material by hash, the
+send sequence (type 17 PID 59) by length only. `--phase fdsk` or `--phase
+tool` keeps only bussard's writes under that key, for a capture of which only
+one half is decodable. The verdict is the property parity.
+
 ## KNXnet/IP Secure sessions
 
 ```

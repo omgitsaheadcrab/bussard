@@ -439,6 +439,7 @@ def cmd_imgdiff(args) -> int:
         min_coverage=args.min_coverage,
         page_size=args.page_size,
         scope=[x for x in args.scope.split(",") if x] if args.scope else None,
+        phase=args.phase,
     )
     if args.json:
         print(json.dumps(report, indent=2))
@@ -551,6 +552,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--scope",
         help="comma-separated regions the verdict and coverage judge (addr, assoc, gobj, par, "
         "seg0x4800, ...); default: all",
+    )
+    p.add_argument(
+        "--phase",
+        choices=("fdsk", "tool"),
+        help="an `interface secure` plan: compare only the writes bussard sends under this key",
     )
     p.set_defaults(func=cmd_imgdiff)
 

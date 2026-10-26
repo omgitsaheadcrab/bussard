@@ -44,6 +44,19 @@ impl SecureLayer {
         }
     }
 
+    /// Replaces the tool key of an activated layer (see
+    /// [`DataSecureSession::set_tool_key`]); `false` on a plain layer, which
+    /// has no key to replace.
+    pub fn set_tool_key(&mut self, tool_key: bussard_secure::Key16) -> bool {
+        match &mut self.session {
+            Some(session) => {
+                session.set_tool_key(tool_key);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Whether this layer wraps management APDUs (the device is activated).
     pub fn is_active(&self) -> bool {
         self.session.is_some()

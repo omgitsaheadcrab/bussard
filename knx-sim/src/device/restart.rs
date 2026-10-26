@@ -83,6 +83,11 @@ impl Device {
             // ETS opening of an initial System B download, issue #117): erase
             // every loadable object's image and load state, keep the individual
             // address. The KNX-Virtual 0x04 behaviour above is left as observed.
+            // A KNX IP interface: its KNXnet/IP Secure properties take
+            // effect (bussard issue #398).
+            if error_code == 0 {
+                self.apply_ip_secure();
+            }
             let process_time = if erase_code == ERASE_CODE_FACTORY_RESET_KEEP_IA {
                 self.factory_reset_keep_address();
                 self.restart_process_time_s

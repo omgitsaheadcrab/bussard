@@ -115,12 +115,14 @@ use crate::state::ConnState;
 
 mod flash;
 mod interface;
+mod ip_secure;
 mod restore;
 
 /// The tools of the programming tier, in registration order.
-pub const PROGRAMMING_TOOLS: [&str; 5] = [
+pub const PROGRAMMING_TOOLS: [&str; 6] = [
     "knx_plan_device",
     "knx_apply_device",
+    "knx_interface_secure",
     "knx_apply_status",
     "knx_last_apply",
     "knx_restore_parameters",
@@ -250,6 +252,19 @@ pub struct RestoreParametersArgs {
     pub backup: String,
     /// Omit it to get the restore plan and its digest; pass that digest
     /// (after the human's explicit yes) to write.
+    #[serde(default)]
+    pub plan_digest: Option<String>,
+}
+
+/// Arguments for `knx_interface_secure`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InterfaceSecureArgs {
+    /// The individual address of the KNX IP interface, e.g. `"1.1.200"`.
+    pub address: String,
+    /// `"on"` or `"off"`.
+    pub state: String,
+    /// Omit it to get the plan and its digest; pass that digest (after the
+    /// human's explicit yes) to switch.
     #[serde(default)]
     pub plan_digest: Option<String>,
 }
@@ -391,6 +406,39 @@ impl BussardMcp {
             .restore_parameters(
                 &args.address,
                 &args.backup,
+                args.plan_digest.as_deref().map(str::trim),
+            )
+            .await
+        {
+            Ok(value) => ok(value),
+            Err(reason) => refusal(&args.address, reason),
+        }
+    }
+
+    /// `knx_interface_secure` (registered only with `--allow-programming`).
+    #[tool(
+        description = "Switch KNXnet/IP Secure of ONE KNX IP interface on or off on the \
+        PHYSICAL bus (issue #398), in two calls, as `bussard interface secure on|off` does. \
+        Without plan_digest: returns the steps (the security mode and tool key under the \
+        device's factory key, then the device authentication code, the password hashes, the \
+        tunnelling users and the secured service families under the tool key, and a master \
+        reset; `off` undoes it), the credentials the key store would gain (names only), the \
+        `question` and a plan_digest. Show the steps to the human and ask the question. With \
+        the plan_digest (ONLY after the human's explicit yes in this conversation): saves \
+        generated credentials to the key store first, switches, waits out the restart and \
+        reads back on a fresh connection; the result says `verified`. Credentials never leave \
+        the key store and are never returned. Refused when the server's own session is a \
+        KNXnet/IP Secure session with that interface (the restart would end it): the owner \
+        runs it in a terminal. Only available with --allow-programming."
+    )]
+    async fn knx_interface_secure(
+        &self,
+        Parameters(args): Parameters<InterfaceSecureArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self
+            .interface_secure(
+                &args.address,
+                &args.state,
                 args.plan_digest.as_deref().map(str::trim),
             )
             .await
