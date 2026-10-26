@@ -25,9 +25,8 @@ use bussard_download::backup::backups_root;
 use bussard_download::{
     ChangeMark, ChangeSubject, DecodedParameters, DevicePlan, FlashPlan, FullImage, LiveTables,
     OctetRange, OctetRole, ParamRegions, ParamValue, PlanChange, PlanReport, PlanWrites,
-    ResidentState, Sys7Identity, decode_parameters, group_object_change, object_changes,
-    probe_resident_state, read_parameter_regions, regions_memory, select_application, sort_changes,
-    state_hash,
+    ResidentState, Sys7Identity, object_changes, probe_resident_state, read_parameter_regions,
+    regions_memory, select_application, sort_changes, state_hash,
 };
 use bussard_mgmt::{L4Channel, Layer4Connection};
 use bussard_model::schema::{Device, ProductEntry};
@@ -540,17 +539,26 @@ pub async fn read_state<Ch: L4Channel>(
             "the application is not in the product data".into(),
         );
     };
-    let plan =
-        match bussard_download::plan_for_readback(&source.product, app, model, target, device_mask)
-        {
-            Ok(plan) => plan,
-            Err(err) => {
-                return ParamState::noted(
-                    &app.id,
-                    format!("the parameter memory cannot be located: {err}"),
-                );
-            }
-        };
+    // One evaluation of the Dynamic section per distinct value map, shared by
+    // the read-back plan, the decode, the group-object change and the octet
+    // attribution below (issue #367).
+    let memo = bussard_prod::dynamic::DynamicMemo::new(app);
+    let plan = match bussard_download::plan_for_readback_with(
+        &source.product,
+        app,
+        model,
+        target,
+        device_mask,
+        &memo,
+    ) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return ParamState::noted(
+                &app.id,
+                format!("the parameter memory cannot be located: {err}"),
+            );
+        }
+    };
     let access = plan.sys7_lsm_access();
     let resident = probe_resident_state(l4, device_mask, access.as_ref()).await;
     // The parameter-only download's rule: the same program (any build hash)
@@ -580,8 +588,10 @@ pub async fn read_state<Ch: L4Channel>(
     }
     let current = regions_memory(&regions);
     let (overrides, bases) = bussard_download::model_parameters(model, target);
-    let decoded = decode_parameters(app, &overrides, &bases, &current);
-    let change = group_object_change(app, &decoded.values, &overrides);
+    let decoded =
+        bussard_download::decode_parameters_with(app, &overrides, &bases, &current, &memo);
+    let change =
+        bussard_download::group_object_change_with(app, &decoded.values, &overrides, &memo);
     let needs_flash =
         (!change.is_empty()).then(|| bussard_download::describe_group_object_change(&change));
     let device_managed = decoded
@@ -595,13 +605,14 @@ pub async fn read_state<Ch: L4Channel>(
         .parameters_only(&regions)
         .map(|partial| {
             let attribute = |changed: &BTreeMap<String, Vec<(usize, u8)>>| {
-                bussard_download::attribute_octets(
+                bussard_download::attribute_octets_with(
                     app,
                     &overrides,
                     &bases,
                     &current,
                     &model_images(&partial, changed),
                     changed,
+                    &memo,
                 )
             };
             (
@@ -718,7 +729,17 @@ pub async fn read_flashed_parameters<Ch: L4Channel>(
         compared: 0,
         note: Some(note),
     };
-    let plan = match bussard_download::plan_for_readback(product, app, model, target, device_mask) {
+    // The plan and the decode share one evaluation of the model's values
+    // (issue #367).
+    let memo = bussard_prod::dynamic::DynamicMemo::new(app);
+    let plan = match bussard_download::plan_for_readback_with(
+        product,
+        app,
+        model,
+        target,
+        device_mask,
+        &memo,
+    ) {
         Ok(plan) => plan,
         Err(err) => return noted(format!("the parameter memory cannot be located: {err}")),
     };
@@ -729,7 +750,8 @@ pub async fn read_flashed_parameters<Ch: L4Channel>(
     }
     let current = regions_memory(&regions);
     let (overrides, bases) = bussard_download::model_parameters(model, target);
-    let decoded = decode_parameters(app, &overrides, &bases, &current);
+    let decoded =
+        bussard_download::decode_parameters_with(app, &overrides, &bases, &current, &memo);
     let device = model
         .and_then(|m| m.devices.get(&target))
         .map(|d| &d.device);

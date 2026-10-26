@@ -669,7 +669,23 @@ pub fn dynamic_group_object_table(
     overrides: &BTreeMap<String, String>,
     linked: &BTreeMap<u16, LinkedObject>,
 ) -> Option<Vec<u8>> {
-    let config = bussard_prod::dynamic::evaluate_dynamic(app, overrides);
+    dynamic_group_object_table_with(
+        app,
+        overrides,
+        linked,
+        &bussard_prod::dynamic::DynamicMemo::new(app),
+    )
+}
+
+/// [`dynamic_group_object_table`], evaluating the Dynamic section through
+/// `memo` (issue #367). The image is the same.
+pub fn dynamic_group_object_table_with(
+    app: &bussard_prod::ApplicationProgram,
+    overrides: &BTreeMap<String, String>,
+    linked: &BTreeMap<u16, LinkedObject>,
+    memo: &bussard_prod::dynamic::DynamicMemo<'_, bussard_prod::ApplicationProgram>,
+) -> Option<Vec<u8>> {
+    let config = memo.evaluate_for(app, overrides);
     let descriptors = dynamic_group_object_descriptors(app, &config, linked);
     let count = group_object_table_count(app, &descriptors);
     compute_group_object_table_with_count(&descriptors, count)

@@ -149,9 +149,31 @@ pub fn compute_parameter_image_placed(
     overrides: &BTreeMap<String, String>,
     base_offsets: &BTreeMap<String, u32>,
 ) -> Result<(BTreeMap<String, Vec<u8>>, PlacedOctets)> {
+    compute_parameter_image_placed_with(
+        app,
+        overrides,
+        base_offsets,
+        &bussard_ets::dynamic::DynamicMemo::new(app),
+    )
+}
+
+/// [`compute_parameter_image_placed`], evaluating the Dynamic section through
+/// `memo` (issue #367), so a caller that evaluates the same values again
+/// shares the evaluation. The result is the same, byte for byte.
+///
+/// # Errors
+///
+/// As [`compute_parameter_image`].
+pub fn compute_parameter_image_placed_with(
+    app: &ApplicationProgram,
+    overrides: &BTreeMap<String, String>,
+    base_offsets: &BTreeMap<String, u32>,
+    memo: &bussard_ets::dynamic::DynamicMemo<'_, ApplicationProgram>,
+) -> Result<(BTreeMap<String, Vec<u8>>, PlacedOctets)> {
     let mut placed = PlacedOctets::new();
     if uses_dynamic_image(app) {
-        let images = dynamic_image(app, overrides, &mut placed)?;
+        let config = memo.evaluate_for(app, overrides);
+        let images = dynamic_image(app, &config, &mut placed)?;
         return Ok((images, placed));
     }
     // Pre-index the first ParameterRef Value override per parameter id, in a
@@ -570,18 +592,19 @@ pub fn compute_dynamic_parameter_image(
     app: &ApplicationProgram,
     overrides: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, Vec<u8>>> {
-    dynamic_image(app, overrides, &mut PlacedOctets::new())
+    let config = bussard_ets::dynamic::evaluate_dynamic(app, overrides);
+    dynamic_image(app, &config, &mut PlacedOctets::new())
 }
 
-/// [`compute_dynamic_parameter_image`], recording the octets each slot writes
-/// into `placed`.
+/// [`compute_dynamic_parameter_image`] from the evaluated configuration
+/// `config` (the Dynamic section under the overrides), recording the octets
+/// each slot writes into `placed`.
 fn dynamic_image(
     app: &ApplicationProgram,
-    overrides: &BTreeMap<String, String>,
+    config: &bussard_ets::dynamic::DynamicConfig,
     placed: &mut PlacedOctets,
 ) -> Result<BTreeMap<String, Vec<u8>>> {
     validate_segments(app)?;
-    let config = bussard_ets::dynamic::evaluate_dynamic(app, overrides);
     if let Some(key) = config.unresolved_overrides.first() {
         return Err(param_err(
             app,
@@ -605,7 +628,7 @@ fn dynamic_image(
             .or_insert_with(|| base_image(app, seg));
     }
 
-    for slot in dynamic_parameter_slots(app, &config)? {
+    for slot in dynamic_parameter_slots(app, config)? {
         let (value, source) = match slot.param_ref_id.as_deref() {
             Some(ref_id) => (
                 config.value(app, slot.module, ref_id),

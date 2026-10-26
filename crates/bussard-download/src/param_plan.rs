@@ -272,9 +272,27 @@ pub fn group_object_change(
     before: &BTreeMap<String, String>,
     after: &BTreeMap<String, String>,
 ) -> GroupObjectChange {
+    group_object_change_with(
+        app,
+        before,
+        after,
+        &bussard_prod::dynamic::DynamicMemo::new(app),
+    )
+}
+
+/// [`group_object_change`], evaluating the Dynamic section through `memo`
+/// (issue #367): each side is evaluated once for both the shown objects and
+/// the table image, and a side a parameter decode with the same memo already
+/// evaluated is not evaluated again. The change is the same.
+pub fn group_object_change_with(
+    app: &ApplicationProgram,
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+    memo: &bussard_prod::dynamic::DynamicMemo<'_, ApplicationProgram>,
+) -> GroupObjectChange {
     let linked = BTreeMap::new();
     let asaps = |values: &BTreeMap<String, String>| -> BTreeSet<u16> {
-        let config = bussard_prod::dynamic::evaluate_dynamic(app, values);
+        let config = memo.evaluate_for(app, values);
         crate::compute::dynamic_group_object_descriptors(app, &config, &linked)
             .iter()
             .map(|d| d.asap)
@@ -284,8 +302,8 @@ pub fn group_object_change(
     GroupObjectChange {
         shown: new.difference(&old).copied().collect(),
         hidden: old.difference(&new).copied().collect(),
-        table_differs: crate::compute::dynamic_group_object_table(app, before, &linked)
-            != crate::compute::dynamic_group_object_table(app, after, &linked),
+        table_differs: crate::compute::dynamic_group_object_table_with(app, before, &linked, memo)
+            != crate::compute::dynamic_group_object_table_with(app, after, &linked, memo),
     }
 }
 

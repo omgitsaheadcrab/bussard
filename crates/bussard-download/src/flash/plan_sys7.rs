@@ -191,6 +191,7 @@ fn add_ets_prelude(steps: &mut Vec<FlashStep>, profile: &bussard_mgmt::Sys7Profi
 /// The mask profile ([`bussard_mgmt::Sys7Profile`]) supplies the LSM realisation,
 /// authorize level and mem-types; absent `HawkConfigurationData`, the
 /// corpus-default profile drives blind (`[system7-spec §2.4]`).
+#[allow(clippy::too_many_arguments)] // the plan inputs plus the shared Dynamic memo (issue #367).
 pub(super) fn plan_flash_sys7(
     app: &ApplicationProgram,
     device_mask: u16,
@@ -199,6 +200,7 @@ pub(super) fn plan_flash_sys7(
     profile: bussard_mgmt::MaskProfile,
     hawk: Option<&bussard_prod::HawkConfig>,
     tables: &Sys7PlanTables,
+    memo: &bussard_prod::dynamic::DynamicMemo<'_, ApplicationProgram>,
 ) -> std::result::Result<FlashPlan, PlanError> {
     let sys7_tables = &tables.tables;
     let linked_flags = &tables.linked_flags;
@@ -219,12 +221,11 @@ pub(super) fn plan_flash_sys7(
     // the vendor's template, and the image streamed for it is that template with
     // the parameters laid over it.
     let (param_images, placed) =
-        bussard_prod::compute_parameter_image_placed(app, overrides, base_offsets).map_err(
-            |e| PlanError::UnresolvableImage {
+        bussard_prod::compute_parameter_image_placed_with(app, overrides, base_offsets, memo)
+            .map_err(|e| PlanError::UnresolvableImage {
                 step: 0,
                 reason: format!("computing the parameter image: {e}"),
-            },
-        )?;
+            })?;
 
     // The data-driven mask profile: from `HawkConfigurationData` when the import
     // path supplied one, else the corpus-default fallback (`[system7-spec §2.4]`).
@@ -506,7 +507,7 @@ pub(super) fn plan_flash_sys7(
         .unwrap_or_default();
     // Every unlinked object's CONFIG (and TYPE) comes from the ComObjectRef the
     // device's parameter values make visible, as in ETS (issue #117).
-    let config = bussard_prod::dynamic::evaluate_dynamic(app, overrides);
+    let config = memo.evaluate_for(app, overrides);
     let default_flags = sys7_object_defaults(app, &config);
     // Module instances shift numbers past the declared ones: count those too.
     let last_object = app
@@ -905,6 +906,7 @@ pub fn plan_flash_sys7_with_hawk(
         profile,
         hawk,
         &tables,
+        &bussard_prod::dynamic::DynamicMemo::new(app),
     )
 }
 

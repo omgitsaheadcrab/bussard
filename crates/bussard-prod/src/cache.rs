@@ -5,7 +5,7 @@
 //! Layout: `<cache>/<key>/catalog.json` and
 //! `<cache>/<key>/<application-id>@<language>.json` (a program's texts depend on
 //! the language it was parsed in).
-//! The key is the SHA-256 of the archive bytes, the selected inner `.knxprod`
+//! The key is a SHA-256 over the archive's SHA-256, the selected inner `.knxprod`
 //! of a wrapper, the cache format and the identity of the running bussard
 //! build (its version and the size and modification time of its executable).
 //! So an edited or replaced archive, or a rebuilt bussard whose parser may
@@ -19,7 +19,7 @@
 //! [`MAX_ENTRIES`] archive entries are kept; the least recently written are
 //! removed first.
 
-use std::io::{BufReader, BufWriter, Read};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use crate::{ApplicationProgram, ProductCatalog};
 
 /// Bumped whenever the stored shape changes incompatibly.
-const FORMAT: &str = "bussard-parsed-product-v2";
+const FORMAT: &str = "bussard-parsed-product-v3";
 
 /// The archive entries kept under one cache directory.
 pub const MAX_ENTRIES: usize = 32;
@@ -87,9 +87,11 @@ impl Store {
 }
 
 /// The cache key of `archive`: hex SHA-256 over the format, the build
-/// identity, the inner selector and the archive bytes.
+/// identity, the inner selector and the archive's own SHA-256. The archive
+/// hash is the process-wide memoized one ([`bussard_model::sha256_file_cached`],
+/// issue #367), so verifying the pinned archive later does not read it again.
 fn key(archive: &Path, inner: Option<&str>) -> Option<String> {
-    let file = std::fs::File::open(archive).ok()?;
+    let (archive_sha, _) = bussard_model::sha256_file_cached(archive).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(FORMAT.as_bytes());
     hasher.update([0]);
@@ -97,15 +99,7 @@ fn key(archive: &Path, inner: Option<&str>) -> Option<String> {
     hasher.update([0]);
     hasher.update(inner.unwrap_or("").as_bytes());
     hasher.update([0]);
-    let mut reader = BufReader::with_capacity(1 << 20, file);
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = reader.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(buf.get(..n)?);
-    }
+    hasher.update(archive_sha.as_bytes());
     Some(
         hasher
             .finalize()
@@ -147,9 +141,14 @@ fn file_name(id: &str, language: &str) -> Option<String> {
 }
 
 /// Reads and deserializes `path`, `None` on any failure.
+///
+/// The file is read whole and parsed from the slice: `serde_json` decodes a
+/// slice about twice as fast as a reader (issue #367: 415 ms against 230 ms
+/// for the 12.8 MB ABB A0ED-10 program in a debug build; the read itself is
+/// 2 ms).
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    let file = std::fs::File::open(path).ok()?;
-    match serde_json::from_reader(BufReader::with_capacity(1 << 20, file)) {
+    let bytes = std::fs::read(path).ok()?;
+    match serde_json::from_slice(&bytes) {
         Ok(value) => Some(value),
         Err(err) => {
             tracing::debug!(path = %path.display(), %err, "ignoring an unreadable parsed-product cache file");

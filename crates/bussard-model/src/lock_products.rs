@@ -63,6 +63,67 @@ pub fn sha256_file(path: &Path) -> std::io::Result<(String, u64)> {
     Ok((hex_lower(&hasher.finalize()), size))
 }
 
+/// [`sha256_file`], hashed at most once per process for an unchanged file
+/// (issue #367): a command that both opens the parsed-product cache and
+/// verifies the pinned archive reads a 159 MB archive once, not twice.
+///
+/// The memo is keyed by the canonical path, the size and the modification
+/// time, so a file that was replaced or rewritten since (a different size or
+/// mtime) is hashed again.
+///
+/// # Errors
+///
+/// The file cannot be read.
+pub fn sha256_file_cached(path: &Path) -> std::io::Result<(String, u64)> {
+    static MEMO: HashMemo = HashMemo::new();
+    MEMO.hash(path)
+}
+
+/// The identity a memoized hash stays valid for: the canonical path, the
+/// size and the modification time.
+type FileStamp = (PathBuf, u64, Option<std::time::SystemTime>);
+
+/// A memo of file hashes keyed by [`FileStamp`].
+struct HashMemo {
+    entries: std::sync::Mutex<Vec<(FileStamp, String)>>,
+}
+
+impl HashMemo {
+    const fn new() -> HashMemo {
+        HashMemo {
+            entries: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The entries; a poisoned lock still holds whole entries.
+    fn entries(&self) -> std::sync::MutexGuard<'_, Vec<(FileStamp, String)>> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The stamp of `path` as it is on disk now.
+    fn stamp(path: &Path) -> std::io::Result<FileStamp> {
+        let canonical = std::fs::canonicalize(path)?;
+        let meta = std::fs::metadata(&canonical)?;
+        Ok((canonical, meta.len(), meta.modified().ok()))
+    }
+
+    /// The memoized hash of `path`, hashing it when its stamp is new. A
+    /// file whose stamp changed while it was hashed is not memoized.
+    fn hash(&self, path: &Path) -> std::io::Result<(String, u64)> {
+        let stamp = Self::stamp(path)?;
+        if let Some((_, sha)) = self.entries().iter().find(|(s, _)| *s == stamp) {
+            return Ok((sha.clone(), stamp.1));
+        }
+        let (sha, size) = sha256_file(&stamp.0)?;
+        if size == stamp.1 && Self::stamp(path)? == stamp {
+            let mut entries = self.entries();
+            entries.retain(|(s, _)| s.0 != stamp.0);
+            entries.push((stamp, sha.clone()));
+        }
+        Ok((sha, size))
+    }
+}
+
 /// Lowercase hex of `bytes`.
 fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -448,6 +509,44 @@ product = "OTHER-1"
         assert_eq!(lock.products.len(), 1);
         assert_eq!(lock.products[0].sha256, "cd34");
         assert_eq!(lock.devices[0].product_sha256.as_deref(), Some("cd34"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_sha256_file_cached_hit_and_miss() -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!("bussard-sha-memo-{}", std::process::id()));
+        std::fs::write(&path, b"abc")?;
+        let memo = HashMemo::new();
+        let (first, size) = memo.hash(&path)?;
+        assert_eq!((first.as_str(), size), (sha256_file(&path)?.0.as_str(), 3));
+        // Same size and mtime: a hit, even though the bytes changed.
+        let mtime = std::fs::metadata(&path)?.modified()?;
+        std::fs::write(&path, b"abd")?;
+        std::fs::File::options()
+            .write(true)
+            .open(&path)?
+            .set_modified(mtime)?;
+        assert_eq!(memo.hash(&path)?.0, first);
+        // Another size: a miss, hashed again.
+        std::fs::write(&path, b"abcd")?;
+        let (changed, size) = memo.hash(&path)?;
+        let fresh = sha256_file(&path)?.0;
+        std::fs::remove_file(&path)?;
+        assert_eq!((changed.as_str(), size), (fresh.as_str(), 4));
+        assert_ne!(changed, first);
+        Ok(())
+    }
+
+    #[test]
+    fn test_sha256_file_cached_matches_sha256_file() -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!("bussard-sha-memo2-{}", std::process::id()));
+        std::fs::write(&path, b"abc")?;
+        let cached = sha256_file_cached(&path)?;
+        let again = sha256_file_cached(&path)?;
+        let plain = sha256_file(&path)?;
+        std::fs::remove_file(&path)?;
+        assert_eq!(cached, plain);
+        assert_eq!(again, plain);
         Ok(())
     }
 

@@ -55,8 +55,8 @@ pub use fetch::{DownloadConsent, MAX_DOWNLOAD_BYTES, fetch_entry};
 pub use hardware::HardwareCatalog;
 pub use image::{
     ParameterSlot, PlacedOctets, canonical_parameter_value, compute_dynamic_parameter_image,
-    compute_parameter_image, compute_parameter_image_placed, decode_parameter_value,
-    dynamic_parameter_slots, uses_dynamic_image, write_parameter_value,
+    compute_parameter_image, compute_parameter_image_placed, compute_parameter_image_placed_with,
+    decode_parameter_value, dynamic_parameter_slots, uses_dynamic_image, write_parameter_value,
 };
 pub use index::{IndexEntry, ProductIndex, normalize_order_number};
 

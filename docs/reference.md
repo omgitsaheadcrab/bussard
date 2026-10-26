@@ -1066,7 +1066,7 @@ What was parsed is stored here as JSON, one directory per archive: the catalogue
 .bussard/products/<key>/<application-id>.json
 ```
 
-The key is the SHA-256 of the archive bytes, the selected inner archive, the cache format and the running bussard build (its version and executable). An edited or replaced archive, or a rebuilt bussard, gets a new directory, so nothing is read from a stale entry. The 32 most recently written entries are kept. An unreadable or foreign file is a cache miss, never an error, and a program read back is the same value the parser returns, so the images `flash` writes are unchanged. `BUSSARD_PRODUCT_CACHE=off` turns the cache off. Deleting the directory is always safe.
+The key is a SHA-256 over the archive's SHA-256 (computed once per process and shared with the pinned-archive check), the selected inner archive, the cache format and the running bussard build (its version and executable). An edited or replaced archive, or a rebuilt bussard, gets a new directory, so nothing is read from a stale entry. The 32 most recently written entries are kept. An unreadable or foreign file is a cache miss, never an error, and a program read back is the same value the parser returns, so the images `flash` writes are unchanged. `BUSSARD_PRODUCT_CACHE=off` turns the cache off. Deleting the directory is always safe.
 
 Two other start-up costs are paid once per process: the model is parsed once per command (a later load of unchanged files returns the same model; any edit is parsed again), and a keyring is decrypted once per process or MCP server for the same file bytes and password (an edited keyring or another password is decrypted again).
 

@@ -33,7 +33,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use bussard_prod::application::{ApplicationProgram, Parameter, ParameterType};
-use bussard_prod::dynamic::{evaluate_dynamic, split_selector};
+use bussard_prod::dynamic::{DynamicMemo, Union, UnionMember, split_selector};
 
 use crate::param_plan::{CurrentMemory, ParamChange, ParamReading, ParamValue};
 
@@ -83,9 +83,31 @@ pub fn decode_parameters(
     base_offsets: &BTreeMap<String, u32>,
     current: &CurrentMemory,
 ) -> DecodedParameters {
+    decode_parameters_with(
+        app,
+        overrides,
+        base_offsets,
+        current,
+        &DynamicMemo::new(app),
+    )
+}
+
+/// [`decode_parameters`], evaluating the Dynamic section through `memo`
+/// (issue #367): the model's values are evaluated once for the placements,
+/// the differences and the unshown overrides, and once more for each
+/// distinct set of values the device holds. A caller that planned the
+/// read-back with the same memo shares those evaluations too. The decoding
+/// is the same.
+pub fn decode_parameters_with(
+    app: &ApplicationProgram,
+    overrides: &BTreeMap<String, String>,
+    base_offsets: &BTreeMap<String, u32>,
+    current: &CurrentMemory,
+    memo: &DynamicMemo<'_, ApplicationProgram>,
+) -> DecodedParameters {
     let keys = KeyForms::new(overrides);
     let placements = |values: &BTreeMap<String, String>| -> Vec<Placed<'_>> {
-        placements_of(app, values, base_offsets, &keys)
+        placements_of(app, values, base_offsets, &keys, memo)
     };
 
     // The device's configuration: iterate until the decoded values settle.
@@ -174,7 +196,7 @@ pub fn decode_parameters(
         differences,
         device_managed,
         unknown,
-        unshown: unshown_overrides(app, overrides, &keys),
+        unshown: unshown_overrides(app, overrides, &keys, memo),
     }
 }
 
@@ -185,11 +207,12 @@ fn unshown_overrides(
     app: &ApplicationProgram,
     overrides: &BTreeMap<String, String>,
     keys: &KeyForms,
+    memo: &DynamicMemo<'_, ApplicationProgram>,
 ) -> Vec<String> {
     if !bussard_prod::uses_dynamic_image(app) {
         return Vec::new();
     }
-    let config = evaluate_dynamic(app, overrides);
+    let config = memo.evaluate_for(app, overrides);
     let reached: std::collections::HashSet<String> = config
         .parameters
         .iter()
@@ -208,9 +231,10 @@ fn placements_of<'a>(
     values: &BTreeMap<String, String>,
     base_offsets: &BTreeMap<String, u32>,
     keys: &KeyForms,
+    memo: &DynamicMemo<'_, ApplicationProgram>,
 ) -> Vec<Placed<'a>> {
     if bussard_prod::uses_dynamic_image(app) {
-        dynamic_placements(app, values, keys)
+        dynamic_placements(app, values, keys, memo)
     } else {
         static_placements(app, values, base_offsets)
     }
@@ -348,8 +372,36 @@ pub fn attribute_octets(
     image: &CurrentMemory,
     changed: &BTreeMap<String, Vec<(usize, u8)>>,
 ) -> Vec<OctetRange> {
+    attribute_octets_with(
+        app,
+        overrides,
+        base_offsets,
+        current,
+        image,
+        changed,
+        &DynamicMemo::new(app),
+    )
+}
+
+/// [`attribute_octets`], evaluating the Dynamic section through `memo`
+/// (issue #367). The ranges are the same.
+pub fn attribute_octets_with(
+    app: &ApplicationProgram,
+    overrides: &BTreeMap<String, String>,
+    base_offsets: &BTreeMap<String, u32>,
+    current: &CurrentMemory,
+    image: &CurrentMemory,
+    changed: &BTreeMap<String, Vec<(usize, u8)>>,
+    memo: &DynamicMemo<'_, ApplicationProgram>,
+) -> Vec<OctetRange> {
+    // No differing octet: nothing to attribute, and no placement to compute
+    // (issue #367: the application-wide placements cost 0.6 s on the ABB
+    // A0ED-10 program in a debug build, for a plan with nothing to write).
+    if changed.values().all(Vec::is_empty) {
+        return Vec::new();
+    }
     let keys = KeyForms::new(overrides);
-    let placed = placements_of(app, overrides, base_offsets, &keys);
+    let placed = placements_of(app, overrides, base_offsets, &keys, memo);
     let unreached = application_placements(app);
     let values = |param: &Parameter, segment: &str, offset: usize, bit_offset: u8| {
         let ptype = parameter_type(app, param);
@@ -485,7 +537,7 @@ pub fn device_managed_octets(
 ) -> bussard_prod::PlacedOctets {
     let keys = KeyForms::new(overrides);
     let mut out = bussard_prod::PlacedOctets::new();
-    for p in placements_of(app, overrides, base_offsets, &keys) {
+    for p in placements_of(app, overrides, base_offsets, &keys, &DynamicMemo::new(app)) {
         if !(p.reached && p.device_managed(app)) {
             continue;
         }
@@ -534,11 +586,12 @@ impl Unreached<'_> {
 fn application_placements(app: &ApplicationProgram) -> Vec<Unreached<'_>> {
     let mut params: Vec<&Parameter> = app.parameters.values().collect();
     params.sort_by(|a, b| a.id.cmp(&b.id));
+    let members = UnionMembers::new(app);
     params
         .into_iter()
         .filter_map(|param| {
             let (segment, offset, bit_offset) =
-                static_location(app, param, None, &BTreeMap::new())?;
+                static_location_with(param, None, &BTreeMap::new(), &members)?;
             Some(Unreached {
                 param,
                 segment,
@@ -684,8 +737,9 @@ fn dynamic_placements<'a>(
     app: &'a ApplicationProgram,
     values: &BTreeMap<String, String>,
     keys: &KeyForms,
+    memo: &DynamicMemo<'_, ApplicationProgram>,
 ) -> Vec<Placed<'a>> {
-    let config = evaluate_dynamic(app, values);
+    let config = memo.evaluate_for(app, values);
     let Ok(slots) = bussard_prod::dynamic_parameter_slots(app, &config) else {
         return Vec::new();
     };
@@ -921,6 +975,53 @@ fn static_location<'a>(
     instance: Option<&str>,
     base_offsets: &BTreeMap<String, u32>,
 ) -> Option<(&'a str, usize, u8)> {
+    static_location_with(param, instance, base_offsets, &UnionMembers::Scan(app))
+}
+
+/// Where a union member's parameter sits: the first `<Union>` (in document
+/// order) that lists it, and that member.
+enum UnionMembers<'a> {
+    /// Search the unions on each lookup (one lookup).
+    Scan(&'a ApplicationProgram),
+    /// Every member parameter's first union, indexed once (many lookups).
+    Index(HashMap<&'a str, (&'a Union, &'a UnionMember)>),
+}
+
+impl<'a> UnionMembers<'a> {
+    /// The index over every union of `app`.
+    fn new(app: &'a ApplicationProgram) -> Self {
+        let mut index = HashMap::new();
+        for union in &app.unions {
+            for member in &union.members {
+                index
+                    .entry(member.parameter.as_str())
+                    .or_insert((union, member));
+            }
+        }
+        UnionMembers::Index(index)
+    }
+
+    /// The first union listing `param`, and its member entry.
+    fn of(&self, param: &str) -> Option<(&'a Union, &'a UnionMember)> {
+        match self {
+            UnionMembers::Scan(app) => app.unions.iter().find_map(|u| {
+                u.members
+                    .iter()
+                    .find(|m| m.parameter == param)
+                    .map(|m| (u, m))
+            }),
+            UnionMembers::Index(index) => index.get(param).copied(),
+        }
+    }
+}
+
+/// [`static_location`], finding a union member through `members`.
+fn static_location_with<'a>(
+    param: &'a Parameter,
+    instance: Option<&str>,
+    base_offsets: &BTreeMap<String, u32>,
+    members: &UnionMembers<'a>,
+) -> Option<(&'a str, usize, u8)> {
     let (segment, offset, bit_offset, module_relative) = match param.memory.as_ref() {
         Some(mem) => (
             mem.code_segment.as_deref()?,
@@ -929,12 +1030,7 @@ fn static_location<'a>(
             mem.base_offset.is_some(),
         ),
         None => {
-            let (union, member) = app.unions.iter().find_map(|u| {
-                u.members
-                    .iter()
-                    .find(|m| m.parameter == param.id)
-                    .map(|m| (u, m))
-            })?;
+            let (union, member) = members.of(&param.id)?;
             let mem = union.memory.as_ref()?;
             let bits =
                 u32::from(mem.bit_offset.unwrap_or(0)) + u32::from(member.bit_offset.unwrap_or(0));
@@ -1426,6 +1522,87 @@ mod tests {
         let decoded = decode_parameters(&app, &model, &BTreeMap::new(), &current);
         assert!(decoded.differences.is_empty(), "{:?}", decoded.differences);
         assert_eq!(decoded.non_default[0].value, "999.68");
+        Ok(())
+    }
+
+    /// The differing bits of each segment between `a` and `b`.
+    fn changed_bits(a: &CurrentMemory, b: &CurrentMemory) -> BTreeMap<String, Vec<(usize, u8)>> {
+        a.iter()
+            .filter_map(|(segment, bytes)| {
+                let other = b.get(segment)?;
+                let diffs: Vec<(usize, u8)> = bytes
+                    .iter()
+                    .zip(other)
+                    .enumerate()
+                    .filter(|(_, (x, y))| x != y)
+                    .map(|(i, (x, y))| (i, x ^ y))
+                    .collect();
+                Some((segment.clone(), diffs))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_decode_parameters_with_shared_memo_matches_per_call() -> TestResult {
+        let app = app()?;
+        let bases = BTreeMap::new();
+        // The model shows concept 1; the device holds concept 0, so the
+        // decode re-evaluates with the device's values and things differ.
+        let model = map(&[
+            ("P-1_R-1", "1"),
+            ("P-10_R-10", "12"),
+            ("UP-4_R-4", "9"),
+            ("P-2_R-2", "5"),
+            ("P-7_R-7", "1"),
+            ("P-5_R-5", "17.5"),
+            ("P-6_R-6", "90"),
+            ("MD-1_M-2_MI-1_P-2_R-5", "70"),
+            ("MD-1_M-1_MI-1_P-3_R-6", "8"),
+        ]);
+        let current = device(&app, &map(&[("P-1_R-1", "0"), ("UP-3_R-3", "2")]))?;
+        let image = device(&app, &model)?;
+        let changed = changed_bits(&current, &image);
+        assert!(changed.values().any(|c| !c.is_empty()));
+
+        // The read-back's order: the model's image, the decode, the
+        // group-object change and the attribution, all on one memo.
+        let memo = DynamicMemo::new(&app);
+        let (shared_image, _) =
+            bussard_prod::compute_parameter_image_placed_with(&app, &model, &bases, &memo)?;
+        assert_eq!(memo.evaluations(), 1);
+        let shared = decode_parameters_with(&app, &model, &bases, &current, &memo);
+        let change =
+            crate::param_plan::group_object_change_with(&app, &shared.values, &model, &memo);
+        let octets = attribute_octets_with(&app, &model, &bases, &current, &image, &changed, &memo);
+
+        let fresh = decode_parameters(&app, &model, &bases, &current);
+        assert!(!fresh.differences.is_empty());
+        assert_eq!(shared_image, image);
+        assert_eq!(shared, fresh);
+        assert_eq!(
+            change,
+            crate::param_plan::group_object_change(&app, &fresh.values, &model)
+        );
+        assert_eq!(
+            octets,
+            attribute_octets(&app, &model, &bases, &current, &image, &changed)
+        );
+        // The model's values were evaluated once for all four steps; the
+        // device's values add their own.
+        assert!(memo.evaluations() >= 2);
+        assert!(memo.evaluations() <= 1 + MAX_PASSES);
+        Ok(())
+    }
+
+    #[test]
+    fn test_attribute_octets_nothing_changed_is_empty() -> TestResult {
+        let app = app()?;
+        let model = map(&[("P-1_R-1", "1")]);
+        let image = device(&app, &model)?;
+        let changed: BTreeMap<String, Vec<(usize, u8)>> =
+            image.keys().map(|s| (s.clone(), Vec::new())).collect();
+        let octets = attribute_octets(&app, &model, &BTreeMap::new(), &image, &image, &changed);
+        assert!(octets.is_empty());
         Ok(())
     }
 }

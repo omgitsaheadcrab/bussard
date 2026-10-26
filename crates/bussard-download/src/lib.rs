@@ -58,8 +58,8 @@ pub use compute::{
     ChannelConfig, DesiredTables, GroupObjectDescriptor, LinkedObject, Priority,
     app_program_version, compute_group_object_table, compute_group_object_table_with_count,
     compute_tables, descriptors_for_linked_objects, dynamic_group_object_descriptors,
-    dynamic_group_object_table, expand_group_object_descriptors, group_object_table_count,
-    size_code_from_object_size, table_image_with_count,
+    dynamic_group_object_table, dynamic_group_object_table_with, expand_group_object_descriptors,
+    group_object_table_count, size_code_from_object_size, table_image_with_count,
 };
 pub use compute_sys7::{
     SYS7_ADDRESS_REGION_LEN, SYS7_ADDRESS_TABLE_ADDR, SYS7_ASSOCIATION_REGION_LEN,
@@ -75,27 +75,27 @@ pub use flash::{
     AppIdentity, Connector, DeviceFacts, FlashOptions, FlashOutcome, FlashPlan, FlashStep,
     ImageKind, ImageRef, PartialPlanError, PlanError, Progress, RebootReadiness, RestartKind,
     Session, SingleConnector, Sys7Context, Sys7TableBases, discover_application_object, flash,
-    plan_flash, plan_flash_sys7_with_hawk, plan_flash_with_object_flags, same_program,
-    select_application, sys7_profile_from_hawk, sys7_table_bases, trace,
+    plan_flash, plan_flash_sys7_with_hawk, plan_flash_with_memo, plan_flash_with_object_flags,
+    same_program, select_application, sys7_profile_from_hawk, sys7_table_bases, trace,
 };
 pub use model_params::{
     OrderNumberError, Sys7Identity, build_module_obj3_descriptors, build_table_images,
-    describe_group_object_change, flash_gate, identity_gate, linked_object_flags,
-    malformed_parameter_warning, model_parameters, needs_sys7_identity, parameter_overrides,
-    plan_for_readback, product_display, region_rows, resolve_by_order_number, runtime_segments,
-    sys7_code_mismatch, sys7_identity, template_ops_for, verify_readback,
-    write_parameter_memory_backup,
+    build_table_images_with, describe_group_object_change, flash_gate, identity_gate,
+    linked_object_flags, malformed_parameter_warning, model_parameters, needs_sys7_identity,
+    parameter_overrides, plan_for_readback, plan_for_readback_with, product_display, region_rows,
+    resolve_by_order_number, runtime_segments, sys7_code_mismatch, sys7_identity, template_ops_for,
+    verify_readback, write_parameter_memory_backup,
 };
 pub use param_decode::{
-    DecodedParameters, OctetOwner, OctetRange, OctetRole, attribute_octets, decode_parameters,
-    device_managed_octets,
+    DecodedParameters, OctetOwner, OctetRange, OctetRole, attribute_octets, attribute_octets_with,
+    decode_parameters, decode_parameters_with, device_managed_octets,
 };
 pub use param_plan::{
     CurrentMemory, GroupObjectChange, ParamChange, ParamPlan, ParamReading, ParamRegion,
     ParamRegions, ParamValue, SYS7_NOTE, current_parameter_values, group_object_change,
-    non_default_parameters, param_plan, planned_parameter_regions, read_current_parameter_memory,
-    read_current_parameter_memory_with_objects, read_parameter_regions,
-    read_parameter_regions_with_objects, regions_memory,
+    group_object_change_with, non_default_parameters, param_plan, planned_parameter_regions,
+    read_current_parameter_memory, read_current_parameter_memory_with_objects,
+    read_parameter_regions, read_parameter_regions_with_objects, regions_memory,
 };
 pub use plan::{LoadStep, ObjectGa, PlanReport, plan};
 pub use preflight::{

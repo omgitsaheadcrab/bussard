@@ -120,11 +120,12 @@ pub fn verify_archive(archive: &Path, entry: &ProductEntry) -> Result<(), ModelE
     if entry.file.is_none() {
         return Ok(());
     }
-    let (sha256, _) = bussard_model::sha256_file(archive).map_err(|source| ModelError::Io {
-        what: "hashing",
-        path: archive.to_path_buf(),
-        source,
-    })?;
+    let (sha256, _) =
+        bussard_model::sha256_file_cached(archive).map_err(|source| ModelError::Io {
+            what: "hashing",
+            path: archive.to_path_buf(),
+            source,
+        })?;
     if !sha256.eq_ignore_ascii_case(&entry.sha256) {
         return Err(ModelError::Changed(archive_changed_message(
             archive, &sha256, entry,

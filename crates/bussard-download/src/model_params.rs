@@ -13,13 +13,14 @@ use std::path::Path;
 
 use bussard_mgmt::memory::read_memory_range;
 use bussard_model::IndividualAddress;
+use bussard_prod::dynamic::DynamicMemo;
 use bussard_prod::{ApplicationProgram, ProductData, normalize_order_number};
 
 use crate::backup::{
     ParameterBackup, ParameterMemory, encode_hex, parameter_backups_dir, rfc3339_utc, unix_seconds,
     write_parameter_backup,
 };
-use crate::flash::{FlashPlan, FlashStep, plan_flash_with_object_flags};
+use crate::flash::{FlashPlan, FlashStep, plan_flash_with_memo};
 use crate::param_plan::ParamRegions;
 use crate::preflight::{Freshness, ResidentState, assess_freshness};
 
@@ -71,11 +72,33 @@ pub fn plan_for_readback(
     target: IndividualAddress,
     device_mask: u16,
 ) -> Result<FlashPlan, crate::PlanError> {
+    plan_for_readback_with(
+        product_data,
+        app,
+        model,
+        target,
+        device_mask,
+        &DynamicMemo::new(app),
+    )
+}
+
+/// [`plan_for_readback`], evaluating the Dynamic section through `memo`
+/// (issue #367): the group-object table image and the parameter image share
+/// one evaluation of the model's values, and so does a caller that decodes
+/// the memory it reads with the same memo. The plan is the same.
+pub fn plan_for_readback_with(
+    product_data: &ProductData,
+    app: &ApplicationProgram,
+    model: Option<&bussard_model::Model>,
+    target: IndividualAddress,
+    device_mask: u16,
+    memo: &DynamicMemo<'_, ApplicationProgram>,
+) -> Result<FlashPlan, crate::PlanError> {
     let (overrides, bases) = model_parameters(model, target);
     let template_ops = template_ops_for(product_data, app);
-    let table_images = build_table_images(model, target, app, &overrides);
+    let table_images = build_table_images_with(model, target, app, &overrides, memo);
     let object_flags = linked_object_flags(model, target);
-    plan_flash_with_object_flags(
+    plan_flash_with_memo(
         app,
         &target.to_string(),
         device_mask,
@@ -84,6 +107,7 @@ pub fn plan_for_readback(
         template_ops.as_deref(),
         &table_images,
         &object_flags,
+        memo,
     )
 }
 
@@ -201,6 +225,18 @@ pub fn build_table_images(
     app: &ApplicationProgram,
     overrides: &BTreeMap<String, String>,
 ) -> BTreeMap<u32, Vec<u8>> {
+    build_table_images_with(model, target, app, overrides, &DynamicMemo::new(app))
+}
+
+/// [`build_table_images`], evaluating the Dynamic section through `memo`
+/// (issue #367). The images are the same.
+pub fn build_table_images_with(
+    model: Option<&bussard_model::Model>,
+    target: IndividualAddress,
+    app: &ApplicationProgram,
+    overrides: &BTreeMap<String, String>,
+    memo: &DynamicMemo<'_, ApplicationProgram>,
+) -> BTreeMap<u32, Vec<u8>> {
     use crate::compute::{
         GroupObjectDescriptor, Priority, compute_group_object_table,
         descriptors_for_linked_objects, size_code_from_object_size, table_image_with_count,
@@ -273,7 +309,7 @@ pub fn build_table_images(
                 (object, entry)
             })
             .collect();
-        crate::dynamic_group_object_table(app, overrides, &linked_objects)
+        crate::dynamic_group_object_table_with(app, overrides, &linked_objects, memo)
     } else if !app.module_instances.is_empty() && app.channel_membership.is_some() {
         // Module-based application: instantiate the com-objects across channels.
         // Each channel is linked when any of the com-objects it carries appears

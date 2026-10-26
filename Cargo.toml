@@ -233,6 +233,8 @@ opt-level = 3
 opt-level = 3
 [profile.test.package.unsafe-libyaml-norway]
 opt-level = 3
+[profile.test.package.serde_json]
+opt-level = 3
 
 # `cargo test --doc` and any `cargo run` in tests use the `dev` profile, and the
 # CLI integration tests spawn the built `bussard` binary — which itself imports
@@ -284,6 +286,11 @@ opt-level = 3
 [profile.dev.package.serde_norway]
 opt-level = 3
 [profile.dev.package.unsafe-libyaml-norway]
+opt-level = 3
+# The parsed-product cache (issue #367): a large program's JSON decode in a
+# debug build halves with the JSON parser optimized (230 ms to 120 ms for the
+# ABB A0ED-10 program). The derived visitors stay at the crate's own level.
+[profile.dev.package.serde_json]
 opt-level = 3
 [profile.dev.package.crc32fast]
 opt-level = 3
