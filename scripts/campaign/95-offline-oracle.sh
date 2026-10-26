@@ -42,6 +42,11 @@
 #                                not-comparable); unchecked when absent. For a
 #                                read-compare download (mask 0701) whose
 #                                written octets are thin by design
+#                props=VERDICT   the verdict the property-write parity must
+#                                give (identical, differs or not-comparable);
+#                                unchecked when absent. For a property-only
+#                                plan (a KNX IP interface, mask 0021), whose
+#                                memory verdict is always not-comparable
 #                scope=R1,R2     the regions the verdict and coverage judge
 #                                (addr, assoc, gobj, par, seg0x4800, ...), for a
 #                                capture that by design downloads only part of
@@ -292,13 +297,14 @@ run_row() {
   product="$(trim "${product:-}")"; application="$(trim "${application:-}")"
   note_text="$(trim "${note_text:-}")"; recorded="$(trim "${recorded:-}")"
   options="$(trim "${options:-}")"
-  local expect="" confirmed="" scope="" word
+  local expect="" confirmed="" props="" scope="" word
   for word in $options; do
     case "$word" in
       expect=*)    expect="${word#expect=}" ;;
       confirmed=*) confirmed="${word#confirmed=}" ;;
+      props=*)     props="${word#props=}" ;;
       scope=*)     scope="${word#scope=}" ;;
-      *)           die "$device: unknown row option: $word (expect=..., confirmed=..., scope=...)" ;;
+      *)           die "$device: unknown row option: $word (expect=..., confirmed=..., props=..., scope=...)" ;;
     esac
   done
   local scope_args=()
@@ -310,12 +316,13 @@ run_row() {
 
   # The row's recorded coverage and expected verdict, for the summary and
   # --check (written next to the result, whatever the result is).
-  "$PYTHON" - "$dir/row.json" "$recorded" "$expect" "$confirmed" <<'PY'
+  "$PYTHON" - "$dir/row.json" "$recorded" "$expect" "$confirmed" "$props" <<'PY'
 import json, sys
-path, recorded, expect, confirmed = sys.argv[1:5]
+path, recorded, expect, confirmed, props = sys.argv[1:6]
 with open(path, "w", encoding="utf-8") as fh:
     json.dump({"recorded_coverage": float(recorded.rstrip("% ")) if recorded else None,
                "expect": expect or "identical", "expect_confirmed": confirmed or None,
+               "expect_props": props or None,
                "skipped": None}, fh)
 PY
   if [ -z "$product" ] || [ "$product" = "-" ]; then
@@ -478,6 +485,10 @@ for dev in devices:
         continue
     if r["verdict"] != row.get("expect", "identical"):
         failures.append("%s: %s, expected %s" % (dev, r["verdict"], row.get("expect")))
+    want_props = row.get("expect_props")
+    if want_props and props.get("verdict", "not-comparable") != want_props:
+        failures.append("%s: property writes %s, expected %s" % (
+            dev, props.get("verdict", "not-comparable"), want_props))
     want = row.get("expect_confirmed")
     if want and conf.get("verdict", "not-comparable") != want:
         failures.append("%s: confirmed %s, expected %s" % (

@@ -12,6 +12,8 @@
     uv run tools/knxtrace/knxtrace.py imgdiff bussard-dump/ ets-img/
     BUSSARD_KEYRING_PASSWORD=... uv run tools/knxtrace/knxtrace.py \
         trace secure.pcapng --device 1.1.12 --keyring project.knxkeys --seq-check
+    BUSSARD_KEYRING_PASSWORD=... uv run tools/knxtrace/knxtrace.py \
+        trace rotation.pcapng --keyring before.knxkeys --keyring after.knxkeys
 
 Why no scapy: the campaign machine reads captures offline, and this repository
 refuses copyleft dependencies (scapy is GPLv2, see CLAUDE.md "License Policy").
@@ -19,7 +21,9 @@ The reader is stdlib-only, which also keeps every parse failure ours to handle:
 a malformed record is skipped, never fatal.
 
 Nothing here ever prints key material. `A_Authorize` keys are hashed and
-KNXnet/IP Secure frames are named and sized but never decrypted. `A_SecureData`
+KNXnet/IP Secure frames are named and sized but never decrypted (they cannot
+be: see ipsecure.py); with a keyring, each session's device authentication is
+checked against the keyring's codes. `A_SecureData`
 (Data Secure) payloads are reported as a length and a hash, unless `--keyring`
 names an ETS `.knxkeys` export: then each frame's MAC is verified with the
 device's tool key, its FDSK or the group key (see datasecure.py), and a frame
@@ -38,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from capture import CaptureError  # noqa: E402
 import datasecure  # noqa: E402
+import ipsecure  # noqa: E402
 from knxip import KnxFrame, frames_from_file  # noqa: E402
 from normalize import (  # noqa: E402
     DeviceOps,
@@ -53,19 +58,32 @@ KEYRING_PASSWORD_ENV = "BUSSARD_KEYRING_PASSWORD"
 
 
 def load_keyring(args) -> "datasecure.Keyring | None":
-    """Loads `--keyring`, if given, with the password from the environment."""
-    path = getattr(args, "keyring", None)
-    if not path:
+    """Loads `--keyring` (repeatable), with the password from the environment.
+
+    Several keyrings are consulted in the order given: the export from before
+    a key rotation decodes the frames under the old keys (and carries the
+    FDSK, which ETS drops from the export once a tool key is set), the one
+    after it the frames under the new keys. They share the password.
+    """
+    paths = getattr(args, "keyring", None)
+    if not paths:
         return None
+    if isinstance(paths, str):
+        paths = [paths]
     password = os.environ.get(KEYRING_PASSWORD_ENV)
     if password is None:
         raise SystemExit("--keyring needs the keyring password in $%s" % KEYRING_PASSWORD_ENV)
-    try:
-        return datasecure.load_keyring(path, password)
-    except datasecure.KeyringError as exc:
-        raise SystemExit("%s: %s" % (path, exc))
-    except OSError as exc:
-        raise SystemExit("cannot read %s: %s" % (path, exc))
+    rings = []
+    for path in paths:
+        try:
+            rings.append(datasecure.load_keyring(path, password))
+        except datasecure.KeyringError as exc:
+            raise SystemExit("%s: %s" % (path, exc))
+        except OSError as exc:
+            raise SystemExit("cannot read %s: %s" % (path, exc))
+    first = rings[0]
+    first.extra = rings[1:]
+    return first
 
 
 def load_frames(path: str, keyring=None) -> list:
@@ -77,6 +95,7 @@ def load_frames(path: str, keyring=None) -> list:
         raise SystemExit("cannot read %s: %s" % (path, exc))
     if keyring is not None:
         datasecure.unwrap_frames(frames, keyring)
+        datasecure.annotate_credentials(frames, keyring)
     return frames
 
 
@@ -95,6 +114,29 @@ def load_ops(path: str, keyring=None) -> dict:
     return normalize(load_frames(path, keyring))
 
 
+def resolve(buckets: dict, device, path: str, keyring=None):
+    """`resolve_device`, with the secure sessions named when a device is missing.
+
+    A device ETS reached only through KNXnet/IP Secure sessions has no
+    decodable operation in the capture; saying so beats "devices seen: none".
+    """
+    try:
+        return resolve_device(buckets, device)
+    except SystemExit as exc:
+        if path.endswith(TPDU_SUFFIXES):
+            raise
+        found = ipsecure.sessions(load_frames(path), keyring)
+        if device:
+            found = [s for s in found if s.device in ("", device)]
+        if not found:
+            raise
+        kinds = ", ".join("%s x%d" % kv for kv in ipsecure.connection_counts(found))
+        raise SystemExit(
+            "%s; the capture holds %d KNXnet/IP Secure session(s) (%s) whose content "
+            "cannot be decrypted (`knxtrace trace` lists them)" % (exc, len(found), kinds)
+        )
+
+
 # --------------------------------------------------------------------------
 # devices
 # --------------------------------------------------------------------------
@@ -106,6 +148,9 @@ def cmd_devices(args) -> int:
     buckets = normalize(frames) if frames is not None else load_ops(args.capture)
     if not buckets:
         print("no KNX operations found in %s" % args.capture)
+        for line in ipsecure.report(ipsecure.sessions(frames or [], keyring),
+                                    base=frames[0].ts if frames else 0.0):
+            print(line)
         return 0
     print("%-10s %6s  %s" % ("device", "ops", "operation kinds"))
     for name in sorted(buckets):
@@ -117,6 +162,12 @@ def cmd_devices(args) -> int:
         print()
         for line in secure_summary(frames):
             print(line)
+    if frames is not None:
+        lines = ipsecure.report(ipsecure.sessions(frames, keyring), base=frames[0].ts if frames else 0.0)
+        if lines:
+            print()
+            for line in lines:
+                print(line)
     return 0
 
 
@@ -196,6 +247,14 @@ def cmd_trace(args) -> int:
         print()
         for line in secure_summary(shown):
             print(line)
+    found = ipsecure.sessions(frames, keyring)
+    if args.device:
+        found = [s for s in found if s.device in ("", args.device)]
+    lines = ipsecure.report(found, shapes=args.session_shapes, base=base)
+    if lines:
+        print()
+        for line in lines:
+            print(line)
     if args.seq_check:
         problems = datasecure.sequence_problems(shown)
         print()
@@ -238,8 +297,9 @@ def _trace_line(frame: KnxFrame, base: float) -> str:
 
 
 def cmd_ops(args) -> int:
-    buckets = load_ops(args.capture, load_keyring(args))
-    ops = resolve_device(buckets, args.device)
+    keyring = load_keyring(args)
+    buckets = load_ops(args.capture, keyring)
+    ops = resolve(buckets, args.device, args.capture, keyring)
     if args.json:
         print(json.dumps(_ops_json(ops, args.capture), indent=2))
         return 0
@@ -299,8 +359,8 @@ def _jsonable(value):
 
 def cmd_diff(args) -> int:
     keyring = load_keyring(args)
-    ops_a = resolve_device(load_ops(args.a, keyring), args.device)
-    ops_b = resolve_device(load_ops(args.b, keyring), args.device)
+    ops_a = resolve(load_ops(args.a, keyring), args.device, args.a, keyring)
+    ops_b = resolve(load_ops(args.b, keyring), args.device, args.b, keyring)
     if ops_a.device != ops_b.device:
         raise SystemExit(
             "the two captures name different devices (%s vs %s); pass --device"
@@ -353,7 +413,8 @@ def cmd_diff(args) -> int:
 
 
 def cmd_image(args) -> int:
-    ops = resolve_device(load_ops(args.capture, load_keyring(args)), args.device)
+    keyring = load_keyring(args)
+    ops = resolve(load_ops(args.capture, keyring), args.device, args.capture, keyring)
     index = memimage.compose(ops, args.out, source=args.capture)
     print(
         "%s: %d region(s), %d octet(s) written, %d read-confirmed, %d allocation(s), "
@@ -394,8 +455,10 @@ def _keyring_arg(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--keyring",
         metavar="FILE.knxkeys",
-        help="ETS keyring to verify and decrypt Data Secure frames "
-        "(password from $%s)" % KEYRING_PASSWORD_ENV,
+        action="append",
+        help="ETS keyring to verify and decrypt Data Secure frames, to check KNXnet/IP "
+        "Secure device authentication and credential writes (password from $%s; "
+        "repeatable, e.g. the exports before and after a key rotation)" % KEYRING_PASSWORD_ENV,
     )
 
 
@@ -420,6 +483,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="only this KNXnet/IP service name (repeatable)",
     )
     _keyring_arg(p)
+    p.add_argument(
+        "--session-shapes",
+        action="store_true",
+        help="list the plain length of every wrapped frame of each KNXnet/IP Secure session",
+    )
     p.add_argument(
         "--seq-check",
         action="store_true",

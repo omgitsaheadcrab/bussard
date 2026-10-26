@@ -40,6 +40,20 @@ MAC_LEN = 4
 A_SECURE_DATA = 0x3F1
 KEYRING_SALT = b"1.keyring.ets.knx.org"
 PBKDF2_ITERATIONS = 65536
+# KNXnet/IP Secure password derivations (docs/knx-secure-spec.md §3.4, after
+# the KNX standard 3/8/9 "KNXnet/IP Secure" and the MIT XKNX reference): the
+# 16-octet key is PBKDF2-HMAC-SHA256 over the Latin-1 password, 65536
+# iterations, with these salts. What ETS writes to PID_DEVICE_AUTHENTICATION_CODE
+# (type 11, PID 92) and to each entry of PID_PASSWORD_HASHES (type 11, PID 93)
+# is exactly this key, and the session handshake MACs use it too
+# (`crates/bussard-secure/src/crypto.rs` `salt`).
+DEVICE_AUTH_SALT = b"device-authentication-code.1.secure.ip.knx.org"
+USER_PASSWORD_SALT = b"user-password.1.secure.ip.knx.org"
+
+
+def derive_ip_secure_key(password: bytes, salt: bytes) -> bytes:
+    """PBKDF2-HMAC-SHA256(password, salt, 65536, 16): an IP Secure password key."""
+    return hashlib.pbkdf2_hmac("sha256", password, salt, PBKDF2_ITERATIONS, BLOCK)
 
 # --------------------------------------------------------------------------
 # AES-128 (FIPS-197), pure Python
@@ -359,6 +373,21 @@ class Keyring:
     # Device serial number (6 bytes) -> individual address, for the broadcast
     # S-A_Sync_Req, which names its target only by serial.
     serials: Dict[bytes, int] = field(default_factory=dict, repr=False)
+    # KNXnet/IP Secure passwords, decrypted, never printed; `ip_key` derives
+    # the 16-octet key on demand. Device authentication codes by device IA
+    # (`Device/@Authentication`, else an `Interface/@Authentication` of that
+    # host); the management password (user 1) by device IA
+    # (`Device/@ManagementPassword`); tunnelling user passwords by
+    # (host IA, user id) (`Interface/@Password`).
+    auth_codes: Dict[int, bytes] = field(default_factory=dict, repr=False)
+    management_passwords: Dict[int, bytes] = field(default_factory=dict, repr=False)
+    user_passwords: Dict[Tuple[int, int], bytes] = field(default_factory=dict, repr=False)
+    # Where the keyring came from (a file name), for labels.
+    source: str = ""
+    # Further keyrings consulted after this one (`--keyring` given twice: the
+    # export before a key rotation and the one after it).
+    extra: List["Keyring"] = field(default_factory=list, repr=False)
+    _derived: Dict[Tuple[bytes, bytes], bytes] = field(default_factory=dict, repr=False)
 
     def __repr__(self) -> str:
         return "Keyring(project=%r, %d tool key(s), %d FDSK(s), %d group key(s))" % (
@@ -367,6 +396,55 @@ class Keyring:
             len(self.fdsks),
             len(self.group_keys),
         )
+
+    def rings(self) -> List["Keyring"]:
+        """This keyring and every one added with `extra`, in order."""
+        return [self] + list(self.extra)
+
+    def ip_key(self, password: bytes, salt: bytes) -> bytes:
+        """The derived KNXnet/IP Secure key of a password (cached)."""
+        cached = self._derived.get((password, salt))
+        if cached is None:
+            cached = self._derived[(password, salt)] = derive_ip_secure_key(password, salt)
+        return cached
+
+    def device_auth_keys(self, ia: Optional[int] = None) -> List[Tuple[str, bytes]]:
+        """Every device authentication key of every keyring, labelled.
+
+        With `ia`, only that device's. The label names the device and the
+        keyring file, never the key.
+        """
+        out: List[Tuple[str, bytes]] = []
+        for ring in self.rings():
+            for dev, code in sorted(ring.auth_codes.items()):
+                if ia is not None and dev != ia:
+                    continue
+                label = "device authentication code of %s (%s)" % (_ia_text(dev), ring.source or "keyring")
+                out.append((label, ring.ip_key(code, DEVICE_AUTH_SALT)))
+        return out
+
+    def user_key(self, ia: int, user: int) -> List[Tuple[str, bytes]]:
+        """The password keys of user `user` on device `ia`, from every keyring.
+
+        User 1 is the management user (`ManagementPassword`), users 2 and up
+        the tunnelling users of the `Interface` entries hosted on `ia`.
+        """
+        out: List[Tuple[str, bytes]] = []
+        for ring in self.rings():
+            pw = ring.management_passwords.get(ia) if user == 1 else ring.user_passwords.get((ia, user))
+            if pw is not None:
+                out.append((ring.source or "keyring", ring.ip_key(pw, USER_PASSWORD_SALT)))
+        return out
+
+    def tool_key_entries(self, ia: int) -> List[Tuple[str, bytes]]:
+        """The tool keys and FDSKs of device `ia` from every keyring, labelled."""
+        out: List[Tuple[str, bytes]] = []
+        for ring in self.rings():
+            for label, table in (("tool key", ring.tool_keys), ("FDSK", ring.fdsks)):
+                key = table.get(ia)
+                if key is not None:
+                    out.append(("%s (%s)" % (label, ring.source or "keyring"), key))
+        return out
 
     def candidates(
         self, src: int, dst: int, group: bool, tool_access: bool, serial: Optional[bytes] = None
@@ -381,19 +459,24 @@ class Keyring:
         `serial`, or else to its source.
         """
         out: List[Tuple[str, bytes]] = []
+        rings = self.rings()
         if group and not tool_access:
-            key = self.group_keys.get(dst)
-            if key is not None:
-                out.append(("group", key))
+            for ring in rings:
+                key = ring.group_keys.get(dst)
+                if key is not None and all(key != k for _, k in out):
+                    out.append(("group", key))
             return out
         ends = [dst, src] if not group else [src]
-        if serial is not None and serial in self.serials:
-            ends.insert(0, self.serials[serial])
-        for label, table in (("tool", self.tool_keys), ("fdsk", self.fdsks)):
-            for ia in ends:
-                key = table.get(ia)
-                if key is not None and all(key != k for _, k in out):
-                    out.append((label, key))
+        for ring in rings:
+            if serial is not None and serial in ring.serials and ring.serials[serial] not in ends:
+                ends.insert(0, ring.serials[serial])
+        for attr, label in (("tool_keys", "tool"), ("fdsks", "fdsk")):
+            for ring in rings:
+                table = getattr(ring, attr)
+                for ia in ends:
+                    key = table.get(ia)
+                    if key is not None and all(key != k for _, k in out):
+                        out.append((label, key))
         return out
 
 
@@ -441,6 +524,10 @@ def _parse_ia(text: str) -> int:
         raise KeyringError("not an individual address: %r" % text)
     a, l, d = (int(p) for p in parts)
     return (a << 12) | (l << 8) | d
+
+
+def _ia_text(raw: int) -> str:
+    return "%d.%d.%d" % (raw >> 12, (raw >> 8) & 0x0F, raw & 0xFF)
 
 
 def _parse_ga(text: str) -> int:
@@ -499,9 +586,37 @@ def parse_keyring(xml_text: str, password: str) -> Keyring:
             raise KeyringError("%s is %d bytes, expected one AES block" % (name, len(ct)))
         return aes_cbc_decrypt(kk, iv, ct)
 
+    def password_attr(el: ET.Element, name: str) -> Optional[bytes]:
+        """An encrypted password (docs/knx-secure-spec.md §4.3): an 8-octet
+        prefix, the password, PKCS#7 padding."""
+        value = el.get(name)
+        if not value:
+            return None
+        try:
+            ct = base64.b64decode(value, validate=True)
+        except ValueError:
+            raise KeyringError("%s is not valid base64" % name)
+        if not ct or len(ct) % BLOCK:
+            raise KeyringError("%s is not whole AES blocks" % name)
+        blob = aes_cbc_decrypt(kk, iv, ct)
+        pad = blob[-1]
+        if not 1 <= pad <= BLOCK or blob[-pad:] != bytes([pad]) * pad or len(blob) < 8 + pad:
+            raise KeyringError("%s does not decrypt to a padded password" % name)
+        return blob[8:-pad]
+
     ring = Keyring(project=root.get("Project", ""))
     for el in root:
         tag = _local(el.tag)
+        if tag == "Interface" and el.get("Host"):
+            host = _parse_ia(el.get("Host", ""))
+            auth = password_attr(el, "Authentication")
+            if auth is not None:
+                ring.auth_codes.setdefault(host, auth)
+            pw = password_attr(el, "Password")
+            user = el.get("UserID", "")
+            if pw is not None and user.isdigit():
+                ring.user_passwords[(host, int(user))] = pw
+            continue
         if tag == "GroupAddresses":
             for g in el:
                 if _local(g.tag) == "Group" and g.get("Key") and g.get("Address"):
@@ -517,6 +632,12 @@ def parse_keyring(xml_text: str, password: str) -> Keyring:
                 fdsk = key_attr(d, "FDSK")
                 if fdsk is not None:
                     ring.fdsks[ia] = fdsk
+                auth = password_attr(d, "Authentication")
+                if auth is not None:
+                    ring.auth_codes[ia] = auth
+                mgmt = password_attr(d, "ManagementPassword")
+                if mgmt is not None:
+                    ring.management_passwords[ia] = mgmt
                 serial = d.get("SerialNumber", "")
                 if len(serial) == 12:
                     try:
@@ -528,8 +649,12 @@ def parse_keyring(xml_text: str, password: str) -> Keyring:
 
 def load_keyring(path: str, password: str) -> Keyring:
     """Reads and decrypts a `.knxkeys` file."""
+    import os
+
     with open(path, "r", encoding="utf-8-sig") as fh:
-        return parse_keyring(fh.read(), password)
+        ring = parse_keyring(fh.read(), password)
+    ring.source = os.path.basename(path)
+    return ring
 
 
 # --------------------------------------------------------------------------
@@ -701,12 +826,12 @@ def redact_keys(apdu):
 
     f = apdu.fields
     data = f.get("data")
-    if not isinstance(data, str):
+    if not isinstance(data, str) or data.startswith("redacted:"):
         return apdu
     secret = False
     if apdu.name.startswith("A_PropertyValue"):
         secret = is_key_material(None, f.get("obj"), f.get("pid"), len(data) // 2)
-    elif "obj_type" in f:
+    elif "obj_type" in f and "pid" in f:
         # Extended services name the object by type: anything key-sized
         # written to or read from the security object is treated as a key.
         secret = is_key_material(f.get("obj_type"), None, f.get("pid"), len(data) // 2)
@@ -757,3 +882,88 @@ def key_class(apdu) -> str:
     if "key" in apdu.fields:
         return str(apdu.fields["key"])
     return "tool" if apdu.fields.get("tool_access") else "group"
+
+
+# --------------------------------------------------------------------------
+# KNXnet/IP Secure credentials written as properties
+# --------------------------------------------------------------------------
+
+# (object type, PID) of the credential properties ETS writes when it switches
+# IP Secure on: the tool key on the security object, the device
+# authentication code and the password hashes on the KNXnet/IP parameter
+# object (knx_master.xml: PID-17-56 PID_TOOL_KEY, PID-11-92
+# PID_DEVICE_AUTHENTICATION_CODE, PID-11-93 PID_PASSWORD_HASHES).
+CREDENTIAL_PROPERTIES = frozenset({(17, 56), (11, 92), (11, 93)})
+# Octets ahead of the value: an extended value write (type 2, inst/pid 3,
+# count 1, index 2), a cEMI M_PropWrite.req body (iot 2, oi 1, pid 1, noe/six 2).
+_VALUE_OFFSET = {
+    "A_PropertyExtValue_WriteCon": 8,
+    "A_PropertyExtValue_WriteUnCon": 8,
+    "M_PropWrite.req": 6,
+}
+
+
+def credential_check(ring: Keyring, device: int, apdu) -> Optional[str]:
+    """Compares a credential property write with the keyring, by value.
+
+    Returns a label for `Apdu.fields["keyring"]` (which keyring entry the
+    written octets equal, or that none does), or None when the APDU is not a
+    credential write. Nothing derived from a key is returned: only names.
+
+    PID 93 entries are 16-octet password hashes, entry n for user id n (1 the
+    management user, 2 and up the tunnelling users; CONFIRMED by the 1.1.200
+    activation capture of 2026-10-26: nine entries, users 1 to 9 of the
+    keyring). Its element 0 is the array length, not key material.
+    """
+    f = apdu.fields
+    offset = _VALUE_OFFSET.get(apdu.name)
+    if offset is None or (f.get("obj_type"), f.get("pid")) not in CREDENTIAL_PROPERTIES:
+        return None
+    value = bytes(apdu.payload[offset:])
+    pid, obj_type = f.get("pid"), f.get("obj_type")
+    if obj_type == 17:
+        for label, key in ring.tool_key_entries(device):
+            if hmac.compare_digest(key, value):
+                return "equals the %s" % label
+        return "equals no tool key or FDSK in the keyring"
+    if pid == 92:
+        for label, key in ring.device_auth_keys(device):
+            if hmac.compare_digest(key, value):
+                return "equals the %s" % label
+        return "equals no device authentication code in the keyring"
+    index = int(f.get("index") or 0)
+    if index == 0 or len(value) % BLOCK:
+        return None
+    parts = []
+    for k in range(len(value) // BLOCK):
+        user = index + k
+        entry = value[k * BLOCK : (k + 1) * BLOCK]
+        hit = next((src for src, key in ring.user_key(device, user)
+                    if hmac.compare_digest(key, entry)), None)
+        parts.append("user %d %s" % (user, ("= " + hit) if hit else "matches nothing"))
+    return "; ".join(parts)
+
+
+def annotate_credentials(frames: Iterable, ring: Keyring) -> None:
+    """Marks every credential property write with its keyring comparison.
+
+    Runs after `unwrap_frames`: a write inside a verified A_SecureData is
+    checked on its decrypted inner APDU. The target device is the frame's
+    destination (requests only).
+    """
+    for frame in frames:
+        cemi = frame.cemi
+        if cemi is None or cemi.l4 is None or cemi.l4.apdu is None or cemi.mc in (0x2E, 0x29, 0x89):
+            continue
+        apdu = cemi.l4.apdu
+        if apdu.inner is not None:
+            apdu = apdu.inner
+        if not cemi.dst or cemi.dst_is_group:
+            continue
+        try:
+            device = _parse_ia(cemi.dst)
+        except (KeyringError, ValueError):
+            continue
+        label = credential_check(ring, device, apdu)
+        if label is not None:
+            apdu.fields["keyring"] = label

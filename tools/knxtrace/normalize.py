@@ -287,8 +287,11 @@ def _op_from_apdu(apdu: Apdu, direction: str, ts: float) -> Optional[Op]:
             kind = KIND_PROP_READ
         return Op(kind, key, detail, direction, ts, data=data)
 
-    if name.startswith("A_PropertyExt") or name.startswith("A_FunctionPropertyExt"):
+    if name.startswith(("A_PropertyExt", "A_FunctionPropertyExt", "M_Prop", "M_FuncProp")):
         return _ext_op(apdu, direction, ts)
+
+    if name.startswith("M_Reset"):
+        return Op(KIND_RESTART, name, dict(f), direction, ts)
 
     if name.startswith("A_PropertyDescription"):
         key = "obj%s/%s" % (f.get("obj"), f.get("pid_name", f.get("pid")))
@@ -371,6 +374,11 @@ _EXT_HEADER = {
     "A_PropertyExtValue_WriteUnCon": 8,
     "A_PropertyExtValue_Response": 8,
     "A_FunctionPropertyExt_Command": 5,
+    # cEMI local device management (knxip.decode_cemi_management): the body
+    # after the message code, `iot oi pid noe/six` or `iot oi pid`.
+    "M_PropWrite.req": 6,
+    "M_PropRead.con": 6,
+    "M_FuncPropCommand.req": 4,
 }
 
 
@@ -379,7 +387,9 @@ def _ext_op(apdu: Apdu, direction: str, ts: float) -> Op:
     a value write (`A_PropertyExtValue_WriteCon`/`_WriteUnCon`, and the
     confirmation) is a prop-write, a value read and its response a prop-read,
     a description read a prop-desc-read, and `A_FunctionPropertyExt_*` a
-    function-prop. The key names the object by type and instance
+    function-prop. The cEMI device management services of a KNXnet/IP device
+    management connection map the same way (`M_PropWrite.req`/`.con` a
+    prop-write, `M_PropRead.*` a prop-read, `M_FuncProp*` a function-prop). The key names the object by type and instance
     (`type11.1/PID205`). Key material is never fingerprinted.
     """
     from datasecure import is_key_material
@@ -405,10 +415,10 @@ def _ext_op(apdu: Apdu, direction: str, ts: float) -> Op:
     if secret:
         detail["key_material"] = True
         data = b""
-    if name.startswith("A_FunctionPropertyExt"):
+    if name.startswith(("A_FunctionPropertyExt", "M_FuncProp")):
         kind = KIND_FUNC_PROP
     elif name in ("A_PropertyExtValue_WriteCon", "A_PropertyExtValue_WriteUnCon",
-                  "A_PropertyExtValue_WriteConResponse"):
+                  "A_PropertyExtValue_WriteConResponse", "M_PropWrite.req", "M_PropWrite.con"):
         kind = KIND_PROP_WRITE
     elif name.startswith("A_PropertyExtDescription"):
         kind = KIND_PROP_DESC_READ

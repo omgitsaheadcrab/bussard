@@ -1823,5 +1823,279 @@ class TestDataSecure(unittest.TestCase):
         self.assertIn("BUSSARD_KEYRING_PASSWORD", str(ctx.exception))
 
 
+
+# --------------------------------------------------------------------------
+# Device management connections and KNXnet/IP Secure sessions (issue #398)
+# --------------------------------------------------------------------------
+
+
+def device_info_dib(device: str, name: str = "Synthetic IP") -> bytes:
+    """A DEVICE_INFO DIB (54 octets) naming the server's individual address."""
+    body = (
+        bytes([0x02, 0x00])
+        + struct.pack("!H", ia(device))
+        + b"\x00\x00"
+        + bytes(6)  # serial
+        + bytes([224, 0, 23, 12])
+        + bytes(6)  # MAC
+        + name.encode().ljust(30, b"\x00")
+    )
+    return bytes([2 + len(body), 0x01]) + body
+
+
+def knxip_frame(service: int, body: bytes) -> bytes:
+    return b"\x06\x10" + struct.pack("!HH", service, 6 + len(body)) + body
+
+
+def device_configuration(cemi: bytes, channel: int = 3, seq: int = 0) -> bytes:
+    return knxip_frame(0x0310, bytes([0x04, channel, seq, 0x00]) + cemi)
+
+
+def t_data_connected(npdu: bytes, mc: int = 0x41) -> bytes:
+    """A cEMI T_Data_Connected frame: reserved addressing, then the TPDU."""
+    return bytes([mc, 0x00]) + bytes(6) + bytes([len(npdu) - 1]) + npdu
+
+
+def unnumbered(tpdu: bytes) -> bytes:
+    """The same TPDU as an unnumbered data PDU (what a T_Data_Connected carries)."""
+    return bytes([tpdu[0] & 0x03]) + tpdu[1:]
+
+
+def m_prop_write(obj_type: int, pid: int, count: int, index: int, data: bytes) -> bytes:
+    return (
+        bytes([0xF6])
+        + struct.pack("!H", obj_type)
+        + bytes([1, pid, (count << 4) | (index >> 8), index & 0xFF])
+        + data
+    )
+
+
+def enc_password(kk: bytes, iv: bytes, password: str) -> str:
+    """An ETS-style encrypted password: 8-octet prefix, password, PKCS#7, AES-CBC."""
+    import base64
+
+    blob = bytes(range(8)) + password.encode()
+    pad = 16 - len(blob) % 16
+    blob += bytes([pad]) * pad
+    aes = ds.Aes128(kk)
+    out, prev = b"", iv
+    for i in range(0, len(blob), 16):
+        prev = aes.encrypt_block(bytes(a ^ b for a, b in zip(blob[i:i + 16], prev)))
+        out += prev
+    return base64.b64encode(out).decode()
+
+
+def ip_secure_keyring(device: str, auth: str, management: str, users: dict, password: str = SYN_PASSWORD) -> str:
+    """A signed keyring with KNXnet/IP Secure passwords for one interface."""
+    import base64
+    import hashlib
+    import xml.etree.ElementTree as ET
+
+    created = "2026-03-04T05:06:07"
+    kk = hashlib.pbkdf2_hmac("sha256", password.encode(), ds.KEYRING_SALT, 65536, 16)
+    iv = hashlib.sha256(created.encode()).digest()[:16]
+    root = ET.Element("Keyring", {"Project": "Synthetic", "CreatedBy": "knxtrace-test", "Created": created})
+    for n, (user, pw) in enumerate(sorted(users.items())):
+        ET.SubElement(root, "Interface", {
+            "Type": "Tunneling", "Host": device, "IndividualAddress": "1.1.%d" % (100 + n),
+            "UserID": str(user), "Password": enc_password(kk, iv, pw),
+            "Authentication": enc_password(kk, iv, auth),
+        })
+    devs = ET.SubElement(root, "Devices")
+    ET.SubElement(devs, "Device", {
+        "IndividualAddress": device,
+        "ManagementPassword": enc_password(kk, iv, management),
+        "Authentication": enc_password(kk, iv, auth),
+    })
+    sig = base64.b64encode(hashlib.sha256(ds._canonical(root, kk)).digest()[:16]).decode()
+    root.set("Signature", sig)
+    return ET.tostring(root, encoding="unicode")
+
+
+def tcp_capture(path: str, knx_frames: list, client_port: int = TOOL_PORT) -> None:
+    """Every frame as one TCP segment of one connection, client <-> gateway."""
+    eth = []
+    seq = {True: 1000, False: 5000}
+    for frame, to_gateway in knx_frames:
+        if to_gateway:
+            eth.append(_eth_ipv4_tcp(TOOL_IP, client_port, GATEWAY_IP, KNX_PORT, seq[True], frame))
+        else:
+            eth.append(_eth_ipv4_tcp(GATEWAY_IP, KNX_PORT, TOOL_IP, client_port, seq[False], frame))
+        seq[to_gateway] += len(frame)
+    write_pcapng(path, eth)
+
+
+SYN_AUTH_CODE = "synthetic-device-auth"
+SYN_MGMT_PW = "synthetic-management"
+SYN_USERS = {2: "synthetic-user-2", 3: "synthetic-user-3"}
+TCP_ROUTE_BACK = bytes([0x08, 0x02]) + bytes(6)
+
+
+class TestDeviceManagement(unittest.TestCase):
+    def test_decode_cemi_t_data_connected(self):
+        cemi = knxip.decode_cemi(t_data_connected(bytes([0x03, 0x00])))
+        self.assertEqual(cemi.mc_name, "T_Data_Connected.req")
+        self.assertEqual(cemi.l4.apdu.name, "A_DeviceDescriptor_Read")
+        resp = knxip.decode_cemi(t_data_connected(bytes([0x03, 0x40, 0x00, 0x21]), mc=0x89))
+        self.assertEqual(resp.mc_name, "T_Data_Connected.ind")
+        self.assertEqual(resp.l4.apdu.fields["mask"], "0021")
+
+    def test_decode_cemi_management_property_services(self):
+        cemi = knxip.decode_cemi(m_prop_write(11, 76, 3, 1, b"abc"))
+        apdu = cemi.l4.apdu
+        self.assertEqual(apdu.name, "M_PropWrite.req")
+        self.assertEqual(
+            (apdu.fields["obj_type"], apdu.fields["instance"], apdu.fields["pid"],
+             apdu.fields["count"], apdu.fields["index"], apdu.fields["data"]),
+            (11, 1, 76, 3, 1, b"abc".hex()),
+        )
+        self.assertEqual(apdu.fields["pid_name"], "PID_FRIENDLY_NAME")
+        con = knxip.decode_cemi(bytes([0xF5, 0x00, 0x0B, 0x01, 76, 0x00, 0x01, 0x07]))
+        self.assertEqual(con.l4.apdu.fields["error"], "0x07")
+        func = knxip.decode_cemi(bytes([0xF8, 0x00, 0x0B, 0x01, 94, 0x00, 0x00, 0x03, 0x01]))
+        self.assertEqual(func.l4.apdu.fields["family"], "device_management")
+        self.assertEqual(func.l4.apdu.fields["secured"], "on")
+        self.assertEqual(knxip.decode_cemi(bytes([0xF1])).l4.apdu.name, "M_Reset.req")
+
+    def test_decode_cemi_management_redacts_a_device_authentication_code(self):
+        code = bytes([0x3C] * 16)
+        apdu = knxip.decode_cemi(m_prop_write(11, 92, 1, 1, code)).l4.apdu
+        self.assertTrue(apdu.fields["data"].startswith("redacted:"))
+        self.assertNotIn(code.hex(), apdu.summary())
+
+    def test_decode_function_command_security_mode(self):
+        head = struct.pack("!H", 17) + ((1 << 12) | 51).to_bytes(3, "big")
+        apdu = knxip.decode_apdu(0x1D4, head + bytes([0x00, 0x00, 0x01]), 0)
+        self.assertEqual((apdu.fields["pid_name"], apdu.fields["mode"]), ("PID_SECURITY_MODE", "on"))
+
+    def test_decode_knxip_connect_request_names_the_connection(self):
+        mgmt = knxip.decode_knxip(0.0, "a", "b", "tcp", knxip_frame(0x0205, TCP_ROUTE_BACK * 2 + b"\x02\x03"))
+        self.assertEqual(mgmt.fields["connection"], "device_management")
+        tunnel = knxip.decode_knxip(
+            0.0, "a", "b", "tcp", knxip_frame(0x0205, TCP_ROUTE_BACK * 2 + b"\x04\x04\x02\x00")
+        )
+        self.assertEqual((tunnel.fields["connection"], tunnel.fields["layer"]), ("tunnel", "0x02"))
+
+    def device_management_capture(self) -> str:
+        path = tempfile.mkstemp(suffix=".pcapng")[1]
+        self.addCleanup(os.unlink, path)
+        friendly = b"Synthetic".ljust(10, b"\x00")
+        frames = [
+            (knxip_frame(0x0203, TCP_ROUTE_BACK), True),
+            (knxip_frame(0x0204, device_info_dib("1.1.250")), False),
+            (knxip_frame(0x0205, TCP_ROUTE_BACK * 2 + b"\x02\x03"), True),
+            (device_configuration(t_data_connected(bytes([0x03, 0x00]))), True),
+            (device_configuration(t_data_connected(bytes([0x03, 0x40, 0x00, 0x21]), mc=0x89)), False),
+            (device_configuration(t_data_connected(unnumbered(ext_write(11, 204, 1, 1, b"\x0a")))), True),
+            (device_configuration(m_prop_write(11, 76, 10, 1, friendly)), True),
+        ]
+        tcp_capture(path, frames)
+        return path
+
+    def test_device_management_frames_are_filed_under_the_server(self):
+        frames = knxip.frames_from_file(self.device_management_capture())
+        config = [f for f in frames if f.service == 0x0310]
+        self.assertEqual([f.fields["device"] for f in config], ["1.1.250"] * 4)
+        ops = norm.normalize(frames)["1.1.250"]
+        self.assertEqual(ops.counts(), {"descriptor": 1, "prop-write": 2})
+        props = memimage.property_writes(ops)
+        self.assertEqual(
+            [(p["service"], p["object"], p["pid"], p["length"]) for p in props],
+            [
+                ("A_PropertyExtValue_WriteCon", {"type": 11, "instance": 1}, 204, 1),
+                ("M_PropWrite.req", {"type": 11, "instance": 1}, 76, 10),
+            ],
+        )
+        self.assertEqual(props[1]["data"], b"Synthetic".ljust(10, b"\x00").hex())
+
+
+class TestIpSecureSessions(unittest.TestCase):
+    def keyring(self, auth: str = SYN_AUTH_CODE) -> "ds.Keyring":
+        return ds.parse_keyring(ip_secure_keyring("1.1.250", auth, SYN_MGMT_PW, SYN_USERS), SYN_PASSWORD)
+
+    def test_session_response_mac_matches_the_rust_vector(self):
+        import ipsecure
+
+        mac = ipsecure.session_response_mac(bytes([0x01] * 16), 1, bytes([0x11] * 32), bytes([0x22] * 32))
+        self.assertEqual(mac.hex(), "3651034f87ba7fdad9675c2db8a9e52c")
+
+    def test_parse_keyring_decrypts_ip_secure_passwords(self):
+        ring = ds.parse_keyring(RUST_FULL_KEYRING, SYN_PASSWORD)
+        self.assertEqual(ring.user_passwords[(ia("1.1.0"), 2)], b"tunnel-user-pw")
+        self.assertEqual(ring.auth_codes[ia("1.1.0")], b"device-auth-pw")
+        self.assertIn(ia("1.1.10"), ring.management_passwords)
+        self.assertNotIn("tunnel-user-pw", repr(ring))
+
+    def session_capture(self, code: str) -> str:
+        import ipsecure
+
+        path = tempfile.mkstemp(suffix=".pcapng")[1]
+        self.addCleanup(os.unlink, path)
+        client, server = bytes([0x11] * 32), bytes([0x22] * 32)
+        key = ds.derive_ip_secure_key(code.encode(), ds.DEVICE_AUTH_SALT)
+        mac = ipsecure.session_response_mac(key, 1, client, server)
+
+        def wrapper(plain_len: int, seq: int) -> bytes:
+            return knxip_frame(0x0950, struct.pack("!H", 1) + seq.to_bytes(6, "big") + bytes(8)
+                               + bytes(plain_len) + bytes(16))
+
+        frames = [
+            (knxip_frame(0x0203, TCP_ROUTE_BACK), True),
+            (knxip_frame(0x0204, device_info_dib("1.1.250")), False),
+            (knxip_frame(0x0951, TCP_ROUTE_BACK + client), True),
+            (knxip_frame(0x0952, struct.pack("!H", 1) + server + mac), False),
+            (wrapper(24, 0), True),
+            (wrapper(8, 0), False),
+            (wrapper(24, 1), True),
+            (wrapper(18, 1), False),
+        ]
+        tcp_capture(path, frames)
+        return path
+
+    def test_sessions_verify_the_device_authentication_code(self):
+        import ipsecure
+
+        frames = knxip.frames_from_file(self.session_capture(SYN_AUTH_CODE))
+        found = ipsecure.sessions(frames, self.keyring())
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].device, "1.1.250")
+        self.assertEqual(found[0].connection, "device_management")
+        self.assertIn("device authentication verified: device authentication code of 1.1.250",
+                      found[0].authenticated_by)
+        self.assertEqual(found[0].shape(), ">24 <8 >24 <18")
+        other = ipsecure.sessions(frames, self.keyring(auth="another-code"))
+        self.assertEqual(other[0].authenticated_by, "device authentication matches no code in the keyring")
+
+    def test_main_image_names_secure_sessions_for_a_missing_device(self):
+        with self.assertRaises(SystemExit) as ctx:
+            main(["image", self.session_capture(SYN_AUTH_CODE), "--device", "1.1.250",
+                  "--out", tempfile.mkdtemp()])
+        self.assertIn("1 KNXnet/IP Secure session(s) (device_management x1)", str(ctx.exception))
+
+    def test_credential_check_names_the_keyring_entry_never_the_value(self):
+        ring = self.keyring()
+        auth_key = ds.derive_ip_secure_key(SYN_AUTH_CODE.encode(), ds.DEVICE_AUTH_SALT)
+        mgmt = ds.derive_ip_secure_key(SYN_MGMT_PW.encode(), ds.USER_PASSWORD_SALT)
+        user2 = ds.derive_ip_secure_key(SYN_USERS[2].encode(), ds.USER_PASSWORD_SALT)
+        head = struct.pack("!H", 11)
+        write92 = knxip.decode_apdu(0x1CE, head + ((1 << 12) | 92).to_bytes(3, "big") + b"\x01\x00\x01" + auth_key, 0)
+        label = ds.credential_check(ring, ia("1.1.250"), write92)
+        self.assertIn("equals the device authentication code of 1.1.250", label)
+        hashes = mgmt + user2 + bytes(16)
+        write93 = knxip.decode_apdu(0x1CE, head + ((1 << 12) | 93).to_bytes(3, "big") + b"\x03\x00\x01" + hashes, 0)
+        label = ds.credential_check(ring, ia("1.1.250"), write93)
+        self.assertTrue(label.startswith("user 1 = "), label)
+        self.assertIn("user 3 matches nothing", label)
+        self.assertNotIn(mgmt.hex(), label + write93.summary())
+        self.assertTrue(write93.fields["data"].startswith("redacted:"))
+
+    def test_keyring_extra_rings_add_candidates(self):
+        first = ds.parse_keyring(synthetic_keyring({"1.1.12": {"FDSK": SYN_FDSK}}), SYN_PASSWORD)
+        second = ds.parse_keyring(synthetic_keyring({"1.1.12": {"ToolKey": SYN_TOOL_KEY}}), SYN_PASSWORD)
+        first.extra = [second]
+        cands = first.candidates(ia("1.1.25"), ia("1.1.12"), False, True)
+        self.assertEqual([label for label, _ in cands], ["tool", "fdsk"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
