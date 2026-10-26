@@ -313,13 +313,11 @@ fn value_error(kind: &ParamKind, value: &str) -> Option<String> {
             }
             Err(_) => Some(format!("enum value {value:?} is not an integer")),
         },
-        ParamKind::Text { len } => match len {
-            Some(len) if value.len() > *len => Some(format!(
-                "text {value:?} is {} bytes but the field holds {len}",
-                value.len()
-            )),
-            _ => None,
-        },
+        ParamKind::Text { len, encoding } => len.and_then(|len| {
+            crate::text_codec::TextCodec::from_declaration(encoding.as_deref())
+                .encode(value, len)
+                .err()
+        }),
         ParamKind::Float => {
             if v.parse::<f64>().is_ok() {
                 None
@@ -1405,5 +1403,24 @@ parameters:
                 .all(|d| d.code != "E046" || d.severity == Severity::Error)
         );
         Ok(())
+    }
+
+    /// A text value is measured in the program's code page (issue #401):
+    /// MDT's `Scènario` fits eight octets in ISO 8859-15, not in UTF-8.
+    #[test]
+    fn test_parameter_value_error_text_in_the_declared_code_page() {
+        let kind = |encoding: Option<&str>| ParamKind::Text {
+            len: Some(8),
+            encoding: encoding.map(str::to_string),
+        };
+        assert_eq!(
+            parameter_value_error(&kind(Some("iso-8859-15")), "Scènario"),
+            None
+        );
+        let utf8 = parameter_value_error(&kind(Some("utf-8")), "Scènario");
+        assert!(utf8.is_some_and(|e| e.contains("9 octets")));
+        let undeclared = parameter_value_error(&kind(None), "Scènario");
+        assert!(undeclared.is_some_and(|e| e.contains("#401")));
+        assert_eq!(parameter_value_error(&kind(None), "Scene"), None);
     }
 }

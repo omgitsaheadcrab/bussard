@@ -99,7 +99,11 @@ normal), so bussard streams them with `quick-xml` and never builds a DOM. It ext
   (the two agree).
 - Parameter types: `TypeNumber` (int min/max/size), `TypeRestriction` (enum value/text
   pairs), `TypeText` (string length), `TypeFloat`, `TypeNone`, and any other `Type*`
-  element preserved by name.
+  element preserved by name. A `TypeText` value is written in the code page the
+  program declares in `<Options TextParameterEncoding>` (`iso-8859-15`, `utf-8`, ...),
+  padded with NUL to its field; a character outside that code page, or a text longer
+  than the field, is refused. A program that declares no encoding takes ASCII text
+  only, because no capture shows ETS's choice for one (issue #401).
 - Parameters and parameter refs: name, text, type ref, default value, access, and the
   memory location (`CodeSegment` + `Offset` + `BitOffset`). A parameter-ref
   `Value`/`Access` overrides the parameter's own.

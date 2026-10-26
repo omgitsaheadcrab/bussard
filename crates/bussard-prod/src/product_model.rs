@@ -535,6 +535,9 @@ enum ParamTypeModel {
     Text {
         #[serde(skip_serializing_if = "Option::is_none")]
         size: Option<u32>,
+        /// The program's `TextParameterEncoding` (issue #401).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encoding: Option<String>,
     },
     Float {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -846,7 +849,10 @@ fn param_type_model(app: &ApplicationProgram, type_id: Option<&str>) -> ParamTyp
                 })
                 .collect(),
         },
-        ParameterType::Text { size_bits } => ParamTypeModel::Text { size: *size_bits },
+        ParameterType::Text { size_bits } => ParamTypeModel::Text {
+            size: *size_bits,
+            encoding: app.text_parameter_encoding.clone(),
+        },
         ParameterType::Float { encoding, min, max } => ParamTypeModel::Float {
             encoding: encoding.clone(),
             min: *min,

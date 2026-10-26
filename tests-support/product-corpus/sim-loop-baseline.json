@@ -29,8 +29,8 @@
     },
     "M-0083_A-0255-21-0ECA": {
       "step": "flash[2] (generated 2)",
-      "reason": "label text `Scènario` is 9 octets in UTF-8 for an 8-octet TypeText property; bussard encodes TypeText as UTF-8, no capture shows ETS's encoding (#390 sim run)",
-      "issue": 401
+      "reason": "flash completes but the read-back finds 71 parameters in segment AS-4770 (logic operations, weekday checkboxes) differing from the model although all 3112 octets were streamed (#401 sim run)",
+      "issue": 415
     }
   }
 }

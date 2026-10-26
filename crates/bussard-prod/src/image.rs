@@ -51,6 +51,7 @@ use std::ops::Range;
 use bussard_ets::application::{
     ApplicationProgram, LabelMatch, ParameterType, SegmentKind, enum_member_by_label,
 };
+use bussard_model::text_codec::TextCodec;
 
 use crate::error::{ProdError, Result};
 
@@ -1274,22 +1275,13 @@ fn encode_value(
             encode_int_bits(app, pname, size_bits.unwrap_or(8), false, n)
         }
         Some(ParameterType::Text { size_bits }) => {
+            // The program's `TextParameterEncoding`, NUL-padded, refused when
+            // it does not fit (issue #401).
             let len = (size_bits.unwrap_or(0) / 8) as usize;
-            let s = value.unwrap_or("");
-            let bytes = s.as_bytes();
-            if bytes.len() > len {
-                return Err(param_err(
-                    app,
-                    pname,
-                    &format!(
-                        "text `{s}` is {} bytes but the field holds {len}",
-                        bytes.len()
-                    ),
-                ));
-            }
-            let mut buf = vec![0u8; len];
-            buf[..bytes.len()].copy_from_slice(bytes);
-            Ok(Placement::Bytes(buf))
+            TextCodec::from_declaration(app.text_parameter_encoding.as_deref())
+                .encode(value.unwrap_or(""), len)
+                .map(Placement::Bytes)
+                .map_err(|reason| param_err(app, pname, &reason))
         }
         Some(ParameterType::Float { encoding, max, .. }) => {
             encode_float(app, pname, encoding.as_deref(), *max, value)
@@ -1838,6 +1830,7 @@ pub fn decode_parameter_value(
         offset,
         bit_offset,
         app.parameters_little_endian,
+        TextCodec::from_declaration(app.text_parameter_encoding.as_deref()),
     )
 }
 
@@ -1869,7 +1862,14 @@ pub fn canonical_parameter_value(
     // Placed MSB-first and read back the same way: the canonical form does
     // not depend on the program's byte order.
     place(&mut scratch, 0, 0, &placement);
-    decode_value(ptype, &scratch, 0, 0, false)
+    decode_value(
+        ptype,
+        &scratch,
+        0,
+        0,
+        false,
+        TextCodec::from_declaration(app.text_parameter_encoding.as_deref()),
+    )
 }
 
 /// Encodes `value` for `param` and writes it into `image` at the byte
@@ -1908,6 +1908,7 @@ fn decode_value(
     offset: usize,
     bit_offset: u8,
     little_endian: bool,
+    text: TextCodec,
 ) -> Option<String> {
     let bytes = |len: usize| image.get(offset..offset.checked_add(len)?);
     match ptype? {
@@ -1940,9 +1941,7 @@ fn decode_value(
                 .map(|raw| raw.to_string())
         }
         ParameterType::Text { size_bits } => {
-            let slice = bytes((size_bits.unwrap_or(0) / 8) as usize)?;
-            let end = slice.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
-            Some(String::from_utf8_lossy(&slice[..end]).into_owned())
+            Some(text.decode(bytes((size_bits.unwrap_or(0) / 8) as usize)?))
         }
         ParameterType::Float { encoding, .. } => {
             match encoding
@@ -2594,6 +2593,39 @@ mod tests {
             .err()
             .ok_or("expected an error")?;
         assert!(err.to_string().contains("label"), "{err}");
+        Ok(())
+    }
+
+    /// A text parameter takes the program's `TextParameterEncoding` (issue
+    /// #401): MDT's eight-octet `Scènario` in ISO 8859-15, refused in UTF-8
+    /// and when the program declares no encoding; it reads back the same.
+    #[test]
+    fn test_compute_parameter_image_text_uses_the_declared_encoding()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut app = app_with(&[(
+            "label",
+            r#"<TypeText SizeInBit="64" />"#,
+            Some("Scènario"),
+            0,
+            0,
+        )])?;
+        assert!(compute_parameter_image(&app, &no_overrides(), &no_bases()).is_err());
+        app.text_parameter_encoding = Some("utf-8".to_string());
+        let err = compute_parameter_image(&app, &no_overrides(), &no_bases())
+            .err()
+            .ok_or("utf-8 fits")?;
+        assert!(err.to_string().contains("9 octets in UTF-8"), "{err}");
+        app.text_parameter_encoding = Some("iso-8859-15".to_string());
+        assert_eq!(&image_of(&app)?[0..8], b"Sc\xE8nario");
+        let param = app.parameters.values().next().ok_or("no parameter")?;
+        assert_eq!(
+            canonical_parameter_value(&app, param, Some("Scènario")).as_deref(),
+            Some("Scènario")
+        );
+        assert_eq!(
+            decode_parameter_value(&app, param, b"Sc\xE8nario", 0, 0).as_deref(),
+            Some("Scènario")
+        );
         Ok(())
     }
 
