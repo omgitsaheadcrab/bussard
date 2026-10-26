@@ -270,16 +270,25 @@ pub(crate) fn read_device(
                         .map(|check| check.device);
                     let read = read_live_tables(l4, product).await?;
                     let params = match (&read, product) {
-                        (LiveRead::Tables(live), Some(product)) => Some(
-                            crate::param_readback::read_state(
+                        (LiveRead::Tables(live), Some(product)) => {
+                            let started = std::time::Instant::now();
+                            let state = crate::param_readback::read_state(
                                 l4,
                                 product,
                                 model,
                                 target,
                                 live.tables().mask,
                             )
-                            .await,
-                        ),
+                            .await;
+                            // The parameter memory's reads plus its plan and
+                            // decode (issue #367), a `--timing` phase.
+                            crate::timing::record(
+                                "parameter read",
+                                started.elapsed(),
+                                "bus reads, plan and decode",
+                            );
+                            Some(state)
+                        }
                         _ => None,
                     };
                     // PID 54, for `admit_tunnel_senders` only (issue #297).

@@ -1001,6 +1001,74 @@ pub fn evaluate_dynamic<S: DynamicSource + ?Sized>(
     }
 }
 
+/// The evaluations of one program's Dynamic section, memoized by the value
+/// map they ran with (issue #367).
+///
+/// A parameter read-back evaluates the same program with the same values
+/// several times: the read-back plan's image and group-object table, the
+/// parameter decode, the group-object change and the octet attribution. On a
+/// large program (ABB `M-0002_A-A0ED-10-9B4E`) each [`evaluate_dynamic`]
+/// costs a fraction of a second, so the callers share one memo and each
+/// distinct value map is evaluated once. The result is the one
+/// [`evaluate_dynamic`] returns, so nothing a caller computes from it changes.
+///
+/// [`Self::evaluate_for`] answers from the memo only for the program the
+/// memo was made for; any other program is evaluated directly.
+pub struct DynamicMemo<'a, S: DynamicSource + ?Sized> {
+    app: &'a S,
+    entries: std::sync::Mutex<MemoEntries>,
+}
+
+/// The evaluations a [`DynamicMemo`] holds: each value map with its result.
+type MemoEntries = Vec<(BTreeMap<String, String>, std::sync::Arc<DynamicConfig>)>;
+
+impl<'a, S: DynamicSource + ?Sized> DynamicMemo<'a, S> {
+    /// An empty memo for `app`.
+    pub fn new(app: &'a S) -> DynamicMemo<'a, S> {
+        DynamicMemo {
+            app,
+            entries: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// [`evaluate_dynamic`] of the memo's program with `values`, evaluated
+    /// on the first request for this value map and shared after that.
+    pub fn evaluate(&self, values: &BTreeMap<String, String>) -> std::sync::Arc<DynamicConfig> {
+        if let Some((_, config)) = self.entries().iter().find(|(v, _)| v == values) {
+            return std::sync::Arc::clone(config);
+        }
+        let config = std::sync::Arc::new(evaluate_dynamic(self.app, values));
+        self.entries()
+            .push((values.clone(), std::sync::Arc::clone(&config)));
+        config
+    }
+
+    /// [`Self::evaluate`] when `app` is the memo's program (the same
+    /// object), else a direct [`evaluate_dynamic`] of `app` that the memo
+    /// does not keep.
+    pub fn evaluate_for(
+        &self,
+        app: &S,
+        values: &BTreeMap<String, String>,
+    ) -> std::sync::Arc<DynamicConfig> {
+        if std::ptr::addr_eq(app, self.app) {
+            self.evaluate(values)
+        } else {
+            std::sync::Arc::new(evaluate_dynamic(app, values))
+        }
+    }
+
+    /// How many distinct value maps the memo has evaluated.
+    pub fn evaluations(&self) -> usize {
+        self.entries().len()
+    }
+
+    /// The entries; a poisoned lock still holds whole entries.
+    fn entries(&self) -> std::sync::MutexGuard<'_, MemoEntries> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// Splits a device-file parameter key into its module instance id and the
 /// app-relative `ParameterRef` id: `MD-15_M-26_MI-1_UP-22_R-27` becomes
 /// (`Some("MD-15_M-26")`, `MD-15_UP-22_R-27`); a key without a selector is
@@ -2111,6 +2179,34 @@ mod tests {
         assert_eq!(direct.containers, by_ref.containers);
         assert_eq!(direct.value(&src, None, "P-1_R-1").as_deref(), Some("1"));
         assert_eq!(direct.value(&src, None, "P-3_R-3").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn test_dynamic_memo_evaluate_shares_one_evaluation_per_value_map() {
+        let src = source();
+        let other = source();
+        let memo = DynamicMemo::new(&src);
+        let on = BTreeMap::from([("P-1_R-1".to_string(), "1".to_string())]);
+        let first = memo.evaluate(&on);
+        let again = memo.evaluate(&on);
+        assert!(std::sync::Arc::ptr_eq(&first, &again));
+        let direct = evaluate_dynamic(&src, &on);
+        assert_eq!(first.parameters, direct.parameters);
+        assert_eq!(first.com_objects, direct.com_objects);
+        assert_eq!(first.containers, direct.containers);
+        assert_eq!(first.parameter_placements, direct.parameter_placements);
+        assert_eq!(
+            memo.evaluate(&BTreeMap::new()).parameters,
+            evaluate_dynamic(&src, &BTreeMap::new()).parameters
+        );
+        assert_eq!(memo.evaluations(), 2);
+        // Another program object is evaluated directly, never memoized.
+        assert_eq!(memo.evaluate_for(&other, &on).parameters, direct.parameters);
+        assert!(std::sync::Arc::ptr_eq(
+            &memo.evaluate_for(&src, &on),
+            &first
+        ));
+        assert_eq!(memo.evaluations(), 2);
     }
 
     #[test]

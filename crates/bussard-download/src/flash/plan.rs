@@ -227,6 +227,35 @@ pub fn plan_flash_with_object_flags(
     table_images: &BTreeMap<u32, Vec<u8>>,
     object_flags: &BTreeMap<u16, bussard_model::Flags>,
 ) -> std::result::Result<FlashPlan, PlanError> {
+    plan_flash_with_memo(
+        app,
+        device,
+        device_mask,
+        overrides,
+        base_offsets,
+        template_ops,
+        table_images,
+        object_flags,
+        &bussard_prod::dynamic::DynamicMemo::new(app),
+    )
+}
+
+/// [`plan_flash_with_object_flags`], evaluating the Dynamic section through
+/// `memo` (issue #367), so a caller that evaluates the same overrides for
+/// other reasons (the group-object table image, a parameter decode) shares
+/// the evaluation. The plan is the same.
+#[allow(clippy::too_many_arguments)] // plan_flash_with_object_flags's inputs plus the memo.
+pub fn plan_flash_with_memo(
+    app: &ApplicationProgram,
+    device: &str,
+    device_mask: u16,
+    overrides: &BTreeMap<String, String>,
+    base_offsets: &BTreeMap<String, u32>,
+    template_ops: Option<&[LoadOp]>,
+    table_images: &BTreeMap<u32, Vec<u8>>,
+    object_flags: &BTreeMap<u16, bussard_model::Flags>,
+    memo: &bussard_prod::dynamic::DynamicMemo<'_, ApplicationProgram>,
+) -> std::result::Result<FlashPlan, PlanError> {
     // 1. Family gate. System B and System 7 (mask 0705/0701, issue #49) are the
     //    two supported families; every other mask refuses cleanly. System 7 is
     //    dispatched to its own lowering below (after the shared mask-match check).
@@ -275,6 +304,7 @@ pub fn plan_flash_with_object_flags(
             profile,
             None,
             &tables,
+            memo,
         );
     }
 
@@ -297,12 +327,11 @@ pub fn plan_flash_with_object_flags(
     // not in the product data): a module-instance override therefore refuses at
     // pre-flight rather than misplacing a byte — see `compute_parameter_image`.
     let (param_images, placed) =
-        bussard_prod::compute_parameter_image_placed(app, overrides, base_offsets).map_err(
-            |e| PlanError::UnresolvableImage {
+        bussard_prod::compute_parameter_image_placed_with(app, overrides, base_offsets, memo)
+            .map_err(|e| PlanError::UnresolvableImage {
                 step: 0,
                 reason: format!("computing the parameter image: {e}"),
-            },
-        )?;
+            })?;
 
     // The 5-octet application-program-version (app-id / run-state) value ETS
     // writes to the app object's PID 13 on LoadCompleted, synthesized from the

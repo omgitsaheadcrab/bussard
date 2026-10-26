@@ -77,7 +77,7 @@ pub use keyring_checks::{KeyringFacts, KeyringStatus, validate_keyring};
 pub use keystore_meta::{KEYSTORE_META_FILE, KeyStoreMeta, KeyStoreMetaError, KeyringExport};
 pub use lint::{GroupsLint, LintConfig, TopologyLint, lint};
 pub use loader::{LoadError, LoadedDevice, Model, SaveError, import_language, load_config};
-pub use lock_products::{PinError, PinReport, pin_products, sha256_file};
+pub use lock_products::{PinError, PinReport, pin_products, sha256_file, sha256_file_cached};
 pub use merge::{Conflict, MergeReport, merge, normalize_spellings};
 pub use param_model::{ParamDef, ParamKind, ProductModel, ProductModels};
 pub use scaffold::{Plan, PlanRoom, Scheme, scaffold, scaffold_file};
