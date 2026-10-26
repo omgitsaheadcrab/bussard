@@ -45,6 +45,12 @@ impl Bus {
         self.devices.get(&address)
     }
 
+    /// Borrow a device mutably: the KNXnet/IP server's local device
+    /// management (bussard issue #398) reaches the interface it serves.
+    pub fn device_mut(&mut self, address: IndividualAddress) -> Option<&mut Device> {
+        self.devices.get_mut(&address)
+    }
+
     /// Deliver an inbound telegram from the tool. Returns the response telegrams
     /// the addressed device produced (already framed as `L_Data.ind`). Every
     /// telegram in both directions is published on the event stream.

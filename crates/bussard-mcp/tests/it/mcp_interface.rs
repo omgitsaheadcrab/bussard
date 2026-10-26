@@ -281,3 +281,79 @@ async fn test_knx_plan_device_refuses_to_reconfigure_its_own_interface() -> anyh
     assert_eq!(h.device(|d| d.writes)?, 0);
     h.stop().await
 }
+
+/// `knx_interface_secure` (issue #398): without a digest it returns the
+/// steps, the generated credentials (names only) and a digest; a wrong
+/// digest is refused; without a key store the call is refused.
+#[tokio::test]
+async fn test_knx_interface_secure_plans_and_checks_the_digest() -> anyhow::Result<()> {
+    let h = Harness::start([192, 168, 1, 74]).await?;
+    // SAFETY: nextest runs each test in its own process.
+    unsafe {
+        std::env::set_var("BUSSARD_KEYRING_PASSWORD", "synthetic-store-password");
+    }
+    let refused = h
+        .call(
+            "knx_interface_secure",
+            json!({"address": "1.1.200", "state": "on"}),
+        )
+        .await?;
+    assert_eq!(refused["refused"], true, "{refused}");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no key store"),
+        "{refused}"
+    );
+
+    let mut store = bussard_project::KeyStore::new("Synthetic");
+    store.devices.insert(
+        "1.1.200".parse()?,
+        bussard_project::keystore::StoreDevice {
+            fdsk: Some(bussard_secure::Key16::new([0x24; 16])),
+            ..bussard_project::keystore::StoreDevice::default()
+        },
+    );
+    store.save(h.dir.path(), "synthetic-store-password")?;
+    let plan = h
+        .call(
+            "knx_interface_secure",
+            json!({"address": "1.1.200", "state": "on"}),
+        )
+        .await?;
+    assert_eq!(plan["ok"], true, "{plan}");
+    assert_eq!(plan["steps"].as_array().map(Vec::len), Some(10), "{plan}");
+    assert_eq!(
+        plan["generated"].as_array().map(Vec::len),
+        Some(11),
+        "tool key, code, management password, 8 users: {plan}"
+    );
+    let digest = plan["plan_digest"].as_str().unwrap_or("").to_string();
+    assert_eq!(digest.len(), 16, "{plan}");
+    let text = plan.to_string();
+    assert!(
+        !text.contains("2424"),
+        "no key material in the plan: {text}"
+    );
+
+    let wrong = h
+        .call(
+            "knx_interface_secure",
+            json!({"address": "1.1.200", "state": "on", "plan_digest": "0000000000000000"}),
+        )
+        .await?;
+    assert_eq!(wrong["refused"], true, "{wrong}");
+    assert!(
+        wrong["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("does not match"),
+        "{wrong}"
+    );
+    // Nothing was written: the store still has no tool key.
+    let store = bussard_project::KeyStore::load(h.dir.path(), "synthetic-store-password")?
+        .ok_or_else(|| anyhow::anyhow!("no key store"))?;
+    assert!(store.devices[&"1.1.200".parse()?].tool_key.is_none());
+    h.stop().await
+}

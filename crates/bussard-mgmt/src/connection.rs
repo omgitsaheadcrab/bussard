@@ -922,6 +922,52 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
         }
     }
 
+    /// A request/response round-trip whose request is wrapped under the
+    /// current tool key and whose response, and everything after it, uses
+    /// `next_key` (issue #398).
+    ///
+    /// This is the write of a new tool key (`PID_TOOL_KEY`): a Data Secure
+    /// device answers it under the key it was just given, and the connection
+    /// continues under that key with the sequences running on (CONFIRMED by
+    /// the ETS activation capture of 1.1.200, 2026-10-26). The key is switched
+    /// after the request is wrapped and before it is sent, so a response the
+    /// device folds into its `T_ACK` verifies too.
+    ///
+    /// # Errors
+    ///
+    /// [`MgmtError::Secure`] on a plain connection (there is no key to
+    /// replace) and as [`request`](Self::request) otherwise. When the request
+    /// fails after the switch, the connection keeps the new key: the device
+    /// may have taken it, and the caller decides which key to retry with.
+    pub async fn request_rekeyed(
+        &mut self,
+        apci: u16,
+        data: &[u8],
+        next_key: bussard_secure::Key16,
+    ) -> Result<(u16, Vec<u8>)> {
+        if self.closed {
+            return Err(MgmtError::Disconnected {
+                address: self.target,
+            });
+        }
+        if !self.secure.is_active() {
+            return Err(MgmtError::Secure {
+                address: self.target,
+                source: bussard_secure::AsduError::UnexpectedService(0x90),
+            });
+        }
+        self.ensure_secure_sync().await?;
+        self.last_send_apci = apci;
+        let tpci_octet = tpci::ndt(self.send_seq);
+        let (wire_apci, wire_data) =
+            self.secure
+                .wrap_outgoing(self.target, self.source, tpci_octet, apci, data)?;
+        self.secure.set_tool_key(next_key);
+        self.send_numbered(tpci_octet, wire_apci, &wire_data)
+            .await?;
+        self.recv_response().await
+    }
+
     /// A request/response round-trip: send the request NDT, wait for the ACK,
     /// then wait for and acknowledge the response NDT. Returns the response APCI
     /// and payload octets.

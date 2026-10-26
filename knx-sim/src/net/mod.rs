@@ -39,7 +39,8 @@ use crate::secure::ipsecure::{self, Handshake, SecureSession};
 use crate::wire::IndividualAddress;
 use crate::wire::cemi::CemiLData;
 use crate::wire::knxnetip::{
-    ConnectionHeader, E_CONNECTION_ID, E_CONNECTION_TYPE, KnxnetIpFrame, service,
+    ConnectionHeader, DEVICE_MGMT_CONNECTION, E_CONNECTION_ID, E_CONNECTION_TYPE, KnxnetIpFrame,
+    service,
 };
 
 /// Who a frame came from: a UDP endpoint, a secure TCP connection, or a
@@ -128,6 +129,20 @@ pub struct KnxnetIpServer {
     started: Instant,
     /// KNXnet/IP Secure, when enabled.
     secure: Option<SecureGateway>,
+    /// The bus device this gateway is the management server of (bussard
+    /// issue #398): its KNXnet/IP Secure properties decide, after each of its
+    /// master resets, whether the gateway serves plain or secure tunnelling.
+    interface_device: Option<u16>,
+    /// The master-reset epoch of [`interface_device`](Self::interface_device)
+    /// last applied.
+    interface_epoch: u64,
+    /// Open device management connections (bussard issue #398): the channel
+    /// and the next sequence of the requests the server sends, per peer.
+    mgmt: BTreeMap<Peer, (u8, u8)>,
+    /// The transport connection the server holds to the interface device for
+    /// each device management peer's `T_Data_Connected` traffic: the next
+    /// numbered-data sequence it sends.
+    mgmt_transport: BTreeMap<Peer, u8>,
 }
 
 /// Errors from running the server.
@@ -153,7 +168,71 @@ impl KnxnetIpServer {
             peer: None,
             started: Instant::now(),
             secure: None,
+            interface_device: None,
+            interface_epoch: 0,
+            mgmt: BTreeMap::new(),
+            mgmt_transport: BTreeMap::new(),
         })
+    }
+
+    /// Makes the gateway the KNXnet/IP server of the bus device `address`
+    /// (bussard issue #398): the description names it, and after each of its
+    /// master resets the gateway switches to secure-only tunnelling with the
+    /// credentials of its KNXnet/IP Secure properties, or back to plain.
+    pub fn set_interface_device(&mut self, address: u16) {
+        self.interface_device = Some(address);
+    }
+
+    /// Applies the interface device's KNXnet/IP Secure state after a master
+    /// reset (bussard issue #398). A restart ends every tunnel and session.
+    fn sync_interface_secure(&mut self) {
+        let Some(address) = self.interface_device else {
+            return;
+        };
+        let Some(ip) = self
+            .bus
+            .device(IndividualAddress(address))
+            .and_then(|d| d.ip_secure())
+        else {
+            return;
+        };
+        if ip.epoch() == self.interface_epoch {
+            return;
+        }
+        self.interface_epoch = ip.epoch();
+        let state = ip.applied().cloned();
+        self.peer = None;
+        self.tx_seqs.clear();
+        let old_listener = self.secure.take().and_then(|s| s.listener);
+        let Some(state) = state else {
+            tracing::info!("interface {address:#06x}: KNXnet/IP Secure off, plain tunnelling");
+            return;
+        };
+        let listener = match old_listener {
+            Some(l) => Some(l),
+            None => self
+                .socket
+                .local_addr()
+                .and_then(TcpListener::bind)
+                .and_then(|l| l.set_nonblocking(true).map(|()| l))
+                .ok(),
+        };
+        tracing::info!(
+            users = state.users.len(),
+            "interface {address:#06x}: KNXnet/IP Secure on, secure-only tunnelling"
+        );
+        self.secure = Some(SecureGateway {
+            individual_address: address,
+            device_key: state.device_key,
+            secure_only: true,
+            users: state.users,
+            listener,
+            next_id: 0,
+            conns: BTreeMap::new(),
+            udp: false,
+            udp_sessions: BTreeMap::new(),
+            session_timeout: None,
+        });
     }
 
     /// Enables KNXnet/IP Secure: binds TCP on the gateway's own address and
@@ -215,7 +294,11 @@ impl KnxnetIpServer {
         // stimulus periods while keeping the loop responsive to client traffic.
         // With a TCP side the loop also polls the secure connections, so it
         // wakes every few milliseconds instead.
-        let wake = if self.secure.is_some() { 5 } else { 100 };
+        let wake = if self.secure.is_some() || self.interface_device.is_some() {
+            5
+        } else {
+            100
+        };
         self.socket
             .set_read_timeout(Some(Duration::from_millis(wake)))?;
         let mut buf = [0u8; 1024];
@@ -247,6 +330,7 @@ impl KnxnetIpServer {
             }
             self.poll_tcp();
             self.pump_stimulus();
+            self.sync_interface_secure();
         }
     }
 
@@ -338,6 +422,9 @@ impl KnxnetIpServer {
             service::CONNECTIONSTATE_REQUEST => self.on_connectionstate_request(&frame.body, peer),
             service::DISCONNECT_REQUEST => self.on_disconnect_request(&frame.body, peer),
             service::TUNNELLING_REQUEST => self.on_tunnelling_request(&frame.body, peer),
+            service::DEVICE_CONFIGURATION_REQUEST => {
+                self.on_device_configuration(&frame.body, peer)
+            }
             service::DESCRIPTION_REQUEST => {
                 let out = KnxnetIpFrame::encode(service::DESCRIPTION_RESPONSE, &self.dibs(false));
                 self.send_frame(&out, peer)
@@ -365,6 +452,7 @@ impl KnxnetIpServer {
             .secure
             .as_ref()
             .map(|s| s.individual_address)
+            .or(self.interface_device)
             .unwrap_or(0x1000);
         let mut out = vec![0u8; 54];
         out[0] = 54;
@@ -573,6 +661,8 @@ impl KnxnetIpServer {
             }
         }
         self.tx_seqs.remove(&peer);
+        self.mgmt.remove(&peer);
+        self.mgmt_transport.remove(&peer);
         if self.peer == Some(peer) {
             self.peer = None;
         }
@@ -698,7 +788,12 @@ impl KnxnetIpServer {
         }
     }
 
-    fn on_connect_request(&mut self, _body: &[u8], peer: Peer) -> Result<(), ServerError> {
+    fn on_connect_request(&mut self, body: &[u8], peer: Peer) -> Result<(), ServerError> {
+        // The CRI after the two HPAIs: a device management connection (type
+        // 3, bussard issue #398) is served by the interface device itself.
+        if body.get(17) == Some(&DEVICE_MGMT_CONNECTION) && self.interface_device.is_some() {
+            return self.on_mgmt_connect(peer);
+        }
         if let (Peer::Udp(_), Some(secure)) = (peer, &self.secure)
             && secure.secure_only
         {
@@ -748,6 +843,163 @@ impl KnxnetIpServer {
         body.extend_from_slice(&tunnel_ia.to_be_bytes());
         let out = KnxnetIpFrame::encode(service::CONNECT_RESPONSE, &body);
         self.send_frame(&out, peer)
+    }
+
+    /// A device management CONNECT_REQUEST: refused on a secure-only
+    /// interface over plain UDP (device management is a secured family
+    /// there), else answered with a device management CRD.
+    fn on_mgmt_connect(&mut self, peer: Peer) -> Result<(), ServerError> {
+        if let (Peer::Udp(_), Some(secure)) = (peer, &self.secure)
+            && secure.secure_only
+        {
+            let out = KnxnetIpFrame::encode(service::CONNECT_RESPONSE, &[0x00, E_CONNECTION_TYPE]);
+            return self.send_frame(&out, peer);
+        }
+        let channel = 0x80u8.wrapping_add(self.mgmt.len() as u8);
+        self.mgmt.insert(peer, (channel, 0));
+        let mut body = vec![channel, 0x00];
+        match peer {
+            Peer::Tcp(_) => body.extend_from_slice(&[0x08, 0x02, 0, 0, 0, 0, 0, 0]),
+            _ => body.extend_from_slice(&hpai(self.socket.local_addr()?)),
+        }
+        body.extend_from_slice(&[0x02, DEVICE_MGMT_CONNECTION]);
+        let out = KnxnetIpFrame::encode(service::CONNECT_RESPONSE, &body);
+        self.send_frame(&out, peer)
+    }
+
+    /// A DEVICE_CONFIGURATION_REQUEST on a device management connection
+    /// (bussard issue #398), as ETS sends them to the Jung interface: cEMI
+    /// `T_Data_Connected.req` / `T_Data_Individual.req` (reserved addresses,
+    /// then a TPDU) reach the interface device as `L_Data` from `0.0.0` and
+    /// its answers come back as `.ind`; `M_PropRead.req`, `M_PropWrite.req`
+    /// and `M_Reset.req` are the device's local management.
+    fn on_device_configuration(&mut self, body: &[u8], peer: Peer) -> Result<(), ServerError> {
+        let (Some(hdr), Some(&(channel, _)), Some(device)) = (
+            ConnectionHeader::parse(body),
+            self.mgmt.get(&peer),
+            self.interface_device,
+        ) else {
+            return Ok(());
+        };
+        if matches!(peer, Peer::Udp(_) | Peer::SecureUdp(_)) {
+            let ack = KnxnetIpFrame::encode(
+                service::DEVICE_CONFIGURATION_ACK,
+                &ConnectionHeader {
+                    channel: hdr.channel,
+                    seq: hdr.seq,
+                    status: if hdr.channel == channel {
+                        0x00
+                    } else {
+                        E_CONNECTION_ID
+                    },
+                }
+                .to_bytes(),
+            );
+            self.send_frame(&ack, peer)?;
+        }
+        if hdr.channel != channel {
+            return Ok(());
+        }
+        let cemi = body.get(4..).unwrap_or_default();
+        let mut answers: Vec<Vec<u8>> = Vec::new();
+        match cemi.first() {
+            Some(&mc @ (0x41 | 0x4A)) => {
+                let add = usize::from(cemi.get(1).copied().unwrap_or(0));
+                let off = 2 + add + 6;
+                let Some(tpdu) = cemi.get(off + 1..).filter(|t| !t.is_empty()) else {
+                    return Ok(());
+                };
+                let ind = if mc == 0x41 { 0x89 } else { 0x94 };
+                for resp in self.mgmt_deliver(peer, device, tpdu, mc == 0x41) {
+                    let mut out = vec![ind, 0x00, 0, 0, 0, 0, 0, 0];
+                    out.push((resp.len() - 1) as u8);
+                    out.extend_from_slice(&resp);
+                    answers.push(out);
+                }
+            }
+            Some(_) => {
+                if let Some(con) = self
+                    .bus
+                    .device_mut(IndividualAddress(device))
+                    .and_then(|d| d.local_management(cemi))
+                {
+                    answers.push(con);
+                }
+            }
+            None => {}
+        }
+        for cemi in answers {
+            let seq = match self.mgmt.get_mut(&peer) {
+                Some((_, seq)) => {
+                    let s = *seq;
+                    *seq = seq.wrapping_add(1);
+                    s
+                }
+                None => 0,
+            };
+            let mut out = ConnectionHeader {
+                channel,
+                seq,
+                status: 0x00,
+            }
+            .to_bytes()
+            .to_vec();
+            out.extend_from_slice(&cemi);
+            let frame = KnxnetIpFrame::encode(service::DEVICE_CONFIGURATION_REQUEST, &out);
+            self.send_frame(&frame, peer)?;
+        }
+        Ok(())
+    }
+
+    /// Delivers one transport-layer service of a device management peer to
+    /// the interface device and returns the application answers as
+    /// unnumbered TPDUs. A connected service rides the transport connection
+    /// the server holds to the device (opened with `T_Connect` on first use):
+    /// the request goes as numbered data, the device's numbered answers are
+    /// acknowledged here, as the cEMI server of a real interface does.
+    fn mgmt_deliver(
+        &mut self,
+        peer: Peer,
+        device: u16,
+        tpdu: &[u8],
+        connected: bool,
+    ) -> Vec<Vec<u8>> {
+        let frame = |tpdu: Vec<u8>| CemiLData {
+            message_code: crate::wire::cemi::MessageCode::LDataReq,
+            ctrl1: 0xBC,
+            ctrl2: 0x60,
+            source: IndividualAddress(0),
+            dest: device,
+            tpdu,
+        };
+        let mut request = tpdu.to_vec();
+        if connected {
+            if !self.mgmt_transport.contains_key(&peer) {
+                self.bus.deliver_from_tool(&frame(vec![0x80]));
+                self.mgmt_transport.insert(peer, 0);
+            }
+            let seq = self.mgmt_transport.get(&peer).copied().unwrap_or(0);
+            request[0] = 0x40 | ((seq & 0x0F) << 2) | (request[0] & 0x03);
+            self.mgmt_transport.insert(peer, seq.wrapping_add(1) & 0x0F);
+        }
+        let mut out = Vec::new();
+        for resp in self.bus.deliver_from_tool(&frame(request)) {
+            let Some(&first) = resp.tpdu.first() else {
+                continue;
+            };
+            if resp.tpdu.len() < 2 {
+                continue; // a transport ACK or control frame
+            }
+            if first & 0xC0 == 0x40 {
+                // Numbered data from the device: acknowledge it.
+                let ack = 0xC2 | (first & 0x3C);
+                self.bus.deliver_from_tool(&frame(vec![ack]));
+            }
+            let mut plain = resp.tpdu.clone();
+            plain[0] &= 0x03;
+            out.push(plain);
+        }
+        out
     }
 
     fn on_connectionstate_request(&mut self, body: &[u8], peer: Peer) -> Result<(), ServerError> {

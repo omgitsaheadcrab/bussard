@@ -12,6 +12,7 @@ mod data_secure;
 mod group_comm;
 mod group_dispatch;
 mod interface_object;
+pub mod ip_secure;
 pub mod knxnet_object;
 mod load_state;
 mod lsm;
@@ -272,6 +273,9 @@ pub struct Device {
     /// How many tunnelling addresses (PID 53) the KNXnet/IP parameter object
     /// holds at most, as its property description says.
     knxnet_slots: u16,
+    /// The KNXnet/IP Secure properties of a simulated KNX IP interface
+    /// (bussard issue #398), present with the KNXnet/IP parameter object.
+    ip_secure: Option<ip_secure::IpSecureObject>,
     /// The process time (seconds) reported in the `A_Restart_Response` to a
     /// factory reset (erase code 7).
     restart_process_time_s: u16,
@@ -454,7 +458,126 @@ impl Device {
         }
         self.knxnet_by_type = Some(object);
         self.knxnet_slots = params.tunnel_slots;
+        if self.ip_secure.is_none() {
+            self.ip_secure = Some(ip_secure::IpSecureObject::new());
+        }
         self
+    }
+
+    /// Puts the device's security object in factory state (security mode
+    /// off), for a device that takes Data Secure tool access under its FDSK:
+    /// a KNX IP interface before IP Secure is switched on (bussard issue
+    /// #398). No effect on a plain device.
+    pub fn with_factory_security(mut self) -> Self {
+        if self.security_object.is_some() {
+            self.security_object = Some(SecurityObject::new_factory());
+        }
+        self
+    }
+
+    /// The KNXnet/IP Secure properties, on a simulated KNX IP interface.
+    pub fn ip_secure(&self) -> Option<&ip_secure::IpSecureObject> {
+        self.ip_secure.as_ref()
+    }
+
+    /// The tunnelling addresses (`PID_ADDITIONAL_INDIVIDUAL_ADDRESSES`), raw,
+    /// in slot order.
+    fn tunnel_addresses(&self) -> Vec<u16> {
+        self.knxnet_property(53)
+            .unwrap_or_default()
+            .chunks(2)
+            .filter(|c| c.len() == 2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect()
+    }
+
+    /// cEMI local device management on the device a KNXnet/IP server serves
+    /// (bussard issue #398): `M_PropRead.req`, `M_PropWrite.req` and
+    /// `M_Reset.req` (KNX 3/6/3 §4.1.7) on the objects reached by type (the
+    /// KNXnet/IP parameter object, its Secure properties, a vendor object).
+    /// `body` is the cEMI frame from the message code on; the answer is the
+    /// confirmation frame (`M_PropRead.con`, `M_PropWrite.con`), or `None`
+    /// for `M_Reset.req` and anything else.
+    pub fn local_management(&mut self, body: &[u8]) -> Option<Vec<u8>> {
+        let (&mc, rest) = body.split_first()?;
+        if mc == 0xF1 {
+            self.apply_ip_secure();
+            return None;
+        }
+        if !(mc == 0xFC || mc == 0xF6) || rest.len() < 6 {
+            return None;
+        }
+        let object_type = u16::from_be_bytes([rest[0], rest[1]]);
+        let instance = u32::from(rest[2]);
+        let pid = u32::from(rest[3]);
+        let count = rest[4] >> 4;
+        let start = (u16::from(rest[4] & 0x0F) << 8) | u16::from(rest[5]);
+        let packed = (instance << 12) | pid;
+        let mut request = object_type.to_be_bytes().to_vec();
+        request.extend_from_slice(&packed.to_be_bytes()[1..]);
+        request.push(count);
+        request.extend_from_slice(&start.to_be_bytes());
+        request.extend_from_slice(&rest[6..]);
+        let write = mc == 0xF6;
+        let answer = self.ip_secure.as_mut().and_then(|ip| {
+            if write {
+                ip.write(&request)
+            } else {
+                ip.read(&request)
+            }
+        });
+        let answer = match answer {
+            Some(a) => Some(a),
+            None if object_type == knxnet_object::IOT_KNXNET_IP_PARAMETER => {
+                let slots = self.knxnet_slots;
+                let obj = self.knxnet_by_type.as_mut()?;
+                if write {
+                    knxnet_object::ext_write(obj, &request, slots).map(|(a, _)| a)
+                } else {
+                    knxnet_object::typed_ext_read(object_type, obj, &request)
+                }
+            }
+            None => {
+                let obj = self.typed_objects.get_mut(&object_type)?;
+                if write {
+                    knxnet_object::typed_ext_write(object_type, obj, &request)
+                } else {
+                    knxnet_object::typed_ext_read(object_type, obj, &request)
+                }
+            }
+        }?;
+        // The extended answer: header(5) count start(2) then data (read) or
+        // the return code (write).
+        let header = &rest[..4];
+        let mut out = vec![if write { 0xF5 } else { 0xFB }];
+        out.extend_from_slice(header);
+        if write {
+            let rc = answer.get(8).copied().unwrap_or(1);
+            if rc == 0 {
+                out.extend_from_slice(&rest[4..6]);
+            } else {
+                out.extend_from_slice(&[rest[4] & 0x0F, rest[5], 0x07]);
+            }
+        } else {
+            let served = answer.get(5).copied().unwrap_or(0);
+            if served == 0 {
+                out.extend_from_slice(&[rest[4] & 0x0F, rest[5], 0x07]);
+            } else {
+                out.push((served << 4) | (rest[4] & 0x0F));
+                out.push(rest[5]);
+                out.extend_from_slice(answer.get(8..).unwrap_or_default());
+            }
+        }
+        Some(out)
+    }
+
+    /// The master reset of a simulated KNX IP interface: its KNXnet/IP Secure
+    /// properties take effect.
+    pub(super) fn apply_ip_secure(&mut self) {
+        let tunnels = self.tunnel_addresses();
+        if let Some(ip) = self.ip_secure.as_mut() {
+            ip.apply(&tunnels);
+        }
     }
 
     /// The object index of the listed KNXnet/IP parameter object, if any.

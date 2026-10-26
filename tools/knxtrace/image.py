@@ -558,6 +558,7 @@ def compare(
     min_coverage: float = DEFAULT_MIN_COVERAGE,
     page_size: int = DEFAULT_PAGE_SIZE,
     scope: Optional[List[str]] = None,
+    phase: Optional[str] = None,
 ) -> Dict[str, object]:
     """Diffs bussard's dry-run images against the composed ETS image.
 
@@ -668,7 +669,7 @@ def compare(
     # The property parity has its own verdict: `verdict` stays the image
     # verdict the pre-flash gate reads, so a known extra property write does
     # not hide whether the memory images match.
-    props = compare_properties(plan, image_dir, _ets_groups(plan, results, ets))
+    props = compare_properties(plan, image_dir, _ets_groups(plan, results, ets), phase=phase)
     for r in results:
         r["in_scope"] = scope is None or region_short(r["region"]) in scope
     judged = [r for r in results if r["in_scope"]]
@@ -685,6 +686,11 @@ def compare(
         # Matching octets from a thin capture are not evidence (issue #347).
         overall = NOT_COMPARABLE
         reason = "thin: " + cov["reason"] if IDENTICAL in verdicts else "nothing compared"
+    if plan.get("system") == IP_SECURE_SYSTEM:
+        # `bussard interface secure --dry-run` (issue #398) writes no memory:
+        # the property parity is the verdict.
+        overall = str(props.get("verdict", NOT_COMPARABLE))
+        reason = str(props.get("reason") or "")
     return {
         "device": plan.get("device"),
         "application": plan.get("application", {}).get("id"),
@@ -887,6 +893,7 @@ def _structured_entry(step: dict, rec: dict) -> Dict[str, object]:
         "data": data if isinstance(data, str) else None,
         "sha256": rec.get("sha256"),
         "entries": rec.get("entries"),
+        "phase": rec.get("phase"),
     }
 
 
@@ -1064,6 +1071,8 @@ def _value_check(ours: Dict[str, object], theirs: Dict[str, object]) -> Tuple[st
         ours_hash = sha256(bytes.fromhex(ours_hex))[:8]
     elif isinstance(ours_sha, str):
         ours_hash = ours_sha[:8]
+    elif ours["object"].get("type") == SECURITY_OBJECT_TYPE and int(ours["pid"]) == 59:
+        return "no-value", "the send sequence comes from the clock on both sides"
     else:
         return "no-value", "plan.json carries no value for this step"
     if redacted:
@@ -1091,8 +1100,28 @@ def _is_commissioning(entry: Dict[str, object], ours_keys: set) -> bool:
     )
 
 
+# The KNXnet/IP Secure properties `bussard interface secure on|off` writes
+# (issue #398): the security object's mode, tool key and send sequence (type
+# 17 PIDs 51, 56, 59) and the KNXnet/IP parameter object's PIDs 91 to 97. A
+# plan with `system: "ip-secure"` is compared against these only: ETS also
+# rewrites the `[knxnet]` table and may run the load procedure in the same
+# capture, which `bussard apply` and `bussard flash` cover.
+IP_SECURE_SYSTEM = "ip-secure"
+IP_SECURE_PROPERTIES = frozenset(
+    {("type17.1", 51), ("type17.1", 56), ("type17.1", 59)}
+    | {("type11.1", pid) for pid in range(91, 98)}
+)
+
+
+def _ip_secure_entry(entry: Dict[str, object]) -> bool:
+    return (_obj_label(entry["object"]), int(entry["pid"])) in IP_SECURE_PROPERTIES
+
+
 def compare_properties(
-    plan: dict, image_dir: str, ets_groups: Optional[Dict[int, str]] = None
+    plan: dict,
+    image_dir: str,
+    ets_groups: Optional[Dict[int, str]] = None,
+    phase: Optional[str] = None,
 ) -> Dict[str, object]:
     """Aligns bussard's property-write steps with ETS's `properties.json`.
 
@@ -1122,6 +1151,14 @@ def compare_properties(
                 if ga:
                     entry["ga"] = ga
     ours = plan_property_writes(plan)
+    ip_secure = plan.get("system") == IP_SECURE_SYSTEM
+    if ip_secure:
+        # Only the IP Secure properties, and with `phase` only the writes
+        # bussard sends under that key (`fdsk` or `tool`): the decoded half of
+        # a capture whose other half ran inside a KNXnet/IP Secure session.
+        ets = [e for e in ets if _ip_secure_entry(e)]
+        if phase:
+            ours = [e for e in ours if e.get("phase") == phase]
     matcher = difflib.SequenceMatcher(
         None, [_prop_key(e) for e in ours], [_prop_key(e) for e in ets], autojunk=False
     )
@@ -1264,6 +1301,11 @@ def _ranges(addrs: List[int]) -> List[List[int]]:
 
 
 def render(report: Dict[str, object]) -> List[str]:
+    if report.get("system") == IP_SECURE_SYSTEM:
+        # An `interface secure` plan writes properties only (issue #398).
+        lines = ["%s KNXnet/IP Secure: %s" % (report["device"], report["verdict"])]
+        lines.extend(render_properties(report.get("properties")))
+        return lines
     lines = [
         "%s %s (System %s): %s"
         % (report["device"], report["application"], report["system"], report["verdict"])

@@ -201,6 +201,18 @@ with `bussard apply` and requires the plan after it to be a no-op. Locally:
 `BUSSARD_KNX_SIM_BIN=$PWD/knx-sim/target/debug/serve cargo nextest run -p
 bussard-cli -E 'test(/sim_interface_loop/)'`.
 
+The same step runs `sim_interface_secure` (issue #398): a simulated interface
+in factory state (`security: { status: factory, tool_key: <FDSK> }`, Data
+Secure tool access under the FDSK, security mode off) whose gateway is its own
+KNXnet/IP server (`gateway.interface_device: "1.1.200"`). `bussard interface
+secure on` switches it on; at the master reset the sim's gateway turns to
+secure-only tunnelling with the credentials the interface was given, and the
+read-back runs over a KNXnet/IP Secure session with the key store's
+credentials. `off` switches it back to plain. The sim also serves KNXnet/IP
+device management for that interface (a type 3 CONNECT,
+`DEVICE_CONFIGURATION_REQUEST` with cEMI `M_PropRead`/`M_PropWrite`/`M_Reset`
+and `T_Data_Connected`, as ETS sends them; `knx-sim/tests/interface_device_management.rs`).
+
 The `corpus-sweep` job runs the committed-fixture sweep on every push and pull
 request. The `sim-catalog-loop` job runs the flash-then-plan loop over the
 curated subset (`--subset`) and needs the corpus like the corpus-gated tests:

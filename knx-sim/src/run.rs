@@ -75,6 +75,13 @@ pub fn serve_config(config_path: &Path) -> Result<()> {
             "KNXnet/IP Secure tunnelling"
         );
     }
+    if let Some(device) = &cfg.gateway.interface_device {
+        let ia: crate::wire::IndividualAddress = device
+            .parse()
+            .map_err(|e| anyhow::anyhow!("gateway.interface_device {device:?}: {e}"))?;
+        server.set_interface_device(ia.0);
+        tracing::info!(%device, "the gateway is the KNXnet/IP server of this device");
+    }
     tracing::info!(%addr, "KNXnet/IP tunnelling gateway listening");
     server.serve().context("serving")?;
     Ok(())

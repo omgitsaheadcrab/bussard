@@ -6,7 +6,7 @@
 #   scripts/campaign/95-offline-oracle.sh \
 #       --keyring project.knxkeys --row '1.1.12|secure.pcapng|project.knxproj|M-0004_A-...'
 #
-# Options: --dir MODEL (default knx), --out DIR, --keyring FILE, --no-admit,
+# Options: --dir MODEL (default knx), --out DIR, --keyring FILE (repeatable), --no-admit,
 # --min-coverage PERCENT (default 50), --check, --date YYYY-MM-DD.
 #
 # Before a real device is flashed, compare the memory images bussard WOULD
@@ -47,6 +47,16 @@
 #                                unchecked when absent. For a property-only
 #                                plan (a KNX IP interface, mask 0021), whose
 #                                memory verdict is always not-comparable
+#                run=secure-on|secure-off  compare `bussard interface secure
+#                                on|off --dry-run` (issue #398) instead of a
+#                                flash: the KNXnet/IP Secure property writes
+#                                (type 17 PIDs 51/56/59, type 11 PIDs 91-97)
+#                                against the capture's, key material by hash.
+#                                The product field is `-`; the verdict is the
+#                                property parity
+#                phase=fdsk|tool with run=: compare only bussard's writes under
+#                                that key (the decoded half of a capture whose
+#                                other half ran in a KNXnet/IP Secure session)
 #                scope=R1,R2     the regions the verdict and coverage judge
 #                                (addr, assoc, gobj, par, seg0x4800, ...), for a
 #                                capture that by design downloads only part of
@@ -113,6 +123,10 @@ ROWS_FILE=""
 SINGLE_ROW=""
 OUT=""
 KEYRING=""
+# Further keyrings for knxtrace (--keyring given again, issue #398): the export
+# from before a key rotation decodes the frames under the old keys.
+EXTRA_KEYRINGS=()
+CLI_KEYRING=0
 NO_ADMIT=0
 MIN_COVERAGE=""
 CHECK=0
@@ -131,8 +145,14 @@ while [ $# -gt 0 ]; do
     --out=*)   OUT="${1#*=}" ;;
     --date)    CAMPAIGN_DATE="${2:?--date needs YYYY-MM-DD}"; shift ;;
     --date=*)  CAMPAIGN_DATE="${1#*=}" ;;
-    --keyring) KEYRING="${2:?--keyring needs a .knxkeys file}"; shift ;;
-    --keyring=*) KEYRING="${1#*=}" ;;
+    --keyring)
+      CLI_KEYRING=1
+      if [ -z "$KEYRING" ]; then KEYRING="${2:?--keyring needs a .knxkeys file}"
+      else EXTRA_KEYRINGS+=("${2:?--keyring needs a .knxkeys file}"); fi
+      shift ;;
+    --keyring=*)
+      CLI_KEYRING=1
+      if [ -z "$KEYRING" ]; then KEYRING="${1#*=}"; else EXTRA_KEYRINGS+=("${1#*=}"); fi ;;
     --no-admit) NO_ADMIT=1 ;;
     --min-coverage) MIN_COVERAGE="${2:?--min-coverage needs a percent}"; shift ;;
     --min-coverage=*) MIN_COVERAGE="${1#*=}" ;;
@@ -158,7 +178,12 @@ if [ -n "$ROWS_FILE" ] && [ -f "$ROWS_FILE" ]; then
     set -- ${directive+"${directive[@]}"}
     while [ $# -gt 0 ]; do
       case "$1" in
-        --keyring)      [ -n "$KEYRING" ] || KEYRING="${2:?#@ --keyring needs a file}"; shift ;;
+        --keyring)
+          # The command line wins; several #@ lines give several keyrings.
+          if [ "$CLI_KEYRING" = 1 ]; then :
+          elif [ -z "$KEYRING" ]; then KEYRING="${2:?#@ --keyring needs a file}"
+          else EXTRA_KEYRINGS+=("${2:?#@ --keyring needs a file}"); fi
+          shift ;;
         --dir)          [ "$CLI_DIR" = 1 ] || MODEL_DIR="${2:?#@ --dir needs a directory}"; shift ;;
         --min-coverage) [ -n "$MIN_COVERAGE" ] || MIN_COVERAGE="${2:?#@ --min-coverage needs a percent}"; shift ;;
         --no-admit)     NO_ADMIT=1 ;;
@@ -181,6 +206,10 @@ if [ -n "$KEYRING" ]; then
   [ -f "$KEYRING" ] || die "no keyring at $KEYRING"
   [ -n "${BUSSARD_KEYRING_PASSWORD:-}" ] || die "--keyring needs the keyring password in \$BUSSARD_KEYRING_PASSWORD (export it or put it in the model's .env)"
   KEYRING_ARGS=(--keyring "$KEYRING")
+  for extra in ${EXTRA_KEYRINGS+"${EXTRA_KEYRINGS[@]}"}; do
+    [ -f "$extra" ] || die "no keyring at $extra"
+    KEYRING_ARGS+=(--keyring "$extra")
+  done
 fi
 
 # The bussard side's key material and admission (issue #347): the model's key
@@ -297,18 +326,25 @@ run_row() {
   product="$(trim "${product:-}")"; application="$(trim "${application:-}")"
   note_text="$(trim "${note_text:-}")"; recorded="$(trim "${recorded:-}")"
   options="$(trim "${options:-}")"
-  local expect="" confirmed="" props="" scope="" word
+  local expect="" confirmed="" props="" scope="" run="" phase="" word
   for word in $options; do
     case "$word" in
       expect=*)    expect="${word#expect=}" ;;
       confirmed=*) confirmed="${word#confirmed=}" ;;
       props=*)     props="${word#props=}" ;;
+      run=*)       run="${word#run=}" ;;
+      phase=*)     phase="${word#phase=}" ;;
       scope=*)     scope="${word#scope=}" ;;
-      *)           die "$device: unknown row option: $word (expect=..., confirmed=..., props=..., scope=...)" ;;
+      *)           die "$device: unknown row option: $word (expect=..., confirmed=..., props=..., run=..., phase=..., scope=...)" ;;
     esac
   done
   local scope_args=()
   [ -n "$scope" ] && scope_args=(--scope "$scope")
+  [ -n "$phase" ] && scope_args+=(--phase "$phase")
+  case "$run" in
+    ""|secure-on|secure-off) ;;
+    *) die "$device: unknown run=$run (secure-on or secure-off)" ;;
+  esac
   [ -n "$device" ] || return 0
   local dir="$OUT/$key"
   rm -rf "$dir"; ensure_dir "$dir"
@@ -325,7 +361,7 @@ with open(path, "w", encoding="utf-8") as fh:
                "expect_props": props or None,
                "skipped": None}, fh)
 PY
-  if [ -z "$product" ] || [ "$product" = "-" ]; then
+  if [ -z "$run" ] && { [ -z "$product" ] || [ "$product" = "-" ]; }; then
     not_comparable "$dir" "$device" "no product data${note_text:+: $note_text}"
     mark_skipped "$dir" "no product data"
     return 0
@@ -345,20 +381,31 @@ PY
   note "$(tail -1 "$dir/ets.log")"
 
   # 2. What bussard would write. --dry-run opens no connection.
-  local prod
-  if ! prod="$(resolve_product "$product")" || [ ! -f "$prod" ]; then
-    not_comparable "$dir" "$device" "product file not found"
-    return 0
-  fi
-  local app_args=()
-  [ -n "$application" ] && app_args=(--application "$application")
-  # No --keyring and no $BUSSARD_KEYRING: the model's key store decides.
-  if ! env -u BUSSARD_KEYRING "$BUSSARD_BIN" flash "$device" --product "$prod" \
-       ${app_args+"${app_args[@]}"} \
-       --dir "$PLAN_DIR" --dry-run --dump-images "$dir/bussard" --json \
-       >"$dir/plan.log" 2>"$dir/plan.err"; then
-    not_comparable "$dir" "$device" "bussard refused to plan: $(grep -v '^\s*$' "$dir/plan.err" | tail -1 | cut -c1-160)"
-    return 0
+  if [ -n "$run" ]; then
+    # `interface secure on|off --dry-run` (issue #398): the key store's
+    # credentials, hashed into plan.json, never printed.
+    if ! env -u BUSSARD_KEYRING "$BUSSARD_BIN" interface secure "${run#secure-}" "$device" \
+         --dir "$PLAN_DIR" --dry-run --dump-images "$dir/bussard" \
+         >"$dir/plan.log" 2>"$dir/plan.err"; then
+      not_comparable "$dir" "$device" "bussard refused to plan: $(grep -v '^\s*$' "$dir/plan.err" | tail -1 | cut -c1-160)"
+      return 0
+    fi
+  else
+    local prod
+    if ! prod="$(resolve_product "$product")" || [ ! -f "$prod" ]; then
+      not_comparable "$dir" "$device" "product file not found"
+      return 0
+    fi
+    local app_args=()
+    [ -n "$application" ] && app_args=(--application "$application")
+    # No --keyring and no $BUSSARD_KEYRING: the model's key store decides.
+    if ! env -u BUSSARD_KEYRING "$BUSSARD_BIN" flash "$device" --product "$prod" \
+         ${app_args+"${app_args[@]}"} \
+         --dir "$PLAN_DIR" --dry-run --dump-images "$dir/bussard" --json \
+         >"$dir/plan.log" 2>"$dir/plan.err"; then
+      not_comparable "$dir" "$device" "bussard refused to plan: $(grep -v '^\s*$' "$dir/plan.err" | tail -1 | cut -c1-160)"
+      return 0
+    fi
   fi
 
   # 3. The per-region diff.

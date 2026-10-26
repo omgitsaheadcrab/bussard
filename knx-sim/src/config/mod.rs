@@ -37,6 +37,12 @@ pub struct GatewayConfig {
     /// UDP tunnelling gateway, as before.
     #[serde(default)]
     pub secure: Option<IpSecureConfig>,
+    /// The bus device this gateway is the KNXnet/IP server of (e.g.
+    /// `1.1.200`, bussard issue #398): the description names it, and its
+    /// KNXnet/IP Secure properties switch the gateway between plain and
+    /// secure-only tunnelling at each of its master resets.
+    #[serde(default)]
+    pub interface_device: Option<String>,
 }
 
 /// A KNXnet/IP Secure tunnelling interface: TCP (and optionally UDP) on the
@@ -172,6 +178,10 @@ pub enum SecurityStatus {
     Activated,
     /// The device is plain (the default when the block is omitted).
     Plain,
+    /// The device takes Data Secure tool access under `tool_key`, its FDSK,
+    /// with the security mode off: a KNX IP interface in factory state before
+    /// IP Secure is switched on (bussard issue #398).
+    Factory,
 }
 
 impl SecurityConfig {
@@ -179,8 +189,11 @@ impl SecurityConfig {
     /// Returns a plain (`None`) activation only when `status: plain`; an
     /// `activated` block with a bad key is an error.
     fn to_activation(&self) -> Result<crate::device::SecureActivation, String> {
-        if self.status != SecurityStatus::Activated {
-            return Err("security block present but status is not `activated`".into());
+        if !matches!(
+            self.status,
+            SecurityStatus::Activated | SecurityStatus::Factory
+        ) {
+            return Err("security block present but status is not `activated` or `factory`".into());
         }
         let tool_key = crate::secure::Key16::from_hex(&self.tool_key)
             .ok_or_else(|| "tool_key must be 32 hex characters (16 bytes)".to_string())?;
@@ -543,7 +556,7 @@ impl SimConfig {
             // Only an `activated` security block produces a session; a `plain`
             // block (or an absent one) leaves the device plain (spec §6.4).
             let secure = match &dc.security {
-                Some(sec) if sec.status == SecurityStatus::Activated => Some(
+                Some(sec) if sec.status != SecurityStatus::Plain => Some(
                     sec.to_activation()
                         .map_err(|reason| ConfigError::BadDeviceOption {
                             device: dc.address.clone(),
@@ -571,6 +584,12 @@ impl SimConfig {
                 reason,
             })?
             .with_l4_exchange_budget(effective_l4_budget(dc.l4_exchange_budget));
+            let device = match &dc.security {
+                Some(sec) if sec.status == SecurityStatus::Factory => {
+                    device.with_factory_security()
+                }
+                _ => device,
+            };
             let device = match &dc.knxnet {
                 Some(k) => device.with_knxnet(
                     &k.parameters(address)

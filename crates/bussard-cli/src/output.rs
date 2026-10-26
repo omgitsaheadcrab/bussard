@@ -43,6 +43,8 @@ pub mod schema {
     pub const GROUPS_SECURE: u32 = 1;
     /// `bussard history --json`: `{ "snapshots": [...] }`.
     pub const HISTORY: u32 = 1;
+    /// `bussard interface secure --json` (issue #398).
+    pub const INTERFACE_SECURE: u32 = 1;
     /// `bussard keys export --json`.
     pub const KEYS_EXPORT: u32 = 1;
     /// `bussard keys import --json`.

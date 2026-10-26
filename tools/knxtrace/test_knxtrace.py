@@ -2097,5 +2097,65 @@ class TestIpSecureSessions(unittest.TestCase):
         self.assertEqual([label for label, _ in cands], ["tool", "fdsk"])
 
 
+class TestIpSecureCompare(unittest.TestCase):
+    """`imgdiff` of a `bussard interface secure --dry-run` plan (issue #398)."""
+
+    def ets_dir(self, records) -> str:
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        with open(os.path.join(out, "properties.json"), "w") as fh:
+            json.dump(records, fh)
+        return out
+
+    @staticmethod
+    def ets(seq, obj_type, pid, data_hex, index=1, redact=False, service="A_PropertyExtValue_WriteCon"):
+        import hashlib
+
+        data = bytes.fromhex(data_hex)
+        value = "redacted:" + hashlib.sha256(data).hexdigest()[:8] if redact else data_hex
+        return {"seq": seq, "service": service, "object": {"type": obj_type, "instance": 1},
+                "pid": pid, "count": 1, "index": index, "length": len(data), "data": value,
+                "secured": "tool"}
+
+    @staticmethod
+    def ours(step, obj_type, pid, data_hex, start=1, secret=False, phase="tool"):
+        import hashlib
+
+        data = bytes.fromhex(data_hex)
+        rec = {"object_type": obj_type, "instance": 1, "pid": pid, "start_element": start,
+               "length": len(data), "phase": phase}
+        if secret:
+            rec["sha256"] = hashlib.sha256(data).hexdigest()
+        else:
+            rec["data"] = data_hex
+        return {"index": step, "label": "step %d" % step, "phase": phase, "properties": [rec]}
+
+    def test_compare_properties_ip_secure_filters_and_hashes(self):
+        key = "42" * 16
+        ets = [
+            self.ets(1, 11, 76, "4142"),  # the [knxnet] table: not an IP Secure property
+            self.ets(2, 17, 56, key, redact=True),
+            self.ets(3, 11, 94, "00000401", index=None, service="A_FunctionPropertyExt_Command"),
+        ]
+        plan = {"system": "ip-secure", "steps": [
+            self.ours(1, 17, 56, key, secret=True, phase="fdsk"),
+            self.ours(2, 11, 94, "00000401", start=None),
+        ]}
+        props = memimage.compare_properties(plan, self.ets_dir(ets))
+        self.assertEqual(props["verdict"], memimage.IDENTICAL, props)
+        self.assertEqual(props["value_counts"], {"hash-equal": 1, "equal": 1})
+        only_tool = memimage.compare_properties(plan, self.ets_dir(ets), phase="tool")
+        self.assertEqual(only_tool["verdict"], memimage.DIFFERS)
+        self.assertEqual([e["key"][1] for e in only_tool["ets_only"]], [56])
+
+    def test_compare_properties_ip_secure_sequence_is_not_a_value(self):
+        plan = {"system": "ip-secure", "steps": [{"index": 1, "label": "seq", "properties": [
+            {"object_type": 17, "instance": 1, "pid": 59, "start_element": 1, "length": 6,
+             "phase": "tool"}]}]}
+        props = memimage.compare_properties(plan, self.ets_dir([self.ets(1, 17, 59, "0040b605ae0c")]))
+        self.assertEqual(props["verdict"], memimage.IDENTICAL)
+        self.assertIn("clock", props["matched"][0]["why"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

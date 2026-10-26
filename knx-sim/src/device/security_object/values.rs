@@ -183,6 +183,9 @@ impl SecurityObject {
                     return rc::INVALID_COMMAND;
                 }
                 self.tool_key_writes += 1;
+                let mut key = [0u8; TOOL_KEY_LEN];
+                key.copy_from_slice(value);
+                self.pending_tool_key = Some(key);
                 return rc::SUCCESS;
             }
             pid::SEQUENCE_NUMBER_SENDING => {
@@ -190,6 +193,9 @@ impl SecurityObject {
                     return rc::INVALID_COMMAND;
                 }
                 self.seq_sending.copy_from_slice(value);
+                let mut wide = [0u8; 8];
+                wide[2..].copy_from_slice(value);
+                self.pending_seq = Some(u64::from_be_bytes(wide));
                 return rc::SUCCESS;
             }
             _ => {}

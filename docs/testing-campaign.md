@@ -283,8 +283,17 @@ never read-confirmed, even when ETS read it first.
 summary table with a coverage column. A row is
 `device|capture|product|application|note|coverage|options`; the last two are
 optional: the coverage recorded for the row, and `expect=<verdict>`,
-`confirmed=<verdict>` (the verdict on the read-confirmed octets) or
-`scope=<regions>`. The summary's `confirmed` column shows the read-confirmed
+`confirmed=<verdict>` (the verdict on the read-confirmed octets),
+`props=<verdict>` (the property-write parity, for a property-only plan whose
+memory verdict is always not comparable) or `scope=<regions>`. `run=secure-on`
+or `run=secure-off` (issue #398) compares `bussard interface secure on|off
+--dry-run` instead of a flash: the KNXnet/IP Secure property writes (type 17
+PIDs 51, 56, 59, type 11 PIDs 91 to 97) against the capture's, key material by
+hash, with `-` as the product; `phase=fdsk` or `phase=tool` keeps only the
+writes bussard sends under that key, for a capture whose other half ran inside
+a KNXnet/IP Secure session that no keyring decrypts. `--keyring` (and `#@
+--keyring`) may be given twice: the export before a key rotation and the one
+after it. The summary's `confirmed` column shows the read-confirmed
 coverage and verdict, and each confirmed mismatch gets its own line. A `#@ <options>` line sets `--keyring`, `--dir`,
 `--no-admit` or `--min-coverage` for the whole file. `--check` exits 1 when a
 row with its capture present gives another verdict than expected (identical by
