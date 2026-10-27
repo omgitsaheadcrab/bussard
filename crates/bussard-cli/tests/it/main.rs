@@ -46,6 +46,7 @@ mod plan_property_mock;
 mod product_store_cli;
 mod reconstruct_line_mock;
 mod reconstruct_mock;
+mod restart_mock;
 mod scan_mock;
 mod secure_capture_oracle;
 mod secure_group_mock;

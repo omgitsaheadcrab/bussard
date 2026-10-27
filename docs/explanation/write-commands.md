@@ -73,6 +73,22 @@ device, application or mask, and a device that does not run the application.
 It writes only placed octets, keeps device-managed octets as the device holds
 them, backs up what it overwrites and verifies by read-back.
 
+## `restart` restarts one device
+
+`bussard restart <ADDRESS>` sends a basic `A_Restart`: the device re-runs its
+application, as a power cycle of that one device would. Parameters, tables and
+the address stay. It is what ETS's *Restart device* sends, and what a device
+needs when it should take up a change at startup.
+
+- **Asks** once, naming the device and the gateway, behind the real-gateway
+  gate.
+- **Verifies** by reconnecting until the device answers its descriptor read
+  again with the mask it reported before the restart. A device that stays
+  silent past `--timeout` (30 s), or comes back as another mask, exits 1.
+- **Acts on the bus**: a device may transmit its status objects as it starts,
+  as it does when bus voltage returns. Anything that listens to those
+  addresses sees them.
+
 ## `flash` downloads an application
 
 - **Writes** a whole application program: parameters at the vendor defaults
@@ -344,7 +360,7 @@ reset button to return it to its FDSK and plain tunnelling, then run
 
 ## Next steps
 
-- [Programming commands](../reference/commands/programming.md): every flag of `apply`, `flash`, `restore` and `replace`.
+- [Programming commands](../reference/commands/programming.md): every flag of `apply`, `flash`, `restore`, `replace` and `restart`.
 - [Back up and replace](../how-to/back-up-and-replace.md): backups, restores and a dead device, step by step.
 - [KNX Secure](knx-secure.md): keys, the key store and what activated means.
 - [Device support](device-support.md): which masks each command supports.

@@ -12,7 +12,7 @@ device half-programmed. The write path is built to make those cases loud.
 Read commands (`monitor`, `read`, `scan`, `plan`, `reconstruct`) never
 transmit device programming and are never gated. These commands write:
 `write`, `apply`, `flash`, `assign`, `adopt`, `commission`, `restore`,
-`replace` and `test`. [What each write command does](write-commands.md)
+`replace`, `restart` and `test`. [What each write command does](write-commands.md)
 covers each one.
 
 Two long-running servers can also write. They pass the same gate once, at

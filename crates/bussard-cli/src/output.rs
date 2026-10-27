@@ -63,6 +63,8 @@ pub mod schema {
     pub const RECONSTRUCT: u32 = 1;
     /// `bussard reconstruct --line --json`.
     pub const RECONSTRUCT_LINE: u32 = 1;
+    /// `bussard restart <ADDRESS> --json`.
+    pub const RESTART: u32 = 1;
     /// `bussard scan --json`.
     pub const SCAN: u32 = 1;
     /// `bussard show --json`.

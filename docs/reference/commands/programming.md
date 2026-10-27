@@ -534,6 +534,34 @@ Behaviour:
 - Adds no write of its own: each step is the `assign`, `flash` or `apply` path with its own verification.
 - If the flash or apply step fails, the address is already assigned; the error names the command to re-run.
 
+## `bussard restart <ADDRESS>`
+
+Restart one device and wait until it answers again.
+
+```console
+$ bussard restart 1.1.39
+gateway: 192.168.1.74:3671
+restart 1.1.39 (Kids room thermostat) via 192.168.1.74:3671? [y/N] y
+1.1.39 restarted: it answered again after 2.0 s (mask 0705)
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `<ADDRESS>` | | The device to restart, e.g. `1.1.39`. |
+| `--timeout <SECONDS>` | 30 | How long the device may take to answer again. |
+| `--yes` | off | Skip the confirmation prompt. Without a terminal the command is refused unless this is given. |
+| `--keyring <FILE>` | the key store | KNX Data Secure tool keys: a device the keyring lists is restarted over a secured session. |
+| `--tool-key <HEX>` | | A raw 32-hex-character KNX Data Secure tool key, for a simulator or bench device. Conflicts with `--keyring`. |
+| `--json` | off | Print `address`, `mask` and `answered_after_ms`. |
+
+Behaviour:
+
+- Sends a basic `A_Restart` (no erase code): the device re-runs its application. Parameters, link tables and the individual address are kept. It is not a factory reset.
+- Refuses a non-loopback gateway without `--allow-remote-gateway`, and without a terminal and without `--yes` refuses before it sends anything.
+- Reads the device's mask first, so a device that does not answer is an error before anything is sent.
+- After the restart, waits 2 s and then reconnects every second until the device answers its descriptor read. `restarted` means it answered with the mask it reported before. A device that stays silent past `--timeout`, or answers with another mask, exits 1.
+- A device may transmit its status objects as it starts, as it does when bus voltage returns.
+
 ## Related
 
 - [Global options](../global-options.md): confirmation, `--yes`, the real-gateway gate and exit codes.

@@ -48,6 +48,7 @@ mod progress;
 mod read_cmd;
 mod reconstruct_cmd;
 mod replace_cmd;
+mod restart_cmd;
 mod restore_cmd;
 
 mod scan_cmd;
@@ -220,6 +221,7 @@ impl Command {
             | Command::Commission { .. }
             | Command::Backup { .. }
             | Command::Restore { .. }
+            | Command::Restart { .. }
             | Command::Replace { .. }
             | Command::Monitor { .. }
             | Command::Capture { .. }
@@ -250,6 +252,7 @@ impl Command {
             | Command::Commission { tool_key, .. }
             | Command::Backup { tool_key, .. }
             | Command::Restore { tool_key, .. }
+            | Command::Restart { tool_key, .. }
             | Command::Replace { tool_key, .. } => tool_key.is_some(),
             _ => false,
         }
@@ -302,6 +305,7 @@ impl Command {
                 | Command::Apply { .. }
                 | Command::Commission { .. }
                 | Command::Status { .. }
+                | Command::Restart { .. }
                 | Command::History { .. }
                 | Command::Device { .. }
                 | Command::Backup { .. }
@@ -1245,6 +1249,25 @@ enum Command {
         #[arg(long, value_name = "HEX", conflicts_with = "keyring")]
         tool_key: Option<String>,
     },
+    /// Restart a device (basic `A_Restart`: the application restarts,
+    /// nothing is erased) and wait until it answers again. The device may
+    /// transmit its status objects as it starts.
+    Restart {
+        /// The device to restart, e.g. `1.1.39`.
+        #[arg(value_name = "ADDRESS")]
+        address: String,
+        /// How many seconds the device may take to answer again.
+        #[arg(long, value_name = "SECONDS", default_value_t = 30)]
+        timeout: u64,
+        /// Skip the confirmation prompt. Without a terminal the command is
+        /// refused unless this is given.
+        #[arg(long)]
+        yes: bool,
+        /// The raw 32-hex-character KNX Data Secure tool key — the test/bench
+        /// escape hatch.
+        #[arg(long, value_name = "HEX", conflicts_with = "keyring")]
+        tool_key: Option<String>,
+    },
     /// Replace a dead device: assign, flash, apply and record, in one guided
     /// flow with one confirmation (issue #98).
     Replace {
@@ -1925,6 +1948,21 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
             &addresses,
             line.as_deref(),
             out.as_deref(),
+            dir,
+            json,
+            g.tool_keys(tool_key.as_deref()),
+            g.mgmt(),
+        ),
+        Command::Restart {
+            address,
+            timeout,
+            yes,
+            tool_key,
+        } => restart_cmd::run(
+            &address,
+            timeout,
+            yes,
+            g.allow_remote_gateway,
             dir,
             json,
             g.tool_keys(tool_key.as_deref()),
