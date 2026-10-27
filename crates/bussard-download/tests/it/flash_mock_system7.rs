@@ -2237,48 +2237,95 @@ async fn authed_connection<'a>(
     Ok(l4)
 }
 
+/// Where the products of the incremental-apply tests declare their group-object
+/// table (`<ComObjectTable>`): an application segment of its own, as on the
+/// Ekinex EK-E72 (`0x41D8`) and the Jung A-2088 (`0x43FF`).
+const OBJECT_TABLE: u16 = 0x4400;
+
+/// The table bases a product with a declared group-object table gives the
+/// reader.
+fn bases_with_object_table() -> bussard_download::Sys7TableBases {
+    bussard_download::Sys7TableBases {
+        address: Some(0x4000),
+        association: Some(0x4201),
+        packed_end: None,
+        address_size: Some(0x201),
+        object_table: Some(OBJECT_TABLE),
+    }
+}
+
 async fn run_table_apply(mode: LsmMode) -> Result<(), Box<dyn std::error::Error>> {
     let (mut bus, state, handle) = setup(mode, Fault::None).await?;
     let target: bussard_model::IndividualAddress = "1.1.99".parse()?;
     let own_ia = target.raw();
-    // Two descriptors the download put there; `apply` must carry them over
-    // untouched even though the address table in front of them changes length.
+    // Behind the address table, the unused rest of its segment: the EK-E72
+    // reads `08 05 08 06 …` there. It is not a group-object table and must
+    // never be read or moved as one.
+    let filler = vec![0x08, 0x05, 0x08, 0x06, 0x08, 0x07, 0x08, 0x08];
+    seed_tables(&state, own_ia, &[0x0801], &[(1, 1)], &filler);
+    // The group-object table the product declares: objects 0..=2, the
+    // communication flag on the linked object 1 (4F), off on object 2 (DB).
     let go_image = vec![
-        0x02, 0x07, 0x00, // CNT + RAM-flags ptr
-        0x07, 0x00, 0xDF, 0x00, // descriptor 1
-        0x07, 0x02, 0x87, 0x00, // descriptor 2
+        0x03, 0x07, 0x00, // CNT + RAM-flags ptr
+        0x07, 0x75, 0x13, 0x00, // object 0
+        0x07, 0x76, 0x4F, 0x08, // object 1
+        0x07, 0x78, 0xDB, 0x08, // object 2
     ];
-    let go_base = seed_tables(&state, own_ia, &[0x0801], &[(1, 1)], &go_image);
-    assert_eq!(go_base, 0x4005, "CNT + own IA + one GA");
+    {
+        let mut s = lock(&state);
+        for (i, &b) in go_image.iter().enumerate() {
+            s.memory.insert(OBJECT_TABLE + i as u16, b);
+        }
+    }
 
     let mut l4 = authed_connection(&mut bus, target).await?;
 
     // --- plan: read the live tables and diff them -----------------------------
-    let live = read_sys7_tables(&mut l4).await?;
+    let live = bussard_download::read_sys7_tables_at(&mut l4, bases_with_object_table()).await?;
     assert_eq!(live.tables.mask, MASK_0705);
     assert_eq!(live.own_ia, own_ia, "entry 0 is the device's own IA");
     assert_eq!(live.tables.addresses, vec![ga("1/0/1")?]);
     assert_eq!(live.tables.associations, vec![(1, 1)]);
-    assert_eq!(live.tables.resolved.len(), 1);
-    assert_eq!(live.tables.resolved[0].object, 1);
-    assert_eq!(live.tables.resolved[0].ga, ga("1/0/1")?);
-    assert_eq!(live.group_object_base, go_base);
+    assert_eq!(live.group_object_base, Some(OBJECT_TABLE));
     assert_eq!(live.group_object_image, go_image);
-    assert_eq!(live.group_objects.len(), 2);
+    assert_eq!(live.group_objects.len(), 3);
 
-    let desired = desired_links()?;
+    // Object 1 sends 1/0/1 and listens on 1/0/2; object 2 gains its first
+    // link, 1/0/3.
+    let desired = compute_tables(&[
+        bussard_model::schema::Link {
+            object: 1,
+            name: None,
+            send: Some(ga("1/0/1")?),
+            listen: vec![ga("1/0/2")?],
+        },
+        bussard_model::schema::Link {
+            object: 2,
+            name: None,
+            send: None,
+            listen: vec![ga("1/0/3")?],
+        },
+    ]);
     let report = plan(&live.tables, &desired);
-    assert_eq!(report.additions.len(), 1, "one new link: {report:?}");
-    assert_eq!(report.additions[0].ga, ga("1/0/2")?);
+    assert_eq!(report.additions.len(), 2, "two new links: {report:?}");
     assert_eq!(report.unchanged.len(), 1);
     assert!(report.removals.is_empty());
 
-    // --- apply: write only the two table LSMs ---------------------------------
+    // --- apply: the two table LSMs, then object 2's communication flag -------
     let images = sys7_table_images(&live, &desired, own_ia)?;
     assert_eq!(
-        images.group_object_moved,
-        Some((0x4005, 0x4007)),
-        "the address table grew by one entry, so the descriptors move with it"
+        images.address_region.len(),
+        9,
+        "the address table alone: CNT + own IA + three GAs"
+    );
+    assert_eq!(
+        images.flag_writes,
+        vec![bussard_download::Sys7FlagWrite {
+            object: 2,
+            address: OBJECT_TABLE + 3 + 4 * 2 + 2,
+            from: 0xDB,
+            to: 0xDF,
+        }]
     );
     let profile = bussard_mgmt::MaskProfile::from_mask(MASK_0705)
         .sys7_default_profile()
@@ -2294,7 +2341,7 @@ async fn run_table_apply(mode: LsmMode) -> Result<(), Box<dyn std::error::Error>
     assert!(outcome.ok(), "apply must verify: {outcome:?}");
 
     // --- reconstruct: read it all back and confirm the model is on the device --
-    let after = read_sys7_tables(&mut l4).await?;
+    let after = bussard_download::read_sys7_tables_at(&mut l4, bases_with_object_table()).await?;
     assert_eq!(after.tables.addresses, desired.addresses);
     assert_eq!(after.tables.associations, desired.associations);
     assert!(
@@ -2303,17 +2350,32 @@ async fn run_table_apply(mode: LsmMode) -> Result<(), Box<dyn std::error::Error>
         plan(&after.tables, &desired)
     );
     assert_eq!(after.own_ia, own_ia, "the own-IA slot survived the rewrite");
+    let mut flagged = go_image.clone();
+    flagged[3 + 4 * 2 + 2] = 0xDF;
     assert_eq!(
-        after.group_object_base, 0x4007,
-        "the descriptors moved with the longer address table"
+        after.group_object_image, flagged,
+        "only object 2's CONFIG octet changed in the group-object table"
     );
-    assert_eq!(
-        after.group_object_image, go_image,
-        "the descriptors are byte-identical after the move"
+    let linked = desired.associations.iter().map(|&(_, a)| a).collect();
+    assert!(
+        bussard_download::sys7_flag_writes(&after, &linked)
+            .0
+            .is_empty(),
+        "a re-plan after apply leaves the flags alone"
     );
 
     {
         let s = lock(&state);
+        // The new address table ends at 0x4009; the rest of the segment behind
+        // it is exactly as it was.
+        for (i, &b) in filler.iter().enumerate().skip(4) {
+            assert_eq!(
+                s.memory.get(&(0x4005 + i as u16)),
+                Some(&b),
+                "octet {:#06X} behind the address table is untouched",
+                0x4005 + i
+            );
+        }
         assert_eq!(
             s.restarts_seen, 0,
             "a table-only apply must not restart the device"
@@ -2361,6 +2423,8 @@ async fn test_read_sys7_tables_at_reads_the_product_association_base()
         address: Some(0x4000),
         association: Some(0x41FF),
         packed_end: None,
+        address_size: None,
+        object_table: None,
     };
     let live = bussard_download::read_sys7_tables_at(&mut l4, bases).await?;
     assert_eq!(live.association_base, 0x41FF);
@@ -2396,6 +2460,8 @@ async fn test_read_sys7_tables_at_reads_a_packed_association_table()
         address: Some(0x4000),
         association: Some(0x41FF),
         packed_end: Some(0x43FE),
+        address_size: None,
+        object_table: None,
     };
     let live = bussard_download::read_sys7_tables_at(&mut l4, bases).await?;
     assert_eq!(live.association_base, 0x4007);

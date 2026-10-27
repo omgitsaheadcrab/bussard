@@ -7,8 +7,7 @@
 //! driven by two of the three parallel load-state machines
 //! (`[system7-spec §2/§3]`):
 //!
-//! - **LSM 1** owns the `0x4000` region — the address table (GrAT) followed by
-//!   the group-object descriptor table;
+//! - **LSM 1** owns the `0x4000` region — the address table (GrAT);
 //! - **LSM 2** owns the `0x4201` region — the association table (GrOAT).
 //!
 //! So an `apply` here is the same shape as a download, restricted to the two
@@ -29,29 +28,41 @@
 //! 1. `Unload` LSM 2, `Unload` LSM 1 — tear both down (spec §3, every corpus
 //!    download unloads before loading).
 //! 2. `StartLoading` LSM 2, `StartLoading` LSM 1 — both inactive and writable.
-//! 3. Allocate + stream the **0x4000** region (new address table + the device's
-//!    own group-object descriptors, relocated — see below).
+//! 3. Allocate + stream the **0x4000** region (the new address table).
 //! 4. Allocate + stream the **0x4201** region (the association table, whose TSAPs
 //!    now index the just-written address content).
 //! 5. `TaskSegment` + `LoadCompleted` on LSM 1 (activate the address table).
 //! 6. `TaskSegment` + `LoadCompleted` on LSM 2 (activate the associations).
+//! 7. Switch the communication flags of the objects whose links changed (see
+//!    below), each octet read back.
 //!
 //! A device evaluates group telegrams against a table only in the `Loaded` state
 //! (KNX 3/5/1 load-state machine), so no partially-updated table is ever active.
 //!
-//! # Why the whole 0x4000 region is rewritten, not just the address table
+//! # Only the address table is written into the 0x4000 region
 //!
-//! The `0x4000` region holds the address table **and** the group-object
-//! descriptor table, packed back to back (`[system7-spec §2.3]`: "address /
-//! com-object descriptors"). The descriptor table's base therefore moves whenever
-//! the address table's entry count changes. Writing only a longer address table
-//! would bury the descriptors; writing only a shorter one would leave them
-//! stranded at the old offset. `apply` reads the descriptors first
-//! ([`crate::tables_sys7`]) and re-writes them verbatim at their new offset, so a
-//! link change never disturbs what the download put there.
-//! `S7-CAL: confirm the group-object table is co-located after the GrAT in the
-//! 0x4000 region (rather than at a fixed sub-address) against a live 0705
-//! read-back.`
+//! The group-object descriptor table is not behind the address table: a System 7
+//! program declares it in an application segment of its own (the Ekinex EK-E72
+//! at `0x41D8`, the Jung `A-2088` at `0x43FF`), and the octets behind the
+//! address table are the unused rest of its segment. So `apply` writes the
+//! address table and nothing past it, and refuses a table longer than the
+//! segment ([`Sys7LiveTables::address_capacity`]), so a longer table can never
+//! run into the association or group-object table.
+//!
+//! # Communication flags
+//!
+//! A device ignores every telegram for an object whose descriptor has the
+//! communication flag (C, bit 2 of CONFIG) cleared, and ETS clears it on every
+//! object without a link (the EK-E72 1.1.39: C on exactly its five linked
+//! objects; the flash post-pass does the same). A new link on such an object
+//! is written and verified but never acts: the EK-E72 kept ignoring a write to
+//! its newly linked object 32 until its C flag was set. So, where the product
+//! declares the group-object table ([`Sys7LiveTables::group_object_base`]),
+//! `apply` sets C on every object the model links that lacks it, and clears it
+//! on an object that loses its last link, writing the one CONFIG octet each
+//! and reading it back. Nothing else in a descriptor changes. Without product
+//! data the table's place is unknown: the plan names the newly linked objects
+//! whose flag it could not check ([`Sys7TableImages::unchecked_flags`]).
 //!
 //! # Restart: not issued
 //!
@@ -74,10 +85,11 @@ use bussard_mgmt::{LsmAccess, Sys7Profile, alloc_attr_octets};
 
 use crate::compute::DesiredTables;
 use crate::compute_sys7::{
-    SYS7_ADDRESS_REGION_LEN, SYS7_ASSOCIATION_REGION_LEN, sys7_address_table,
+    SYS7_ASSOCIATION_REGION_LEN, SYS7_GROUP_OBJECT_HEADER_LEN, sys7_address_table,
     sys7_association_table,
 };
 use crate::tables_sys7::{Sys7LiveTables, read_region};
+use std::collections::BTreeSet;
 
 /// The load-state machine that owns the `0x4000` address-table region
 /// (`[system7-spec §3]`).
@@ -131,17 +143,41 @@ pub struct Sys7TableImages {
     /// Where the LSM 2 region starts on this device
     /// ([`Sys7LiveTables::association_base`]).
     pub association_base: u16,
-    /// The whole LSM 1 region image: the new address table followed by the
-    /// device's own group-object descriptor table, relocated to its new offset.
+    /// The LSM 1 image: the new address table, nothing behind it.
     pub address_region: Vec<u8>,
-    /// How many leading octets of `address_region` are the address table itself.
-    pub address_table_len: usize,
     /// The `0x4201` association-table image.
     pub association_image: Vec<u8>,
-    /// The group-object table's base before and after, when the address table's
-    /// length moved it. `None` when it did not move (or the device has none).
-    pub group_object_moved: Option<(u16, u16)>,
+    /// The communication-flag octets to write after the tables, in object order.
+    pub flag_writes: Vec<Sys7FlagWrite>,
+    /// Objects the model links anew whose communication flag could not be
+    /// checked, because the group-object table's place is unknown (no product
+    /// data). The device may ignore their new links.
+    pub unchecked_flags: Vec<u16>,
 }
+
+/// One communication-flag change: the CONFIG octet of one object's descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sys7FlagWrite {
+    /// The com-object number (ASAP).
+    pub object: u16,
+    /// The CONFIG octet's address in the group-object table.
+    pub address: u16,
+    /// The octet as read.
+    pub from: u8,
+    /// The octet to write.
+    pub to: u8,
+}
+
+impl Sys7FlagWrite {
+    /// Whether this write switches the communication flag on (else off).
+    pub fn enables(&self) -> bool {
+        self.to & SYS7_COMMUNICATION_FLAG != 0
+    }
+}
+
+/// The communication-enable bit (C) of a descriptor's CONFIG octet
+/// (`[system7-spec §7.3]`).
+const SYS7_COMMUNICATION_FLAG: u8 = 0x04;
 
 /// What the post-write verification found.
 #[derive(Debug, Clone)]
@@ -154,6 +190,8 @@ pub struct Sys7VerifyOutcome {
     pub addresses_match: bool,
     /// Whether the `0x4201` region read back byte-for-byte.
     pub associations_match: bool,
+    /// Whether every communication-flag octet read back as written.
+    pub flags_match: bool,
 }
 
 impl Sys7VerifyOutcome {
@@ -163,6 +201,7 @@ impl Sys7VerifyOutcome {
             && self.association_state == LoadState::Loaded
             && self.addresses_match
             && self.associations_match
+            && self.flags_match
     }
 }
 
@@ -176,24 +215,21 @@ impl Sys7VerifyOutcome {
 /// is the only thing that ever fixes it up. Writing the connected address is the
 /// only value that can be right.
 ///
-/// The group-object descriptors are carried over verbatim from `live` at their
-/// new offset (see the module docs). Both images are refused if they do not fit
-/// their region.
+/// The address table is refused past [`Sys7LiveTables::address_capacity`], the
+/// association table past its region. The communication flags follow the links
+/// (see the module docs, [`sys7_flag_writes`]).
 pub fn sys7_table_images(
     live: &Sys7LiveTables,
     desired: &DesiredTables,
     own_ia: u16,
 ) -> Result<Sys7TableImages, Sys7ApplyError> {
-    let address_table = sys7_address_table(own_ia, desired);
-    let address_table_len = address_table.len();
-    let mut address_region = address_table;
-    address_region.extend_from_slice(&live.group_object_image);
-    if address_region.len() > SYS7_ADDRESS_REGION_LEN {
+    let address_region = sys7_address_table(own_ia, desired);
+    if address_region.len() > live.address_capacity {
         return Err(Sys7ApplyError::RegionOverflow {
             table: "address",
             base: live.address_base,
             len: address_region.len(),
-            capacity: SYS7_ADDRESS_REGION_LEN,
+            capacity: live.address_capacity,
         });
     }
 
@@ -221,19 +257,73 @@ pub fn sys7_table_images(
         });
     }
 
-    let new_go_base = live.address_base.wrapping_add(address_table_len as u16);
-    let group_object_moved = (!live.group_object_image.is_empty()
-        && new_go_base != live.group_object_base)
-        .then_some((live.group_object_base, new_go_base));
-
+    let linked: BTreeSet<u16> = desired.associations.iter().map(|&(_, a)| a).collect();
+    let (flag_writes, unchecked_flags) = sys7_flag_writes(live, &linked);
     Ok(Sys7TableImages {
         address_base: live.address_base,
         association_base,
         address_region,
-        address_table_len,
         association_image,
-        group_object_moved,
+        flag_writes,
+        unchecked_flags,
     })
+}
+
+/// The communication-flag writes that keep `live`'s group-object table in step
+/// with the objects the model links (`linked`, see the module docs): C on for
+/// every linked object that lacks it, C off for an object that loses its last
+/// link. The second list names the objects that gain their first link while
+/// the table is unknown, or that it does not describe.
+pub fn sys7_flag_writes(
+    live: &Sys7LiveTables,
+    linked: &BTreeSet<u16>,
+) -> (Vec<Sys7FlagWrite>, Vec<u16>) {
+    let was_linked: BTreeSet<u16> = live
+        .tables
+        .associations
+        .iter()
+        .filter(|&&(tsap, _)| tsap != 0)
+        .map(|&(_, a)| a)
+        .collect();
+    let Some(base) = live.group_object_base else {
+        return (
+            Vec::new(),
+            linked.difference(&was_linked).copied().collect(),
+        );
+    };
+    let mut writes = Vec::new();
+    let mut unchecked = Vec::new();
+    let mut want = |object: u16, on: bool| {
+        let Some(descriptor) = live.group_objects.get(usize::from(object)) else {
+            if on && !was_linked.contains(&object) {
+                unchecked.push(object);
+            }
+            return;
+        };
+        let to = if on {
+            descriptor.config | SYS7_COMMUNICATION_FLAG
+        } else {
+            descriptor.config & !SYS7_COMMUNICATION_FLAG
+        };
+        if to != descriptor.config {
+            // [CNT:1][RAM-flags ptr:2], then 4-octet descriptors with CONFIG third.
+            let offset = SYS7_GROUP_OBJECT_HEADER_LEN + 4 * usize::from(object) + 2;
+            writes.push(Sys7FlagWrite {
+                object,
+                address: base.wrapping_add(offset as u16),
+                from: descriptor.config,
+                to,
+            });
+        }
+    };
+    for &object in linked {
+        want(object, true);
+    }
+    for &object in was_linked.difference(linked) {
+        want(object, false);
+    }
+    writes.sort_by_key(|w| w.object);
+    (writes, unchecked)
 }
 
 /// Writes the two table regions to a System 7 device and verifies the result.
@@ -319,16 +409,27 @@ pub async fn apply_sys7_tables<Ch: L4Channel>(
         .drive(l4, SYS7_ASSOCIATION_LSM, LoadControl::LoadCompleted)
         .await?;
 
-    // Verify by reading both regions back off the loaded device.
+    // 7: the communication flags of the objects whose links changed.
+    for flag in &images.flag_writes {
+        write_verified(l4, "group-object", flag.address, &[flag.to]).await?;
+    }
+
+    // Verify by reading both regions and every flag octet back off the loaded
+    // device.
     let addr_back = read_region(l4, images.address_base, images.address_region.len()).await?;
     let assoc_back =
         read_region(l4, images.association_base, images.association_image.len()).await?;
+    let mut flags_match = true;
+    for flag in &images.flag_writes {
+        flags_match &= read_region(l4, flag.address, 1).await? == [flag.to];
+    }
 
     Ok(Sys7VerifyOutcome {
         address_state,
         association_state,
         addresses_match: addr_back == images.address_region,
         associations_match: assoc_back == images.association_image,
+        flags_match,
     })
 }
 
@@ -399,12 +500,14 @@ async fn write_verified<Ch: L4Channel>(
 mod tests {
     use super::*;
     use crate::compute::compute_tables;
+    use crate::compute_sys7::{
+        SYS7_ADDRESS_REGION_LEN, SYS7_ADDRESS_TABLE_ADDR, SYS7_ASSOCIATION_TABLE_ADDR,
+        Sys7GroupObject,
+    };
     use bussard_mgmt::tables::DeviceTables;
     use bussard_model::schema::Link;
 
-    use crate::compute_sys7::{SYS7_ADDRESS_TABLE_ADDR, SYS7_ASSOCIATION_TABLE_ADDR};
-
-    fn live(own_ia: u16, go_image: Vec<u8>, go_base: u16) -> Sys7LiveTables {
+    fn live(own_ia: u16, address_capacity: usize) -> Sys7LiveTables {
         Sys7LiveTables {
             tables: DeviceTables {
                 mask: 0x0705,
@@ -416,13 +519,42 @@ mod tests {
                 group_objects: None,
             },
             own_ia,
+            address_capacity,
             address_base: SYS7_ADDRESS_TABLE_ADDR,
             association_base: SYS7_ASSOCIATION_TABLE_ADDR,
             packed_end: None,
-            group_object_base: go_base,
-            group_object_image: go_image,
+            group_object_base: None,
+            group_object_image: Vec::new(),
             group_objects: Vec::new(),
         }
+    }
+
+    /// The EK-E72-TP 1.1.39 as read live: five links (objects 20, 24, 27, 38
+    /// and 52), its group-object table at `0x41D8`, the communication flag on
+    /// exactly the linked objects (CONFIG `4F`) and off on the eight preset
+    /// setpoints 29..=36 (CONFIG `DB`).
+    fn e72() -> Sys7LiveTables {
+        let mut live = live(0x1127, 237);
+        live.association_base = 0x40ED;
+        live.tables.associations = vec![(1, 20), (2, 24), (3, 27), (4, 38), (5, 52)];
+        live.group_object_base = Some(0x41D8);
+        live.group_objects = (0..=52)
+            .map(|asap| Sys7GroupObject {
+                asap,
+                data_ptr: 0x0775 + asap,
+                config: match asap {
+                    20 | 24 | 27 | 38 | 52 => 0x4F,
+                    29..=36 => 0xDB,
+                    _ => 0x13,
+                },
+                type_code: 0x08,
+            })
+            .collect();
+        live
+    }
+
+    fn objects(list: &[u16]) -> BTreeSet<u16> {
+        list.iter().copied().collect()
     }
 
     fn desired_one_link() -> DesiredTables {
@@ -435,39 +567,32 @@ mod tests {
     }
 
     #[test]
-    fn test_sys7_table_images_relocates_the_group_object_table() {
-        // The device had an empty address table (CNT 1, own IA only) with its
-        // group-object table at 0x4003; the model adds one GA, so the address
-        // table grows by two octets and the descriptors move with it.
-        let go = vec![0x01, 0x07, 0x00, 0x07, 0x5C, 0xDF, 0x03];
-        let live = live(0x1105, go.clone(), 0x4003);
-        let images = sys7_table_images(&live, &desired_one_link(), 0x1105).expect("images");
-        assert_eq!(images.address_table_len, 5, "CNT + own IA + one GA");
-        assert_eq!(images.group_object_moved, Some((0x4003, 0x4005)));
+    fn test_sys7_table_images_writes_only_the_address_table() {
+        // The octets behind the address table are the unused rest of its
+        // segment, never carried along: the image is the table and nothing more.
+        let images =
+            sys7_table_images(&live(0x1105, 237), &desired_one_link(), 0x1105).expect("images");
         assert_eq!(
-            &images.address_region[..5],
-            &[0x01 + 1, 0x11, 0x05, 0x08, 0x01]
-        );
-        assert_eq!(
-            &images.address_region[5..],
-            &go[..],
-            "the descriptors are carried over verbatim at their new offset"
+            images.address_region,
+            vec![0x02, 0x11, 0x05, 0x08, 0x01],
+            "CNT + own IA + one GA, nothing behind it"
         );
         assert_eq!(images.association_image, vec![0x01, 0x01, 0x01]);
     }
 
     #[test]
-    fn test_sys7_table_images_refuses_an_oversized_region() {
-        // A group-object table that already fills the region leaves no room for a
-        // growing address table: refuse rather than write past 0x4201.
-        let live = live(0x1105, vec![0u8; SYS7_ADDRESS_REGION_LEN], 0x4001);
-        let err = sys7_table_images(&live, &desired_one_link(), 0x1105)
-            .expect_err("an oversized region is refused");
+    fn test_sys7_table_images_refuses_an_address_table_past_its_segment() {
+        // A three-octet segment holds the own IA and no group address: refuse
+        // rather than write into whatever follows it.
+        let err = sys7_table_images(&live(0x1105, 3), &desired_one_link(), 0x1105)
+            .expect_err("an address table past its segment is refused");
         assert!(
             matches!(
                 err,
                 Sys7ApplyError::RegionOverflow {
                     table: "address",
+                    len: 5,
+                    capacity: 3,
                     ..
                 }
             ),
@@ -481,7 +606,7 @@ mod tests {
         // association table sits right behind a 31-octet address table at
         // 0x401F; the model has one GA, so the address table is 5 octets and
         // the association table moves to 0x4005, inside 0x4000..0x43FE.
-        let mut live = live(0x1131, Vec::new(), 0x401F);
+        let mut live = live(0x1131, SYS7_ADDRESS_REGION_LEN);
         live.association_base = 0x401F;
         live.packed_end = Some(0x43FE);
         let images = sys7_table_images(&live, &desired_one_link(), 0x1131)?;
@@ -496,7 +621,7 @@ mod tests {
     fn test_sys7_table_images_refuses_a_packed_table_past_the_segment() {
         // Both tables must end before the product's LSM 2 segment does
         // (M-00E1_A-A00D: 0x4000/23 + 0x4017/21, so they end at 0x402C).
-        let mut live = live(0x1131, Vec::new(), 0x4005);
+        let mut live = live(0x1131, SYS7_ADDRESS_REGION_LEN);
         live.packed_end = Some(0x4007);
         let err = sys7_table_images(&live, &desired_one_link(), 0x1131);
         assert!(
@@ -514,12 +639,81 @@ mod tests {
     }
 
     #[test]
+    fn test_sys7_flag_writes_switches_on_a_newly_linked_object() {
+        // 1.1.39 links its standby cooling setpoint (object 32): the one CONFIG
+        // octet at 0x41D8 + 3 + 4 * 32 + 2 goes DB → DF, as the live fix wrote.
+        let (writes, unchecked) = sys7_flag_writes(&e72(), &objects(&[20, 24, 27, 32, 38, 52]));
+        assert_eq!(
+            writes,
+            vec![Sys7FlagWrite {
+                object: 32,
+                address: 0x425D,
+                from: 0xDB,
+                to: 0xDF,
+            }]
+        );
+        assert!(writes[0].enables());
+        assert!(unchecked.is_empty());
+    }
+
+    #[test]
+    fn test_sys7_flag_writes_repairs_a_linked_object_without_its_flag() {
+        // The state an older apply left: object 32 linked, its flag still off.
+        let mut live = e72();
+        live.tables.associations.push((6, 32));
+        let (writes, _) = sys7_flag_writes(&live, &objects(&[20, 24, 27, 32, 38, 52]));
+        assert_eq!(writes.len(), 1);
+        assert_eq!((writes[0].object, writes[0].to), (32, 0xDF));
+    }
+
+    #[test]
+    fn test_sys7_flag_writes_switches_off_an_object_losing_its_last_link() {
+        // Fan speed (object 52) loses its only link: 4F → 4B. The others keep
+        // theirs and are left alone.
+        let (writes, _) = sys7_flag_writes(&e72(), &objects(&[20, 24, 27, 38]));
+        assert_eq!(
+            writes,
+            vec![Sys7FlagWrite {
+                object: 52,
+                address: 0x41D8 + 3 + 4 * 52 + 2,
+                from: 0x4F,
+                to: 0x4B,
+            }]
+        );
+        assert!(!writes[0].enables());
+    }
+
+    #[test]
+    fn test_sys7_flag_writes_leaves_a_matching_device_alone() {
+        let (writes, unchecked) = sys7_flag_writes(&e72(), &objects(&[20, 24, 27, 38, 52]));
+        assert!(writes.is_empty());
+        assert!(unchecked.is_empty());
+    }
+
+    #[test]
+    fn test_sys7_flag_writes_names_new_links_it_cannot_check() {
+        // Without product data the group-object table's place is unknown: no
+        // write, and the newly linked object is named, the already linked not.
+        let mut live = e72();
+        live.group_object_base = None;
+        live.group_objects.clear();
+        let (writes, unchecked) = sys7_flag_writes(&live, &objects(&[20, 24, 27, 32, 38, 52]));
+        assert!(writes.is_empty());
+        assert_eq!(unchecked, vec![32]);
+        // An object past the table the product declares cannot be checked either.
+        let (writes, unchecked) = sys7_flag_writes(&e72(), &objects(&[20, 24, 27, 38, 52, 60]));
+        assert!(writes.is_empty());
+        assert_eq!(unchecked, vec![60]);
+    }
+
+    #[test]
     fn test_verify_outcome_requires_everything() {
         let base = Sys7VerifyOutcome {
             address_state: LoadState::Loaded,
             association_state: LoadState::Loaded,
             addresses_match: true,
             associations_match: true,
+            flags_match: true,
         };
         assert!(base.ok());
         let mut bad = base.clone();
@@ -527,6 +721,9 @@ mod tests {
         assert!(!bad.ok());
         let mut bad = base.clone();
         bad.addresses_match = false;
+        assert!(!bad.ok());
+        let mut bad = base.clone();
+        bad.flags_match = false;
         assert!(!bad.ok());
     }
 }

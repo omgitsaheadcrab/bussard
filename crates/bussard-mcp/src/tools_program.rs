@@ -744,7 +744,11 @@ impl BussardMcp {
 
         // A security-object change of its own rewrites the tables too (issue
         // #297): the security object is written inside the table download.
-        let tables_noop = report.is_noop() && !built.plan.writes.security_object;
+        // A System 7 communication flag that does not follow its links is written
+        // with the tables too.
+        let tables_noop = report.is_noop()
+            && !built.plan.writes.security_object
+            && built.plan.writes.communication_flags.is_empty();
         let noop = tables_noop && built.partial.is_none() && flash.is_none();
         if noop {
             // The device already holds the model: nothing this session
@@ -1224,7 +1228,9 @@ impl BussardMcp {
         }
         // The plan is consumed from here on: one digest, one write.
         tier.plans().remove(digest);
-        let tables_change = !report.is_noop() || built.plan.writes.security_object;
+        let tables_change = !report.is_noop()
+            || built.plan.writes.security_object
+            || !built.plan.writes.communication_flags.is_empty();
         let images = match live.sys7() {
             Some(s7) if tables_change => Some(
                 sys7_table_images(s7, &desired, target.raw())
@@ -1381,7 +1387,9 @@ impl BussardMcp {
         }
         let live = &read.live;
         let tables = live.tables();
-        let tables_change = !report.is_noop() || built.plan.writes.security_object;
+        let tables_change = !report.is_noop()
+            || built.plan.writes.security_object
+            || !built.plan.writes.communication_flags.is_empty();
         let param_write = match (
             &built.partial,
             read.params.as_ref().and_then(|p| p.detail.as_ref()),
@@ -2423,7 +2431,10 @@ fn live_digest(read: &DeviceRead) -> [u8; 32] {
             put(&mut h, &s7.address_base.to_be_bytes());
             put(&mut h, &s7.association_base.to_be_bytes());
             put(&mut h, &s7.own_ia.to_be_bytes());
-            put(&mut h, &s7.group_object_base.to_be_bytes());
+            match s7.group_object_base {
+                Some(base) => put(&mut h, &base.to_be_bytes()),
+                None => put(&mut h, b"no-object-table"),
+            }
             put(&mut h, &s7.group_object_image);
         }
         None => put(&mut h, b"system-b"),

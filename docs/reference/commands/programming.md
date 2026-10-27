@@ -150,7 +150,7 @@ Behaviour:
 ??? note "Details"
     System B (`x7B0`): each table is written into a segment the device allocates for it: StartLoading, `LdCtrlRelSegment`, read the placement from `PID_TABLE_REFERENCE`, memory-write the count word plus the elements, LoadCompleted. The `PID_TABLE` property array is never written, because real devices refuse it. A parameter change then runs the parameter-only download: no unload, no segment allocation, then the load completes and the device restarts.
 
-    System 7 (`0705`, `0701`): a link change drives only the two table load-state machines (Unload, StartLoading, allocate, 12-octet writes with read-back verify, TaskSegment, LoadCompleted). Parameters are untouched and the device is not restarted, so a link change costs no downtime.
+    System 7 (`0705`, `0701`): a link change drives only the two table load-state machines (Unload, StartLoading, allocate, 12-octet writes with read-back verify, TaskSegment, LoadCompleted). Parameters are untouched and the device is not restarted, so a link change costs no downtime. The address table is written alone, bounded by its segment. With product data, the communication flag of each object that gains its first link is switched on, and of each object that loses its last link switched off: one octet each in the group-object table the product declares, written after the tables and read back. A device ignores an object whose flag is off, so without product data `plan` names the newly linked objects whose flag it could not check.
 
     With `--keyring`, `apply` rewrites the security object next to the tables, because the group key table indexes the address table.
 

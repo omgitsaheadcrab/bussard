@@ -516,7 +516,12 @@ pub(crate) fn apply_desired(
         matches!(origin, DesiredSource::Model) && admission.as_ref().is_some_and(|a| a.changes());
     let flags_change = matches!(origin, DesiredSource::Model)
         && security_change.as_ref().is_some_and(|c| c.changes());
-    let tables_change = !report.is_noop() || admits || flags_change;
+    // A System 7 object whose communication flag does not follow its links is
+    // written with the tables (the flag octets go after them).
+    let object_flags = sys7
+        .as_ref()
+        .is_some_and(|(_, images)| !images.flag_writes.is_empty());
+    let tables_change = !report.is_noop() || admits || flags_change || object_flags;
     if !tables_change && partial.is_none() {
         return Ok(ExitCode::SUCCESS);
     }
@@ -720,16 +725,6 @@ fn write_tables_then_parameters(
     read_options: &L4Options,
     backup_path: &Path,
 ) -> anyhow::Result<(ExitCode, bool)> {
-    if let Some(images) = images
-        && let Some((from, to)) = images.group_object_moved
-    {
-        println!(
-            "the group-object descriptor table moves {from:#06X} → {to:#06X} with the \
-                 address table; its {} octets are rewritten verbatim",
-            images.address_region.len() - images.address_table_len
-        );
-    }
-
     // Phase B (write): execute the load sequence and verify.
     // The same tunnel phase A used: its L4 session and bus lease are both
     // released by now, so the write phase simply takes the lease again.

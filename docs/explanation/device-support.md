@@ -52,19 +52,36 @@ interface, and ends with a read-back of every property it wrote.
   its tables elsewhere reads back as an empty table set, never as wrong links,
   and must be programmed with `bussard flash`, which takes the addresses from
   the product data.
+- **System 7 communication flags.** A System 7 device ignores every telegram
+  for an object whose communication flag is off, and ETS switches it off on
+  every object without a link. So a new link on such an object only works once
+  its flag is on. With the device's product data, `apply` switches the flag on
+  for each newly linked object and off for an object that loses its last link,
+  and `plan` lists each switch. Without product data bussard does not know
+  where the group-object table is: `plan` names each newly linked object whose
+  flag it could not check.
 
 ??? note "Details"
     On System B each table lives in a segment the device allocates: `apply`
     opens the table object, requests a segment with `LdCtrlRelSegment`, reads
     the placement from `PID_TABLE_REFERENCE` and writes the image there. It
     never writes the `PID_TABLE` property array, which real devices refuse.
-    On System 7 the tables are the memory regions at `0x4000` (address table
-    and group-object descriptors) and `0x4201` (association table). `apply`
-    rewrites only those two table load-state machines, never the parameters
-    or the application, and does not restart the device. Every System 7 table
-    read is bounded by its region: a count octet claiming more entries than
-    the region holds (virgin EEPROM reads `0xFF`) is refused, and an image
-    that would not fit is refused before anything is written.
+    On System 7 the tables are the memory regions at `0x4000` (address table)
+    and `0x4201` (association table), or wherever the product's load
+    procedure puts them. `apply` rewrites only those two table load-state
+    machines, never the parameters or the application, and does not restart
+    the device. The address table is written alone and may fill its segment
+    and no more: the product's segment size, else up to the association table
+    the device reports. Every System 7 table read is bounded the same way: a
+    count octet claiming more entries than the region holds (virgin EEPROM
+    reads `0xFF`) is refused, and an image that would not fit is refused
+    before anything is written.
+
+    The group-object table is not behind the address table: the program
+    declares it in a segment of its own (`<ComObjectTable>`), on the Ekinex
+    EK-E72 at `0x41D8`. `apply` reads it there and writes only the
+    communication-flag octet of each object whose flag changes, after the
+    tables, and reads each one back.
 
 ## Source address check
 

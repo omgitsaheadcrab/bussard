@@ -37,7 +37,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, bail};
-use bussard_download::{DesiredTables, compute_tables, plan, sys7_table_images};
+use bussard_download::{DesiredTables, compute_tables, plan, sys7_flag_writes, sys7_table_images};
 use bussard_mgmt::{MaskProfile, system_type};
 use bussard_model::{IndividualAddress, Model};
 use bussard_service::{Authorize, BusService, L4Options, ServiceError, SourcePolicy, WritePolicy};
@@ -697,8 +697,14 @@ async fn visit_one(
     }
 
     let report = plan(live, desired);
-    let changes = report.additions.len() + report.removals.len();
-    if report.is_noop() {
+    // A System 7 communication flag that does not follow its links is a change
+    // too: `apply` writes it with the tables.
+    let flag_writes = sys7_live.as_ref().map_or(0, |s7| {
+        let linked = desired.associations.iter().map(|&(_, a)| a).collect();
+        sys7_flag_writes(s7, &linked).0.len()
+    });
+    let changes = report.additions.len() + report.removals.len() + flag_writes;
+    if report.is_noop() && flag_writes == 0 {
         return make(Some(mask), DeviceStatus::Unchanged);
     }
     if mode == Mode::Plan {
