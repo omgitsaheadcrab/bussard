@@ -80,6 +80,11 @@ pub trait DynamicSource {
     fn enum_members(&self, param_id: &str) -> Option<&[EnumValue]>;
     /// The application's `<Union>`s, in document order.
     fn unions(&self) -> &[Union];
+    /// The application's `<ParameterCalculation>`s, in document order. A
+    /// source without them (the default) evaluates no scripts.
+    fn calculations(&self) -> &[ParameterCalculation] {
+        &[]
+    }
 }
 
 impl<T: DynamicSource + ?Sized> DynamicSource for &T {
@@ -112,6 +117,9 @@ impl<T: DynamicSource + ?Sized> DynamicSource for &T {
     }
     fn unions(&self) -> &[Union] {
         (**self).unions()
+    }
+    fn calculations(&self) -> &[ParameterCalculation] {
+        (**self).calculations()
     }
 }
 
@@ -574,6 +582,38 @@ pub struct UnionMember {
     /// lays into the shared memory). `true` for `DefaultUnionParameter="1"` or
     /// `"true"`.
     pub is_default: bool,
+}
+
+/// A `<ParameterCalculation>`: a script that derives parameter values from
+/// others.
+///
+/// ETS runs the left-to-right script (`<LRTransformation>`) whenever an input
+/// changes and stores its results in the output parameters, which a download
+/// then writes like any other parameter. Products use it for values a user
+/// never edits directly, such as an Ekinex thermostat's fan block switch or a
+/// Jung LED dimmer's dimming curve points. The script sees each parameter as a
+/// variable named by its `AliasName`, else by the parameter's `Name`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ParameterCalculation {
+    /// The calculation's id, app-relative (e.g. `PC-2`).
+    pub id: String,
+    /// The script language, as declared (`JavaScript`, `VBScript`).
+    pub language: String,
+    /// The left-to-right script, run to compute the outputs.
+    pub lr_script: String,
+    /// The input parameters (`<LParameters>`), in document order.
+    pub inputs: Vec<CalculationParameter>,
+    /// The output parameters (`<RParameters>`), in document order.
+    pub outputs: Vec<CalculationParameter>,
+}
+
+/// One parameter a [`ParameterCalculation`] reads or writes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CalculationParameter {
+    /// The app-relative `ParameterRef` id (e.g. `P-12_R-34`).
+    pub param_ref: String,
+    /// The `AliasName` the script uses for it, when declared.
+    pub alias: Option<String>,
 }
 
 /// How deep `<Module>` instantiations may nest before the walk stops (real
