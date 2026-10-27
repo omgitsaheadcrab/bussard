@@ -629,8 +629,10 @@ pub fn uses_dynamic_image(app: &ApplicationProgram) -> bool {
 /// This reproduces the ETS 6 image of a Jung 52921ST (F50, app A-D142-21)
 /// byte for byte, where the template-plus-every-default image differed in 240
 /// of 6152 octets (see the `f50_golden` test in `bussard-download`). Values an
-/// application computes with `<ParameterCalculation>` scripts (a Jung A-3030
-/// LED dimmer's dimming curves) are not produced.
+/// application computes with `<ParameterCalculation>` scripts (an Ekinex
+/// EK-E72's fan block, a Jung A-3030 LED dimmer's dimming curves) come from
+/// the Dynamic evaluation, which runs them; an output of a script bussard
+/// cannot run is refused rather than written.
 ///
 /// # Errors
 ///
@@ -677,7 +679,27 @@ fn dynamic_image(
             .or_insert_with(|| base_image(app, seg));
     }
 
+    // An output of a calculation that could not run holds a value the
+    // script did not compute; writing it would be a silent wrong image.
+    let refused: BTreeMap<&str, &bussard_ets::dynamic::RefusedCalculation> = config
+        .refused_calculations
+        .iter()
+        .flat_map(|calc| calc.outputs.iter().map(move |r| (r.as_str(), calc)))
+        .collect();
     for slot in dynamic_parameter_slots(app, config)? {
+        if let Some(ref_id) = slot.param_ref_id.as_deref()
+            && slot.module.is_none()
+            && let Some(calc) = refused.get(ref_id)
+        {
+            return Err(param_err(
+                app,
+                ref_id,
+                &format!(
+                    "is computed by calculation {}, which bussard cannot run: {}",
+                    calc.id, calc.reason
+                ),
+            ));
+        }
         let (value, source) = match slot.param_ref_id.as_deref() {
             Some(ref_id) => (
                 config.value(app, slot.module, ref_id),
@@ -3617,6 +3639,80 @@ mod tests {
     /// `DownloadInvisibleParameters`. A display-only selector hides a 16-bit
     /// sending cycle (default 600, as in `M-0007_A-6179-82` at +0x2A) and one
     /// member of a union; a plain parameter is always shown.
+    /// A `<ParameterCalculation>` derives `fan` from `mode` (the Ekinex EK-E72
+    /// shape: its fan block switch comes from a VBScript), and `fan` decides
+    /// whether `extra` is shown. `{script}` is the calculation's script.
+    fn calc_xml(script: &str) -> String {
+        format!(
+            r#"<KNX xmlns="http://knx.org/xml/project/20">
+     <ApplicationProgram Id="A" MaskVersion="MV-07B0" Name="calc">
+      <Static>
+       <Code><RelativeSegment Id="A_RS-1" Size="3" LoadStateMachine="4" Offset="0"><Data>AAAA</Data></RelativeSegment></Code>
+       <ParameterTypes><ParameterType Id="A_PT-1" Name="n"><TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="255" /></ParameterType></ParameterTypes>
+       <Parameters>
+        <Parameter Id="A_P-1" Name="mode" ParameterType="A_PT-1" Value="0"><Memory CodeSegment="A_RS-1" Offset="0" BitOffset="0" /></Parameter>
+        <Parameter Id="A_P-2" Name="fan" ParameterType="A_PT-1" Value="0"><Memory CodeSegment="A_RS-1" Offset="1" BitOffset="0" /></Parameter>
+        <Parameter Id="A_P-3" Name="extra" ParameterType="A_PT-1" Value="9"><Memory CodeSegment="A_RS-1" Offset="2" BitOffset="0" /></Parameter>
+       </Parameters>
+       <ParameterRefs>
+        <ParameterRef Id="A_P-1_R-1" RefId="A_P-1" />
+        <ParameterRef Id="A_P-2_R-2" RefId="A_P-2" />
+        <ParameterRef Id="A_P-3_R-3" RefId="A_P-3" />
+       </ParameterRefs>
+       <ParameterCalculations>
+        <ParameterCalculation Id="A_PC-1" Name="Fan" Language="VBScript">
+         <LParameters><ParameterRefRef RefId="A_P-1_R-1" AliasName="Mode" /></LParameters>
+         <RParameters><ParameterRefRef RefId="A_P-2_R-2" /></RParameters>
+         <LRTransformation>{script}</LRTransformation>
+        </ParameterCalculation>
+       </ParameterCalculations>
+       <Options DownloadInvisibleParameters="None" />
+      </Static>
+      <Dynamic>
+       <ChannelIndependentBlock><ParameterBlock Id="A_PB-1">
+        <ParameterRefRef RefId="A_P-1_R-1" />
+        <ParameterRefRef RefId="A_P-2_R-2" />
+        <choose ParamRefId="A_P-2_R-2"><when test="4"><ParameterRefRef RefId="A_P-3_R-3" /></when></choose>
+       </ParameterBlock></ChannelIndependentBlock>
+      </Dynamic>
+     </ApplicationProgram></KNX>"#
+        )
+    }
+
+    /// A calculated value is written, steers the Dynamic section like any
+    /// other value, and wins over an override of the computed parameter.
+    #[test]
+    fn test_compute_parameter_image_runs_parameter_calculations() -> Result<()> {
+        let xml = calc_xml("If Mode = 1 Then fan = 4 Else fan = 0");
+        let app = parse_application_program("A", xml.as_bytes())?;
+        let images = compute_parameter_image(&app, &no_overrides(), &BTreeMap::new())?;
+        assert_eq!(images["A_RS-1"], [0, 0, 0]);
+        let mut overrides = BTreeMap::new();
+        overrides.insert("P-1_R-1".to_string(), "1".to_string());
+        let images = compute_parameter_image(&app, &overrides, &BTreeMap::new())?;
+        // fan = 4 shows extra, written with its default.
+        assert_eq!(images["A_RS-1"], [1, 4, 9]);
+        overrides.insert("P-2_R-2".to_string(), "7".to_string());
+        let images = compute_parameter_image(&app, &overrides, &BTreeMap::new())?;
+        assert_eq!(images["A_RS-1"], [1, 4, 9]);
+        Ok(())
+    }
+
+    /// A calculation bussard cannot run makes the image refuse to write its
+    /// output, naming the calculation, rather than write a stale value.
+    #[test]
+    fn test_compute_parameter_image_refuses_output_of_unrunnable_calculation() -> Result<()> {
+        let xml = calc_xml("fan = Abs(-4)");
+        let app = parse_application_program("A", xml.as_bytes())?;
+        let err = compute_parameter_image(&app, &no_overrides(), &BTreeMap::new())
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("calculation PC-1"), "{err}");
+        assert!(err.contains("abs()"), "{err}");
+        Ok(())
+    }
+
     const HIDDEN_XML: &str = r#"<KNX xmlns="http://knx.org/xml/project/20">
      <ApplicationProgram Id="A" MaskVersion="MV-07B0" Name="bm">
       <Static>

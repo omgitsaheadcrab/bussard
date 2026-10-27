@@ -36,6 +36,10 @@ impl DynamicSource for ApplicationProgram {
         &self.calculations
     }
 
+    fn parameter_name(&self, param_id: &str) -> Option<&str> {
+        self.parameters.get(param_id)?.name.as_deref()
+    }
+
     fn parameter_ref(&self, ref_id: &str) -> Option<(&str, Option<&str>)> {
         ApplicationProgram::parameter_ref(self, ref_id)
             .map(|r| (r.ref_id.as_str(), r.value.as_deref()))

@@ -198,6 +198,14 @@ after 2 seconds.
   (`BUSSARD_SECURE_KEEPALIVE_SECS` changes it; `bussard test --secure-idle
   <secs>` measures an interface read-only). An interface without a TCP
   endpoint gets a UDP session only with `--secure-transport udp`.
+- **Calculated parameters.** Some programs compute parameter values with a
+  small script instead of storing what you set, such as a thermostat's fan
+  settings or a dimmer's dimming curve. bussard runs these scripts (the
+  VBScript and JavaScript that product data uses). A script it cannot run
+  makes `plan`, `apply` and `flash` refuse that device and name the
+  calculation, rather than write a value the script did not compute.
+  Verified byte for byte on Ekinex EK-E72 thermostats; the dimming curves of
+  a Jung LED dimmer are computed but not yet compared with an ETS download.
 - **Not implemented:** secure routing (multicast), activating or deactivating
   Data Secure on a device, and activation from the FDSK certificate. Use ETS.
 

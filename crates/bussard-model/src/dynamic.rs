@@ -46,6 +46,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::script::{ScriptValue, run_script};
+
 /// The application data the Dynamic evaluator reads.
 ///
 /// All ids passed in and out are those of the source: `ParameterRef`,
@@ -85,6 +87,11 @@ pub trait DynamicSource {
     fn calculations(&self) -> &[ParameterCalculation] {
         &[]
     }
+    /// The `Name` of a parameter: the variable a calculation script uses for
+    /// it when its ref declares no `AliasName`.
+    fn parameter_name(&self, _param_id: &str) -> Option<&str> {
+        None
+    }
 }
 
 impl<T: DynamicSource + ?Sized> DynamicSource for &T {
@@ -120,6 +127,9 @@ impl<T: DynamicSource + ?Sized> DynamicSource for &T {
     }
     fn calculations(&self) -> &[ParameterCalculation] {
         (**self).calculations()
+    }
+    fn parameter_name(&self, param_id: &str) -> Option<&str> {
+        (**self).parameter_name(param_id)
     }
 }
 
@@ -704,6 +714,18 @@ pub struct ActiveComObject {
     pub com_object_ref_id: String,
 }
 
+/// A `<ParameterCalculation>` whose script could not be run (see
+/// [`DynamicConfig::refused_calculations`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedCalculation {
+    /// The calculation's app-relative id (e.g. `PC-2`).
+    pub id: String,
+    /// The app-relative `ParameterRef` ids of its outputs.
+    pub outputs: Vec<String>,
+    /// Why it was refused.
+    pub reason: String,
+}
+
 /// The result of evaluating an application's Dynamic section.
 #[derive(Debug, Clone, Default)]
 pub struct DynamicConfig {
@@ -724,6 +746,11 @@ pub struct DynamicConfig {
     pub containers: Vec<ActiveContainer>,
     /// Override keys that name no `ParameterRef` of this application.
     pub unresolved_overrides: Vec<String>,
+    /// The `<ParameterCalculation>`s whose script could not be run, in
+    /// document order. Their outputs keep the value they had before the
+    /// script would have run, which need not be what ETS computes, so a
+    /// download that writes one must refuse.
+    pub refused_calculations: Vec<RefusedCalculation>,
     /// Resolved values keyed by (module instance id or `""`, app-relative
     /// `ParameterRef` id): the overrides and the `<Assign>` results.
     values: HashMap<(String, String), String>,
@@ -911,6 +938,7 @@ pub fn evaluate_dynamic<S: DynamicSource + ?Sized>(
     // order, or only through another gated choose, is taken once a pass has
     // reached that parameter.
     let mut active = HashSet::new();
+    let mut refused = Vec::new();
     let mut walk = Walk::default();
     for _ in 0..MAX_ASSIGN_PASSES {
         walk = Walk {
@@ -926,6 +954,9 @@ pub fn evaluate_dynamic<S: DynamicSource + ?Sized>(
         let now = walk.active_set(app);
         changed |= now != walk.active_before;
         active = now;
+        // Calculations before the assigns, so an `<Assign>` to a calculated
+        // parameter still wins, as for an override.
+        changed |= run_calculations(app, &mut values, &mut overridden, &mut refused);
         for assign in &walk.assigns {
             let instance = walk.instance_id(assign.target_module).to_string();
             let new = match (&assign.value, &assign.source) {
@@ -1036,9 +1067,97 @@ pub fn evaluate_dynamic<S: DynamicSource + ?Sized>(
         com_object_placements,
         containers,
         unresolved_overrides: unresolved,
+        refused_calculations: refused,
         values,
         overridden,
     }
+}
+
+/// Runs every `<ParameterCalculation>` of `app` on the current `values` and
+/// stores its outputs, as ETS does when an input changes (see
+/// [`ParameterCalculation`]). A calculated value wins over an override of the
+/// same ref: ETS does not let the user edit it. Returns whether a value
+/// changed. `refused` ends up holding the calculations the last pass could
+/// not run.
+///
+/// Calculations are application-level elements, so their refs are read and
+/// written outside any module instance; one that names a module-definition
+/// ref is refused.
+fn run_calculations<S: DynamicSource + ?Sized>(
+    app: &S,
+    values: &mut HashMap<(String, String), String>,
+    overridden: &mut HashSet<(String, String)>,
+    refused: &mut Vec<RefusedCalculation>,
+) -> bool {
+    refused.clear();
+    let mut changed = false;
+    for calc in app.calculations() {
+        let refuse = |reason: String| RefusedCalculation {
+            id: calc.id.clone(),
+            outputs: calc.outputs.iter().map(|p| p.param_ref.clone()).collect(),
+            reason,
+        };
+        let name = |p: &CalculationParameter| -> Option<String> {
+            p.alias.clone().or_else(|| {
+                let (param_id, _) = app.parameter_ref(&p.param_ref)?;
+                app.parameter_name(param_id).map(str::to_string)
+            })
+        };
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        let mut missing = None;
+        // The script may read its outputs too (their current values).
+        for p in calc.inputs.iter().chain(&calc.outputs) {
+            let Some(var) = name(p).filter(|_| !p.param_ref.starts_with("MD-")) else {
+                missing = Some(p.param_ref.clone());
+                break;
+            };
+            let value = value_of(app, values, "", None, &p.param_ref).unwrap_or_default();
+            let value = match value.trim().parse::<f64>() {
+                Ok(n) => ScriptValue::Number(n),
+                Err(_) => ScriptValue::Text(value),
+            };
+            inputs.push((var, value));
+        }
+        if let Some(param_ref) = missing {
+            refused.push(refuse(format!(
+                "parameter {param_ref} has no script variable name or sits in a module"
+            )));
+            continue;
+        }
+        for p in &calc.outputs {
+            outputs.push(name(p).unwrap_or_default());
+        }
+        let inputs: Vec<(&str, ScriptValue)> = inputs
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.clone()))
+            .collect();
+        let outputs_ref: Vec<&str> = outputs.iter().map(String::as_str).collect();
+        let results = match run_script(&calc.language, &calc.lr_script, &inputs, &outputs_ref) {
+            Ok(results) => results,
+            Err(err) => {
+                refused.push(refuse(err.to_string()));
+                continue;
+            }
+        };
+        for (p, result) in calc.outputs.iter().zip(results) {
+            let Some(result) = result else {
+                continue;
+            };
+            let text = match result {
+                ScriptValue::Number(n) if n.fract() == 0.0 && n.abs() < 1e15 => format!("{n:.0}"),
+                ScriptValue::Number(n) => n.to_string(),
+                ScriptValue::Text(t) => t,
+            };
+            let key = (String::new(), p.param_ref.clone());
+            if values.get(&key) != Some(&text) {
+                overridden.remove(&key);
+                values.insert(key, text);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// The evaluations of one program's Dynamic section, memoized by the value
