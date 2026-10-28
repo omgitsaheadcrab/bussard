@@ -4,8 +4,11 @@
 //! `If`/`ElseIf`/`Else`/`End If` (also the single-line form), `Dim`,
 //! arithmetic (`+ - * / \ Mod`), concatenation (`&`), comparisons and the
 //! bitwise `And`/`Or`/`Not`, with `True` = -1 and `False` = 0 as in VBScript.
-//! Names are case-insensitive; a variable never assigned reads as Empty (0 or
-//! the empty string). Everything else is refused.
+//! Names are case-insensitive. A variable that is neither an input nor
+//! declared with `Dim` reads as Empty (0 or the empty string) in VBScript, but
+//! here reading one before it is assigned is refused: it almost always means a
+//! parameter name the script expects did not resolve, and 0 would be a silent
+//! wrong value. Everything else is refused.
 
 use std::collections::HashMap;
 
@@ -17,12 +20,26 @@ pub(super) fn run(
     inputs: &[(&str, ScriptValue)],
     outputs: &[&str],
 ) -> Result<Vec<Option<ScriptValue>>, ScriptError> {
-    let program = Parser::new(tokenize(src)?).program()?;
-    let mut interp = Interp {
-        env: inputs
+    let mut parser = Parser::new(tokenize(src)?);
+    let program = parser.program()?;
+    let mut env: HashMap<String, Value> = parser
+        .dims
+        .into_iter()
+        .map(|name| (name, Value::Empty))
+        .collect();
+    // The outputs are known names too: unset, they read as Empty.
+    env.extend(
+        outputs
             .iter()
-            .map(|(name, value)| (name.to_ascii_lowercase(), Value::from(value)))
-            .collect(),
+            .map(|name| (name.to_ascii_lowercase(), Value::Empty)),
+    );
+    env.extend(
+        inputs
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), Value::from(value))),
+    );
+    let mut interp = Interp {
+        env,
         budget: Budget::default(),
     };
     interp.run(&program)?;
@@ -46,8 +63,10 @@ enum Tok {
     Name(String),
     /// A keyword, lower-cased.
     Kw(&'static str),
-    /// A statement separator: a line break or `:`.
+    /// A line break, which ends a statement and a single-line `If`.
     Nl,
+    /// `:`, which ends a statement but not a single-line `If`.
+    Colon,
     Eof,
 }
 
@@ -70,12 +89,16 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, ScriptError> {
                     i += 1;
                 }
             }
-            '\r' | '\n' | ':' => {
+            '\r' | '\n' => {
                 if c == '\r' && chars.get(i + 1) == Some(&'\n') {
                     i += 1;
                 }
                 i += 1;
                 out.push(Tok::Nl);
+            }
+            ':' => {
+                i += 1;
+                out.push(Tok::Colon);
             }
             '_' => {
                 // A line continuation: `_` then only spaces up to the line end.
@@ -226,11 +249,22 @@ enum Stmt {
 struct Parser {
     toks: Vec<Tok>,
     i: usize,
+    /// The current nesting of statements and unary expressions (see
+    /// [`super::MAX_DEPTH`]).
+    depth: usize,
+    /// The names declared with `Dim`, lower-cased: they read as Empty
+    /// before an assignment, as in VBScript.
+    dims: Vec<String>,
 }
 
 impl Parser {
     fn new(toks: Vec<Tok>) -> Self {
-        Self { toks, i: 0 }
+        Self {
+            toks,
+            i: 0,
+            depth: 0,
+            dims: Vec::new(),
+        }
     }
 
     fn peek(&self) -> &Tok {
@@ -274,7 +308,7 @@ impl Parser {
     }
 
     fn skip_newlines(&mut self) {
-        while *self.peek() == Tok::Nl {
+        while matches!(self.peek(), Tok::Nl | Tok::Colon) {
             self.i += 1;
         }
     }
@@ -308,14 +342,22 @@ impl Parser {
     }
 
     fn statement(&mut self) -> Result<Stmt, ScriptError> {
+        super::enter(&mut self.depth)?;
+        let stmt = self.statement_inner();
+        self.depth -= 1;
+        stmt
+    }
+
+    fn statement_inner(&mut self) -> Result<Stmt, ScriptError> {
         if self.accept_kw("if") {
             return self.if_statement();
         }
         if self.accept_kw("dim") {
             loop {
-                if !matches!(self.next(), Tok::Name(_)) {
+                let Tok::Name(name) = self.next() else {
                     return Err(ScriptError::unsupported("bad Dim"));
-                }
+                };
+                self.dims.push(name.to_ascii_lowercase());
                 if !self.accept_op(",") {
                     return Ok(Stmt::Dim);
                 }
@@ -334,11 +376,13 @@ impl Parser {
     fn if_statement(&mut self) -> Result<Stmt, ScriptError> {
         let cond = self.expr()?;
         self.expect_kw("then")?;
-        if *self.peek() != Tok::Nl {
-            // The single-line form: `If c Then stmt [Else stmt]`.
-            let body = vec![self.statement()?];
+        if !matches!(self.peek(), Tok::Nl | Tok::Eof) {
+            // The single-line form: `If c Then a : b [Else c : d]`. Every
+            // statement up to the end of the line belongs to its branch;
+            // `:` separates them, it does not end the `If`.
+            let body = self.single_line_branch(true)?;
             let other = if self.accept_kw("else") {
-                vec![self.statement()?]
+                self.single_line_branch(false)?
             } else {
                 Vec::new()
             };
@@ -363,6 +407,28 @@ impl Parser {
 
     // Expressions, loosest-binding first (VBScript precedence).
 
+    /// The `:`-separated statements of one branch of a single-line `If`, up
+    /// to the end of the line, or to its `Else` for the `Then` branch.
+    fn single_line_branch(&mut self, stop_at_else: bool) -> Result<Vec<Stmt>, ScriptError> {
+        let mut stmts = Vec::new();
+        loop {
+            while self.accept_colon() {}
+            match self.peek() {
+                Tok::Nl | Tok::Eof => return Ok(stmts),
+                Tok::Kw("else") if stop_at_else => return Ok(stmts),
+                _ => stmts.push(self.statement()?),
+            }
+        }
+    }
+
+    fn accept_colon(&mut self) -> bool {
+        if *self.peek() == Tok::Colon {
+            self.i += 1;
+            return true;
+        }
+        false
+    }
+
     fn expr(&mut self) -> Result<Expr, ScriptError> {
         let mut left = self.and_expr()?;
         while self.accept_kw("or") {
@@ -381,7 +447,10 @@ impl Parser {
 
     fn not_expr(&mut self) -> Result<Expr, ScriptError> {
         if self.accept_kw("not") {
-            return Ok(Expr::Not(Box::new(self.not_expr()?)));
+            super::enter(&mut self.depth)?;
+            let inner = self.not_expr();
+            self.depth -= 1;
+            return Ok(Expr::Not(Box::new(inner?)));
         }
         self.comparison()
     }
@@ -456,6 +525,13 @@ impl Parser {
     }
 
     fn unary(&mut self) -> Result<Expr, ScriptError> {
+        super::enter(&mut self.depth)?;
+        let e = self.unary_inner();
+        self.depth -= 1;
+        e
+    }
+
+    fn unary_inner(&mut self) -> Result<Expr, ScriptError> {
         if self.accept_op("-") {
             return Ok(Expr::Neg(Box::new(self.unary()?)));
         }
@@ -526,12 +602,12 @@ impl Value {
         }
     }
 
-    fn text(&self) -> String {
-        match self {
+    fn text(&self) -> Result<String, ScriptError> {
+        Ok(match self {
             Value::Empty => String::new(),
-            Value::Num(n) => format_number(*n),
+            Value::Num(n) => format_number(*n)?,
             Value::Str(s) => s.clone(),
-        }
+        })
     }
 
     fn truth(&self) -> Result<bool, ScriptError> {
@@ -539,13 +615,28 @@ impl Value {
     }
 }
 
-/// VBScript's text for a number: whole numbers without a decimal point.
-fn format_number(n: f64) -> String {
-    if n.fract() == 0.0 && n.abs() < 1e15 {
-        format!("{n:.0}")
-    } else {
-        format!("{n}")
+/// VBScript's text for a number (`CStr`): rounded to 15 significant digits,
+/// so `0.1 + 0.2` reads `0.3`, and whole numbers without a decimal point.
+/// VBScript switches to exponent notation outside about `1e-4 ..< 1e15`; this
+/// subset refuses those rather than print them differently.
+fn format_number(n: f64) -> Result<String, ScriptError> {
+    if n == 0.0 {
+        return Ok("0".to_string());
     }
+    if !n.is_finite() || !(1e-4..1e15).contains(&n.abs()) {
+        return Err(ScriptError::unsupported(format!(
+            "the text of {n} (VBScript writes it in exponent form)"
+        )));
+    }
+    // Round to 15 significant digits, then print the shortest form of that.
+    let rounded: f64 = format!("{n:.14e}")
+        .parse()
+        .map_err(|_| ScriptError::unsupported(format!("the text of {n}")))?;
+    Ok(if rounded.fract() == 0.0 {
+        format!("{rounded:.0}")
+    } else {
+        format!("{rounded}")
+    })
 }
 
 /// VBScript rounds the operands of `\`, `Mod`, `And`, `Or` and `Not` to whole
@@ -600,7 +691,15 @@ impl Interp {
         self.budget.tick()?;
         Ok(match e {
             Expr::Lit(v) => v.clone(),
-            Expr::Var(name) => self.env.get(name).cloned().unwrap_or(Value::Empty),
+            Expr::Var(name) => self
+                .env
+                .get(&name.to_ascii_lowercase())
+                .cloned()
+                .ok_or_else(|| {
+                    ScriptError::unsupported(format!(
+                        "{name} is read before it is assigned (not an input, output or Dim)"
+                    ))
+                })?,
             Expr::Neg(inner) => Value::Num(-self.eval(inner)?.num()?),
             Expr::Not(inner) => Value::Num(!whole(&self.eval(inner)?)? as f64),
             Expr::Cmp(op, a, b) => {
@@ -624,9 +723,11 @@ impl Interp {
             Expr::Bin(op, a, b) => {
                 let (a, b) = (self.eval(a)?, self.eval(b)?);
                 match op {
-                    BinOp::Concat => Value::Str(a.text() + &b.text()),
+                    BinOp::Concat => Value::Str(super::check_text(a.text()? + &b.text()?)?),
                     BinOp::Add => match (&a, &b) {
-                        (Value::Str(x), Value::Str(y)) => Value::Str(format!("{x}{y}")),
+                        (Value::Str(x), Value::Str(y)) => {
+                            Value::Str(super::check_text(format!("{x}{y}"))?)
+                        }
                         _ => Value::Num(a.num()? + b.num()?),
                     },
                     BinOp::Sub => Value::Num(a.num()? - b.num()?),
@@ -689,7 +790,7 @@ mod tests {
         let src = "If a > 1 And _\n   b < 3 Then x = 1 Else x = 2\n' a comment\ny = 7 : z = 8";
         assert_eq!(num(src, &[("a", 2.0), ("b", 1.0)], "x")?, Some(1.0));
         assert_eq!(num(src, &[("a", 0.0), ("b", 1.0)], "x")?, Some(2.0));
-        assert_eq!(num(src, &[], "z")?, Some(8.0));
+        assert_eq!(num(src, &[("a", 0.0), ("b", 0.0)], "z")?, Some(8.0));
         Ok(())
     }
 
@@ -722,7 +823,60 @@ mod tests {
             &["s", "m"],
         )?;
         assert_eq!(out, [Some(ScriptValue::Text("a\"b3".to_string())), None]);
-        assert_eq!(num("x = never + 1", &[], "x")?, Some(1.0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_single_line_if_owns_its_colon_statements() -> Result<(), ScriptError> {
+        // In VBScript `b = 2` belongs to the Then branch: with c false it
+        // must not run.
+        let src = "a = 0 : b = 0\nIf c Then a = 1 : b = 2 Else a = 3 : b = 4\nd = 5";
+        let out = |c: f64| run(src, &[("c", ScriptValue::Number(c))], &["a", "b", "d"]);
+        let n = |v: f64| Some(ScriptValue::Number(v));
+        assert_eq!(out(0.0)?, [n(3.0), n(4.0), n(5.0)]);
+        assert_eq!(out(-1.0)?, [n(1.0), n(2.0), n(5.0)]);
+        // Without Else, the statements after `:` are still the branch's.
+        let src = "b = 0\nIf c Then a = 1 : b = 2";
+        assert_eq!(num(src, &[("c", 0.0)], "b")?, Some(0.0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_refuses_a_name_read_before_it_is_assigned() -> Result<(), ScriptError> {
+        // A parameter name that did not resolve must not read as 0.
+        assert!(matches!(
+            run("x = never + 1", &[], &["x"]),
+            Err(ScriptError::Unsupported(_))
+        ));
+        // A `Dim` declares it Empty, as in VBScript.
+        assert_eq!(num("Dim t\nx = t + 1", &[], "x")?, Some(1.0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_refuses_deep_nesting_and_long_strings() {
+        let parens = format!("x = {}1{}", "(".repeat(10_000), ")".repeat(10_000));
+        let nots = format!("x = {}1", "Not ".repeat(10_000));
+        let negs = format!("x = {}1", "-".repeat(10_000));
+        let doubling = format!("s = \"ab\"\n{}", "s = s & s\n".repeat(20));
+        for src in [parens, nots, negs, doubling] {
+            assert!(
+                matches!(
+                    run(&src, &[], &["x", "s"]),
+                    Err(ScriptError::Unsupported(_))
+                ),
+                "{}",
+                &src[..20]
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_number_rounds_to_fifteen_digits() -> Result<(), ScriptError> {
+        let out = run("s = (0.1 + 0.2) & \"|\" & 2.5 & \"|\" & 7", &[], &["s"])?;
+        assert_eq!(out, [Some(ScriptValue::Text("0.3|2.5|7".to_string()))]);
+        // Exponent notation is refused, not printed differently.
+        assert!(run("s = 1E+20 & \"\"", &[], &["s"]).is_err());
         Ok(())
     }
 

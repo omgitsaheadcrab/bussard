@@ -1822,8 +1822,6 @@ fn insert_com_object_ref(app: &mut ApplicationProgram, m: &Attrs) {
     );
 }
 
-/// An id-valued attribute with the `<app-id>_` prefix stripped (kept verbatim
-/// when it lacks the prefix); `None` when absent or empty.
 /// Adds a `<ParameterRefRef>` inside an open calculation's `<LParameters>`
 /// or `<RParameters>` to its inputs or outputs.
 fn calc_parameter(state: &mut ParseState, m: &Attrs, app_id: &str) {
@@ -1844,6 +1842,8 @@ fn calc_parameter(state: &mut ParseState, m: &Attrs, app_id: &str) {
     }
 }
 
+/// An id-valued attribute with the `<app-id>_` prefix stripped (kept verbatim
+/// when it lacks the prefix); `None` when absent or empty.
 fn relative_attr(m: &Attrs, key: &[u8], app_id: &str) -> Option<String> {
     get(m, key)
         .filter(|s| !s.is_empty())

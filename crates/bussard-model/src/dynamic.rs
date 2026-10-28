@@ -92,6 +92,13 @@ pub trait DynamicSource {
     fn parameter_name(&self, _param_id: &str) -> Option<&str> {
         None
     }
+    /// How a calculation script sees a parameter's value: `Some(true)` as a
+    /// string (a text parameter), `Some(false)` as a number (an integer,
+    /// enumeration or float parameter), `None` for a type the scripts are
+    /// not run with (the calculation is then refused).
+    fn parameter_is_text(&self, _param_id: &str) -> Option<bool> {
+        None
+    }
 }
 
 impl<T: DynamicSource + ?Sized> DynamicSource for &T {
@@ -130,6 +137,9 @@ impl<T: DynamicSource + ?Sized> DynamicSource for &T {
     }
     fn parameter_name(&self, param_id: &str) -> Option<&str> {
         (**self).parameter_name(param_id)
+    }
+    fn parameter_is_text(&self, param_id: &str) -> Option<bool> {
+        (**self).parameter_is_text(param_id)
     }
 }
 
@@ -726,6 +736,20 @@ pub struct RefusedCalculation {
     pub reason: String,
 }
 
+/// An override of a calculation output that the calculation replaced (see
+/// [`DynamicConfig::calculated_overrides`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalculatedOverride {
+    /// The app-relative `ParameterRef` id.
+    pub param_ref: String,
+    /// The calculation's app-relative id.
+    pub calculation: String,
+    /// The value the override set.
+    pub overridden: String,
+    /// The value the calculation computed.
+    pub computed: String,
+}
+
 /// The result of evaluating an application's Dynamic section.
 #[derive(Debug, Clone, Default)]
 pub struct DynamicConfig {
@@ -751,6 +775,10 @@ pub struct DynamicConfig {
     /// script would have run, which need not be what ETS computes, so a
     /// download that writes one must refuse.
     pub refused_calculations: Vec<RefusedCalculation>,
+    /// The overrides of a calculated parameter that the calculation replaced
+    /// with another value: ETS does not let the user set such a parameter, so
+    /// a download refuses rather than write a value the model does not say.
+    pub calculated_overrides: Vec<CalculatedOverride>,
     /// Resolved values keyed by (module instance id or `""`, app-relative
     /// `ParameterRef` id): the overrides and the `<Assign>` results.
     values: HashMap<(String, String), String>,
@@ -938,8 +966,9 @@ pub fn evaluate_dynamic<S: DynamicSource + ?Sized>(
     // order, or only through another gated choose, is taken once a pass has
     // reached that parameter.
     let mut active = HashSet::new();
-    let mut refused = Vec::new();
+    let mut calcs = CalcRuns::default();
     let mut walk = Walk::default();
+    let mut settled = false;
     for _ in 0..MAX_ASSIGN_PASSES {
         walk = Walk {
             shared: std::mem::take(&mut shared),
@@ -956,7 +985,7 @@ pub fn evaluate_dynamic<S: DynamicSource + ?Sized>(
         active = now;
         // Calculations before the assigns, so an `<Assign>` to a calculated
         // parameter still wins, as for an override.
-        changed |= run_calculations(app, &mut values, &mut overridden, &mut refused);
+        changed |= calcs.run(app, &mut values, &mut overridden);
         for assign in &walk.assigns {
             let instance = walk.instance_id(assign.target_module).to_string();
             let new = match (&assign.value, &assign.source) {
@@ -984,9 +1013,17 @@ pub fn evaluate_dynamic<S: DynamicSource + ?Sized>(
             }
         }
         if !changed {
+            settled = true;
             break;
         }
     }
+    // A calculation whose outputs still changed in the last pass never
+    // settled (two calculations feeding each other): its outputs are not
+    // what ETS shows, so it is refused like one that could not run.
+    if !settled {
+        calcs.refuse_unsettled(app);
+    }
+    let (refused, calculated_overrides) = calcs.finish(app.calculations(), &values);
 
     // The written parameters: every reached ParameterRefRef plus the target
     // and source of every reached Assign, without duplicates.
@@ -1068,96 +1105,267 @@ pub fn evaluate_dynamic<S: DynamicSource + ?Sized>(
         containers,
         unresolved_overrides: unresolved,
         refused_calculations: refused,
+        calculated_overrides,
         values,
         overridden,
     }
 }
 
-/// Runs every `<ParameterCalculation>` of `app` on the current `values` and
-/// stores its outputs, as ETS does when an input changes (see
-/// [`ParameterCalculation`]). A calculated value wins over an override of the
-/// same ref: ETS does not let the user edit it. Returns whether a value
-/// changed. `refused` ends up holding the calculations the last pass could
-/// not run.
-///
-/// Calculations are application-level elements, so their refs are read and
-/// written outside any module instance; one that names a module-definition
-/// ref is refused.
-fn run_calculations<S: DynamicSource + ?Sized>(
-    app: &S,
-    values: &mut HashMap<(String, String), String>,
-    overridden: &mut HashSet<(String, String)>,
-    refused: &mut Vec<RefusedCalculation>,
-) -> bool {
-    refused.clear();
-    let mut changed = false;
-    for calc in app.calculations() {
-        let refuse = |reason: String| RefusedCalculation {
-            id: calc.id.clone(),
-            outputs: calc.outputs.iter().map(|p| p.param_ref.clone()).collect(),
-            reason,
-        };
-        let name = |p: &CalculationParameter| -> Option<String> {
-            p.alias.clone().or_else(|| {
-                let (param_id, _) = app.parameter_ref(&p.param_ref)?;
-                app.parameter_name(param_id).map(str::to_string)
-            })
-        };
-        let mut inputs = Vec::new();
-        let mut outputs = Vec::new();
-        let mut missing = None;
-        // The script may read its outputs too (their current values).
-        for p in calc.inputs.iter().chain(&calc.outputs) {
-            let Some(var) = name(p).filter(|_| !p.param_ref.starts_with("MD-")) else {
-                missing = Some(p.param_ref.clone());
-                break;
-            };
-            let value = value_of(app, values, "", None, &p.param_ref).unwrap_or_default();
-            let value = match value.trim().parse::<f64>() {
-                Ok(n) => ScriptValue::Number(n),
-                Err(_) => ScriptValue::Text(value),
-            };
-            inputs.push((var, value));
-        }
-        if let Some(param_ref) = missing {
-            refused.push(refuse(format!(
-                "parameter {param_ref} has no script variable name or sits in a module"
-            )));
-            continue;
-        }
-        for p in &calc.outputs {
-            outputs.push(name(p).unwrap_or_default());
-        }
-        let inputs: Vec<(&str, ScriptValue)> = inputs
-            .iter()
-            .map(|(n, v)| (n.as_str(), v.clone()))
-            .collect();
-        let outputs_ref: Vec<&str> = outputs.iter().map(String::as_str).collect();
-        let results = match run_script(&calc.language, &calc.lr_script, &inputs, &outputs_ref) {
-            Ok(results) => results,
-            Err(err) => {
-                refused.push(refuse(err.to_string()));
-                continue;
-            }
-        };
-        for (p, result) in calc.outputs.iter().zip(results) {
-            let Some(result) = result else {
-                continue;
-            };
-            let text = match result {
-                ScriptValue::Number(n) if n.fract() == 0.0 && n.abs() < 1e15 => format!("{n:.0}"),
-                ScriptValue::Number(n) => n.to_string(),
-                ScriptValue::Text(t) => t,
-            };
-            let key = (String::new(), p.param_ref.clone());
-            if values.get(&key) != Some(&text) {
-                overridden.remove(&key);
-                values.insert(key, text);
-                changed = true;
+/// The app-relative `ParameterRef` ids whose value decides something in the
+/// application's own Dynamic section or another calculation: a `<choose>`'s
+/// parameter, an `<Assign>`'s source, a calculation's input. A refused
+/// calculation output among them can steer the configuration with a value ETS
+/// would not have, even when nothing writes it to memory.
+pub fn refs_read_by_dynamic<S: DynamicSource + ?Sized>(app: &S) -> HashSet<String> {
+    fn walk(nodes: &[DynamicNode], out: &mut HashSet<String>) {
+        for node in nodes {
+            match node {
+                DynamicNode::Channel { children, .. }
+                | DynamicNode::ParameterBlock { children, .. } => walk(children, out),
+                DynamicNode::Choose {
+                    param_ref_id,
+                    whens,
+                } => {
+                    out.insert(param_ref_id.clone());
+                    for when in whens {
+                        walk(&when.children, out);
+                    }
+                }
+                DynamicNode::Assign {
+                    source: Some(source),
+                    ..
+                } => {
+                    out.insert(source.clone());
+                }
+                _ => {}
             }
         }
     }
-    changed
+    let mut out = HashSet::new();
+    walk(app.dynamic(), &mut out);
+    for calc in app.calculations() {
+        out.extend(calc.inputs.iter().map(|p| p.param_ref.clone()));
+    }
+    out
+}
+
+/// The state of the `<ParameterCalculation>`s across the passes of one
+/// evaluation.
+///
+/// ETS runs a calculation when one of its inputs (`<LParameters>`) changes and
+/// stores its results in the outputs (see [`ParameterCalculation`]). So a
+/// calculation runs again only when its inputs differ from its last run: a
+/// script that reads its own output (`y = y + 1`) runs once, as in ETS, and
+/// does not drift with every pass.
+#[derive(Default)]
+struct CalcRuns {
+    /// The input values each calculation last ran with, by calculation id.
+    last_inputs: HashMap<String, Vec<String>>,
+    /// The calculations that could not run, by id; cleared when one runs.
+    refused: BTreeMap<String, RefusedCalculation>,
+    /// The calculations whose outputs changed in the latest pass.
+    changed_last_pass: Vec<String>,
+    /// Overrides a calculation replaced, by `ParameterRef` id.
+    replaced: BTreeMap<String, CalculatedOverride>,
+}
+
+impl CalcRuns {
+    /// Runs every calculation of `app` whose inputs changed and stores its
+    /// outputs. A calculated value wins over an override of the same ref
+    /// (ETS does not let the user edit it); an override it replaces with
+    /// another value is recorded. Returns whether a value changed.
+    ///
+    /// Calculations are application-level elements, so their refs are read
+    /// and written outside any module instance; one that names a
+    /// module-definition ref is refused.
+    fn run<S: DynamicSource + ?Sized>(
+        &mut self,
+        app: &S,
+        values: &mut HashMap<(String, String), String>,
+        overridden: &mut HashSet<(String, String)>,
+    ) -> bool {
+        self.changed_last_pass.clear();
+        let mut changed = false;
+        for calc in app.calculations() {
+            let key: Vec<String> = calc
+                .inputs
+                .iter()
+                .map(|p| value_of(app, values, "", None, &p.param_ref).unwrap_or_default())
+                .collect();
+            if self.last_inputs.get(&calc.id) == Some(&key) {
+                continue;
+            }
+            self.last_inputs.insert(calc.id.clone(), key);
+            let results = match run_one(app, values, calc) {
+                Ok(results) => {
+                    self.refused.remove(&calc.id);
+                    results
+                }
+                Err(reason) => {
+                    self.refused.insert(
+                        calc.id.clone(),
+                        RefusedCalculation {
+                            id: calc.id.clone(),
+                            outputs: calc.outputs.iter().map(|p| p.param_ref.clone()).collect(),
+                            reason,
+                        },
+                    );
+                    continue;
+                }
+            };
+            for (p, text) in calc.outputs.iter().zip(results) {
+                let Some(text) = text else {
+                    continue;
+                };
+                let key = (String::new(), p.param_ref.clone());
+                if values.get(&key) == Some(&text) {
+                    continue;
+                }
+                if overridden.remove(&key)
+                    && let Some(old) = values.get(&key)
+                {
+                    self.replaced.entry(p.param_ref.clone()).or_insert_with(|| {
+                        CalculatedOverride {
+                            param_ref: p.param_ref.clone(),
+                            calculation: calc.id.clone(),
+                            overridden: old.clone(),
+                            computed: String::new(),
+                        }
+                    });
+                }
+                values.insert(key, text);
+                changed = true;
+                if !self.changed_last_pass.contains(&calc.id) {
+                    self.changed_last_pass.push(calc.id.clone());
+                }
+            }
+        }
+        changed
+    }
+
+    /// Refuses the calculations still changing their outputs when the passes
+    /// ran out.
+    fn refuse_unsettled<S: DynamicSource + ?Sized>(&mut self, app: &S) {
+        for calc in app.calculations() {
+            if self.changed_last_pass.contains(&calc.id) {
+                self.refused.insert(
+                    calc.id.clone(),
+                    RefusedCalculation {
+                        id: calc.id.clone(),
+                        outputs: calc.outputs.iter().map(|p| p.param_ref.clone()).collect(),
+                        reason: "its outputs did not settle (calculations feeding each other)"
+                            .to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// The refused calculations in document order, and the replaced
+    /// overrides whose final computed value differs from the override.
+    fn finish(
+        self,
+        app_calcs: &[ParameterCalculation],
+        values: &HashMap<(String, String), String>,
+    ) -> (Vec<RefusedCalculation>, Vec<CalculatedOverride>) {
+        let mut refused = self.refused;
+        let in_order = app_calcs
+            .iter()
+            .filter_map(|c| refused.remove(&c.id))
+            .collect();
+        let replaced = self
+            .replaced
+            .into_values()
+            .filter_map(|mut o| {
+                o.computed = values
+                    .get(&(String::new(), o.param_ref.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                (o.computed != o.overridden).then_some(o)
+            })
+            .collect();
+        (in_order, replaced)
+    }
+}
+
+/// Runs one calculation on the current `values` and returns the text of each
+/// output, in order (`None` for one the script leaves unset), or why it could
+/// not run.
+fn run_one<S: DynamicSource + ?Sized>(
+    app: &S,
+    values: &HashMap<(String, String), String>,
+    calc: &ParameterCalculation,
+) -> Result<Vec<Option<String>>, String> {
+    let param_of = |p: &CalculationParameter| -> Result<&str, String> {
+        if p.param_ref.starts_with("MD-") {
+            return Err(format!("parameter {} sits in a module", p.param_ref));
+        }
+        app.parameter_ref(&p.param_ref)
+            .map(|(param_id, _)| param_id)
+            .ok_or_else(|| format!("parameter {} does not exist", p.param_ref))
+    };
+    let name = |p: &CalculationParameter| -> Result<String, String> {
+        match &p.alias {
+            Some(alias) => Ok(alias.clone()),
+            None => app
+                .parameter_name(param_of(p)?)
+                .map(str::to_string)
+                .ok_or_else(|| format!("parameter {} has no script variable name", p.param_ref)),
+        }
+    };
+    let mut inputs = Vec::new();
+    // The script may read its outputs too (their current values).
+    for p in calc.inputs.iter().chain(&calc.outputs) {
+        let var = name(p)?;
+        let is_text = app.parameter_is_text(param_of(p)?).ok_or_else(|| {
+            format!(
+                "parameter {} has a type scripts are not run with",
+                p.param_ref
+            )
+        })?;
+        let Some(value) = value_of(app, values, "", None, &p.param_ref) else {
+            return Err(format!("parameter {} has no value", p.param_ref));
+        };
+        let value = if is_text {
+            ScriptValue::Text(value)
+        } else {
+            match value.trim().parse::<f64>() {
+                Ok(n) if n.is_finite() => ScriptValue::Number(n),
+                _ => {
+                    return Err(format!(
+                        "parameter {} is numeric but holds {value:?}",
+                        p.param_ref
+                    ));
+                }
+            }
+        };
+        inputs.push((var, value));
+    }
+    let outputs: Vec<String> = calc.outputs.iter().map(name).collect::<Result<_, _>>()?;
+    let inputs: Vec<(&str, ScriptValue)> = inputs
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.clone()))
+        .collect();
+    let outputs_ref: Vec<&str> = outputs.iter().map(String::as_str).collect();
+    let results = run_script(&calc.language, &calc.lr_script, &inputs, &outputs_ref)
+        .map_err(|err| err.to_string())?;
+    calc.outputs
+        .iter()
+        .zip(results)
+        .map(|(p, result)| {
+            Ok(match result {
+                None => None,
+                Some(ScriptValue::Number(n)) if !n.is_finite() => {
+                    return Err(format!("output {} computes to {n}", p.param_ref));
+                }
+                Some(ScriptValue::Number(n)) if n.fract() == 0.0 && n.abs() < 1e15 => {
+                    Some(format!("{n:.0}"))
+                }
+                Some(ScriptValue::Number(n)) => Some(n.to_string()),
+                Some(ScriptValue::Text(t)) => Some(t),
+            })
+        })
+        .collect()
 }
 
 /// The evaluations of one program's Dynamic section, memoized by the value

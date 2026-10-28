@@ -203,7 +203,10 @@ after 2 seconds.
   settings or a dimmer's dimming curve. bussard runs these scripts (the
   VBScript and JavaScript that product data uses). A script it cannot run
   makes `plan`, `apply` and `flash` refuse that device and name the
-  calculation, rather than write a value the script did not compute.
+  calculation, rather than write a value the script did not compute. So do
+  calculations that keep changing each other's results, and a value in the
+  device file for a parameter a calculation computes differently: remove it,
+  or change the parameters the calculation reads.
   Verified byte for byte on Ekinex EK-E72 thermostats; the dimming curves of
   a Jung LED dimmer are computed but not yet compared with an ETS download.
 - **Not implemented:** secure routing (multicast), activating or deactivating

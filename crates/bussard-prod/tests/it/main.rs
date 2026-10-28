@@ -9,6 +9,7 @@ mod enum_default_leniency;
 mod evaluator_conformance;
 mod fetch;
 mod knxprod;
+mod parameter_calculations_corpus;
 mod parameter_image;
 mod selected;
 mod sys7_visible_parameters;

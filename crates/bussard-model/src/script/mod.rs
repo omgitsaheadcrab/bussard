@@ -20,6 +20,42 @@ mod vbscript;
 /// the largest seen (a 218-entry thermistor table) takes a few thousand.
 const MAX_STEPS: u64 = 2_000_000;
 
+/// How deeply statements and expressions may nest. Product data stays at a
+/// handful of levels; the bound keeps a hostile `((((…` or `Not Not …` from
+/// overflowing the stack of the recursive parsers and interpreters.
+const MAX_DEPTH: usize = 100;
+
+/// The longest string a script may build, in characters, and the most
+/// elements an array may hold. Real calculations build short labels and
+/// tables of a few hundred entries; the bounds keep a loop that doubles a
+/// string from exhausting memory within the step budget.
+const MAX_TEXT: usize = 65_536;
+
+/// The most elements one JavaScript array may hold (see [`MAX_TEXT`]).
+const MAX_ARRAY: usize = 65_536;
+
+/// Refuses a string longer than [`MAX_TEXT`].
+fn check_text(text: String) -> Result<String, ScriptError> {
+    if text.chars().count() > MAX_TEXT {
+        return Err(ScriptError::unsupported(format!(
+            "string longer than {MAX_TEXT} characters"
+        )));
+    }
+    Ok(text)
+}
+
+/// Counts one level of nesting in a recursive parser and refuses past
+/// [`MAX_DEPTH`].
+fn enter(depth: &mut usize) -> Result<(), ScriptError> {
+    *depth += 1;
+    if *depth > MAX_DEPTH {
+        return Err(ScriptError::unsupported(format!(
+            "nested more than {MAX_DEPTH} levels deep"
+        )));
+    }
+    Ok(())
+}
+
 /// A value a script reads or produces.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScriptValue {

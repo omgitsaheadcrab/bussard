@@ -40,6 +40,17 @@ impl DynamicSource for ApplicationProgram {
         self.parameters.get(param_id)?.name.as_deref()
     }
 
+    fn parameter_is_text(&self, param_id: &str) -> Option<bool> {
+        let ptype = self.parameters.get(param_id)?.parameter_type.as_deref()?;
+        match &self.parameter_types.get(ptype)?.kind {
+            ParameterType::Text { .. } => Some(true),
+            ParameterType::Int { .. }
+            | ParameterType::Enum { .. }
+            | ParameterType::Float { .. } => Some(false),
+            _ => None,
+        }
+    }
+
     fn parameter_ref(&self, ref_id: &str) -> Option<(&str, Option<&str>)> {
         ApplicationProgram::parameter_ref(self, ref_id)
             .map(|r| (r.ref_id.as_str(), r.value.as_deref()))

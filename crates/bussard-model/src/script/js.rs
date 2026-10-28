@@ -20,7 +20,9 @@ pub(super) fn run(
     inputs: &[(&str, ScriptValue)],
     outputs: &[&str],
 ) -> Result<Vec<Option<ScriptValue>>, ScriptError> {
-    let program = Parser::new(tokenize(src)?).program()?;
+    let mut parser = Parser::new(tokenize(src)?);
+    let program = parser.program()?;
+    check_block_scoping(&parser, inputs, outputs)?;
     let mut interp = Interp {
         env: inputs
             .iter()
@@ -48,6 +50,28 @@ pub(super) fn run(
             ))),
         })
         .collect()
+}
+
+/// Refuses a `let`/`const` in a nested scope whose name the script also uses
+/// elsewhere: this subset keeps every variable global, so such a declaration
+/// would overwrite the outer variable where JavaScript shadows it. A nested
+/// `let` used only inside its block (`for (let i = 0; …)`) behaves the same
+/// either way and is accepted.
+fn check_block_scoping(
+    parser: &Parser,
+    inputs: &[(&str, ScriptValue)],
+    outputs: &[&str],
+) -> Result<(), ScriptError> {
+    for name in &parser.nested_lexical {
+        let declared_twice = parser.declared.get(name).is_some_and(|n| *n > 1);
+        let outer = inputs.iter().any(|(n, _)| n == name) || outputs.contains(&name.as_str());
+        if declared_twice || outer {
+            return Err(ScriptError::unsupported(format!(
+                "block-scoped {name} shadows another variable of the same name"
+            )));
+        }
+    }
+    Ok(())
 }
 
 // --- tokens -----------------------------------------------------------------
@@ -120,8 +144,17 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, ScriptError> {
                             'n' => '\n',
                             't' => '\t',
                             'r' => '\r',
-                            '0' => '\0',
-                            other => other,
+                            '0' if !at(i + 2).is_some_and(|d| d.is_ascii_digit()) => '\0',
+                            '\\' | '\'' | '"' => escaped,
+                            // `\x41`, `\u00e9`, `\b`, `\v`, `\f`, octal: JavaScript
+                            // gives them a meaning this subset does not
+                            // implement, so they are refused, not read as
+                            // the bare letter.
+                            other => {
+                                return Err(ScriptError::unsupported(format!(
+                                    "string escape \\{other}"
+                                )));
+                            }
                         });
                         i += 2;
                     }
@@ -260,11 +293,28 @@ fn precedence(op: &str) -> Option<u8> {
 struct Parser {
     toks: Vec<Tok>,
     i: usize,
+    /// The current nesting of statements and unary expressions (see
+    /// [`super::MAX_DEPTH`]).
+    depth: usize,
+    /// Every `let`/`const` declared inside a block or loop, which this
+    /// subset makes global (see [`check_block_scoping`]).
+    nested_lexical: Vec<String>,
+    /// Every declared name, with how many times it is declared.
+    declared: HashMap<String, usize>,
+    /// How many blocks and loop bodies enclose the current statement.
+    block_depth: usize,
 }
 
 impl Parser {
     fn new(toks: Vec<Tok>) -> Self {
-        Self { toks, i: 0 }
+        Self {
+            toks,
+            i: 0,
+            depth: 0,
+            nested_lexical: Vec::new(),
+            declared: HashMap::new(),
+            block_depth: 0,
+        }
     }
 
     fn peek(&self) -> &Tok {
@@ -308,6 +358,17 @@ impl Parser {
     }
 
     fn statement(&mut self) -> Result<Stmt, ScriptError> {
+        super::enter(&mut self.depth)?;
+        // A statement inside another statement (a block, a branch, a loop
+        // body) is in a nested scope.
+        self.block_depth += 1;
+        let stmt = self.statement_inner();
+        self.block_depth -= 1;
+        self.depth -= 1;
+        stmt
+    }
+
+    fn statement_inner(&mut self) -> Result<Stmt, ScriptError> {
         if self.accept(";") {
             return Ok(Stmt::Block(Vec::new()));
         }
@@ -343,7 +404,11 @@ impl Parser {
             let init = if self.at(";") {
                 None
             } else if self.at("var") || self.at("let") || self.at("const") {
-                Some(Box::new(self.declaration()?))
+                // A `let` in the loop head is scoped to the loop.
+                self.block_depth += 1;
+                let decl = self.declaration();
+                self.block_depth -= 1;
+                Some(Box::new(decl?))
             } else {
                 Some(Box::new(Stmt::Expr(self.expr()?)))
             };
@@ -434,12 +499,18 @@ impl Parser {
     }
 
     fn declaration(&mut self) -> Result<Stmt, ScriptError> {
+        let lexical = !self.at("var");
         self.next(); // var / let / const
         let mut decls = Vec::new();
         loop {
             let Tok::Name(name) = self.next() else {
                 return Err(ScriptError::unsupported("bad declaration"));
             };
+            *self.declared.entry(name.clone()).or_default() += 1;
+            // `block_depth` counts the statement holding this declaration.
+            if lexical && self.block_depth > 1 {
+                self.nested_lexical.push(name.clone());
+            }
             let init = if self.accept("=") {
                 Some(self.assignment()?)
             } else {
@@ -509,6 +580,13 @@ impl Parser {
     }
 
     fn unary(&mut self) -> Result<Expr, ScriptError> {
+        super::enter(&mut self.depth)?;
+        let e = self.unary_inner();
+        self.depth -= 1;
+        e
+    }
+
+    fn unary_inner(&mut self) -> Result<Expr, ScriptError> {
         for op in ["!", "-", "+"] {
             if self.accept(op) {
                 return Ok(Expr::Unary(op, Box::new(self.unary()?)));
@@ -656,31 +734,51 @@ impl Value {
             Value::Bool(b) => f64::from(u8::from(*b)),
             Value::Num(n) => *n,
             Value::Str(s) => string_to_number(s),
-            Value::Array(_) => string_to_number(&self.text()),
+            // An array too large or too deep to print is not a number
+            // either: JavaScript gives NaN for any array of two or more
+            // elements.
+            Value::Array(_) => self.text().map_or(f64::NAN, |t| string_to_number(&t)),
             Value::Math | Value::Builtin(_) | Value::ToFixed(_) => f64::NAN,
         }
     }
 
-    /// JavaScript's `ToString`.
-    fn text(&self) -> String {
-        match self {
+    /// JavaScript's `ToString`, refused for a string past
+    /// [`super::MAX_TEXT`] and for arrays nested past [`super::MAX_DEPTH`]
+    /// (which a cycle such as `a[0] = a` always is).
+    fn text(&self) -> Result<String, ScriptError> {
+        self.text_at(0)
+    }
+
+    fn text_at(&self, depth: usize) -> Result<String, ScriptError> {
+        Ok(match self {
             Value::Undefined => "undefined".to_string(),
             Value::Null => "null".to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Num(n) => number_to_string(*n),
             Value::Str(s) => s.clone(),
-            Value::Array(items) => items
-                .borrow()
-                .iter()
-                .map(|v| match v {
-                    Value::Undefined | Value::Null => String::new(),
-                    v => v.text(),
-                })
-                .collect::<Vec<_>>()
-                .join(","),
+            Value::Array(items) => {
+                if depth >= super::MAX_DEPTH {
+                    return Err(ScriptError::unsupported(
+                        "array nested too deeply (or containing itself)",
+                    ));
+                }
+                let mut out = String::new();
+                for (k, v) in items.borrow().iter().enumerate() {
+                    if k > 0 {
+                        out.push(',');
+                    }
+                    if !matches!(v, Value::Undefined | Value::Null) {
+                        out.push_str(&v.text_at(depth + 1)?);
+                    }
+                    if out.len() > super::MAX_TEXT * 4 {
+                        break;
+                    }
+                }
+                super::check_text(out)?
+            }
             Value::Math => "[object Math]".to_string(),
             Value::Builtin(_) | Value::ToFixed(_) => "function".to_string(),
-        }
+        })
     }
 
     fn truthy(&self) -> bool {
@@ -694,11 +792,11 @@ impl Value {
     }
 
     /// `ToPrimitive`: an array becomes its text; everything else is itself.
-    fn primitive(self) -> Value {
-        match self {
-            Value::Array(_) => Value::Str(self.text()),
+    fn primitive(self) -> Result<Value, ScriptError> {
+        Ok(match self {
+            Value::Array(_) => Value::Str(self.text()?),
             other => other,
-        }
+        })
     }
 }
 
@@ -903,13 +1001,13 @@ fn call_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, ScriptError> 
         Builtin::ParseInt => {
             let text = args
                 .first()
-                .map_or_else(|| "undefined".to_string(), Value::text);
+                .map_or_else(|| Ok("undefined".to_string()), Value::text)?;
             Value::Num(parse_int(&text, args.get(1).map(Value::num)))
         }
         Builtin::ParseFloat => Value::Num(parse_float(
             &args
                 .first()
-                .map_or_else(|| "undefined".to_string(), Value::text),
+                .map_or_else(|| Ok("undefined".to_string()), Value::text)?,
         )),
         Builtin::Number => Value::Num(args.first().map_or(0.0, Value::num)),
         Builtin::IsNaN => Value::Bool(arg(0).is_nan()),
@@ -952,16 +1050,16 @@ fn call_builtin(builtin: Builtin, args: &[Value]) -> Result<Value, ScriptError> 
 }
 
 /// `a == b`.
-fn loose_eq(a: &Value, b: &Value) -> bool {
-    match (a, b) {
+fn loose_eq(a: &Value, b: &Value) -> Result<bool, ScriptError> {
+    Ok(match (a, b) {
         (Value::Undefined | Value::Null, Value::Undefined | Value::Null) => true,
         (Value::Undefined | Value::Null, _) | (_, Value::Undefined | Value::Null) => false,
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Array(x), Value::Array(y)) => Rc::ptr_eq(x, y),
-        (Value::Array(_), _) => loose_eq(&a.clone().primitive(), b),
-        (_, Value::Array(_)) => loose_eq(a, &b.clone().primitive()),
+        (Value::Array(_), _) => loose_eq(&a.clone().primitive()?, b)?,
+        (_, Value::Array(_)) => loose_eq(a, &b.clone().primitive()?)?,
         _ => a.num() == b.num(),
-    }
+    })
 }
 
 /// `a === b`.
@@ -979,9 +1077,9 @@ fn strict_eq(a: &Value, b: &Value) -> bool {
 /// The arithmetic operators, `+` included (string concatenation).
 fn arithmetic(op: &str, a: Value, b: Value) -> Result<Value, ScriptError> {
     if op == "+" {
-        let (a, b) = (a.primitive(), b.primitive());
+        let (a, b) = (a.primitive()?, b.primitive()?);
         if matches!(a, Value::Str(_)) || matches!(b, Value::Str(_)) {
-            return Ok(Value::Str(a.text() + &b.text()));
+            return Ok(Value::Str(super::check_text(a.text()? + &b.text()?)?));
         }
         return Ok(Value::Num(a.num() + b.num()));
     }
@@ -1135,7 +1233,7 @@ impl Interp {
                     ));
                 };
                 let i = self.eval(index)?.num();
-                if !(i.fract() == 0.0 && (0.0..1_000_000.0).contains(&i)) {
+                if !(i.fract() == 0.0 && (0.0..super::MAX_ARRAY as f64).contains(&i)) {
                     return Err(ScriptError::unsupported(format!("bad array index {i}")));
                 }
                 let i = i as usize;
@@ -1215,12 +1313,12 @@ impl Interp {
                 _ => {
                     let (a, b) = (self.eval(a)?, self.eval(b)?);
                     match *op {
-                        "==" => Value::Bool(loose_eq(&a, &b)),
-                        "!=" => Value::Bool(!loose_eq(&a, &b)),
+                        "==" => Value::Bool(loose_eq(&a, &b)?),
+                        "!=" => Value::Bool(!loose_eq(&a, &b)?),
                         "===" => Value::Bool(strict_eq(&a, &b)),
                         "!==" => Value::Bool(!strict_eq(&a, &b)),
                         "<" | ">" | "<=" | ">=" => {
-                            let (a, b) = (a.primitive(), b.primitive());
+                            let (a, b) = (a.primitive()?, b.primitive()?);
                             let ordering = match (&a, &b) {
                                 (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
                                 _ => a.num().partial_cmp(&b.num()),
@@ -1453,5 +1551,81 @@ mod tests {
                 "{src}"
             );
         }
+    }
+
+    fn refused(script: &str, inputs: &[(&str, ScriptValue)], outputs: &[&str]) -> bool {
+        matches!(
+            run(script, inputs, outputs),
+            Err(ScriptError::Unsupported(_))
+        )
+    }
+
+    #[test]
+    fn test_tokenize_refuses_escapes_outside_the_subset() -> Result<(), ScriptError> {
+        assert_eq!(
+            text(r#"s = "a\n\t\"\\\'b\0";"#, "s")?,
+            Some("a\n\t\"\\'b\0".to_string())
+        );
+        for esc in [r"\x41", r"\u00e9", r"\b", r"\v", r"\f", r"\07", r"\q"] {
+            let src = format!("s = \"{esc}\";");
+            assert!(refused(&src, &[], &["s"]), "{esc}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_refuses_deep_nesting_without_overflowing() {
+        // Product data is untrusted: a hostile nesting is an error, not a
+        // stack overflow that aborts the process.
+        let parens = format!("x = {}1{};", "(".repeat(10_000), ")".repeat(10_000));
+        assert!(refused(&parens, &[], &["x"]));
+        let nots = format!("x = {}1;", "!".repeat(10_000));
+        assert!(refused(&nots, &[], &["x"]));
+        let blocks = format!("{}x = 1;{}", "{".repeat(10_000), "}".repeat(10_000));
+        assert!(refused(&blocks, &[], &["x"]));
+    }
+
+    #[test]
+    fn test_run_refuses_a_string_or_array_past_its_bound() {
+        // Doubling a string 30 times fits the step budget but not memory.
+        assert!(refused(
+            "var s = \"ab\"; for (var i = 0; i < 30; i++) { s += s; }",
+            &[],
+            &["s"]
+        ));
+        assert!(refused("var a = []; a[70000] = 1;", &[], &["a"]));
+        // An array holding itself has no finite text.
+        assert!(refused(
+            "var a = [1]; a[0] = a; var s = a + \"\";",
+            &[],
+            &["s"]
+        ));
+    }
+
+    #[test]
+    fn test_run_refuses_a_block_scoped_shadow() -> Result<(), ScriptError> {
+        // All variables are global here, so a nested `let` that shadows
+        // another variable would overwrite it: refused.
+        let input = [("x", ScriptValue::Number(5.0))];
+        assert!(refused(
+            "if (true) { let x = 1; } var y = x;",
+            &input,
+            &["y"]
+        ));
+        assert!(refused(
+            "var t = 2; for (let t = 0; t < 1; t++) {} var y = t;",
+            &[],
+            &["y"]
+        ));
+        // A loop counter used only in its loop behaves the same either way.
+        assert_eq!(
+            number(
+                "var y = 0; for (let i = 0; i < 3; i++) { const d = i * 2; y += d; }",
+                &[],
+                "y"
+            )?,
+            Some(6.0)
+        );
+        Ok(())
     }
 }
