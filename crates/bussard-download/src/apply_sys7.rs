@@ -80,7 +80,7 @@
 use bussard_mgmt::connection::{L4Channel, Layer4Connection};
 use bussard_mgmt::load::{LoadControl, LoadState, WriteError, read_memory, write_memory};
 use bussard_mgmt::sys7::{S7_SUB_ALLOC_DATA, encode_alloc_segment, encode_task_segment};
-use bussard_mgmt::{LsmAccess, Sys7Profile, alloc_attr_octets};
+use bussard_mgmt::{LsmAccess, Sys7Profile, Sys7TaskIdentity, alloc_attr_octets};
 
 use crate::compute::DesiredTables;
 use crate::compute_sys7::{
@@ -131,6 +131,13 @@ pub enum Sys7ApplyError {
         /// What the device answered.
         got: Vec<u8>,
     },
+    /// No product data gave the application identity the TaskSegment records
+    /// carry (PEI type, manufacturer, application number and version), so
+    /// nothing was written.
+    #[error(
+        "the System 7 table write needs the device's product data: each TaskSegment record carries the application's PEI type, manufacturer, number and version, and a guessed identity can leave the device marked with another application; nothing was written"
+    )]
+    NoTaskIdentity,
     /// The application's LSM is not `Loaded`, so its group-object table is
     /// not rewritten (nothing was written).
     #[error(
@@ -172,6 +179,10 @@ pub struct Sys7TableImages {
     /// checked, because the group-object table's place is unknown (no product
     /// data). The device may ignore their new links.
     pub unchecked_flags: Vec<u16>,
+    /// The application identity both TaskSegment records carry
+    /// ([`Sys7LiveTables::task_identity`]). `None` without product data:
+    /// [`crate::write_sys7`] then refuses before it touches the device.
+    pub task_identity: Option<bussard_mgmt::Sys7TaskIdentity>,
 }
 
 /// One communication-flag change: the CONFIG octet of one object's descriptor.
@@ -310,6 +321,7 @@ pub fn sys7_table_images(
         group_object_base,
         group_object_image,
         unchecked_flags,
+        task_identity: live.task_identity,
     })
 }
 
@@ -388,7 +400,7 @@ pub async fn apply_sys7_tables<Ch: L4Channel>(
     lsm: &LsmAccess,
     profile: &Sys7Profile,
     images: &Sys7TableImages,
-    task_marker: [u8; 4],
+    task_identity: &Sys7TaskIdentity,
 ) -> Result<Sys7VerifyOutcome, Sys7ApplyError> {
     // 0: negotiate the APDU size before any table write, as ETS does (#116).
     crate::apply::negotiate_session_apdu(l4).await?;
@@ -419,7 +431,7 @@ pub async fn apply_sys7_tables<Ch: L4Channel>(
         "address",
         images.address_base,
         &images.address_region,
-        task_marker,
+        task_identity,
     )
     .await?;
 
@@ -432,7 +444,7 @@ pub async fn apply_sys7_tables<Ch: L4Channel>(
         "association",
         images.association_base,
         &images.association_image,
-        task_marker,
+        task_identity,
     )
     .await?;
 
@@ -496,12 +508,12 @@ async fn load_table<Ch: L4Channel>(
     table: &'static str,
     base: u16,
     image: &[u8],
-    task_marker: [u8; 4],
+    task_identity: &Sys7TaskIdentity,
 ) -> Result<LoadState, Sys7ApplyError> {
     lsm.drive(l4, index, LoadControl::StartLoading).await?;
     alloc_region(l4, lsm, profile, index, base, image.len()).await?;
     write_verified(l4, table, base, image).await?;
-    lsm.send_control(l4, index, &encode_task_segment(base, task_marker))
+    lsm.send_control(l4, index, &encode_task_segment(base, task_identity))
         .await?;
     Ok(lsm.drive(l4, index, LoadControl::LoadCompleted).await?)
 }
@@ -599,6 +611,7 @@ mod tests {
             group_object_base: None,
             group_object_image: Vec::new(),
             group_objects: Vec::new(),
+            task_identity: None,
         }
     }
 

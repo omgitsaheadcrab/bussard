@@ -157,6 +157,9 @@ pub struct Sys7LiveTables {
     pub group_object_image: Vec<u8>,
     /// The decoded group-object descriptors, descriptor `k` for com-object `k`.
     pub group_objects: Vec<Sys7GroupObject>,
+    /// The application identity a write's TaskSegment records carry, from the
+    /// product ([`Sys7TableBases::task_identity`]); `None` without product data.
+    pub task_identity: Option<bussard_mgmt::Sys7TaskIdentity>,
 }
 
 /// Reads and decodes a System 7 device's address, group-object and association
@@ -381,6 +384,7 @@ pub async fn read_sys7_tables_at<Ch: L4Channel>(
         group_object_base,
         group_object_image,
         group_objects,
+        task_identity: bases.task_identity,
     })
 }
 

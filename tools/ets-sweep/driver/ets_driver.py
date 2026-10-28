@@ -244,19 +244,22 @@ def click(x: int, y: int, button: str = "left", double: bool = False) -> None:
     """Click at layout coordinates (scaled to the physical screen)."""
     s = scale()
     at = (int(round(x * s)), int(round(y * s)))
-    for attempt in range(4):
+    for attempt in range(6):
         try:
             if double:
                 mouse.double_click(button=button, coords=at)
             else:
                 mouse.click(button=button, coords=at)
             return
-        except OSError:
+        except Exception as exc:  # noqa: BLE001 - pywintypes.error is no OSError
             # SetCursorPos fails with 258 'Wartevorgang abgebrochen' while the
-            # session's input desktop is busy (just after an RDP reconnect).
-            if attempt == 3:
+            # session's input desktop is busy (just after an RDP reconnect,
+            # and once mid-sweep, 2026-10-28); pywinauto reports 'There is no
+            # active desktop' for the same moment.
+            transient = "SetCursorPos" in str(exc) or "no active desktop" in str(exc)
+            if attempt == 5 or not transient and not isinstance(exc, OSError):
                 raise
-            time.sleep(1.5)
+            time.sleep(3)
 
 
 def click_text(pattern: str, bbox=None, dx: int = 0, dy: int = 0, button: str = "left", double: bool = False) -> dict:
@@ -877,7 +880,13 @@ def flow_delete_device(req: dict) -> dict:
     s_ = scale()
     mouse.move(coords=(int(2600 * s_), int(1200 * s_)))
     time.sleep(0.4)
-    r, g, b = grab((1450, y - 4, 1460, y + 4)).convert("RGB").getpixel((5, 4))
+    # The background is the most common light colour along the row: one
+    # sample point hit blue link text (82, 129, 190) of a long product name.
+    from collections import Counter
+
+    strip = grab((700, y - 2, 3200, y + 2)).convert("RGB")
+    light = [p for p in strip.getdata() if min(p) > 180]
+    r, g, b = Counter(light).most_common(1)[0][0] if light else (0, 0, 0)
     if not (b > r + 20 and b > 230):
         raise RuntimeError(f"delete: the row of {req['ia']} is not highlighted (rgb {r},{g},{b})")
     mouse.right_click(coords=(int(1000 * s_), int(y * s_)))

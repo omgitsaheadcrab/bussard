@@ -52,6 +52,10 @@ interface, and ends with a read-back of every property it wrote.
   its tables elsewhere reads back as an empty table set, never as wrong links,
   and must be programmed with `bussard flash`, which takes the addresses from
   the product data.
+- **System 7 `apply` needs product data.** Each table write ends with a
+  record naming the application it belongs to (PEI type, manufacturer,
+  application number and version), taken from the product data. Without it,
+  `apply` refuses before it connects; `plan` still runs.
 - **System 7 communication flags.** A System 7 device ignores every telegram
   for an object whose communication flag is off, and ETS switches it off on
   every object without a link. So a new link on such an object only works once
