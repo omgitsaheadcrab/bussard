@@ -143,6 +143,7 @@ def run_exec(code: str) -> dict:
         "re": re,
         "result": None,
     }
+    scope = {**globals(), **scope}  # every driver helper, for developing flows
     buf = io.StringIO()
     try:
         with redirect_stdout(buf):
@@ -165,9 +166,23 @@ from pywinauto import keyboard, mouse
 SCREEN = (0, 0, 4112, 2484)
 
 
+def scale() -> float:
+    """Physical screen width / the 4112-pixel layout every coordinate here is
+    written in. The RDP session ran at 4112x2484; on the VM console (after
+    `tscon`, when no RDP client is attached) the desktop is 2056 wide with the
+    same relative layout, so clicks, grabs and OCR positions scale by this."""
+    import ctypes
+
+    return ctypes.windll.user32.GetSystemMetrics(0) / 4112.0
+
+
 def grab(bbox=None):
+    """A screenshot of `bbox` (layout coordinates), in physical pixels."""
     from PIL import ImageGrab
 
+    if bbox:
+        s = scale()
+        bbox = tuple(int(round(v * s)) for v in bbox)
     return ImageGrab.grab(bbox=tuple(bbox) if bbox else None)
 
 
@@ -179,6 +194,11 @@ def ocr(bbox=None, lang: str = "de", zoom: int = 1) -> list[dict]:
 
     from PIL import ImageOps
 
+    s = scale()
+    if s < 0.9:
+        # A half-size console desktop: magnify so text keeps the pixel size
+        # the OCR read well at 4112 wide.
+        zoom = max(zoom, 2)
     img = grab(bbox)
     if zoom > 1:
         # Magnify and stretch the contrast: a dimmed window (modal overlay) or
@@ -188,10 +208,11 @@ def ocr(bbox=None, lang: str = "de", zoom: int = 1) -> list[dict]:
     out = []
     for line in winocr.recognize_pil_sync(img, lang)["lines"]:
         rects = [w["bounding_rect"] for w in line["words"]]
-        x0 = min(r["x"] for r in rects) / zoom
-        y0 = min(r["y"] for r in rects) / zoom
-        x1 = max(r["x"] + r["width"] for r in rects) / zoom
-        y1 = max(r["y"] + r["height"] for r in rects) / zoom
+        # OCR pixels -> physical pixels (/zoom) -> layout coordinates (/s).
+        x0 = min(r["x"] for r in rects) / zoom / s
+        y0 = min(r["y"] for r in rects) / zoom / s
+        x1 = max(r["x"] + r["width"] for r in rects) / zoom / s
+        y1 = max(r["y"] + r["height"] for r in rects) / zoom / s
         out.append({"text": line["text"], "x": int(ox + x0), "y": int(oy + y0), "w": int(x1 - x0), "h": int(y1 - y0)})
     return out
 
@@ -219,10 +240,22 @@ def find_text(pattern: str, bbox=None, min_ratio: float = 0.8) -> dict | None:
 
 
 def click(x: int, y: int, button: str = "left", double: bool = False) -> None:
-    if double:
-        mouse.double_click(button=button, coords=(int(x), int(y)))
-    else:
-        mouse.click(button=button, coords=(int(x), int(y)))
+    """Click at layout coordinates (scaled to the physical screen)."""
+    s = scale()
+    at = (int(round(x * s)), int(round(y * s)))
+    for attempt in range(4):
+        try:
+            if double:
+                mouse.double_click(button=button, coords=at)
+            else:
+                mouse.click(button=button, coords=at)
+            return
+        except OSError:
+            # SetCursorPos fails with 258 'Wartevorgang abgebrochen' while the
+            # session's input desktop is busy (just after an RDP reconnect).
+            if attempt == 3:
+                raise
+            time.sleep(1.5)
 
 
 def click_text(pattern: str, bbox=None, dx: int = 0, dy: int = 0, button: str = "left", double: bool = False) -> dict:
@@ -341,7 +374,8 @@ def flow_windows(req: dict) -> dict:
 LAYOUT = {
     "tab_strip": (0, 0, 4112, 90),
     "logo": (170, 40),
-    "toolbar_connection": (3686, 113),      # the connection dropdown (left of the info button)
+    "toolbar_connection": (3686, 113),
+    "toolbar_panels": (3535, 113),           # 'Panels' dropdown      # the connection dropdown (left of the info button)
     "connection_menu": (3400, 130, 4112, 500),
     "toolbar_program_arrow": (2980, 113),   # arrow of 'Programmieren'
     "tree_line_1_1": (150, 480),
@@ -403,11 +437,33 @@ def flow_project_tab(req: dict) -> dict:
     return {"project": name}
 
 
+def line_1_1() -> tuple[int, int]:
+    """Screen position of '1.1 TP Linie' in the Topologie tree, expanding the
+    tree when ETS reopened it collapsed (after a restart, 2026-10-28)."""
+    tree = LAYOUT["tree"]
+    for attempt in range(3):
+        # The sweep project holds exactly one TP line; the selection highlight
+        # garbles its number at times ('IJ:: TP Linie'), so match on the rest,
+        # magnified on a second look.
+        lines = ocr(tree, zoom=1 if attempt == 0 else 3)
+        tp = [l for l in lines if "TP Linie" in l["text"] or "TP Unie" in l["text"]]
+        if tp:
+            hit = tp[0]
+            return hit["x"] + hit["w"] // 2, hit["y"] + hit["h"] // 2
+        main = next((l for l in lines if "Haupt" in l["text"]), None) or next(
+            (l for l in lines if l["text"].strip().startswith("IP") or "1.0" in l["text"]), None)
+        if not main:
+            raise RuntimeError(f"no 'IP Hauptlinie' in the Topologie tree: {[l['text'] for l in lines]}")
+        click(18, main["y"] + main["h"] // 2)  # the expander arrow left of the line
+        time.sleep(1.5)
+    raise RuntimeError("'1.1 TP Linie' did not appear in the Topologie tree")
+
+
 @flow("devices")
 def flow_devices(req: dict) -> dict:
     """The devices on line 1.1 of the active project, by OCR of the device list."""
     require_project(req["project"])
-    click(*LAYOUT["tree_line_1_1"])
+    click(*line_1_1())
     time.sleep(1.5)
     x0, y0, x1, y1 = LAYOUT["device_list"]
     # Row centres: every OCR line below the header, clustered by height.
@@ -416,49 +472,285 @@ def flow_devices(req: dict) -> dict:
         cy = line["y"] + line["h"] // 2
         if cy > y0 + 40 and all(abs(cy - c) > 18 for c in centres):
             centres.append(cy)
+    native = [l for l in ocr(LAYOUT["device_list"]) if l["x"] < 860 and _ia_in(l["text"])]
     ias = []
     for cy in sorted(centres):
-        # The Adresse cell alone, magnified: a selected row's grey background
-        # hides it from OCR at native size.
-        cell = ocr((690, cy - 18, 860, cy + 18), zoom=3)
-        ia = next((_ia_in(l["text"]) for l in cell if _ia_in(l["text"])), None)
+        ia = next((_ia_in(l["text"]) for l in native if abs(l["y"] + l["h"] // 2 - cy) < 16), None)
+        for zoom in (3, 2, 4):
+            if ia:
+                break
+            # The Adresse cell alone, magnified: a selected row's grey
+            # background hides it at native size; one zoom level misses a
+            # row now and then, another reads it.
+            cell = ocr((690, cy - 18, 860, cy + 18), zoom=zoom)
+            ia = next((_ia_in(l["text"]) for l in cell if _ia_in(l["text"])), None)
         if ia:
             ias.append({"ia": ia, "y": cy})
     return {"devices": ias}
 
 
+class CompatModeRequired(RuntimeError):
+    """ETS wants to switch to compatibility mode for this product. Declined by
+    the owner's rule (2026-10-28): such products are skipped, not run."""
+
+
+def decline_compat_mode() -> str | None:
+    """Decline ETS's compatibility-mode prompt (old product data) and return
+    its text; the caller records the product as skipped."""
+    lines = ocr((900, 500, 3300, 2000))
+    joined = " ".join(l["text"] for l in lines)
+    if "ompatibilit" not in joined:
+        return None
+    for label in ("Nein", "Abbrechen", "Nicht", "Schließen"):
+        hit = find_text(label, (1500, 900, 3300, 2000), min_ratio=0.9)
+        if hit and "ompatibilit" not in hit["text"]:
+            click(hit["x"] + hit["w"] // 2, hit["y"] + hit["h"] // 2)
+            break
+    else:
+        keys("{ESC}")
+    time.sleep(2)
+    return joined[:400]
+
+
+def ensure_ets_running(project: str = "ets-sweep") -> list[str]:
+    """Start ETS and open `project` when ETS is not running (it closed after a
+    compatibility prompt, 2026-10-28)."""
+    import subprocess
+
+    did: list[str] = []
+    try:
+        ets_app()
+        return did
+    except Exception:
+        pass
+    subprocess.Popen([r"C:\Program Files (x86)\ETS6\ETS6.exe"], creationflags=subprocess.DETACHED_PROCESS)
+    did.append("started ETS")
+    t0 = time.time()
+    while time.time() - t0 < 240:
+        time.sleep(5)
+        try:
+            w = ets_main_window()
+            if w.window_text().startswith("ETS6"):
+                break
+        except Exception:
+            continue
+    time.sleep(10)
+    import ctypes
+
+    ctypes.windll.user32.ShowWindow(ets_main_window().handle, 3)
+    time.sleep(2)
+    if window_project() != project:
+        hit = find_text(project, (0, 900, 4112, 1500), min_ratio=0.9)
+        if not hit:
+            raise RuntimeError(f"ETS started, but no project tile {project!r} on the overview")
+        click(hit["x"] + hit["w"] // 2, hit["y"] + hit["h"] // 2)
+        did.append("opened project")
+        t0 = time.time()
+        while time.time() - t0 < 120 and window_project() != project:
+            time.sleep(3)
+        time.sleep(5)
+    did.append(str(ensure_layout()))
+    return did
+
+
+def wait_busy(timeout: float = 300) -> float:
+    """Wait while ETS shows a progress overlay ('Löschen …', 'Hinzufügen …'):
+    deleting a large device (Zennio ALLinBOX 1612, 110 kB of parameters) takes
+    minutes, and clicks meanwhile go nowhere. Returns the seconds waited."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        text = " ".join(l["text"] for l in ocr((1550, 900, 2560, 1100)))
+        if not re.search(r"(Löschen|Hinzufügen|Einfügen|Speichern|Laden|Konvertiere)\s*(…|\.\.\.)", text):
+            return time.time() - t0
+        time.sleep(2)
+    raise RuntimeError(f"ETS still busy after {int(timeout)} s")
+
+
+def dismiss_password_dialog() -> bool:
+    """'Projektpasswort setzen': ETS asks for a project password the first
+    time a KNX Secure capable product joins a project without one. The plain
+    sweep answers Abbrechen (no project security); the secure pass (part 4)
+    sets one instead. Without this the next keystrokes land in the field."""
+    if not find_text("Projektpasswort setzen", (1300, 750, 2800, 900), min_ratio=0.8):
+        return False
+    hit = find_text("Abbrechen", (2200, 1600, 2800, 1760))
+    if hit:
+        click(hit["x"] + hit["w"] // 2, hit["y"] + hit["h"] // 2)
+    else:
+        keys("{ESC}")
+    time.sleep(1.5)
+    return True
+
+
+def _digits(t: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", t.lower())
+
+
+def _canon(t: str) -> str:
+    """An order number as OCR may read it: case-folded, the letters OCR mixes
+    up with digits unified (I/l/1/| and O/0), punctuation and spaces dropped."""
+    t = t.lower().translate(str.maketrans({"l": "i", "1": "i", "|": "i", "!": "i", "0": "o"}))
+    return re.sub(r"[^0-9a-z]", "", t)
+
+
+def search_term(order: str) -> str:
+    """ETS's catalog search does not take an order number's wildcard suffix
+    ('754411xx', 'BM/A4.11-13x', '4007841059xxx'); search its fixed part."""
+    return re.sub(r"(?<=[0-9.\-])x+$", "", order.strip(), flags=re.IGNORECASE) or order
+
+
+def catalog_rows(expand: bool = True) -> list[dict]:
+    """The catalog result rows as {y, name, order, application, version},
+    grouped from OCR lines by height; manufacturer group headers are left out.
+    A collapsed manufacturer group (ETS keeps a group collapsed across
+    searches) is expanded first."""
+    dy = catalog_dy()
+    x0, y0, x1, y1 = LAYOUT["catalog_rows"]
+    lines = ocr((x0, y0 + 40 + dy, x1, min(y1 + dy, 2440)))
+    if expand and not any(l["x"] >= 1130 for l in lines):
+        # No product rows: expand collapsed manufacturer headers (left column;
+        # the first one sits just above the scanned area).
+        heads = [l for l in ocr((x0, y0 + dy, 1300, min(y1 + dy, 2440))) if l["x"] < 800 and l["y"] > y0 + dy + 10]
+        for head in heads[:6]:
+            click(707, head["y"] + head["h"] // 2)
+            time.sleep(1)
+        lines = ocr((x0, y0 + 40 + dy, x1, min(y1 + dy, 2440)))
+    rows: list[dict] = []
+    for line in sorted(lines, key=lambda l: l["y"]):
+        cy = line["y"] + line["h"] // 2
+        row = next((r for r in rows if abs(r["y"] - cy) < 14), None)
+        if row is None:
+            row = {"y": cy, "cells": []}
+            rows.append(row)
+        row["cells"].append(line)
+    out = []
+    for r in rows:
+        def cell(lo: int, hi: int) -> str:
+            return " ".join(c["text"] for c in r["cells"] if lo <= c["x"] < hi).strip()
+        version = cell(2560, 2740)
+        if not version:
+            continue  # a manufacturer group header
+        out.append({"y": r["y"], "name": cell(1130, 1970), "order": cell(1970, 2240),
+                    "application": cell(2300, 2560), "version": version})
+    return out
+
+
+@flow("catalog_rows")
+def flow_catalog_rows(req: dict) -> dict:
+    return {"rows": catalog_rows()}
+
+
 @flow("catalog_add")
 def flow_catalog_add(req: dict) -> dict:
-    """Search the catalog for `search` (order number works best), select the
-    first result row and add it to line 1.1. Returns the device list afterwards."""
+    """Search the catalog for `search` (an order number), pick the row whose
+    order number matches and whose application version is `version` (as ETS
+    shows it, e.g. "2.3"), and add it to line 1.1. Returns the device list."""
     require_project(req["project"])
+    dismiss_password_dialog()
+    wait_busy()
     before = {d["ia"] for d in flow_devices(req)["devices"]}
-    click(*LAYOUT["catalog_search"])
-    time.sleep(0.3)
-    keys("^a")
-    keys(req["search"] + "{ENTER}")
-    time.sleep(3)
-    click(1000, 1380)  # a neutral spot: closes the search-history dropdown
-    time.sleep(0.5)
-    rows = [l for l in ocr(LAYOUT["catalog_rows"]) if l["y"] > LAYOUT["catalog_rows"][1] + 40 and l["x"] < 1300]
-    # rows: a manufacturer group header, then product rows (indented further)
-    product_rows = [l for l in rows if l["x"] > 780]
-    if not product_rows:
-        raise RuntimeError(f"no catalog row for {req['search']!r}: {[l['text'] for l in rows]}")
-    row = product_rows[0]
-    click(1300, row["y"] + row["h"] // 2)
+    dy = catalog_dy()
+    sx, sy = LAYOUT["catalog_search"]
+    def search(term: str) -> tuple[list[dict], list[dict]]:
+        want = _canon(term)
+        rows: list[dict] = []
+        for attempt in range(4):
+            click(sx, sy + dy)
+            time.sleep(0.3)
+            keys("^a")
+            keys("{DEL}")
+            time.sleep(0.5)
+            keys(term + "{ENTER}")
+            time.sleep(3 + 2 * attempt)
+            click(1000, 1380 + dy)  # a neutral spot: closes the search-history dropdown
+            time.sleep(0.5)
+            rows = catalog_rows()
+            # Only rows of THIS search count: ETS leaves the previous search's
+            # rows up for a while (a third of the misses in the first full run).
+            hits = [r for r in rows if want and (want in _canon(r["order"]) or want in _canon(r["name"]))]
+            if hits:
+                return rows, hits
+        return rows, []
+
+    order = _canon(search_term(req["search"]))
+    want_version = _digits(req.get("version", ""))
+
+    def pick(hits: list[dict]) -> dict | None:
+        # The order number exactly (ZPR1612 is not ZPR1612V2), else a prefix.
+        exact = [r for r in hits if _canon(r["order"]) == order] or [r for r in hits if _canon(r["order"]).startswith(order)]
+        match = [r for r in exact if want_version and _digits(r["version"]) == want_version]
+        if match:
+            return match[0]
+        if not want_version and len(exact) == 1:
+            return exact[0]
+        return None
+
+    rows, hits = search(search_term(req["search"]))
+    row = pick(hits)
+    if row is None and req.get("fallback_search"):
+        # ETS's search by order number shows only some versions of a product
+        # family at times (ZPR1612 listed only the v2 product); the product
+        # name lists them all.
+        rows, more = search(req["fallback_search"])
+        hits = hits + more
+        row = pick(more)
+    if row is None:
+        if hits:
+            raise RuntimeError(f"catalog version mismatch: {req['search']!r} shows {[(r['order'], r['version']) for r in hits][:8]}, wanted {req.get('version')!r}")
+        raise RuntimeError(f"not found in catalog search: {req['search']!r}; rows {rows[:4]}")
+    click(1300, row["y"])
     time.sleep(1)
-    bar = find_text("1.1 TP Linie", LAYOUT["catalog_bar"])
-    if not bar:
-        click(*LAYOUT["catalog_line_dropdown"])
+    bar = (LAYOUT["catalog_bar"][0], LAYOUT["catalog_bar"][1] + dy, LAYOUT["catalog_bar"][2], min(LAYOUT["catalog_bar"][3] + dy, 2484))
+    if not find_text("1.1 TP Linie", bar, min_ratio=0.75):
+        # The add bar's target line follows the tree selection: select the
+        # line, then the catalog row again.
+        click(*line_1_1())
+        time.sleep(1.5)
+        click(1300, row["y"])
         time.sleep(1)
-        choose("1.1 TP Linie", (600, 1900, 1300, 2484))
+    if not find_text("1.1 TP Linie", bar, min_ratio=0.75):
+        lx, ly = LAYOUT["catalog_line_dropdown"]
+        click(lx, ly + dy)
+        time.sleep(1)
+        choose("1.1 TP Linie", (600, 1600, 1300, 2484))
         time.sleep(0.8)
-    click(*LAYOUT["catalog_add"])
+    if not find_text("1.1 TP Linie", bar, min_ratio=0.75):
+        raise RuntimeError(f"the add bar does not target 1.1 TP Linie: {[l['text'] for l in ocr(bar)]}")
+    # The 'Elemente' count left of the add bar must be 1; an interrupted
+    # flow once left it empty (marked red), and Hinzufügen then adds nothing.
+    count = (130, LAYOUT["catalog_add"][1] + dy - 25, 300, LAYOUT["catalog_add"][1] + dy + 25)
+    if not any(l["text"].strip() == "1" for l in ocr(count, zoom=3)):
+        click(200, LAYOUT["catalog_add"][1] + dy)
+        time.sleep(0.3)
+        keys("^a")
+        keys("1{TAB}")
+        time.sleep(0.5)
+    ax, ay = LAYOUT["catalog_add"]
+    click(ax, ay + dy)
     time.sleep(3)
+    wait_busy()
+    # A KNX Secure capable product raises 'Projektpasswort setzen' a few
+    # seconds after it was added (seen up to ~8 s, 2026-10-28): wait for it.
+    password_dialog = False
+    t0 = time.time()
+    while time.time() - t0 < float(req.get("password_wait", 12)):
+        invalid = " ".join(l["text"] for l in ocr((1400, 1000, 2700, 1350)))
+        if "Validierung fehlgeschlagen" in invalid or "defekte Daten" in invalid:
+            # ETS's product store holds data it cannot validate for this
+            # product (Zennio ALLinBOX 1612 v2): it refuses the add.
+            click_text("OK", (2500, 1380, 2700, 1460))
+            time.sleep(1)
+            raise RuntimeError(f"ETS product data invalid: {invalid[:200]}")
+        compat = decline_compat_mode()
+        if compat:
+            raise CompatModeRequired(f"ETS asked for compatibility mode on adding: {compat[:200]}")
+        if dismiss_password_dialog():
+            password_dialog = True
+            break
+        time.sleep(1)
     after = flow_devices(req)["devices"]
     new = [d for d in after if d["ia"] not in before]
-    return {"devices": after, "added": new, "row": row["text"]}
+    return {"devices": after, "added": new, "row": row, "password_dialog": password_dialog}
 
 
 @flow("delete_device")
@@ -471,11 +763,28 @@ def flow_delete_device(req: dict) -> dict:
     click(700, hit[0]["y"])
     time.sleep(0.8)
     keys("{DELETE}")
+    # The confirmation comes later for a larger product (over 2 s for an MDT
+    # room actuator): wait for it, confirm, and check the device is gone.
+    t0 = time.time()
+    confirmed = False
+    while time.time() - t0 < float(req.get("confirm_wait", 10)):
+        time.sleep(1)
+        if find_text("Möchten Sie die markierten Objekte", LAYOUT["delete_dialog"]):
+            # Confirm only when the dialog names the device: an interrupted
+            # flow once left the line selected, and 'Ja' deleted line 1.1
+            # (2026-10-28).
+            named = " ".join(l["text"] for l in ocr(LAYOUT["delete_dialog"]))
+            if req["ia"] in named.replace(" ", "") and "Linie" not in named:
+                click_text("Ja", LAYOUT["delete_yes"])
+                confirmed = True
+            else:
+                click_text("Nein", (2450, 1420, 2700, 1480))
+                raise RuntimeError(f"delete dialog does not name {req['ia']}: {named[:200]}")
+            break
     time.sleep(2)
-    if find_text("Möchten Sie die markierten Objekte", LAYOUT["delete_dialog"]):
-        click_text("Ja", LAYOUT["delete_yes"])
-        time.sleep(2)
-    return {"deleted": True, "devices": flow_devices(req)["devices"]}
+    waited = wait_busy()
+    after = flow_devices(req)["devices"]
+    return {"deleted": confirmed and all(d["ia"] != req["ia"] for d in after), "devices": after, "busy_wait": round(waited)}
 
 
 @flow("select_connection")
@@ -506,7 +815,7 @@ def flow_download(req: dict) -> dict:
     wait for the result: the sweep watches the simulator instead."""
     require_project(req["project"])
     devs = flow_devices(req)["devices"]
-    hit = [d for d in devs if d["ia"] == req["ia"]]
+    hit = [d for d in devs if d["ia"] == req["ia"]] or [d for d in devs if d["ia"].endswith("." + req["ia"].split(".", 1)[1]) and len(devs) == 1]
     if not hit:
         raise RuntimeError(f"device {req['ia']} not in list: {devs}")
     click(700, hit[0]["y"])
@@ -516,13 +825,19 @@ def flow_download(req: dict) -> dict:
     menu_click(PROGRAM_MODES[req.get("mode", "application")])
     t0 = time.time()
     kept = False
+    password = False
     while time.time() - t0 < float(req.get("dialog_wait", 20)):
         if find_text("Schnittstellen-Prüfung", LAYOUT["medium_dialog"]):
             click(*LAYOUT["medium_keep"])
             kept = True
             break
+        if dismiss_password_dialog():
+            password = True
+        compat = decline_compat_mode()
+        if compat:
+            raise CompatModeRequired(f"ETS asked for compatibility mode on download: {compat[:200]}")
         time.sleep(1)
-    return {"ia": req["ia"], "mode": req.get("mode", "application"), "medium_dialog_kept": kept}
+    return {"ia": req["ia"], "mode": req.get("mode", "application"), "medium_dialog_kept": kept, "password_dialog": password}
 
 
 @flow("history")
@@ -536,6 +851,231 @@ def flow_history(req: dict) -> dict:
     time.sleep(1.5)
     lines = ocr(LAYOUT["ops_pane"])
     return {"lines": [l["text"] for l in lines]}
+
+
+def dismiss_ets_error() -> str | None:
+    """Close an 'ETS - Fehler' dialog (an internal ETS exception, e.g. the
+    'Sammlung wurde geändert' one that hit after the 286th catalog import on
+    2026-10-27) and return its text. Those dialogs are overlays: OCR only."""
+    lines = ocr((1200, 950, 3000, 1300))
+    joined = " ".join(l["text"] for l in lines)
+    if "Fehler" not in joined:
+        return None
+    ok = find_text("OK", (2400, 1180, 2800, 1260), min_ratio=0.6)
+    if ok:
+        click(ok["x"] + ok["w"] // 2, ok["y"] + ok["h"] // 2)
+    else:
+        click(2600, 1226)
+    time.sleep(1.5)
+    return joined[:400]
+
+
+@flow("ets_error")
+def flow_ets_error(req: dict) -> dict:
+    return {"dismissed": dismiss_ets_error()}
+
+
+def ensure_layout() -> dict:
+    """Bring ETS back to the sweep layout that LAYOUT assumes: main window
+    maximized, the Topologie panel on top and the Katalog panel below. ETS
+    restarts itself at times (after a catalog update, 2026-10-27) and then
+    opens the project in its default single-panel layout."""
+    import ctypes
+
+    did = []
+    w = ets_main_window()
+    r = w.rectangle()
+    if (r.right - r.left) < SCREEN[2] * scale() - 20:
+        ctypes.windll.user32.ShowWindow(w.handle, 3)  # SW_MAXIMIZE
+        time.sleep(1.5)
+        did.append("maximized")
+    for _ in range(2):
+        # Any panel above the Topologie panel (ETS reopens 'Gebäude' after a
+        # restart) pushes the Katalog panel down: close the top panel while it
+        # is not Topologie (its close button sits at the panel header's right).
+        top = find_text("Gebäude", (0, 160, 660, 210)) or find_text("Gruppenadressen", (0, 160, 660, 210))
+        if not top:
+            break
+        click(648, 185)
+        time.sleep(2)
+        did.append("closed " + top["text"])
+    if not find_text("Topologie", (0, 160, 660, 210)):
+        click(*LAYOUT["toolbar_panels"])
+        time.sleep(1.2)
+        choose("Topologie", (3400, 140, 3900, 620))
+        time.sleep(2.5)
+        did.append("topologie")
+    headers = [l for l in ocr((0, 200, 660, 2440)) if _norm(l["text"]) == "katalog"]
+    for extra in sorted(headers, key=lambda l: l["y"])[1:]:
+        # A second Katalog panel (opened by an earlier restore): close it.
+        click(648, extra["y"] + 12)
+        time.sleep(2)
+        did.append("closed duplicate katalog")
+    if not headers:
+        click(*LAYOUT["toolbar_panels"])
+        time.sleep(1.2)
+        choose("Alle Panels", (3400, 140, 3900, 620))
+        time.sleep(1.2)
+        choose("Katalog", (2800, 140, 4112, 1200))
+        time.sleep(3)
+        did.append("katalog")
+    return {"did": did, "import_button": bool(catalog_import_button()), "catalog_dy": catalog_dy()}
+
+
+def catalog_import_button() -> dict | None:
+    """The Katalog panel's Import button wherever the panel sits."""
+    hits = [l for l in ocr((680, 200, 1100, 2440)) if _norm(l["text"]) in ("import", "impart", "imp0rt")]
+    return min(hits, key=lambda l: abs(l["y"] - 1354)) if hits else None
+
+
+def catalog_dy() -> int:
+    """Vertical offset of the Katalog panel from the layout LAYOUT was
+    measured in (Import button at y=1354): ETS reopens panels with other
+    splitter positions after a restart."""
+    btn = catalog_import_button()
+    return btn["y"] - 1354 if btn else 0
+
+
+@flow("ensure_layout")
+def flow_ensure_layout(req: dict) -> dict:
+    return ensure_layout()
+
+
+@flow("catalog_import")
+def flow_catalog_import(req: dict) -> dict:
+    """Import a `.knxprod` (a path inside the VM) into ETS's catalog: the
+    Import button of the Katalog panel, the 'Produktdatei öffnen' file dialog
+    (UI Automation), 'Alle Sprachen importieren', then the result panel.
+    Returns outcome imported|refused|error, the 'Produkt:' lines and the panel
+    text. ETS imports a file it already holds again without complaint."""
+    path = req["path"]
+    timeout = float(req.get("timeout", 900))
+    region = (1500, 400, 3500, 1600)
+    ets_error = dismiss_ets_error()
+    if not catalog_import_button():
+        ensure_layout()
+    btn = catalog_import_button()
+    wizard_text = " ".join(l["text"] for l in ocr(region))
+    attached = False
+    for _ in range(3):
+        if "erfolgreich" not in wizard_text and "fehlgeschlagen" not in wizard_text:
+            break
+        # A previous file's result panel is still up (its OK click missed
+        # once and covered the Import button for 39 files, 2026-10-27):
+        # close it by position, then look again.
+        click(2488, 1528)
+        time.sleep(1.5)
+        btn = catalog_import_button()
+        wizard_text = " ".join(l["text"] for l in ocr(region))
+    if not btn and any(k in wizard_text for k in ("Konvertiere", "Signiere", "Produktsprache", "Import auswählen")):
+        # An import is already running (a previous call timed out while a
+        # large file converted): wait for its result instead of starting over.
+        attached = True
+    elif not btn:
+        raise RuntimeError("the Katalog panel's Import button is not on screen")
+    else:
+        dialog = None
+        for attempt in range(3):
+            # The click lands on nothing now and then while ETS refreshes the
+            # catalog after the previous import (43 of 498 files on the first
+            # pass, 2026-10-27): press Import again before giving up.
+            click(btn["x"] + btn["w"] // 2, btn["y"] + btn["h"] // 2)
+            t0 = time.time()
+            while time.time() - t0 < 15:
+                dialog = next((p for p in ets_popups() if "Produktdatei" in p.window_text()), None)
+                if dialog:
+                    break
+                time.sleep(0.5)
+            if dialog:
+                break
+            dismiss_ets_error()
+            btn = catalog_import_button() or btn
+        if dialog is None:
+            raise RuntimeError("no 'Produktdatei öffnen' dialog appeared after 3 clicks")
+        edit = dialog.child_window(title="Dateiname:", control_type="Edit")
+        edit.set_edit_text(path)
+        time.sleep(0.3)
+        edit.type_keys("{ENTER}")
+    seen: list[str] = []
+    pressed_languages = False
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(2)
+        if any("Produktdatei" in p.window_text() for p in ets_popups()):
+            # The file dialog is still up: the path was refused.
+            keys("{ESC}")
+            return {"outcome": "error", "products": [], "message": f"file dialog did not accept {path}"}
+        lines = ocr(region)
+        texts = [l["text"] for l in lines]
+        joined = " ".join(texts)
+        if attached and not any(k in joined for k in ("Konvertiere", "erfolgreich", "Produktsprache", "Import", "Signiere", "Lese ", "Lade ")):
+            # The wizard went away while nobody watched (its result panel
+            # was closed by hand): the caller verifies through the catalog.
+            return {"outcome": "done_unverified", "products": [], "message": "wizard closed before the result was read", "attached": True}
+        if "Import auswählen" in joined or "Import auswahlen" in joined:
+            # Multi-product file: a selection list; take every product.
+            hit = find_text("Alle Produkte importieren", (2200, 1700, 3000, 1860))
+            if hit:
+                click(hit["x"] + hit["w"] // 2, hit["y"] + hit["h"] // 2)
+                seen.append("all products")
+                time.sleep(1)
+                continue
+        if "Produktsprache" in joined and not pressed_languages:
+            click_text("Alle Sprachen importieren", (1900, 1490, 2400, 1560))
+            pressed_languages = True
+            continue
+        if "erfolgreich" in joined:
+            # Re-read the panel magnified: the order number and name matter.
+            fine = [l["text"] for l in ocr((1700, 1050, 2600, 1480), zoom=2)]
+            products = [t.partition(":")[2].strip() or t[len("Produkt"):].strip() for t in fine if t.startswith("Produkt")]
+            for _ in range(3):
+                ok = find_text("OK", (2300, 1450, 2700, 1600), min_ratio=0.6)
+                if ok:
+                    click(ok["x"] + ok["w"] // 2, ok["y"] + ok["h"] // 2)
+                else:
+                    click(2488, 1528)  # where the result panel's OK sits
+                time.sleep(1.5)
+                if "erfolgreich" not in " ".join(l["text"] for l in ocr(region)):
+                    break
+            return {"outcome": "imported", "products": products, "message": joined[:600], "attached": attached, "ets_error": ets_error}
+        if any(k in joined for k in ("Fehler", "fehlgeschlagen", "nicht importiert", "ungültig", "Ausnahme")):
+            for label in ("OK", "Schließen", "Abbrechen"):
+                if find_text(label, (1900, 1460, 2700, 1580)):
+                    click_text(label, (1900, 1460, 2700, 1580))
+                    break
+            time.sleep(1)
+            return {"outcome": "refused", "products": [], "message": joined[:800]}
+        # A page with a plain 'Importieren' or 'Weiter' button (product
+        # selection for multi-product files).
+        for label in ("Importieren", "Weiter"):
+            hit = find_text(label, (1900, 1460, 2700, 1580))
+            if hit and hit["ratio"] >= 0.9 and "Alle Sprachen" not in hit["text"]:
+                click(hit["x"] + hit["w"] // 2, hit["y"] + hit["h"] // 2)
+                seen.append(f"pressed {label}")
+                break
+    # No ESC: ETS keeps converting, and the next call attaches to it.
+    return {"outcome": "error", "products": [], "message": f"timed out after {int(timeout)}s; last: {joined[:400]}; {seen}"}
+
+
+@flow("catalog_search")
+def flow_catalog_search(req: dict) -> dict:
+    """Type `term` into the Katalog panel's search box and return the result
+    rows (order number, name, application) read magnified."""
+    dy = catalog_dy()
+    sx, sy = LAYOUT["catalog_search"]
+    click(sx, sy + dy)
+    time.sleep(0.3)
+    keys("^a")
+    keys(req["term"] + "{ENTER}")
+    time.sleep(float(req.get("wait", 3)))
+    click(1000, 1380 + dy)  # closes the search-history dropdown
+    time.sleep(0.5)
+    x0, y0, x1, y1 = LAYOUT["catalog_rows"]
+    y0, y1 = y0 + dy, min(y1 + dy, 2440)
+    rows = []
+    for line in ocr((x0, y0 + 40, x1, y1), zoom=2):
+        rows.append({"text": line["text"], "x": line["x"], "y": line["y"]})
+    return {"term": req["term"], "rows": rows}
 
 
 @flow("dialogs")
@@ -596,8 +1136,32 @@ class Handler(BaseHTTPRequestHandler):
                 if fn is None:
                     self._send(404, {"error": f"unknown flow {name}", "flows": sorted(FLOWS)})
                     return
+                # Watchdog before every flow: a modal left open by the
+                # previous one (the project-password dialog, an ETS error)
+                # would swallow this flow's clicks and keystrokes.
+                if abs(scale() - 1.0) > 0.01:
+                    # Not the 4112-wide RDP desktop the layout was measured on
+                    # (the VM console is 1280x800 and lays ETS out
+                    # differently): refuse rather than click beside the target.
+                    raise RuntimeError(f"desktop is not the RDP layout (scale {scale():.3f}); reconnect the RDP session")
+                started = ensure_ets_running(req.get("project", "ets-sweep")) if name != "windows" else []
+                if name not in ("windows", "state"):
+                    import ctypes
+
+                    fg = ctypes.windll.user32.GetForegroundWindow()
+                    if fg != ets_main_window().handle and not ets_popups():
+                        # Someone works in the VM (another window is in front):
+                        # refuse instead of clicking into their windows.
+                        raise RuntimeError("desktop in use: ETS is not the foreground window; the sweep waits")
+                compat = decline_compat_mode()
+                if compat:
+                    raise CompatModeRequired(f"ETS asked for compatibility mode before {name}: {compat[:200]}")
+                watchdog = {"password_dialog": dismiss_password_dialog(), "ets_error": dismiss_ets_error(),
+                            "ets_started": started}
                 out = fn(req)
                 out.setdefault("ok", True)
+                if any(watchdog.values()):
+                    out["watchdog"] = watchdog
                 self._send(200, out)
             else:
                 self._send(404, {"error": "unknown path"})

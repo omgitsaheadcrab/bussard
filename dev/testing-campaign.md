@@ -377,6 +377,11 @@ no reset.
 `flash` now does the same on System B: a plan with a filled segment starts with
 the factory reset (erase code 7: application, parameters and links erased, the
 individual address kept) and ends with the confirmed restart (erase code 1). The
+KWL (1.1.45) and Steinel (1.1.51) captures decide when (issue #452): ETS sends
+both forms only to an application that declares `IsSecureEnabled="true"`, and
+those two do not. The ETS defaults sweep agrees (38 applications: the three
+secure-capable 07B0 programs end confirmed, every other one bare). The rule is
+`bussard_download::restart_form`. The
 plan and `--dry-run` list the reset as their first step; `--no-factory-reset`
 removes it. When comparing a bussard capture against ETS, expect the reset
 before the first `Unload` and the extra connection it costs. The mock device

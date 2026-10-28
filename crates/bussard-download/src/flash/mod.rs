@@ -106,6 +106,7 @@ mod plan;
 mod plan_props;
 mod plan_sys7;
 mod props;
+mod restart_form;
 mod session;
 #[cfg(test)]
 mod test_support;
@@ -127,6 +128,7 @@ pub use plan_sys7::{
     plan_flash_sys7_with_hawk, sys7_profile_from_hawk, sys7_table_bases, sys7_tables_from_system_b,
 };
 pub use props::{compare_property_value, read_property_value, write_property_value};
+pub use restart_form::{RestartForm, restart_form};
 pub use session::{Connector, DeviceFacts, RebootReadiness, RestartKind, Session, SingleConnector};
 
 /// How a property step names its interface object (issue #390).
@@ -358,7 +360,8 @@ pub enum FlashStep {
     /// waits out the process time and reconnects before the next step.
     ///
     /// Not a load-procedure op: the planner inserts it before the first
-    /// `Unload` when the download allocates a filled segment and writes only the
+    /// `Unload` when the application's [`restart_form`] is confirmed (issue
+    /// #452) and the download allocates a filled segment and writes only the
     /// octets that differ from the fill (a re-flash would otherwise inherit the
     /// previous image's octets wherever the new one writes nothing), and the CLI
     /// adds it when a device that is not factory-fresh is flashed. ETS opens an
@@ -849,8 +852,8 @@ pub struct FlashPlan {
     /// payloads the executor honours on masked writes (`[system7-spec §5]`).
     sys7: Option<Sys7Context>,
     /// Whether the terminal [`FlashStep::Restart`] is sent as the confirmed
-    /// master reset with erase code 1 (the ETS form on System B devices whose
-    /// download allocates filled segments) instead of a bare `A_Restart`.
+    /// master reset with erase code 1 instead of a bare `A_Restart`: the
+    /// application's [`restart_form`] (issue #452).
     confirmed_restart: bool,
     /// The octets the device holds today in each memory region a
     /// parameter-only download rewrites (segment id → bytes), read back before
@@ -906,12 +909,21 @@ impl FlashPlan {
     /// Adds a [`FlashStep::FactoryReset`] (erase code 7) before the first
     /// `Unload`, unless the plan already has one. The CLI calls this when the
     /// device is not factory-fresh. A no-op on a System 7 plan, whose download
-    /// rewrites every region in full.
+    /// rewrites every region in full, and on a plan whose application gets the
+    /// basic restart ([`restart_form`]).
     pub fn require_factory_reset(&mut self) {
         // Never on a property-only plan (issue #390): it loads nothing a reset
         // would clear, and a reset of the KNX IP interface it targets wipes the
         // interface's IP and tunnelling configuration.
-        if self.sys7.is_none() && !self.has_factory_reset() && !self.is_property_only() {
+        // Only where ETS resets with a master reset (issue #452): a device
+        // whose application is not secure-capable gets the basic restart from
+        // ETS and is never sent erase code 7; the download's own unloads
+        // clear it, as ETS's do.
+        if self.sys7.is_none()
+            && self.confirmed_restart
+            && !self.has_factory_reset()
+            && !self.is_property_only()
+        {
             insert_factory_reset(&mut self.steps);
         }
     }
@@ -1000,10 +1012,10 @@ impl FlashPlan {
     }
 
     /// Whether the terminal restart is sent as the confirmed master reset with
-    /// erase code 1 rather than a bare `A_Restart`. True for a System B plan that
-    /// allocates a filled segment, the download shape ETS ends with a confirmed
-    /// restart in the issue #117 captures; false for the KNX Virtual DA.tp and
-    /// thelsing shapes, which end with the bare restart.
+    /// erase code 1 rather than a bare `A_Restart`: true when the application's
+    /// [`restart_form`] is [`RestartForm::Confirmed`] (a secure-capable System B
+    /// application, issue #452); false for every other application, a System 7
+    /// and a property-only plan.
     pub fn uses_confirmed_restart(&self) -> bool {
         self.confirmed_restart
     }

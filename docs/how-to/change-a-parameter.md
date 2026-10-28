@@ -81,7 +81,7 @@ For most parameters `apply` is enough. It backs up the parameter memory to `capt
 When `apply` names a flash, run it:
 
 !!! warning
-    A full flash rewrites the device's application, parameters and links, with no backup. On System B it usually starts with a factory reset that erases everything but the device's address. Try it on a spare device or the simulator first.
+    A full flash rewrites the device's application, parameters and links, with no backup. On a secure-capable System B device it usually starts with a factory reset that erases everything but the device's address. Try it on a spare device or the simulator first.
 
 ```console
 $ bussard flash 1.1.12 --product heating.knxprod --gateway 127.0.0.1:3671

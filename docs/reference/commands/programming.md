@@ -199,7 +199,7 @@ The pre-flight report leads with one line per parameter the flash changes, named
 | `--force` | off | Flash a device that is **not** factory-fresh: it carries a different or unidentifiable application, or its load state could not be read. Destructive: the resident application, its parameters and its links are overwritten with no backup. Not needed to re-flash the same application. Also accepts a `--product` or `--application` that contradicts the lock. |
 | `--full` | off | Skip nothing: re-stream every object. By default, when the device already carries the same application (or none), an object whose resident image matches and which reports `Loaded` is skipped, and the output lists each skipped step. A parameter-only change then re-downloads the parameter segment but not the code segment. |
 | `--parameters-only` | off | Rewrite only the parameter memory of a device that already runs this application (see [parameter-only download](#parameter-only-download)). Conflicts with `--full`, `--force` and `--no-factory-reset`. With `--dry-run` it prints the op sequence offline. |
-| `--no-factory-reset` | off | Leave out the factory reset (System B). Use this only when you know the device holds no stale image, for example a device fresh from the box. |
+| `--no-factory-reset` | off | Leave out the factory reset (secure-capable System B applications). Use this only when you know the device holds no stale image, for example a device fresh from the box. |
 | `--bcu-key <HEX>` | free access | The device's BCU access key, in hex (`FFFFFFFF` or `0x11223344`). Unset presents the free-access key `FFFFFFFF`, correct for an unkeyed device; a keyed device needs its project key here or it denies access. |
 | `--keyring <FILE>` | the key store | KNX Data Secure: the tool key and group keys. With it, `flash` also programs the device's security object. |
 | `--tool-key <HEX>` | | The raw 32-hex-character tool key, for a simulator or bench device. Conflicts with `--keyring`; unsuitable for a real key, because process arguments are visible. Carries no group keys, so it only suits a device without secured group addresses. |
@@ -242,17 +242,17 @@ Because there is no backup, `flash` checks in its read-only pre-flight that the 
 
 ### The factory reset (System B)
 
-Many System B applications allocate their segment with a fill byte, and bussard, like ETS, writes only the octets that differ from it. The fill does not erase anything, so a re-flash would keep the previous image's octets wherever the new one writes nothing. So `flash` starts such a download the way ETS starts an initial one, with a factory reset that keeps the individual address.
+Many System B applications allocate their segment with a fill byte, and bussard, like ETS, writes only the octets that differ from it. The fill does not erase anything, so a re-flash would keep the previous image's octets wherever the new one writes nothing. So `flash` starts such a download of a secure-capable application (one whose product data declares `IsSecureEnabled`) the way ETS unloads one, with a factory reset that keeps the individual address. ETS never sends a master reset to an application that is not secure-capable, so neither does `flash`: such a download starts with its load procedure's own unloads.
 
 - The device erases its application, its parameters and its group addresses and links, keeps its individual address, and reboots. `flash` waits the time the device reports (at most 60 s), reconnects and continues.
-- The reset is added when the download writes filled segments sparsely, and when `--force` replaces an application `flash` did not recognise or could not read.
+- The reset is added, for a secure-capable application, when the download writes filled segments sparsely, and when `--force` replaces an application `flash` did not recognise or could not read.
 - The plan shows it as the first step, and every object is then streamed in full: nothing is skipped.
 - A device that refuses the reset, or does not answer it, fails the flash before anything is written.
 - `--no-factory-reset` leaves it out. System 7 downloads write every region in full and never reset.
 - If the flash stops right after the reset, the device is left unloaded: re-run the same `flash`.
 
 ??? note "Details"
-    The reset is `A_Restart` master reset with erase code 7 and channel 0, sent numbered (`4f 81 07 00`), answered by `A_Restart_Response` with an error code and a process time in seconds (`4f a1 00 00 08`). It sits before the first `Unload`, after any read-only `CompareProp` or `CompareRelMem` preconditions. Such a plan also ends like ETS: the terminal `LdCtrlRestart` goes out as a confirmed master reset with erase code 1, and bussard waits its process time before verifying. Plans without filled segments keep the bare `A_Restart`, and an `LdCtrlMasterReset` op in a load procedure is sent as a bare `A_Restart`.
+    The reset is `A_Restart` master reset with erase code 7 and channel 0, sent numbered (`4f 81 07 00`), answered by `A_Restart_Response` with an error code and a process time in seconds (`4f a1 00 00 08`). It sits before the first `Unload`, after any read-only `CompareProp` or `CompareRelMem` preconditions. Every download of a secure-capable System B application ends like ETS's: the terminal `LdCtrlRestart` goes out as a confirmed master reset with erase code 1, and bussard waits its process time before verifying. Every other application keeps the bare `A_Restart` ETS sends it, and an `LdCtrlMasterReset` op in a load procedure is sent as a bare `A_Restart`.
 
     If the gateway link drops while the reset is pending, it is sent again once the tunnel is back; a link loss during the reconnect after it is ridden out.
 

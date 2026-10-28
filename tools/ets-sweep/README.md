@@ -114,3 +114,68 @@ Each of these ended a run until the sim did it (all 2026-10-27, DA.tp):
 (truncated), which is why the sim writes its own pcap (`gateway.pcap`).
 - The device added to an empty line 1.1 gets 1.1.1; the sweep deletes leftovers
   first, so the sim device is always 1.1.1.
+
+## Part 2: the corpus in ETS's catalog (#421)
+
+`uv run tools/ets-sweep/catalog.py [--filter a,b] [--limit N] [--redo]` uploads
+each corpus `.knxprod` (`tests-support/product-corpus/cache/vendor`, vendor
+data, never committed) to `C:\Users\macremote\ets-sweep\products\` and has
+the driver run ETS's catalog import: the Katalog panel's Import button, the
+`Produktdatei öffnen` file dialog (a Win32 dialog, driven by UI Automation),
+`Alle Produkte importieren` on the selection page of a multi-product file,
+`Alle Sprachen importieren`, then the result panel ("Import erfolgreich" with
+`Produkt:` lines, read magnified). Outcomes land in `tools/ets-sweep/catalog.json`
+(labels and the product names ETS printed; a file with an outcome is skipped
+unless `--redo`). Importing a file ETS already holds just converts it again
+and reports success, so a resumed run is idempotent. A large multi-product
+file (the ABB i-bus catalogue) converts for well over 15 minutes; the flow
+attaches to a conversion that is still running when a previous call timed out.
+
+Result of the first full run (2026-10-27): 497 of 498 corpus files imported,
+1 refused by ETS itself (`helios_kwl_knx_connect.knxprod`: "Masterdaten konnte
+nicht gelesen werden"). `catalog-apps.json` maps every file to its 1354
+application programs (id, name, mask, order numbers) via `bussard
+import-product`; it is the join part 3 uses (order number = ETS catalog search
+term, application id = what the sim and the oracle run).
+
+Three things interrupted the run and are handled by the driver now: a missed
+click on the result panel's OK left it covering the Import button (closed by
+position and checked); an internal ETS error dialog ("Die Sammlung wurde
+geändert") after a few hundred imports (dismissed and recorded); and ETS
+restarting itself, reopening the project in its default panel layout
+(`ensure_layout` maximizes, closes panels above Topologie, opens one Katalog
+panel, and the catalog coordinates follow the panel's actual position).
+
+## Part 3: the defaults sweep (#422)
+
+```sh
+uv run tools/ets-sweep/defaults.py [--filter ...] [--mask 07B0] [--shard k/n] [--redo-failed]
+uv run tools/ets-sweep/oracle.py
+```
+
+`defaults.py` runs every corpus application (one job per application id, from
+`catalog-apps.json`): sim in the VM, delete what line 1.1 holds, add the
+catalog row whose order number and application version match, select the
+knx-sim connection, application download, wait for the bus to go quiet, read
+ETS's history. Results land in `results/defaults.json`; a run directory per
+application under `captures/ets-sweep/<app>/plain-defaults/`.
+
+**Identity learned from ETS.** Before a download ETS compares the device's
+identity with what the product requires, and refuses with "inkompatible
+Produktdaten" on a mismatch. Its log
+(`%LOCALAPPDATA%\KNX\ETS6\Log\ETS6.log`) names the value it wanted:
+`Required data mismatch at SystemProperty(0/78)[$0000]: <device> instead of
+<required>`. `sweep.run_learning` reads those lines after a refusal and runs
+again with the required values as sim property overrides (`properties:` in
+the knx-sim device config); the learned values are kept per application.
+
+`oracle.py` builds a scratch model per captured application (one device
+1.1.1 at its defaults, no links; `oracle_model.py`) and runs the offline
+oracle row against the capture into `results/oracle.json`.
+
+What ETS needed from the sim in this part: connectionless
+`A_DeviceDescriptor_Read` / `A_PropertyValue_Read` (ETS probes KNX Secure
+capable devices before connecting), and the device identity above. A KNX
+Secure capable product makes ETS ask for a project password a few seconds
+after it is added and again at download; the plain pass answers Abbrechen,
+which leaves the device's secure commissioning off.

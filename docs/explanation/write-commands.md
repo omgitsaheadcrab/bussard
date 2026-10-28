@@ -132,13 +132,17 @@ always needs `--force`.
 
 **The factory reset (System B).** Many applications write only the octets
 that differ from a fill byte, so on a re-flash the octets the new image leaves
-out keep the old image's values. `flash` therefore opens such a download, and
-any `--force` over an unknown application, with a confirmed factory reset: it
+out keep the old image's values. `flash` therefore opens such a download of a
+secure-capable application, and any `--force` over an unknown one, with a
+confirmed factory reset, as ETS does: it
 keeps the individual address, erases application, parameters and links, waits
 for the reboot (at most a minute) and streams every object in full. A device
 that refuses or ignores the reset fails the flash before anything is written.
 Pass `--no-factory-reset` only for a device you know holds no stale image.
-System 7 downloads write every region in full and never reset.
+System 7 downloads write every region in full and never reset. An
+application that is not secure-capable is never reset either: ETS sends it no
+master reset, only the download's own unloads, and ends its download with a
+bare `A_Restart`.
 
 **Recovery.** The download is idempotent: re-run the same `bussard flash
 <ADDRESS>`, and fall back to ETS if that fails. A device is not functional
