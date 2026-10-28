@@ -389,6 +389,36 @@ and `knx-sim` both erase on erase code 7 and answer with a process time, and a
 mock test proves a re-flash over stale octets matches the ETS image only
 because of the reset.
 
+**ETS's standalone "Restart device"** (issues #435, #452). Six captures in
+`shared-with-windows/28-10-restarts/` hold one ETS *Restart device* each:
+
+| Capture | Device | Form ETS sent | bussard `restart_form` |
+|---|---|---|---|
+| `restart-1-1-12-secure.pcapng` | 1.1.12 (Data Secure, activated) | confirmed, Secure-wrapped (36-octet request, 37-octet answer) | confirmed |
+| `restart-1-1-18.pcapng` | 1.1.18 | confirmed (`A_Restart_Response error=0`) | confirmed |
+| `restart-1-1-39.pcapng` | 1.1.39 | confirmed | confirmed |
+| `restart-1-1-44.pcapng` | 1.1.44 | basic | basic |
+| `restart-1-1-45.pcapng` | 1.1.45 | basic | basic |
+| `restart-1-1-52.pcapng` | 1.1.52 | basic | basic |
+
+They ran over a KNXnet/IP Secure tunnel, which knxtrace cannot decrypt, so
+they were decoded from the frame lengths of the plain cEMI shapes only. Each
+one is T_Connect, `A_DeviceDescriptor_Read`, `A_PropertyValue_Read` of device
+object PID 56, then the restart form the same device's download ends with. A
+confirmed restart is T_ACKed and answered with `A_Restart_Response`, which ETS
+T_ACKs before closing, with no T_Disconnect and no reconnect. A basic restart
+may or may not be T_ACKed (1.1.44 and 1.1.45 do, 1.1.52 does not), and ETS
+sends T_Disconnect 1 to 3 s later. ETS does not check that the device comes
+back.
+
+These captures are the capture plan for `bussard restart` (#347): no oracle
+row compares a restart. To turn them into rows, re-take them over a plain
+tunnel, or with the tunnel's keyring, so knxtrace can decode them. Then compare
+the form, the erase code and the answer handling against a loopback `bussard
+restart` capture of the same device. Until then, the mock tests in
+`bussard_service::restart` cover the confirmed (answered, unanswered, error
+code, Data Secure) and basic forms.
+
 ## Rehearsing on the simulator
 
 Every script has a loopback dry-run mode, so the runbook can be rehearsed

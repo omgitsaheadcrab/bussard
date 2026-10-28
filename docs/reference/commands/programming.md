@@ -534,6 +534,49 @@ Behaviour:
 - Adds no write of its own: each step is the `assign`, `flash` or `apply` path with its own verification.
 - If the flash or apply step fails, the address is already assigned; the error names the command to re-run.
 
+## `bussard restart <ADDRESS>`
+
+Restart one device and wait until it answers again.
+
+```console
+$ bussard restart 1.1.39
+gateway: 192.168.1.74:3671
+restart form: confirmed (M-0002_A-A0ED-10-9B4E is a secure-capable System B application (IsSecureEnabled))
+restart 1.1.39 (Binary input) via 192.168.1.74:3671? [y/N] y
+1.1.39 restarted: it confirmed the restart (A_Restart_Response, process time 0 s) and answered again after 2.0 s (mask 07B0)
+```
+
+A device that gets the basic form is reported as `restart sent`, never `restarted`:
+
+```console
+$ bussard restart 1.1.52
+gateway: 192.168.1.74:3671
+restart form: basic (M-0004_A-A012-12-D63A-O000A is not a secure-capable System B application)
+restart 1.1.52 (Presence detector) via 192.168.1.74:3671? [y/N] y
+1.1.52: restart sent (a basic A_Restart, which the device does not confirm); it answered again after 2.0 s (mask 0705). The restart itself is not verified.
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `<ADDRESS>` | | The device to restart, e.g. `1.1.39`. |
+| `--timeout <SECONDS>` | 30 | How long the device may take to answer again. |
+| `--yes` | off | Skip the confirmation prompt. Without a terminal the command is refused unless this is given. |
+| `--keyring <FILE>` | the key store | KNX Data Secure tool keys: a device the keyring lists is restarted over a secured session. |
+| `--tool-key <HEX>` | | A raw 32-hex-character KNX Data Secure tool key, for a simulator or bench device. Conflicts with `--keyring`. |
+| `--json` | off | Print `address`, `form` (`confirmed` or `basic`), `form_reason`, `confirmed` (true only when the device answered the confirmed restart with error code 0), `process_time_s` (`null` for the basic form), `mask` and `answered_after_ms`. |
+
+Behaviour:
+
+- Sends the restart form ETS sends that device, chosen from the product data `bussard.lock` pins for it, with the same rule `flash` uses for the restart that ends a download:
+    - **confirmed** for a secure-capable System B application (`IsSecureEnabled`): `A_Restart` master reset with erase code 1 and channel 0. The device answers `A_Restart_Response`; only error code 0 confirms the restart. No answer, or another error code, exits 1. bussard then waits the process time the device reported (at most 60 s).
+    - **basic** for every other application, and for a device without product data: a bare `A_Restart`, which a device never answers. The report says the restart was sent and the device answered again, not that it restarted.
+- Either form only re-runs the application: parameters, link tables and the individual address are kept. Neither is a factory reset.
+- A Data Secure device the keyring lists gets the descriptor reads and the restart inside the secured session, as ETS does.
+- Refuses a non-loopback gateway without `--allow-remote-gateway`, and without a terminal and without `--yes` refuses before it sends anything.
+- Reads the device's mask first, so a device that does not answer is an error before anything is sent.
+- After the restart, waits 2 s and then reconnects every second until the device answers its descriptor read with the mask it reported before. A device that stays silent past `--timeout`, or answers with another mask, exits 1.
+- A device may transmit its status objects as it starts, as it does when bus voltage returns.
+
 ## Related
 
 - [Global options](../global-options.md): confirmation, `--yes`, the real-gateway gate and exit codes.

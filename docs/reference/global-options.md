@@ -85,10 +85,10 @@ A directory without a model file (`bussard.toml`, `groups.toml`, `bussard.lock` 
 
 `--yes` means one thing on every command: skip the confirmation prompt.
 
-- `assign`, `adopt`, `flash`, `apply`, `commission`, `restore`, `replace`, `write`, `test` and `learn` ask on a terminal.
+- `assign`, `adopt`, `flash`, `apply`, `commission`, `restore`, `replace`, `restart`, `write`, `test` and `learn` ask on a terminal.
 - Without a terminal and without `--yes` they refuse with `refusing to <action> without a terminal to confirm on; pass --yes to confirm non-interactively`.
 - `assign`, `adopt`, `replace`, `commission` and `learn` refuse before they load the model.
-- `flash`, `apply`, `restore`, `write` and `test` first read and show what they would change, then refuse at the prompt.
+- `flash`, `apply`, `restore`, `write` and `test` first read and show what they would change, then refuse at the prompt. `restart` refuses at its prompt, before it sends anything.
 - An explicit address or value is never consent on its own.
 - `--yes` never lifts the real-gateway gate, which is checked before the prompt.
 

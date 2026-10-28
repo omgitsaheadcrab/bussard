@@ -11,7 +11,8 @@
 //!   consent. `assign`, `adopt`, `replace`, `commission` and `learn` refuse
 //!   before they load the model ([`require_terminal_or_yes`], called from
 //!   `main`); `flash`, `apply`, `restore`, `write` and `test` first read and
-//!   show what they will change and refuse at their prompt ([`confirm`]).
+//!   show what they will change and refuse at their prompt ([`confirm`]), and
+//!   `restart` refuses at its prompt before it sends anything.
 //! * On a terminal the question goes to stderr and only `y`/`yes` proceeds.
 //! * Consent to download vendor product data is a separate question with its
 //!   own flag, [`DOWNLOAD_FLAG`]; `--yes` never answers it.

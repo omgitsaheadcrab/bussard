@@ -62,6 +62,7 @@ pub mod model_handle;
 pub mod params;
 pub mod policy;
 pub mod property_plan;
+pub mod restart;
 pub mod restore;
 pub mod secure;
 pub mod security_change;
