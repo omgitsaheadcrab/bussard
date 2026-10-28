@@ -1,5 +1,8 @@
 //! `bussard restart <ADDRESS>` against a mock device: one `A_Restart`, then a
-//! reconnect that reads the same mask back; refused without consent.
+//! reconnect that reads the same mask back; refused without consent. The
+//! model pins no product data, so the form is basic and the report says the
+//! restart was sent, not that it was verified (issue #452). The confirmed form
+//! is tested in `bussard_service::restart`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -83,11 +86,18 @@ fn test_restart_sends_one_restart_and_waits_for_the_device() -> TestResult {
     );
     assert_eq!(restarts, 1, "exactly one A_Restart");
     assert!(
-        stdout.contains("1.1.39 restarted: it answered again after")
-            && stdout.contains("(mask 0705)"),
+        stdout.contains("1.1.39: restart sent (a basic A_Restart")
+            && stdout.contains("it answered again after")
+            && stdout.contains("(mask 0705)")
+            && stdout.contains("The restart itself is not verified."),
         "{stdout}"
     );
+    assert!(!stdout.contains("restarted"), "{stdout}");
     assert!(stderr.contains("gateway: 127.0.0.1:"), "{stderr}");
+    assert!(
+        stderr.contains("restart form: basic (bussard.lock pins no product data for 1.1.39)"),
+        "{stderr}"
+    );
     Ok(())
 }
 
@@ -100,6 +110,10 @@ fn test_restart_json_reports_the_mask_and_the_wait() -> TestResult {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(report["address"], "1.1.39");
     assert_eq!(report["mask"], "0705");
+    assert_eq!(report["form"], "basic");
+    assert_eq!(report["confirmed"], false);
+    assert!(report["process_time_s"].is_null(), "{report}");
+    assert!(report["form_reason"].is_string(), "{report}");
     assert!(report["answered_after_ms"].as_u64().is_some(), "{report}");
     Ok(())
 }

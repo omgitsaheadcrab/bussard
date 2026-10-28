@@ -1,11 +1,14 @@
 //! `bussard restart <ADDRESS>`: restart one device and wait until it answers
 //! again.
 //!
-//! The restart and its verification live in [`bussard_service::restart`]. This
-//! module resolves the connection, applies the write gate (a non-loopback
-//! gateway needs `--allow-remote-gateway`), asks once naming the device and the
-//! gateway, and reports the outcome. The exit code is honest: a device that
-//! does not come back exits non-zero.
+//! The restart, the choice of its form and the checks live in
+//! [`bussard_service::restart`]. This module resolves the connection, applies
+//! the write gate (a non-loopback gateway needs `--allow-remote-gateway`), asks
+//! once naming the device and the gateway, and reports the outcome. The report
+//! says "restarted" only for a confirmed restart the device answered with
+//! error code 0; a basic restart is reported as sent, with the device answering
+//! again afterwards. The exit code is honest: a confirmed restart the device
+//! does not accept, or a device that does not come back, exits non-zero.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -13,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bussard_model::IndividualAddress;
-use bussard_service::restart::{RestartWait, restart_device};
+use bussard_service::restart::{RestartWait, restart_choice, restart_device};
 use bussard_service::{L4Options, SourcePolicy, WritePolicy};
 
 use crate::conn_cmd::{
@@ -26,6 +29,17 @@ use crate::conn_cmd::{
 struct Report {
     /// The device address.
     address: String,
+    /// The restart form sent: `confirmed` (master reset, erase code 1) or
+    /// `basic` (a bare `A_Restart`).
+    form: &'static str,
+    /// Why that form: the application and whether it is secure-capable, or
+    /// the missing product data.
+    form_reason: String,
+    /// Whether the device confirmed the restart itself (`A_Restart_Response`
+    /// with error code 0). Always false for the basic form.
+    confirmed: bool,
+    /// The process time the device reported, in seconds (confirmed form).
+    process_time_s: Option<u64>,
     /// The mask version the device reported before and after the restart.
     mask: String,
     /// How long after the restart the device answered again, in milliseconds.
@@ -52,6 +66,8 @@ pub fn run(
     let tool_key = crate::secure_key::resolve(target, tool_key_source, activated)?;
     let presented_tool_key = tool_key.is_some();
     let config = resolve_config(model.as_ref(), &overrides)?;
+    // The form ETS uses for this device, from its product data (issue #452).
+    let choice = restart_choice(dir, model.as_ref(), target);
     let gateway = gateway_display(&config);
 
     enforce_write_gate(&config, allow_remote_gateway)?;
@@ -61,6 +77,7 @@ pub fn run(
         .and_then(|m| m.devices.get(&target))
         .map(|d| format!(" ({})", d.device.name))
         .unwrap_or_default();
+    eprintln!("restart form: {} ({})", choice.form.name(), choice.why);
     let confirmed = crate::confirm::confirm(
         yes,
         &format!("restart {target}{name} via {gateway}?"),
@@ -87,7 +104,7 @@ pub fn run(
                 high_water: bussard_secure::SequenceHighWater::new(),
                 ..L4Options::default()
             };
-            let outcome = restart_device(&service, target, &options, wait).await;
+            let outcome = restart_device(&service, target, &options, choice.form, wait).await;
             service.close().await;
             anyhow::Ok(outcome)
         })
@@ -101,13 +118,26 @@ pub fn run(
                     crate::output::schema::RESTART,
                     &Report {
                         address: target.to_string(),
+                        form: done.form.name(),
+                        form_reason: choice.why,
+                        confirmed: done.confirmed,
+                        process_time_s: done.process_time.map(|t| t.as_secs()),
                         mask,
                         answered_after_ms: done.answered_after.as_millis(),
                     },
                 )?;
+            } else if done.confirmed {
+                println!(
+                    "{target} restarted: it confirmed the restart (A_Restart_Response, process \
+                     time {} s) and answered again after {:.1} s (mask {mask})",
+                    done.process_time.unwrap_or_default().as_secs(),
+                    done.answered_after.as_secs_f64()
+                );
             } else {
                 println!(
-                    "{target} restarted: it answered again after {:.1} s (mask {mask})",
+                    "{target}: restart sent (a basic A_Restart, which the device does not \
+                     confirm); it answered again after {:.1} s (mask {mask}). The restart itself \
+                     is not verified.",
                     done.answered_after.as_secs_f64()
                 );
             }

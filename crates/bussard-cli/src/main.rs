@@ -1249,9 +1249,10 @@ enum Command {
         #[arg(long, value_name = "HEX", conflicts_with = "keyring")]
         tool_key: Option<String>,
     },
-    /// Restart a device (basic `A_Restart`: the application restarts,
-    /// nothing is erased) and wait until it answers again. The device may
-    /// transmit its status objects as it starts.
+    /// Restart a device (the application restarts, nothing is erased) in the
+    /// form ETS uses for it: the confirmed restart for a secure-capable
+    /// System B application, else a bare `A_Restart`. Then wait until it
+    /// answers again. The device may transmit its status objects as it starts.
     Restart {
         /// The device to restart, e.g. `1.1.39`.
         #[arg(value_name = "ADDRESS")]
