@@ -33,14 +33,17 @@
 //! objects ([`bussard_download::apply`]). **System 7** (mask `0705` / `0701`) has
 //! no such objects: its tables are absolute memory regions driven by two of the
 //! three parallel load-state machines, so the write runs
-//! [`bussard_download::apply_sys7`] instead — `Unload` / `StartLoading` the two
-//! table LSMs, allocate each region, stream it in 12-octet chunks with a
+//! [`bussard_download::apply_sys7`] instead — `Unload` the two table LSMs, then
+//! load each in turn: allocate its region, stream it in 12-octet chunks with a
 //! read-back verify, `TaskSegment`, `LoadCompleted` (issue #91). The parameter
-//! LSM and the application image are never touched, which is the whole point:
-//! a link change must not reset the device's parameters.
+//! image and the application are never rewritten, which is the whole point: a
+//! link change must not reset the device's parameters. Only the group-object
+//! table's communication flags follow the links, inside an LSM 3 bracket.
 //!
-//! Neither family restarts the device — a table object activates its content on
-//! `LoadCompleted`. See the ordering and restart rationale in
+//! A System B table write does not restart the device — a table object
+//! activates its content on `LoadCompleted`. A System 7 one ends with a basic
+//! restart, as ETS's table-only downloads do, and `apply` waits for the device
+//! to answer again before it goes on. See the ordering and restart rationale in
 //! [`bussard_download::apply_sys7`].
 //!
 //! # Safety
@@ -758,6 +761,28 @@ fn write_tables_then_parameters(
                 summary.association_state,
                 report.resulting_association_count,
             );
+            // A System 7 table write ends with a basic restart, as ETS's does;
+            // the parameters and the read-back need the device back first.
+            if summary.restarted {
+                let back = runtime.block_on(bussard_service::restart::wait_until_back(
+                    service,
+                    target,
+                    read_options,
+                    mask,
+                    bussard_service::restart::RestartWait::default(),
+                ));
+                match back {
+                    Ok(after) => println!(
+                        "restarted {target}: it answered again after {:.1} s",
+                        after.as_secs_f64()
+                    ),
+                    Err(err) => {
+                        eprintln!("\nERROR: {} {target}: {err}", origin.verb());
+                        recovery_notice(backup_path, target);
+                        return Ok((ExitCode::FAILURE, false));
+                    }
+                }
+            }
             // The security object was written with this PID 54 table and the
             // write verified: record it in the lock, as `adopt` does (issue
             // #297), so the sender admission check sees it.

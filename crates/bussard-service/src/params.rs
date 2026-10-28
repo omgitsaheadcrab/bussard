@@ -1251,11 +1251,6 @@ pub fn ignored_override_notes(model: &Model, target: IndividualAddress, dir: &Pa
         .collect()
 }
 
-/// Builds the plan of writing the model to `target`.
-///
-/// `params` is the parameter read-back, `None` when no product data was at
-/// hand. The parameter half is left out of the write (with a note) when the
-/// read-back could not decode the memory.
 /// The System 7 objects whose communication flag a write switches so that it
 /// follows the model's links ([`bussard_download::sys7_flag_writes`]), with a
 /// note for each switch and for each newly linked object whose flag could not
@@ -1299,6 +1294,11 @@ fn sys7_flag_plan(live: &LiveTables, report: &PlanReport, notes: &mut Vec<String
     writes.iter().map(|write| write.object).collect()
 }
 
+/// Builds the plan of writing the model to `target`.
+///
+/// `params` is the parameter read-back, `None` when no product data was at
+/// hand. The parameter half is left out of the write (with a note) when the
+/// read-back could not decode the memory.
 pub fn build_device_plan(
     model: &Model,
     target: IndividualAddress,
@@ -1471,6 +1471,11 @@ pub fn build_device_plan(
             tables_change,
         }),
         interface_properties: Vec::new(),
+        // A System 7 table write ends with a basic restart, as ETS's does; a
+        // full download names its own.
+        restart: live.sys7().is_some()
+            && needs_flash.is_none()
+            && (tables_change || !communication_flags.is_empty()),
         communication_flags,
     };
     let root = backups_root(dir);

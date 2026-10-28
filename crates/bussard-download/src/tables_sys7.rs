@@ -53,16 +53,22 @@
 //! # How far the address table may grow
 //!
 //! The address table may fill its LSM 1 segment and no more: the product's
-//! segment size, else up to the association table the device reports, else the
-//! corpus region size. A declared group-object table inside that span ends it
-//! too. [`Sys7LiveTables::address_capacity`] carries the bound, and both the
-//! read and `apply` refuse a table past it.
+//! segment size, else up to the association table the device reports or the
+//! product places. A declared group-object table inside that span ends it
+//! too. When none of these is known (no product data, and a device that does
+//! not answer `PID_TABLE_REFERENCE`), the segment's end is unknown: the corpus
+//! region would reach past the EK-E72's group-object table at `0x41D8`, so the
+//! table is bounded at its current length and a plan says so.
+//! [`Sys7LiveTables::address_capacity`] carries the bound, and both the read
+//! and `apply` refuse a table past it.
 //!
 //! # The group-object table
 //!
 //! Read where the product declares it ([`Sys7TableBases::object_table`]),
 //! for the communication flags `apply` keeps in step with the links. Without
-//! product data its place is unknown and it is not read.
+//! product data its place is unknown and it is not read. A read the device
+//! refuses, or an image that does not decode, leaves the flags unchecked with
+//! a note; the address and association tables are still read.
 //!
 //! The result is a [`bussard_mgmt::tables::DeviceTables`] — the same shape the
 //! System B reader produces — so `plan`, the `reconstruct` report and the
@@ -140,7 +146,7 @@ pub struct Sys7LiveTables {
     pub own_ia: u16,
     /// The most octets the address table may take at [`Self::address_base`]
     /// (see the module docs): the product's LSM 1 segment size, else the gap
-    /// to the association table, else [`SYS7_ADDRESS_REGION_LEN`].
+    /// to the association table, else the table's current length.
     pub address_capacity: usize,
     /// Where the group-object descriptor table starts, as the product declares
     /// it ([`Sys7TableBases::object_table`]). `None` without product data: the
@@ -197,26 +203,44 @@ pub async fn read_sys7_tables_at<Ch: L4Channel>(
     // A product with `DynamicTableManagement` keeps its association table
     // directly behind the address table (issue #383), so without the device's
     // answer its base follows from the address table read below.
+    let association_fallback = match (bases.packed_end, bases.association) {
+        (Some(_), _) => "the address table's end".to_string(),
+        (None, Some(at)) => format!("{at:#06X}"),
+        (None, None) => format!("{SYS7_ASSOCIATION_TABLE_ADDR:#06X}"),
+    };
+    let association_device = device_table_base(l4, 2, &association_fallback, &mut notes).await;
+    // Where the association table is known to start: the device's answer or the
+    // product's base. The corpus default is only a guess.
+    let association_known = association_device.or(bases.association);
     let association_reported = if bases.packed_end.is_some() {
-        device_table_base(l4, 2, "the address table's end", &mut notes).await
+        association_device
     } else {
-        Some(
-            table_base(
-                l4,
-                2,
-                bases.association.unwrap_or(SYS7_ASSOCIATION_TABLE_ADDR),
-                &mut notes,
-            )
-            .await,
-        )
+        Some(association_known.unwrap_or(SYS7_ASSOCIATION_TABLE_ADDR))
     };
 
     // --- LSM 1 region: the address table ---
-    let address_capacity = address_capacity(address_base, association_reported, bases);
+    let declared_capacity = address_capacity(address_base, association_known, bases);
+    let read_capacity = declared_capacity.unwrap_or(SYS7_ADDRESS_REGION_LEN);
     let addr_image =
-        read_counted_table(l4, address_base, address_capacity, sys7_address_table_span).await?;
-    let (own_ia, addresses) = decode_sys7_address_table(&addr_image, address_capacity)
+        read_counted_table(l4, address_base, read_capacity, sys7_address_table_span).await?;
+    let (own_ia, addresses) = decode_sys7_address_table(&addr_image, read_capacity)
         .map_err(|source| Sys7TablesError::Decode { address, source })?;
+    // Without product data, and with a device that does not report its
+    // association table, the end of the address segment is unknown: the corpus
+    // region reaches past a group-object table the EK-E72 keeps at 0x41D8. The
+    // table may then be rewritten at its current length but not grown.
+    let address_capacity = match declared_capacity {
+        Some(capacity) => capacity,
+        None => {
+            notes.push(format!(
+                "the address table's segment end is unknown (no product data, and the device \
+                 does not report its association table), so a write may not grow it past its \
+                 current {} entries; pin the device's product to add group addresses",
+                addresses.len()
+            ));
+            addr_image.len()
+        }
+    };
 
     if own_ia != address.raw() {
         // The own-IA slot (TSAP 0) is the device's individual address. A System 7
@@ -244,18 +268,26 @@ pub async fn read_sys7_tables_at<Ch: L4Channel>(
                 sys7_group_object_table_span,
             )
             .await;
+            // The tables bussard writes are the address and association
+            // tables; this one only feeds the communication flags. A device that
+            // refuses the read (an access level, a range it does not map) must
+            // not take the plain table read down with it, so any failure here
+            // becomes a note and the flags go unchecked.
             let decoded = match read {
                 Ok(image) => decode_sys7_group_object_table(&image, SYS7_GROUP_OBJECT_TABLE_MAX)
-                    .map(|(_ram_ptr, objects)| (image, objects)),
-                Err(Sys7TablesError::Decode { source, .. }) => Err(source),
-                Err(err) => return Err(err),
+                    .map(|(_ram_ptr, objects)| (image, objects))
+                    .map_err(|err| format!("not decodable ({err})")),
+                Err(Sys7TablesError::Decode { source, .. }) => {
+                    Err(format!("not decodable ({source})"))
+                }
+                Err(err) => Err(format!("not readable ({err})")),
             };
             match decoded {
                 Ok((image, objects)) => (Some(at), image, objects),
-                Err(err) => {
+                Err(why) => {
                     notes.push(format!(
-                        "group-object table at {at:#06X} not decodable ({err}); \
-                         communication flags are not checked"
+                        "group-object table at {at:#06X} {why}; communication flags are \
+                         not checked"
                     ));
                     (None, Vec::new(), Vec::new())
                 }
@@ -358,10 +390,15 @@ const SYS7_GROUP_OBJECT_TABLE_MAX: usize = SYS7_GROUP_OBJECT_HEADER_LEN + 255 * 
 
 /// How many octets the address table at `address_base` may take (see the module
 /// docs): the product's LSM 1 segment, else up to the association table the
-/// device reported, else the corpus region. A packed product's two tables share
-/// the span to [`Sys7TableBases::packed_end`]. A declared group-object table
-/// inside the span ends it.
-fn address_capacity(address_base: u16, association: Option<u16>, bases: Sys7TableBases) -> usize {
+/// device or the product places (`association`). A packed product's two tables
+/// share the span to [`Sys7TableBases::packed_end`]. A declared group-object
+/// table inside the span ends it. `None` when nothing bounds the segment: the
+/// caller then keeps the table at its current length.
+fn address_capacity(
+    address_base: u16,
+    association: Option<u16>,
+    bases: Sys7TableBases,
+) -> Option<usize> {
     let base = usize::from(address_base);
     let gap_to = |end: u16| usize::from(end).checked_sub(base).filter(|n| *n > 0);
     let capacity = match bases.packed_end {
@@ -370,11 +407,10 @@ fn address_capacity(address_base: u16, association: Option<u16>, bases: Sys7Tabl
             .address_size
             .map(usize::from)
             .or_else(|| association.and_then(gap_to)),
-    }
-    .unwrap_or(SYS7_ADDRESS_REGION_LEN);
-    match bases.object_table.and_then(gap_to) {
-        Some(to_objects) => capacity.min(to_objects),
-        None => capacity,
+    };
+    match (capacity, bases.object_table.and_then(gap_to)) {
+        (Some(capacity), Some(to_objects)) => Some(capacity.min(to_objects)),
+        (capacity, to_objects) => capacity.or(to_objects),
     }
 }
 
@@ -509,22 +545,21 @@ mod tests {
             object_table: Some(0x41D8),
             ..bases()
         };
-        assert_eq!(address_capacity(0x4000, Some(0x40ED), e72), 237);
+        assert_eq!(address_capacity(0x4000, Some(0x40ED), e72), Some(237));
     }
 
     #[test]
-    fn test_address_capacity_stops_at_the_reported_association_table() {
-        // No product data: the device's PID_TABLE_REFERENCE answer bounds it.
-        assert_eq!(address_capacity(0x4000, Some(0x40ED), bases()), 237);
-        // Nothing usable: the corpus region.
-        assert_eq!(
-            address_capacity(0x4000, None, bases()),
-            SYS7_ADDRESS_REGION_LEN
-        );
-        assert_eq!(
-            address_capacity(0x4000, Some(0x3F00), bases()),
-            SYS7_ADDRESS_REGION_LEN
-        );
+    fn test_address_capacity_stops_at_the_association_table() {
+        // No product segment size: the association table bounds it.
+        assert_eq!(address_capacity(0x4000, Some(0x40ED), bases()), Some(237));
+    }
+
+    #[test]
+    fn test_address_capacity_is_unknown_without_a_bound() {
+        // No product data and no usable association base: the caller keeps the
+        // table at its current length rather than assume the corpus region.
+        assert_eq!(address_capacity(0x4000, None, bases()), None);
+        assert_eq!(address_capacity(0x4000, Some(0x3F00), bases()), None);
     }
 
     #[test]
@@ -536,7 +571,13 @@ mod tests {
             object_table: Some(0x4040),
             ..bases()
         };
-        assert_eq!(address_capacity(0x4000, None, inside), 0x40);
+        assert_eq!(address_capacity(0x4000, None, inside), Some(0x40));
+        // It bounds the table on its own too.
+        let only_objects = Sys7TableBases {
+            object_table: Some(0x41D8),
+            ..bases()
+        };
+        assert_eq!(address_capacity(0x4000, None, only_objects), Some(0x1D8));
     }
 
     #[test]
@@ -546,6 +587,6 @@ mod tests {
             address_size: Some(31),
             ..bases()
         };
-        assert_eq!(address_capacity(0x4000, None, packed), 0x3FE);
+        assert_eq!(address_capacity(0x4000, None, packed), Some(0x3FE));
     }
 }

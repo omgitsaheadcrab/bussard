@@ -10,31 +10,31 @@
 //! - **LSM 1** owns the `0x4000` region — the address table (GrAT);
 //! - **LSM 2** owns the `0x4201` region — the association table (GrOAT).
 //!
-//! So an `apply` here is the same shape as a download, restricted to the two
-//! table LSMs: `Unload` both, `StartLoading` both, allocate each region as an
-//! absolute Data segment, stream the images in 12-octet `A_Memory_Write` chunks
-//! with a read-back verify per chunk, commit a `TaskSegment` descriptor, and
-//! `LoadCompleted`. The parameter LSM (3) and the application image are never
-//! touched — that is the whole point of the incremental path: a link change must
-//! not reset parameters (issue #91).
+//! So an `apply` here is the same shape as a download, restricted to the table
+//! LSMs: `Unload` both, then load each in turn (`StartLoading`, allocate the
+//! region as an absolute Data segment, stream the image in 12-octet
+//! `A_Memory_Write` chunks with a read-back verify per chunk, commit a
+//! `TaskSegment` descriptor, `LoadCompleted`). The parameter image and the
+//! application are never rewritten: a link change must not reset parameters
+//! (issue #91). Only the group-object table's communication flags change, and
+//! only when a link set changes which objects are linked.
 //!
-//! # Op-sequence ordering (decision + rationale)
+//! # Op-sequence ordering
 //!
-//! The same coupling as System B: the association table's TSAP column indexes the
-//! address table, so a window where one is active against the other's old content
-//! would orphan TSAPs. Both LSMs are therefore opened before either region is
-//! written, and the address LSM is completed first:
+//! The order ETS 6.4.1 uses for a table-only partial download to an EK-E72
+//! (`M-00B6_A-4537-03-DE59`, knx-sim captures of a first link, its removal
+//! and a second address on a linked object):
 //!
-//! 1. `Unload` LSM 2, `Unload` LSM 1 — tear both down (spec §3, every corpus
-//!    download unloads before loading).
-//! 2. `StartLoading` LSM 2, `StartLoading` LSM 1 — both inactive and writable.
-//! 3. Allocate + stream the **0x4000** region (the new address table).
-//! 4. Allocate + stream the **0x4201** region (the association table, whose TSAPs
-//!    now index the just-written address content).
-//! 5. `TaskSegment` + `LoadCompleted` on LSM 1 (activate the address table).
-//! 6. `TaskSegment` + `LoadCompleted` on LSM 2 (activate the associations).
-//! 7. Switch the communication flags of the objects whose links changed (see
-//!    below), each octet read back.
+//! 1. `Unload` LSM 1, `Unload` LSM 2. Neither table is active from here on, so
+//!    no association can index an address table it was not written against.
+//! 2. `StartLoading` LSM 1, allocate and stream the address table, `TaskSegment`,
+//!    `LoadCompleted` LSM 1.
+//! 3. The same on LSM 2 for the association table.
+//! 4. When a communication flag changes: `StartLoading` LSM 3, the whole
+//!    group-object table rewritten from its live image with the flag octets
+//!    changed, `LoadCompleted` LSM 3. ETS sends no `Unload` and no segment
+//!    record on LSM 3 here, and neither does bussard.
+//! 5. A basic `A_Restart` (see below).
 //!
 //! A device evaluates group telegrams against a table only in the `Loaded` state
 //! (KNX 3/5/1 load-state machine), so no partially-updated table is ever active.
@@ -56,27 +56,26 @@
 //! object without a link (the EK-E72 1.1.39: C on exactly its five linked
 //! objects; the flash post-pass does the same). A new link on such an object
 //! is written and verified but never acts: the EK-E72 kept ignoring a write to
-//! its newly linked object 32 until its C flag was set. So, where the product
-//! declares the group-object table ([`Sys7LiveTables::group_object_base`]),
-//! `apply` sets C on every object the model links that lacks it, and clears it
-//! on an object that loses its last link, writing the one CONFIG octet each
-//! and reading it back. Nothing else in a descriptor changes. Without product
-//! data the table's place is unknown: the plan names the newly linked objects
-//! whose flag it could not check ([`Sys7TableImages::unchecked_flags`]).
+//! its newly linked object 32 until its C flag was set. ETS switches C on for
+//! an object's first link and off with its last, and leaves it alone otherwise
+//! (capture: `0x4259 DB -> DF` and back for object 31, nothing for a second
+//! address). So, where the product declares the group-object table
+//! ([`Sys7LiveTables::group_object_base`]), `apply` does the same: it rewrites
+//! the whole table inside an LSM 3 load bracket, as ETS does, from the image it
+//! read with only the flag octets changed, and reads the whole table back.
+//! Without product data the table's place is unknown: the plan names the newly
+//! linked objects whose flag it could not check
+//! ([`Sys7TableImages::unchecked_flags`]).
 //!
-//! # Restart: not issued
+//! # Restart
 //!
-//! Every full System 7 download ends with a restart (`[corpus: 47/49]`,
-//! `[system7-spec §6]`), but a restart is **not** part of table activation. The
-//! KNX load-state machine activates a table object's content on `LoadCompleted`
-//! (§4.1: `Loading --LoadCompleted--> Loaded`), and the corpus restart is the
-//! terminal step of a procedure that also rewrote the **application and parameter
-//! image** — the thing that genuinely needs a re-init. A table-only write leaves
-//! the application untouched, so bussard does not restart: the device keeps
-//! running, which is the entire value of the incremental path over a full flash.
-//! `S7-CAL: confirm a real 0705/0701 device re-parses its GrAT/GrOAT on
-//! LoadCompleted alone, with no restart — no capture of a table-only download
-//! exists (ETS always rewrites the parameter image too).`
+//! Each of the ETS table-only downloads ends with a basic `A_Restart` before
+//! `T_Disconnect`, and so does `apply`, once the write has read back: the
+//! device re-reads its tables and flags as it starts, as it does after a power
+//! cycle. The restart is unconfirmed (a device never answers the basic form),
+//! so the caller waits for the device to answer again before it reads the
+//! tables back on a fresh connection; that read-back is what shows the write
+//! survived the restart.
 
 use bussard_mgmt::connection::{L4Channel, Layer4Connection};
 use bussard_mgmt::load::{LoadControl, LoadState, WriteError, read_memory, write_memory};
@@ -97,6 +96,9 @@ pub const SYS7_ADDRESS_LSM: u8 = 1;
 /// The load-state machine that owns the `0x4201` association-table region
 /// (`[system7-spec §3]`).
 pub const SYS7_ASSOCIATION_LSM: u8 = 2;
+/// The load-state machine that owns the application, whose segment holds the
+/// group-object table (`[system7-spec §3]`).
+pub const SYS7_APPLICATION_LSM: u8 = 3;
 
 /// Applying the System 7 tables failed.
 #[derive(Debug, thiserror::Error)]
@@ -129,6 +131,15 @@ pub enum Sys7ApplyError {
         /// What the device answered.
         got: Vec<u8>,
     },
+    /// The application's LSM is not `Loaded`, so its group-object table is
+    /// not rewritten (nothing was written).
+    #[error(
+        "the device's application (LSM 3) is {state}, not Loaded: refusing to rewrite its group-object table; nothing was written"
+    )]
+    ApplicationNotLoaded {
+        /// The state LSM 3 reported.
+        state: LoadState,
+    },
     /// An underlying management / load error.
     #[error(transparent)]
     Write(#[from] WriteError),
@@ -147,8 +158,16 @@ pub struct Sys7TableImages {
     pub address_region: Vec<u8>,
     /// The `0x4201` association-table image.
     pub association_image: Vec<u8>,
-    /// The communication-flag octets to write after the tables, in object order.
+    /// The communication-flag changes, in object order. They are written as
+    /// part of [`Self::group_object_image`].
     pub flag_writes: Vec<Sys7FlagWrite>,
+    /// Where the group-object table starts, when [`Self::group_object_image`]
+    /// is to be written.
+    pub group_object_base: Option<u16>,
+    /// The whole group-object table as read, with the flag octets of
+    /// [`Self::flag_writes`] changed. Empty when no flag changes, and then the
+    /// table (and LSM 3) is not touched.
+    pub group_object_image: Vec<u8>,
     /// Objects the model links anew whose communication flag could not be
     /// checked, because the group-object table's place is unknown (no product
     /// data). The device may ignore their new links.
@@ -190,8 +209,15 @@ pub struct Sys7VerifyOutcome {
     pub addresses_match: bool,
     /// Whether the `0x4201` region read back byte-for-byte.
     pub associations_match: bool,
-    /// Whether every communication-flag octet read back as written.
+    /// LSM 3's final load state when the group-object table was written
+    /// (must be [`LoadState::Loaded`]); `None` when it was not touched.
+    pub object_state: Option<LoadState>,
+    /// Whether the group-object table read back byte-for-byte (true when it
+    /// was not written).
     pub flags_match: bool,
+    /// Whether the closing basic restart was sent: only after everything
+    /// above verified. The caller waits for the device before reading back.
+    pub restarted: bool,
 }
 
 impl Sys7VerifyOutcome {
@@ -201,6 +227,9 @@ impl Sys7VerifyOutcome {
             && self.association_state == LoadState::Loaded
             && self.addresses_match
             && self.associations_match
+            && self
+                .object_state
+                .is_none_or(|state| state == LoadState::Loaded)
             && self.flags_match
     }
 }
@@ -259,12 +288,27 @@ pub fn sys7_table_images(
 
     let linked: BTreeSet<u16> = desired.associations.iter().map(|&(_, a)| a).collect();
     let (flag_writes, unchecked_flags) = sys7_flag_writes(live, &linked);
+    let (group_object_base, group_object_image) = match live.group_object_base {
+        Some(base) if !flag_writes.is_empty() => {
+            let mut image = live.group_object_image.clone();
+            for flag in &flag_writes {
+                // `sys7_flag_writes` only names descriptors the image holds.
+                if let Some(octet) = image.get_mut(usize::from(flag.address.wrapping_sub(base))) {
+                    *octet = flag.to;
+                }
+            }
+            (Some(base), image)
+        }
+        _ => (None, Vec::new()),
+    };
     Ok(Sys7TableImages {
         address_base: live.address_base,
         association_base,
         address_region,
         association_image,
         flag_writes,
+        group_object_base,
+        group_object_image,
         unchecked_flags,
     })
 }
@@ -326,12 +370,15 @@ pub fn sys7_flag_writes(
     (writes, unchecked)
 }
 
-/// Writes the two table regions to a System 7 device and verifies the result.
+/// Writes the table regions to a System 7 device, verifies them and restarts
+/// it.
 ///
 /// Runs the ordered sequence in the module docs on an **already authorized**
 /// layer-4 connection (System 7 gates memory access behind `A_Authorize`), then
-/// re-reads both regions and both LSM states. The caller treats
-/// `!outcome.ok()` as a hard failure.
+/// re-reads every written region and every LSM state, and sends the closing
+/// basic restart only when all of it verified. The caller treats
+/// `!outcome.ok()` as a hard failure and, after a restart, waits for the device
+/// before its independent read-back.
 ///
 /// This is the only function here that mutates the device. It is exercised by the
 /// mock-device tests and, in production, only from `bussard apply` after a plan
@@ -346,91 +393,117 @@ pub async fn apply_sys7_tables<Ch: L4Channel>(
     // 0: negotiate the APDU size before any table write, as ETS does (#116).
     crate::apply::negotiate_session_apdu(l4).await?;
 
+    // The group-object table belongs to the application's LSM: rewrite it
+    // only on a device whose application is loaded, before anything changes.
+    let object_table = images
+        .group_object_base
+        .filter(|_| !images.group_object_image.is_empty());
+    if object_table.is_some() {
+        let state = lsm.read_state(l4, SYS7_APPLICATION_LSM).await?;
+        if state != LoadState::Loaded {
+            return Err(Sys7ApplyError::ApplicationNotLoaded { state });
+        }
+    }
+
     // 1: tear both table LSMs down.
+    lsm.drive(l4, SYS7_ADDRESS_LSM, LoadControl::Unload).await?;
     lsm.drive(l4, SYS7_ASSOCIATION_LSM, LoadControl::Unload)
         .await?;
-    lsm.drive(l4, SYS7_ADDRESS_LSM, LoadControl::Unload).await?;
 
-    // 2: open both before either is written (the orphaned-TSAP guard).
-    lsm.drive(l4, SYS7_ASSOCIATION_LSM, LoadControl::StartLoading)
-        .await?;
-    lsm.drive(l4, SYS7_ADDRESS_LSM, LoadControl::StartLoading)
-        .await?;
-
-    // 3: the LSM 1 region — allocate exactly what will be written, then stream.
-    alloc_region(
+    // 2: the address table, loaded to completion.
+    let address_state = load_table(
         l4,
         lsm,
         profile,
         SYS7_ADDRESS_LSM,
+        "address",
         images.address_base,
-        images.address_region.len(),
+        &images.address_region,
+        task_marker,
     )
     .await?;
-    write_verified(l4, "address", images.address_base, &images.address_region).await?;
 
-    // 4: the LSM 2 region — its TSAPs index the content just written.
-    alloc_region(
+    // 3: then the association table, whose TSAPs index it.
+    let association_state = load_table(
         l4,
         lsm,
         profile,
         SYS7_ASSOCIATION_LSM,
-        images.association_base,
-        images.association_image.len(),
-    )
-    .await?;
-    write_verified(
-        l4,
         "association",
         images.association_base,
         &images.association_image,
+        task_marker,
     )
     .await?;
 
-    // 5: finalize and activate the address table first.
-    lsm.send_control(
-        l4,
-        SYS7_ADDRESS_LSM,
-        &encode_task_segment(images.address_base, task_marker),
-    )
-    .await?;
-    let address_state = lsm
-        .drive(l4, SYS7_ADDRESS_LSM, LoadControl::LoadCompleted)
-        .await?;
+    // 4: the group-object table with the changed flags, inside an LSM 3
+    // bracket and with no Unload, as ETS writes it.
+    let object_state = match object_table {
+        Some(base) => {
+            lsm.drive(l4, SYS7_APPLICATION_LSM, LoadControl::StartLoading)
+                .await?;
+            write_verified(l4, "group-object", base, &images.group_object_image).await?;
+            Some(
+                lsm.drive(l4, SYS7_APPLICATION_LSM, LoadControl::LoadCompleted)
+                    .await?,
+            )
+        }
+        None => None,
+    };
 
-    // 6: then the association table.
-    lsm.send_control(
-        l4,
-        SYS7_ASSOCIATION_LSM,
-        &encode_task_segment(images.association_base, task_marker),
-    )
-    .await?;
-    let association_state = lsm
-        .drive(l4, SYS7_ASSOCIATION_LSM, LoadControl::LoadCompleted)
-        .await?;
-
-    // 7: the communication flags of the objects whose links changed.
-    for flag in &images.flag_writes {
-        write_verified(l4, "group-object", flag.address, &[flag.to]).await?;
-    }
-
-    // Verify by reading both regions and every flag octet back off the loaded
-    // device.
+    // Verify by reading every written region back off the loaded device.
     let addr_back = read_region(l4, images.address_base, images.address_region.len()).await?;
     let assoc_back =
         read_region(l4, images.association_base, images.association_image.len()).await?;
-    let mut flags_match = true;
-    for flag in &images.flag_writes {
-        flags_match &= read_region(l4, flag.address, 1).await? == [flag.to];
-    }
-
-    Ok(Sys7VerifyOutcome {
+    let flags_match = match object_table {
+        Some(base) => {
+            read_region(l4, base, images.group_object_image.len()).await?
+                == images.group_object_image
+        }
+        None => true,
+    };
+    let mut outcome = Sys7VerifyOutcome {
         address_state,
         association_state,
         addresses_match: addr_back == images.address_region,
         associations_match: assoc_back == images.association_image,
+        object_state,
         flags_match,
-    })
+        restarted: false,
+    };
+
+    // 5: the basic restart that ends every ETS table-only download. A device
+    // never answers it; the caller's read-back after it is the check.
+    if outcome.ok() {
+        let (apci, payload) = bussard_mgmt::apci::encode_restart(0);
+        l4.send_data_unacked(apci, &payload)
+            .await
+            .map_err(WriteError::Mgmt)?;
+        outcome.restarted = true;
+    }
+    Ok(outcome)
+}
+
+/// Loads one table to completion on its LSM (after its `Unload`):
+/// `StartLoading`, the segment allocation, the image streamed and verified,
+/// `TaskSegment`, `LoadCompleted`. Returns the final load state.
+#[allow(clippy::too_many_arguments)] // one LSM's load: the connection, the LSM and its image
+async fn load_table<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    lsm: &LsmAccess,
+    profile: &Sys7Profile,
+    index: u8,
+    table: &'static str,
+    base: u16,
+    image: &[u8],
+    task_marker: [u8; 4],
+) -> Result<LoadState, Sys7ApplyError> {
+    lsm.drive(l4, index, LoadControl::StartLoading).await?;
+    alloc_region(l4, lsm, profile, index, base, image.len()).await?;
+    write_verified(l4, table, base, image).await?;
+    lsm.send_control(l4, index, &encode_task_segment(base, task_marker))
+        .await?;
+    Ok(lsm.drive(l4, index, LoadControl::LoadCompleted).await?)
 }
 
 /// Sends the absolute Data-segment allocation record for one table region
@@ -550,7 +623,28 @@ mod tests {
                 type_code: 0x08,
             })
             .collect();
+        // The image as read: [CNT][RAM-flags ptr 0x0700], then the descriptors.
+        live.group_object_image = vec![53, 0x07, 0x00];
+        for object in &live.group_objects {
+            let [hi, lo] = object.data_ptr.to_be_bytes();
+            live.group_object_image
+                .extend_from_slice(&[hi, lo, object.config, object.type_code]);
+        }
         live
+    }
+
+    /// The desired tables that link `objects` of the EK-E72, one GA each.
+    fn desired_e72(objects: &[u16]) -> DesiredTables {
+        let links: Vec<Link> = objects
+            .iter()
+            .map(|&object| Link {
+                object,
+                name: None,
+                send: Some(format!("3/1/{object}").parse().expect("a GA")),
+                listen: Vec::new(),
+            })
+            .collect();
+        compute_tables(&links)
     }
 
     fn objects(list: &[u16]) -> BTreeSet<u16> {
@@ -707,13 +801,47 @@ mod tests {
     }
 
     #[test]
+    fn test_sys7_table_images_rewrites_the_object_table_with_the_flag_changed()
+    -> Result<(), Sys7ApplyError> {
+        // A first link on object 32: the whole table, as ETS writes it, with
+        // the one CONFIG octet at 0x425D changed (DB -> DF) and nothing else.
+        let live = e72();
+        let images = sys7_table_images(&live, &desired_e72(&[20, 24, 27, 32, 38, 52]), 0x1127)?;
+        assert_eq!(images.group_object_base, Some(0x41D8));
+        assert_eq!(
+            images.group_object_image.len(),
+            live.group_object_image.len()
+        );
+        let changed: Vec<usize> = (0..live.group_object_image.len())
+            .filter(|&i| images.group_object_image[i] != live.group_object_image[i])
+            .collect();
+        assert_eq!(changed, vec![0x425D - 0x41D8]);
+        assert_eq!(images.group_object_image[0x425D - 0x41D8], 0xDF);
+        Ok(())
+    }
+
+    #[test]
+    fn test_sys7_table_images_leaves_the_object_table_alone_without_a_flag_change()
+    -> Result<(), Sys7ApplyError> {
+        // A second address on a linked object changes no flag: ETS rewrote the
+        // table unchanged, bussard does not touch it (or LSM 3) at all.
+        let images = sys7_table_images(&e72(), &desired_e72(&[20, 24, 27, 38, 52]), 0x1127)?;
+        assert!(images.flag_writes.is_empty());
+        assert_eq!(images.group_object_base, None);
+        assert!(images.group_object_image.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn test_verify_outcome_requires_everything() {
         let base = Sys7VerifyOutcome {
             address_state: LoadState::Loaded,
             association_state: LoadState::Loaded,
             addresses_match: true,
             associations_match: true,
+            object_state: Some(LoadState::Loaded),
             flags_match: true,
+            restarted: false,
         };
         assert!(base.ok());
         let mut bad = base.clone();
@@ -725,5 +853,12 @@ mod tests {
         let mut bad = base.clone();
         bad.flags_match = false;
         assert!(!bad.ok());
+        let mut bad = base.clone();
+        bad.object_state = Some(LoadState::Loading);
+        assert!(!bad.ok());
+        // An untouched group-object table is no failure.
+        let mut untouched = base.clone();
+        untouched.object_state = None;
+        assert!(untouched.ok());
     }
 }

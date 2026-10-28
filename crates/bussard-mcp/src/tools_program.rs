@@ -1479,6 +1479,7 @@ impl BussardMcp {
                 )
                 .await;
                 let verified = matches!(&outcome, Ok(summary) if summary.ok);
+                let restarted = matches!(&outcome, Ok(summary) if summary.restarted);
                 stopped = outcome.is_err();
                 tracing::info!(
                     "audit: knx_apply_device {target} tables via {gateway}: {}; backup {backup_path}",
@@ -1519,6 +1520,54 @@ impl BussardMcp {
                         });
                     }
                     break 'write;
+                }
+                // A System 7 table write ends with a basic restart, as ETS's
+                // does: the parameters and the read-back need the device back.
+                if restarted {
+                    tier.jobs.step(job, "waiting for the device to restart");
+                    let back = match self.state().bus.service() {
+                        Some(service) => {
+                            let options = L4Options {
+                                source: SourcePolicy::Known(source),
+                                tool_key: tool_key.clone(),
+                                high_water: high_water.clone(),
+                                authorize: Authorize::BestEffort(
+                                    bussard_mgmt::apci::FREE_ACCESS_KEY,
+                                ),
+                                ..L4Options::default()
+                            };
+                            bussard_service::restart::wait_until_back(
+                                service,
+                                target,
+                                &options,
+                                tables.mask,
+                                bussard_service::restart::RestartWait::default(),
+                            )
+                            .await
+                            .map_err(|err| err.to_string())
+                        }
+                        None => Err("the bus is not wired".to_string()),
+                    };
+                    match back {
+                        Ok(after) => {
+                            result["restarted"] = json!({
+                                "answered_after_ms": after.as_millis() as u64,
+                            });
+                        }
+                        Err(reason) => {
+                            stopped = true;
+                            merge(
+                                &mut result,
+                                json!({
+                                    "ok": false,
+                                    "verified": false,
+                                    "reason": format!("the device did not come back after its restart: {reason}"),
+                                    "recovery": recovery.clone(),
+                                }),
+                            );
+                            break 'write;
+                        }
+                    }
                 }
                 // The security object was written with this PID 54 table and the
                 // write verified: record it in the lock, as `adopt` does (issue

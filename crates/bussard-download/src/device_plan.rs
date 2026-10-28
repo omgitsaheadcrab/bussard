@@ -135,6 +135,10 @@ pub struct PlanWrites {
     /// PID in write order (issue #391).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub interface_properties: Vec<u8>,
+    /// The write ends with a basic restart: a System 7 table write, as ETS's
+    /// table-only downloads do (see [`crate::apply_sys7`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub restart: bool,
 }
 
 /// What a full application download writes, for the plan's `writes` line.
@@ -246,9 +250,13 @@ impl PlanWrites {
             parts.push(format!("KNXnet/IP parameter object ({})", pids.join(", ")));
         }
         if parts.is_empty() {
-            "nothing".to_string()
+            return "nothing".to_string();
+        }
+        let parts = parts.join(", ");
+        if self.restart {
+            format!("{parts}, then a restart")
         } else {
-            parts.join(", ")
+            parts
         }
     }
 }
@@ -717,6 +725,7 @@ mod tests {
                 full_image: None,
                 interface_properties: Vec::new(),
                 communication_flags: Vec::new(),
+                restart: false,
             },
             backup_dir: "knx/captures/backups/".to_string(),
             notes: Vec::new(),
@@ -757,6 +766,13 @@ mod tests {
             writes.describe(),
             "address table (6 entries), association table (6 entries), \
              communication flags (objects 32, 33)"
+        );
+        // A System 7 table write ends with a restart, and says so.
+        writes.restart = true;
+        assert_eq!(
+            writes.describe(),
+            "address table (6 entries), association table (6 entries), \
+             communication flags (objects 32, 33), then a restart"
         );
     }
 
