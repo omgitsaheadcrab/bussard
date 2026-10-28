@@ -148,6 +148,11 @@ pub struct Sys7LiveTables {
     /// (see the module docs): the product's LSM 1 segment size, else the gap
     /// to the association table, else the table's current length.
     pub address_capacity: usize,
+    /// The most octets the association table may take at
+    /// [`Self::association_base`] when it does not move with the address table:
+    /// the product's LSM 2 segment size, else the region constant, and never
+    /// past a declared group-object table.
+    pub association_capacity: usize,
     /// Where the group-object descriptor table starts, as the product declares
     /// it ([`Sys7TableBases::object_table`]). `None` without product data: the
     /// table was not read.
@@ -378,6 +383,7 @@ pub async fn read_sys7_tables_at<Ch: L4Channel>(
         },
         own_ia,
         address_capacity,
+        association_capacity: association_capacity(association_base, bases),
         address_base,
         association_base,
         packed_end: bases.packed_end,
@@ -416,6 +422,19 @@ fn address_capacity(
         (Some(capacity), Some(to_objects)) => Some(capacity.min(to_objects)),
         (capacity, to_objects) => capacity.or(to_objects),
     }
+}
+
+/// The bound on the association table at `base` (see
+/// [`Sys7LiveTables::association_capacity`]).
+fn association_capacity(base: u16, bases: Sys7TableBases) -> usize {
+    let segment = bases
+        .association_size
+        .map_or(SYS7_ASSOCIATION_REGION_LEN, usize::from);
+    let to_objects = bases
+        .object_table
+        .and_then(|end| usize::from(end).checked_sub(usize::from(base)))
+        .filter(|n| *n > 0);
+    to_objects.map_or(segment, |gap| segment.min(gap))
 }
 
 /// Reads one `CNT`-prefixed System 7 table at `base`, bounded by `capacity`.
@@ -539,6 +558,33 @@ mod tests {
 
     fn bases() -> Sys7TableBases {
         Sys7TableBases::default()
+    }
+
+    #[test]
+    fn test_association_capacity_takes_the_product_segment() {
+        let e72 = Sys7TableBases {
+            association_size: Some(235),
+            object_table: Some(0x41D8),
+            ..Default::default()
+        };
+        assert_eq!(association_capacity(0x40ED, e72), 235);
+    }
+
+    #[test]
+    fn test_association_capacity_stops_at_the_group_object_table() {
+        let declared = Sys7TableBases {
+            object_table: Some(0x41D8),
+            ..Default::default()
+        };
+        assert_eq!(association_capacity(0x40ED, declared), 0x41D8 - 0x40ED);
+    }
+
+    #[test]
+    fn test_association_capacity_falls_back_to_the_region() {
+        assert_eq!(
+            association_capacity(0x4201, Sys7TableBases::default()),
+            SYS7_ASSOCIATION_REGION_LEN
+        );
     }
 
     #[test]

@@ -1286,8 +1286,8 @@ fn sys7_flag_plan(live: &LiveTables, report: &PlanReport, notes: &mut Vec<String
             ),
             None => format!(
                 "object {object} gains its first link, but its communication flag was not \
-                 checked: without the device's product data bussard does not know where its \
-                 group-object table is, and a device ignores an object whose flag is off"
+                 checked: the group-object table was not read (no product data places it, or \
+                 the device refused the read), and a device ignores an object whose flag is off"
             ),
         });
     }

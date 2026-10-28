@@ -875,8 +875,9 @@ fn unchecked_flags_note(objects: &[u16]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "object(s) {list}: newly linked, but the communication flag was not checked (no \
-         product data places the group-object table); the device may ignore these links"
+        "object(s) {list}: newly linked, but the communication flag was not checked (the \
+         group-object table was not read: no product data places it, or the device refused \
+         the read); the device may ignore these links"
     )
 }
 

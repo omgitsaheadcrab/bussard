@@ -84,8 +84,7 @@ use bussard_mgmt::{LsmAccess, Sys7Profile, Sys7TaskIdentity, alloc_attr_octets};
 
 use crate::compute::DesiredTables;
 use crate::compute_sys7::{
-    SYS7_ASSOCIATION_REGION_LEN, SYS7_GROUP_OBJECT_HEADER_LEN, sys7_address_table,
-    sys7_association_table,
+    SYS7_GROUP_OBJECT_HEADER_LEN, sys7_address_table, sys7_association_table,
 };
 use crate::tables_sys7::{Sys7LiveTables, read_region};
 use std::collections::BTreeSet;
@@ -286,7 +285,7 @@ pub fn sys7_table_images(
                 usize::from(end).saturating_sub(base),
             )
         }
-        None => (live.association_base, SYS7_ASSOCIATION_REGION_LEN),
+        None => (live.association_base, live.association_capacity),
     };
     if association_image.len() > association_capacity {
         return Err(Sys7ApplyError::RegionOverflow {
@@ -454,7 +453,18 @@ pub async fn apply_sys7_tables<Ch: L4Channel>(
         Some(base) => {
             lsm.drive(l4, SYS7_APPLICATION_LSM, LoadControl::StartLoading)
                 .await?;
-            write_verified(l4, "group-object", base, &images.group_object_image).await?;
+            if let Err(err) =
+                write_verified(l4, "group-object", base, &images.group_object_image).await
+            {
+                // Leave the application running: every chunk is the table as
+                // read with only flag octets changed, so what is on the device
+                // is a consistent table. Best effort; the write error is what
+                // the caller sees.
+                let _ = lsm
+                    .drive(l4, SYS7_APPLICATION_LSM, LoadControl::LoadCompleted)
+                    .await;
+                return Err(err);
+            }
             Some(
                 lsm.drive(l4, SYS7_APPLICATION_LSM, LoadControl::LoadCompleted)
                     .await?,
@@ -586,8 +596,8 @@ mod tests {
     use super::*;
     use crate::compute::compute_tables;
     use crate::compute_sys7::{
-        SYS7_ADDRESS_REGION_LEN, SYS7_ADDRESS_TABLE_ADDR, SYS7_ASSOCIATION_TABLE_ADDR,
-        Sys7GroupObject,
+        SYS7_ADDRESS_REGION_LEN, SYS7_ADDRESS_TABLE_ADDR, SYS7_ASSOCIATION_REGION_LEN,
+        SYS7_ASSOCIATION_TABLE_ADDR, Sys7GroupObject,
     };
     use bussard_mgmt::tables::DeviceTables;
     use bussard_model::schema::Link;
@@ -605,6 +615,7 @@ mod tests {
             },
             own_ia,
             address_capacity,
+            association_capacity: SYS7_ASSOCIATION_REGION_LEN,
             address_base: SYS7_ADDRESS_TABLE_ADDR,
             association_base: SYS7_ASSOCIATION_TABLE_ADDR,
             packed_end: None,

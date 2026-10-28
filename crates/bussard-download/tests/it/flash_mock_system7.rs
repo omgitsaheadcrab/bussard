@@ -2292,6 +2292,7 @@ fn bases_with_object_table() -> bussard_download::Sys7TableBases {
         association: Some(0x4201),
         packed_end: None,
         address_size: Some(0x201),
+        association_size: None,
         object_table: Some(OBJECT_TABLE),
         task_identity: Some(JUNG_TASK_IDENTITY),
     }
@@ -2466,6 +2467,54 @@ async fn test_apply_sys7_tables_refuses_an_unloaded_application()
         assert_eq!(s.memory_writes_seen, 0, "nothing written");
         assert!(s.lsm_events.is_empty(), "no load event: {:?}", s.lsm_events);
         assert_eq!(s.restarts_seen, 0);
+    }
+    let _ = l4.disconnect().await;
+    drop(handle);
+    Ok(())
+}
+
+/// A group-object table write that fails part-way still closes LSM 3: the
+/// application keeps running on a table that is the one read with at most
+/// some flag octets changed, and the write error reaches the caller.
+#[tokio::test]
+async fn test_apply_sys7_tables_completes_lsm_3_after_a_failed_object_write()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut bus, state, handle) = setup(LsmMode::Property, Fault::None).await?;
+    let target: bussard_model::IndividualAddress = "1.1.99".parse()?;
+    seed_apply_device(&state, target.raw());
+    let mut l4 = authed_connection(&mut bus, target).await?;
+    let live = bussard_download::read_sys7_tables_at(&mut l4, bases_with_object_table()).await?;
+    let images = sys7_table_images(&live, &desired_first_link_on_object_2()?, target.raw())?;
+    let flag = images
+        .flag_writes
+        .first()
+        .ok_or("object 2's flag switches on")?;
+    {
+        // The device does not store object 2's CONFIG octet: the verify fails.
+        let mut s = lock(&state);
+        s.frozen.push(flag.address);
+        s.lsm_events.clear();
+    }
+    let profile = bussard_mgmt::MaskProfile::from_mask(MASK_0705)
+        .sys7_default_profile()
+        .ok_or("a System 7 profile")?;
+    let result = apply_sys7_tables(
+        &mut l4,
+        &lsm_access_for(LsmMode::Property),
+        &profile,
+        &images,
+        &JUNG_TASK_IDENTITY,
+    )
+    .await;
+    assert!(result.is_err(), "{result:?}");
+    {
+        let s = lock(&state);
+        assert_eq!(s.lsm_state(3), LS_LOADED, "the application keeps running");
+        assert_eq!(
+            s.lsm_events.iter().rev().find(|&&(lsm, _)| lsm == 3),
+            Some(&(3, LE_LOAD_COMPLETED))
+        );
+        assert_eq!(s.restarts_seen, 0, "no restart after a failed write");
     }
     let _ = l4.disconnect().await;
     drop(handle);
