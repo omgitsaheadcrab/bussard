@@ -990,11 +990,11 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
                         // no connector to reconnect with, and the mock does not reboot — so
                         // fall back to verifying over the still-open connection before the
                         // restart, preserving those tests' behaviour.
-                        // A plan that allocates filled segments ends with the confirmed
-                        // form ETS uses on those devices (issue #117): A_Restart master
-                        // reset, erase code 1, answered by A_Restart_Response. Every
-                        // other plan (KNX Virtual DA.tp, thelsing) keeps the bare
-                        // A_Restart its captures show.
+                        // A secure-capable System B application ends with the
+                        // confirmed form ETS uses on it (issues #117, #452): A_Restart
+                        // master reset, erase code 1, answered by A_Restart_Response.
+                        // Every other plan keeps the bare A_Restart its captures show
+                        // (restart_form).
                         let (apci, payload) = if plan.confirmed_restart {
                             bussard_mgmt::apci::encode_master_reset(
                                 bussard_mgmt::apci::ERASE_CODE_CONFIRMED_RESTART,

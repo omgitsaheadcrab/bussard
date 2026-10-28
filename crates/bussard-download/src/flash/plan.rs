@@ -973,12 +973,17 @@ pub fn plan_flash_with_memo(
     // the fill, issue #123). The device's fill is bookkeeping, not an erase, so
     // on a re-flash every octet the new image leaves out keeps whatever the
     // previous image put there (issue #117: a Jung F50 kept a blinking status
-    // LED). ETS opens such a download with a factory reset (erase code 7) and
-    // ends it with a confirmed restart (erase code 1); do the same.
+    // LED). ETS opens an unload + download of a secure-capable application
+    // with a factory reset (erase code 7) and ends every download of one with
+    // a confirmed restart (erase code 1); do the same. An application that is
+    // not secure-capable gets neither (issue #452: 1.1.45 and 1.1.51 allocate
+    // a filled segment too, and ETS unloads them with load controls and ends
+    // with a bare A_Restart).
+    let form = super::restart_form(app);
     let sparse = steps
         .iter()
         .any(|s| matches!(s, FlashStep::AllocateSegment { fill: Some(_), .. }));
-    if sparse {
+    if sparse && form.is_confirmed() {
         insert_factory_reset(&mut steps);
     }
 
@@ -996,7 +1001,7 @@ pub fn plan_flash_with_memo(
         param_images,
         spliced_from_template,
         sys7: None,
-        confirmed_restart: sparse,
+        confirmed_restart: form.is_confirmed(),
         baseline: BTreeMap::new(),
         placed,
         unwritten: BTreeMap::new(),

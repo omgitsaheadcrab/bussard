@@ -540,14 +540,24 @@ mod tests {
     fn test_apply_freshness_resets_another_application_unless_waived() -> TestResult {
         let (dir, model) = fixture("freshness")?;
         let product = product()?;
-        let app = product.applications.first().ok_or("no application")?;
+        let plain_app = product.applications.first().ok_or("no application")?;
         let target: IndividualAddress = "1.1.4".parse()?;
-        let (inputs, _) = FlashInputs::from_model(&product, app, "1.1.4", Some(&model), target);
         let resident = Freshness::Resident {
             resident: Some("0001000101".to_string()),
             objects: Vec::new(),
             reason: None,
         };
+        // Issue #452: an application that is not secure-capable is never
+        // sent a master reset, another application resident or not.
+        let (plain, _) =
+            FlashInputs::from_model(&product, plain_app, "1.1.4", Some(&model), target);
+        let mut plain_plan = plain.plan(0x07B0)?;
+        apply_freshness(&mut plain_plan, Some(&resident), false);
+        assert!(!plain_plan.has_factory_reset());
+        let mut secure_app = plain_app.clone();
+        secure_app.is_secure_enabled = true;
+        let app = &secure_app;
+        let (inputs, _) = FlashInputs::from_model(&product, app, "1.1.4", Some(&model), target);
         let mut plan = inputs.plan(0x07B0)?;
         apply_freshness(&mut plan, Some(&resident), false);
         assert!(plan.has_factory_reset());

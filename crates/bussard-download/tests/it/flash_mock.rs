@@ -6067,13 +6067,15 @@ async fn test_param_plan_fresh_mock_device_reports_unknown() -> TestResult {
     Ok(())
 }
 
-/// A sparse System B app: one filled (`Mode=1 Fill=0`) segment whose image is
-/// half zeros, so the engine writes only octets 1, 3 and 5. Its plan therefore
-/// opens with a factory reset and ends with a confirmed restart.
+/// A sparse, secure-capable System B app: one filled (`Mode=1 Fill=0`) segment
+/// whose image is half zeros, so the engine writes only octets 1, 3 and 5. Its
+/// plan therefore opens with a factory reset and ends with a confirmed restart
+/// (issue #452: both only for a secure-capable application).
 fn app_with_sparse_segment() -> TestResult<ApplicationProgram> {
     let xml = r#"<KNX xmlns="http://knx.org/xml/project/23">
      <ApplicationProgram Id="M-2_A-8" ApplicationNumber="8" ApplicationVersion="1"
-        MaskVersion="MV-07B0" Name="Sparse" LoadProcedureStyle="MergedProcedure">
+        MaskVersion="MV-07B0" Name="Sparse" LoadProcedureStyle="MergedProcedure"
+        IsSecureEnabled="true">
       <Static>
        <Code>
         <RelativeSegment Id="M-2_A-8_RS-1" Size="6" LoadStateMachine="4" Offset="0"><Data>AAEAAwAF</Data></RelativeSegment>
@@ -6218,11 +6220,13 @@ async fn test_flash_without_factory_reset_inherits_stale_octets() -> TestResult 
 
 #[tokio::test]
 async fn test_require_factory_reset_adds_one_step_and_skip_removes_it() -> TestResult {
-    // A plan without filled segments (the DA.tp / thelsing shape) has no reset
-    // of its own; the CLI adds one for a device that is not factory-fresh, and
+    // A secure-capable plan without filled segments has no reset of its own;
+    // the CLI adds one for a device that is not factory-fresh, and
     // `--no-factory-reset` takes it out again.
+    let mut app = fabricated_app()?;
+    app.is_secure_enabled = true;
     let mut plan = plan_flash(
-        &fabricated_app()?,
+        &app,
         "1.1.4",
         0x07B0,
         &no_overrides(),
@@ -6231,7 +6235,7 @@ async fn test_require_factory_reset_adds_one_step_and_skip_removes_it() -> TestR
         &BTreeMap::new(),
     )?;
     assert!(!plan.has_factory_reset());
-    assert!(!plan.uses_confirmed_restart());
+    assert!(plan.uses_confirmed_restart());
     plan.require_factory_reset();
     plan.require_factory_reset();
     let resets = plan
@@ -6253,6 +6257,26 @@ async fn test_require_factory_reset_adds_one_step_and_skip_removes_it() -> TestR
     assert!(reset_at < first_unload);
     plan.skip_factory_reset();
     assert!(!plan.has_factory_reset());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_require_factory_reset_is_a_no_op_for_a_basic_restart_application() -> TestResult {
+    // Issue #452: ETS never sends a master reset to an application that is not
+    // secure-capable (1.1.45, 1.1.51), so neither the planner nor a device that
+    // is not factory-fresh adds one, and the download ends with a bare restart.
+    let mut plan = plan_flash(
+        &fabricated_app()?,
+        "1.1.4",
+        0x07B0,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    plan.require_factory_reset();
+    assert!(!plan.has_factory_reset());
+    assert!(!plan.uses_confirmed_restart());
     Ok(())
 }
 
@@ -7036,7 +7060,8 @@ fn app_with_filled_segment(image: &[u8]) -> TestResult<ApplicationProgram> {
     let xml = format!(
         r#"<KNX xmlns="http://knx.org/xml/project/23">
      <ApplicationProgram Id="M-2_A-9" ApplicationNumber="9" ApplicationVersion="1"
-        MaskVersion="MV-07B0" Name="Filled" LoadProcedureStyle="MergedProcedure">
+        MaskVersion="MV-07B0" Name="Filled" LoadProcedureStyle="MergedProcedure"
+        IsSecureEnabled="true">
       <Static>
        <Code>
         <RelativeSegment Id="M-2_A-9_RS-1" Size="{size}" LoadStateMachine="4" Offset="0"><Data>{b64}</Data></RelativeSegment>
@@ -7277,6 +7302,131 @@ async fn measure_flash_speed_profile() -> TestResult {
         s.reboot_answers,
         s.reboot_proceeded,
         run.outcome.reboot_readiness
+    );
+    Ok(())
+}
+
+/// A merged 07B0 application in the shape of the KWL-KNX Connect (1.1.45)
+/// and Steinel Control Pro (1.1.51) programs: object 4 gets a filled
+/// (`Mode=1 Fill=0`) parameter segment, the template does the rest.
+/// `secure` sets `IsSecureEnabled`, the one attribute that separates them from
+/// the ABB BE/S16 (1.1.39) and Theben (1.1.30) programs in the captures.
+fn merged_filled_app(secure: bool) -> TestResult<ApplicationProgram> {
+    let secure = if secure {
+        r#" IsSecureEnabled="true""#
+    } else {
+        ""
+    };
+    let xml = format!(
+        r#"<KNX xmlns="http://knx.org/xml/project/20">
+     <ApplicationProgram Id="M-2_A-7" ApplicationNumber="7" ApplicationVersion="16"
+        MaskVersion="MV-07B0" Name="Merged" LoadProcedureStyle="MergedProcedure"{secure}>
+      <Static>
+       <Code>
+        <RelativeSegment Id="M-2_A-7_RS-04-00000" Size="4" LoadStateMachine="4" Offset="0"><Data>AAEAAw==</Data></RelativeSegment>
+       </Code>
+       <LoadProcedures>
+        <LoadProcedure MergeId="2">
+         <LdCtrlRelSegment LsmIdx="4" Size="4" Mode="1" Fill="0" AppliesTo="full" />
+         <LdCtrlRelSegment LsmIdx="4" Size="4" Mode="0" Fill="0" AppliesTo="par" />
+        </LoadProcedure>
+        <LoadProcedure MergeId="4">
+         <LdCtrlWriteRelMem ObjIdx="4" Offset="0" Size="4" Verify="true" AppliesTo="full,par" />
+        </LoadProcedure>
+       </LoadProcedures>
+      </Static>
+     </ApplicationProgram></KNX>"#
+    );
+    Ok(parse_application_program("M-2_A-7", xml.as_bytes())?)
+}
+
+/// The labels of `plan`'s factory reset and restart steps, in order.
+fn reset_and_restart_steps(plan: &bussard_download::FlashPlan) -> Vec<String> {
+    plan.steps
+        .iter()
+        .filter(|s| {
+            matches!(
+                s,
+                FlashStep::FactoryReset { .. } | FlashStep::Restart | FlashStep::MasterReset { .. }
+            )
+        })
+        .map(|s| plan.step_label(s))
+        .collect()
+}
+
+/// Plans `app` the way the offline oracle does: against the 07B0 master
+/// template, with table images for objects 1 to 3.
+fn plan_merged(app: &ApplicationProgram) -> TestResult<bussard_download::FlashPlan> {
+    let tables = BTreeMap::from([(1, vec![0, 0]), (2, vec![0, 0]), (3, vec![0, 0])]);
+    let template = master_template_all_ops()?;
+    Ok(plan_flash(
+        app,
+        "1.1.45",
+        0x07B0,
+        &no_overrides(),
+        &BTreeMap::new(),
+        Some(&template),
+        &tables,
+    )?)
+}
+
+#[test]
+fn test_plan_flash_secure_capable_app_resets_and_restarts_confirmed() -> TestResult {
+    // Issue #452, `be-s16-230-3-2-binäreingang-download.pcapng` (1.1.39): ETS
+    // opens with `restart master-reset erase_code=7` (op 5) and ends with
+    // `restart master-reset erase_code=1` (op 1650); `bm-1-1-30.pcapng` and
+    // `heizungsaktor-6-fach-1-1-2.pcapng` open the same way.
+    let app = merged_filled_app(true)?;
+    assert_eq!(
+        bussard_download::restart_form(&app),
+        bussard_download::RestartForm::Confirmed
+    );
+    let plan = plan_merged(&app)?;
+    let steps = reset_and_restart_steps(&plan);
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert!(steps[0].contains("erase code 7"), "{steps:?}");
+    assert!(steps[1].contains("confirmed"), "{steps:?}");
+    assert!(steps[1].contains("erase code 1"), "{steps:?}");
+    let reset_at = plan
+        .steps
+        .iter()
+        .position(|s| matches!(s, FlashStep::FactoryReset { .. }))
+        .ok_or("reset step")?;
+    let first_unload = plan
+        .steps
+        .iter()
+        .position(|s| matches!(s, FlashStep::Unload { .. }))
+        .ok_or("unload step")?;
+    assert!(reset_at < first_unload);
+    assert!(plan.uses_confirmed_restart());
+    Ok(())
+}
+
+#[test]
+fn test_plan_flash_plain_app_with_filled_segment_unloads_and_restarts_basic() -> TestResult {
+    // Issue #452, `kwl-knx-connect-download.pcapng` (1.1.45) and
+    // `steinel-1-1-51.pcapng` (1.1.51): the application allocates a filled
+    // segment, yet ETS never sends a master reset. It unloads with load
+    // controls (`restart Restart type=basic` at op 19 belongs to that unload)
+    // and ends the download with `restart Restart type=basic` (ops 70 and 82).
+    let app = merged_filled_app(false)?;
+    assert_eq!(
+        bussard_download::restart_form(&app),
+        bussard_download::RestartForm::Basic
+    );
+    let mut plan = plan_merged(&app)?;
+    // A device that is not factory-fresh gets no master reset either.
+    plan.require_factory_reset();
+    let steps = reset_and_restart_steps(&plan);
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert!(!steps[0].contains("erase code"), "{steps:?}");
+    assert!(!steps[0].contains("confirmed"), "{steps:?}");
+    assert!(!plan.uses_confirmed_restart());
+    assert!(
+        plan.steps
+            .iter()
+            .any(|s| matches!(s, FlashStep::AllocateSegment { fill: Some(_), .. })),
+        "the fixture allocates a filled segment"
     );
     Ok(())
 }

@@ -971,9 +971,9 @@ enum Command {
         #[arg(long)]
         full: bool,
         /// Skip the factory reset before the download. By default a System B
-        /// flash that writes filled segments sparsely, or that replaces a device
-        /// that is not factory-fresh, first sends a confirmed master reset (erase
-        /// code 7): the device erases its application, parameters and links and
+        /// flash of a secure-capable application that writes filled segments
+        /// sparsely, or that replaces a device that is not factory-fresh, first
+        /// sends a confirmed master reset (erase code 7): the device erases its application, parameters and links and
         /// keeps its individual address, so no octet of a previous image survives
         /// where the new one writes nothing (issue #117). Use this only when you
         /// know the device holds no stale image.
