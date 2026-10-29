@@ -937,10 +937,11 @@ pub async fn compare_rel_mem<Ch: L4Channel>(
                 detail: format!("read chunk at {start:#X} + {}", actual.len()),
             }
         })?;
-        let got = read_memory(l4, addr, want as u8).await?;
+        // A refusal (number 0, 03_03_07 §3.5.3) fails as such; an extended
+        // read that returns no octets cannot satisfy the compare either: stop
+        // and let the length check below report the shortfall.
+        let got = read_memory_strict(l4, addr, want as u8).await?;
         if got.is_empty() {
-            // A device that answers a read with zero octets cannot satisfy the
-            // compare: stop and let the length check below report the shortfall.
             break;
         }
         actual.extend_from_slice(&got);
@@ -1494,8 +1495,8 @@ pub async fn read_mcb_table<Ch: L4Channel>(
 // resolving.
 
 pub use crate::memory::{
-    read_memory, read_memory_range, select_extended_memory, write_memory, write_memory_chunked,
-    write_memory_verified,
+    read_memory, read_memory_range, read_memory_strict, select_extended_memory, write_memory,
+    write_memory_chunked, write_memory_verified,
 };
 
 /// Whether an error is a connection-death — a mid-session silence, a dropped ACK,
@@ -1529,7 +1530,10 @@ pub fn is_connection_death(err: &WriteError) -> bool {
     match err {
         WriteError::Mgmt(MgmtError::MidSessionSilence { .. })
         | WriteError::Mgmt(MgmtError::Disconnected { .. })
-        | WriteError::Mgmt(MgmtError::NoResponse { .. }) => true,
+        | WriteError::Mgmt(MgmtError::NoResponse { .. })
+        // A T_Connect the medium did not confirm (03_03_04 §5.4.3 E20): the
+        // device is not up yet, as with a silent one (issue #507).
+        | WriteError::Mgmt(MgmtError::NotConfirmed { .. }) => true,
         WriteError::Mgmt(MgmtError::Transport(e)) => e.is_link_loss(),
         _ => false,
     }
