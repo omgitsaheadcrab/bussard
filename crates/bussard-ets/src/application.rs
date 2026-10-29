@@ -579,6 +579,10 @@ pub enum LoadOp {
         /// `SegFlags` attribute: `128` marks a checksum-controlled segment,
         /// `0` a segment the application rewrites at runtime.
         seg_flags: Option<u32>,
+        /// `SegType` attribute: the Additional Load Controls segment type the
+        /// allocation goes out as, `0` = AllocAbsDataSeg (absent), `1` =
+        /// AllocAbsStackSeg (KNX 3/5/2 §3.31.2, §3.31.3.4; issue #487).
+        seg_type: Option<u32>,
     },
     /// `<LdCtrlWriteRelMem …>`: write into relative (parameter) memory.
     WriteRelMem {
@@ -836,6 +840,18 @@ pub struct ApplicationProgram {
     /// manufacturer in the application id.
     #[serde(default)]
     pub legacy_patch_manufacturer_in_task_segment: bool,
+    /// Whether the program declares an ETS download plugin
+    /// (`<Extension EtsDownloadPlugin=...>`, even an empty one). ETS then
+    /// writes the System B group-object table with the communication flag
+    /// on every declared object (issue #565, the Busch-Jaeger DALI gateways).
+    #[serde(default)]
+    pub ets_download_plugin: bool,
+    /// Whether `<Options>` declares `SupportsExtendedMemoryServices="true"`.
+    /// ETS reads and writes memory above `0xFFFF` with
+    /// `A_MemoryExtended_*` when it does and with `A_UserMemory_*` when it
+    /// does not (issue #472, the sweep over Zennio, ABB and Busch-Jaeger).
+    #[serde(default)]
+    pub supports_extended_memory_services: bool,
     /// Application-program display name (translation applied).
     pub name: Option<String>,
     /// The declared `DefaultLanguage`: the language of the untranslated
@@ -1397,6 +1413,7 @@ fn handle_start(
         b"RelativeSegment" => insert_segment(app, m, SegmentKind::Relative),
         b"AbsoluteSegment" => insert_segment(app, m, SegmentKind::Absolute),
         b"Options" => insert_options(app, m),
+        b"Extension" => insert_extension(app, m),
         b"ComObjectTable" => insert_com_object_table(app, m),
         b"Language" => translations.enter_language(get(m, b"Identifier")),
         b"TranslationElement" => translations.enter_element(get(m, b"RefId")),
@@ -1536,6 +1553,15 @@ fn insert_options(app: &mut ApplicationProgram, m: &Attrs) {
         get(m, b"ParameterByteOrder").is_some_and(|v| v.eq_ignore_ascii_case("LittleEndian"));
     app.text_parameter_encoding = get(m, b"TextParameterEncoding").map(str::to_string);
     app.legacy_patch_manufacturer_in_task_segment = flag(b"LegacyPatchManufacturerIdInTaskSegment");
+    app.supports_extended_memory_services = flag(b"SupportsExtendedMemoryServices");
+}
+
+/// Reads a `<Extension>` element: whether it names an ETS download plugin
+/// (the attribute's presence counts, the products leave it empty).
+fn insert_extension(app: &mut ApplicationProgram, m: &Attrs) {
+    if get(m, b"EtsDownloadPlugin").is_some() {
+        app.ets_download_plugin = true;
+    }
 }
 
 /// Handles an `Empty` (self-closing) event.
@@ -1556,6 +1582,7 @@ fn handle_empty(
         b"Channel" => insert_channel(app, m),
         b"Argument" => insert_argument(app, m),
         b"Options" => insert_options(app, m),
+        b"Extension" => insert_extension(app, m),
         b"ComObjectTable" => insert_com_object_table(app, m),
         b"NumericArg" => {
             // A `<NumericArg RefId=arg-id Value=n>` of the current `<Module>`.
@@ -2528,6 +2555,7 @@ pub(crate) fn push_load_op(cur_lp: &mut Option<LoadProcedure>, e: &BytesStart, m
             access: u(b"Access"),
             mem_type: u(b"MemType"),
             seg_flags: u(b"SegFlags"),
+            seg_type: u(b"SegType"),
         },
         b"LdCtrlWriteRelMem" => LoadOp::WriteRelMem {
             obj_idx: u(b"ObjIdx"),
@@ -2792,6 +2820,48 @@ mod tests {
             );
             assert_eq!(app.prefer_partial_download, partial, "{options}");
             assert_eq!(app.downloads_invisible_parameters(), writes, "{options}");
+        }
+        Ok(())
+    }
+
+    /// `SupportsExtendedMemoryServices` decides the memory service above
+    /// `0xFFFF` (issue #472); absent means no.
+    #[test]
+    fn test_parse_application_program_supports_extended_memory_services() -> Result<()> {
+        for (options, expected) in [
+            (r#"<Options SupportsExtendedMemoryServices="true" />"#, true),
+            (
+                r#"<Options SupportsExtendedMemoryServices="false" />"#,
+                false,
+            ),
+            (r#"<Options Comparable="true" />"#, false),
+        ] {
+            let xml = format!(
+                r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t"><Static>{options}</Static></ApplicationProgram></KNX>"#
+            );
+            let app = parse_application_program_str("M-1_A-1", &xml)?;
+            assert_eq!(app.supports_extended_memory_services, expected, "{options}");
+        }
+        Ok(())
+    }
+
+    /// `<Extension EtsDownloadPlugin="">` marks the program (issue #565);
+    /// an `<Extension>` without the attribute does not.
+    #[test]
+    fn test_parse_application_program_ets_download_plugin() -> Result<()> {
+        for (extension, expected) in [
+            (
+                r#"<Extension EtsDownloadPlugin="" EtsUiPlugin="" EtsDataHandler="" />"#,
+                true,
+            ),
+            (r#"<Extension EtsUiPlugin="" />"#, false),
+            ("", false),
+        ] {
+            let xml = format!(
+                r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t"><Static>{extension}<Options /></Static></ApplicationProgram></KNX>"#
+            );
+            let app = parse_application_program_str("M-1_A-1", &xml)?;
+            assert_eq!(app.ets_download_plugin, expected, "{extension}");
         }
         Ok(())
     }

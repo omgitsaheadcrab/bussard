@@ -355,6 +355,7 @@ pub(super) fn plan_flash_sys7(
                 access,
                 mem_type,
                 seg_flags,
+                seg_type,
             } => {
                 // Validate before anything is bound: the executor folds the LSM
                 // index into the record's opcode nibble and the address/size into
@@ -467,6 +468,21 @@ pub(super) fn plan_flash_sys7(
                         })
                     }
                 };
+                // `SegType="1"` allocates a stack segment: ETS sends it as
+                // AllocAbsStackSeg (subtype 01), every other octet as for a
+                // data segment (issue #487, MDT `A-0222` LSM 3 record 4).
+                let seg_type = match seg_type.unwrap_or(0) {
+                    0 => bussard_mgmt::sys7::S7_SUB_ALLOC_DATA,
+                    1 => bussard_mgmt::sys7::S7_SUB_ALLOC_STACK,
+                    other => {
+                        return Err(PlanError::UnresolvableImage {
+                            step: step_no,
+                            reason: format!(
+                                "LdCtrlAbsSegment SegType {other} is not a data (0) or stack (1) segment"
+                            ),
+                        });
+                    }
+                };
                 steps.push(FlashStep::Sys7AbsSegment {
                     lsm,
                     address: addr,
@@ -474,6 +490,7 @@ pub(super) fn plan_flash_sys7(
                     mem_type,
                     seg_flags,
                     checksum_ctrl,
+                    seg_type,
                     image,
                 });
             }
@@ -663,15 +680,21 @@ pub(super) fn plan_flash_sys7(
         .chain(linked.iter().copied())
         .max();
     let declared = app.com_object_table.as_ref();
-    apply_sys7_group_object_links(
-        &steps,
-        &mut images,
-        declared,
-        &linked,
-        linked_flags,
-        &default_flags,
-        last_object,
-    );
+    // An application that declares no com-object, no module object and no
+    // link has every descriptor past its last declared object: ETS writes the
+    // template unchanged (issue #475, COMIP2 `M-00E1_A-A00D-10-12FB-O00C5`,
+    // all 8 CONFIG octets kept at `df`). Only a declaration rewrites.
+    if let Some(last_object) = last_object {
+        apply_sys7_group_object_links(
+            &steps,
+            &mut images,
+            declared,
+            &linked,
+            linked_flags,
+            &default_flags,
+            Some(last_object),
+        );
+    }
     let code_segments = sys7_code_segments(&steps, &images, declared, &param_images, &placed);
 
     Ok(FlashPlan {
@@ -699,6 +722,7 @@ pub(super) fn plan_flash_sys7(
         unwritten: BTreeMap::new(),
         baseline_address: BTreeMap::new(),
         security_capacity: Default::default(),
+        user_memory_above_64k: false,
     })
 }
 
@@ -909,14 +933,21 @@ pub(super) struct Sys7ObjectDefault {
 /// the flags of the visible ComObjectRef (the 3361-1MWW and 3181 captures of
 /// issue #117: the same object `Number` has refs with different flags under
 /// different `<when>` branches), and leaves an object no branch shows at the
-/// template (C cleared). An application without a Dynamic section (the walk
-/// reaches no com-object) falls back to the flat product defaults: every
-/// declared ref's flags, with the template's TYPE.
+/// template (C cleared). Only an application whose Dynamic section (module
+/// bodies included) holds no `<ComObjectRefRef>` at all falls back to the
+/// flat product defaults: every declared ref's flags, with the template's
+/// TYPE. One that has them but whose walk reaches none at these values gets
+/// no defaults, so every object keeps the template with C cleared (issue
+/// #562, ABB `A-A04C-13`: every object behind `Eingang_freigeben = 1`,
+/// default 0; ETS wrote `template & !C` on all 20 sweep rows).
 pub(super) fn sys7_object_defaults(
     app: &ApplicationProgram,
     config: &bussard_prod::dynamic::DynamicConfig,
 ) -> BTreeMap<u16, Sys7ObjectDefault> {
     if config.com_objects.is_empty() {
+        if dynamic_declares_com_objects(app) {
+            return BTreeMap::new();
+        }
         return app
             .resolved_com_objects()
             .iter()
@@ -957,6 +988,30 @@ pub(super) fn sys7_object_defaults(
         );
     }
     out
+}
+
+/// Whether the program's Dynamic section or any module body holds a
+/// `<ComObjectRefRef>` on any branch.
+fn dynamic_declares_com_objects(app: &ApplicationProgram) -> bool {
+    use bussard_model::dynamic::DynamicNode;
+    let mut stack: Vec<&[DynamicNode]> = vec![app.dynamic.as_slice()];
+    stack.extend(app.module_dynamics.values().map(Vec::as_slice));
+    while let Some(nodes) = stack.pop() {
+        for node in nodes {
+            match node {
+                DynamicNode::ComObjectRefRef(_) => return true,
+                DynamicNode::Channel { children, .. }
+                | DynamicNode::ParameterBlock { children, .. } => stack.push(children),
+                DynamicNode::Choose { whens, .. } => {
+                    stack.extend(whens.iter().map(|w| w.children.as_slice()));
+                }
+                DynamicNode::ParameterRefRef(_)
+                | DynamicNode::Module { .. }
+                | DynamicNode::Assign { .. } => {}
+            }
+        }
+    }
+    false
 }
 
 /// The System 7 TYPE octet for an `ObjectSize` (the KNX size code: `1 Bit` is
@@ -1766,6 +1821,7 @@ mod tests {
             mem_type: 3,
             seg_flags: 0x80,
             checksum_ctrl: 0x00,
+            seg_type: 0,
             image: Some(ImageRef {
                 segment_id: seg_id.clone(),
                 kind: ImageKind::Code,
@@ -1874,6 +1930,7 @@ mod tests {
                 mem_type: 2,
                 seg_flags: 0xF2,
                 checksum_ctrl: 0x00,
+                seg_type: 0,
                 image: None,
             },
             FlashStep::Sys7AbsSegment {
@@ -1883,6 +1940,7 @@ mod tests {
                 mem_type: 3,
                 seg_flags: 0xF2,
                 checksum_ctrl: 0x80,
+                seg_type: 0,
                 image: Some(ImageRef {
                     segment_id: seg_id.clone(),
                     kind: ImageKind::Code,
@@ -2001,6 +2059,7 @@ mod tests {
                 mem_type,
                 seg_flags: 0xF2,
                 checksum_ctrl,
+                seg_type: 0,
                 image: Some(ImageRef {
                     segment_id: id.to_string(),
                     kind,
@@ -2059,6 +2118,7 @@ mod tests {
                 mem_type: 2,
                 seg_flags: 0xF2,
                 checksum_ctrl: 0x00,
+                seg_type: 0,
                 image: None,
             },
             FlashStep::Sys7AbsSegment {
@@ -2068,6 +2128,7 @@ mod tests {
                 mem_type: 3,
                 seg_flags: 0xF2,
                 checksum_ctrl: 0x80,
+                seg_type: 0,
                 image: Some(ImageRef {
                     segment_id: seg_id.clone(),
                     kind: ImageKind::Code,
@@ -2155,6 +2216,7 @@ mod tests {
                 mem_type: 2,
                 seg_flags: 0xF2,
                 checksum_ctrl: 0x00,
+                seg_type: 0,
                 image: None,
             },
             FlashStep::Sys7AbsSegment {
@@ -2164,6 +2226,7 @@ mod tests {
                 mem_type: 3,
                 seg_flags: 0xF2,
                 checksum_ctrl: 0x80,
+                seg_type: 0,
                 image: Some(ImageRef {
                     segment_id: seg_id.clone(),
                     kind: ImageKind::Code,
@@ -2219,6 +2282,124 @@ mod tests {
         );
         Ok(())
     }
+    /// A System 7 (0701) app whose LSM 3 segment `AS-43FF` carries a three-slot
+    /// descriptor table (template C set, `df`) that `<ComObjectTable>` names;
+    /// `objects` goes into `<Static>` and `dynamic` is the Dynamic section.
+    fn sys7_descriptor_app(
+        objects: &str,
+        dynamic: &str,
+    ) -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
+        let xml = format!(
+            r#"<KNX xmlns="http://knx.org/xml/project/23">
+         <ApplicationProgram PeiType="0" Id="A" ApplicationNumber="1" ApplicationVersion="16"
+            MaskVersion="MV-0701" Name="Descriptors" LoadProcedureStyle="ProductProcedure">
+          <Static>
+           <Code>
+            <AbsoluteSegment Id="A_AS-43FF" Size="15" Address="17407"><Data>AwcPBwDfAAcB3wcHAt8A</Data></AbsoluteSegment>
+           </Code>
+           <ParameterTypes><ParameterType Id="A_PT-1" Name="t"><TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="1" /></ParameterType></ParameterTypes>
+           <Parameters><Parameter Id="A_P-1" Name="enable" ParameterType="A_PT-1" Value="0" /></Parameters>
+           <ParameterRefs><ParameterRef Id="A_P-1_R-1" RefId="A_P-1" /></ParameterRefs>
+           {objects}
+           <ComObjectTable CodeSegment="A_AS-43FF" Offset="0" />
+           <LoadProcedures>
+            <LoadProcedure>
+             <LdCtrlConnect />
+             <LdCtrlLoad LsmIdx="3" />
+             <LdCtrlAbsSegment LsmIdx="3" Address="17407" Size="15" />
+             <LdCtrlLoadCompleted LsmIdx="3" />
+             <LdCtrlDisconnect />
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+          {dynamic}
+         </ApplicationProgram></KNX>"#
+        );
+        Ok(parse_application_program("A", xml.as_bytes())?)
+    }
+
+    fn plan_descriptor_table(
+        app: &ApplicationProgram,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let plan = plan_flash(
+            app,
+            "1.1.99",
+            0x0701,
+            &no_overrides(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        Ok(plan
+            .image_bytes("A_AS-43FF")
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default())
+    }
+
+    /// Issue #475 (COMIP2 `M-00E1_A-A00D-10-12FB-O00C5`): an application that
+    /// declares no com-object, no module object and no link writes the
+    /// descriptor table as the template has it, C kept on every slot.
+    #[test]
+    fn test_plan_flash_sys7_template_only_table_keeps_the_template()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = sys7_descriptor_app("", "")?;
+        assert_eq!(
+            plan_descriptor_table(&app)?,
+            vec![
+                0x03, 0x07, 0x0F, 0x07, 0x00, 0xDF, 0x00, 0x07, 0x01, 0xDF, 0x07, 0x07, 0x02, 0xDF,
+                0x00
+            ]
+        );
+        Ok(())
+    }
+
+    /// Issue #562 (ABB `A-A04C-13-0D6B`): the Dynamic section declares the
+    /// objects, but at the defaults the walk reaches none. ETS writes every
+    /// descriptor as the template with C cleared, not the refs' flags.
+    #[test]
+    fn test_plan_flash_sys7_unreached_objects_keep_the_template_without_c()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let objects = r#"<ComObjects>
+            <ComObject Id="A_O-0" Number="0" ObjectSize="1 Bit" TransmitFlag="Enabled" ReadFlag="Enabled" CommunicationFlag="Enabled" />
+            <ComObject Id="A_O-1" Number="1" ObjectSize="1 Bit" WriteFlag="Enabled" CommunicationFlag="Enabled" />
+           </ComObjects>
+           <ComObjectRefs>
+            <ComObjectRef Id="A_O-0_R-1" RefId="A_O-0" />
+            <ComObjectRef Id="A_O-1_R-2" RefId="A_O-1" />
+           </ComObjectRefs>"#;
+        let dynamic = r#"<Dynamic>
+           <ChannelIndependentBlock>
+            <ParameterBlock Id="A_PB-1" Name="main">
+             <ParameterRefRef RefId="A_P-1_R-1" />
+             <choose ParamRefId="A_P-1_R-1">
+              <when test="1"><ComObjectRefRef RefId="A_O-0_R-1" /><ComObjectRefRef RefId="A_O-1_R-2" /></when>
+             </choose>
+            </ParameterBlock>
+           </ChannelIndependentBlock>
+          </Dynamic>"#;
+        let app = sys7_descriptor_app(objects, dynamic)?;
+        // Objects 0 and 1 are declared: `df & !C` = `db`; slot 2 lies past
+        // the last declared object and keeps the template.
+        assert_eq!(
+            plan_descriptor_table(&app)?,
+            vec![
+                0x03, 0x07, 0x0F, 0x07, 0x00, 0xDB, 0x00, 0x07, 0x01, 0xDB, 0x07, 0x07, 0x02, 0xDF,
+                0x00
+            ]
+        );
+        // Without a Dynamic section the flat defaults still apply: the refs'
+        // flags (T R, W) with C cleared.
+        let flat = sys7_descriptor_app(objects, "")?;
+        assert_eq!(
+            plan_descriptor_table(&flat)?,
+            vec![
+                0x03, 0x07, 0x0F, 0x07, 0x00, 0x4B, 0x00, 0x07, 0x01, 0x13, 0x07, 0x07, 0x02, 0xDF,
+                0x00
+            ]
+        );
+        Ok(())
+    }
+
     /// A fabricated System 7 (mask 0705) app in the MDT canonical LSM 1/2/3 shape
     /// (`[system7-spec §3]`): obj0/PID78 preflight, three LSMs, an AbsSegment with
     /// a per-byte `<Mask>` on LSM 1, an allocate-only RAM segment on LSM 3, a
@@ -2283,6 +2464,83 @@ mod tests {
          </ApplicationProgram></KNX>"#
         );
         parse_application_program("M-0083_A-F", xml.as_bytes()).expect("the fixture app parses")
+    }
+
+    /// A minimal System 7 app with a data segment and a stack segment on LSM 3,
+    /// the second carrying `SegType="{seg_type}"` (issue #487).
+    fn sys7_app_with_seg_type(
+        seg_type: &str,
+    ) -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
+        let xml = format!(
+            r#"<KNX xmlns="http://knx.org/xml/project/23">
+         <ApplicationProgram PeiType="0" Id="M-0083_A-G" ApplicationNumber="14" ApplicationVersion="35"
+            MaskVersion="MV-0705" Name="FabS7Stack" LoadProcedureStyle="ProductProcedure">
+          <Static>
+           <Code />
+           <LoadProcedures>
+            <LoadProcedure>
+             <LdCtrlConnect />
+             <LdCtrlLoad LsmIdx="3" />
+             <LdCtrlAbsSegment LsmIdx="3" Address="1792" Size="8" MemType="2" />
+             <LdCtrlAbsSegment LsmIdx="3" Address="2038" Size="1" Access="0" MemType="2" SegFlags="0" SegType="{seg_type}" />
+             <LdCtrlLoadCompleted LsmIdx="3" />
+             <LdCtrlDisconnect />
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+         </ApplicationProgram></KNX>"#
+        );
+        Ok(parse_application_program("M-0083_A-G", xml.as_bytes())?)
+    }
+
+    #[test]
+    fn test_plan_flash_sys7_stack_segment_keeps_seg_type() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let plan = plan_flash(
+            &sys7_app_with_seg_type("1")?,
+            "1.1.99",
+            0x0705,
+            &no_overrides(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        let seg_types: Vec<(u32, u8)> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                FlashStep::Sys7AbsSegment {
+                    address, seg_type, ..
+                } => Some((*address, *seg_type)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            seg_types,
+            vec![
+                (0x0700, bussard_mgmt::sys7::S7_SUB_ALLOC_DATA),
+                (0x07F6, bussard_mgmt::sys7::S7_SUB_ALLOC_STACK)
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_flash_sys7_unknown_seg_type_refuses() -> Result<(), Box<dyn std::error::Error>> {
+        let err = plan_flash(
+            &sys7_app_with_seg_type("2")?,
+            "1.1.99",
+            0x0705,
+            &no_overrides(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        );
+        assert!(
+            matches!(&err, Err(PlanError::UnresolvableImage { reason, .. }) if reason.contains("SegType 2")),
+            "{err:?}"
+        );
+        Ok(())
     }
 
     fn plan_sys7_range(

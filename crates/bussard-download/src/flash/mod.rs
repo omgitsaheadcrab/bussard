@@ -477,6 +477,10 @@ pub enum FlashStep {
         /// from `mem_type`. A `0x00` segment is not spot-checked after the
         /// restart: the application rewrites it (issue #89, 1.1.36 `0x4916`).
         checksum_ctrl: u8,
+        /// The Additional Load Controls segment type the allocation goes out
+        /// as: the op's `SegType`, `0x00` AllocAbsDataSeg (absent) or `0x01`
+        /// AllocAbsStackSeg (KNX 3/5/2 §3.31.2; issue #487).
+        seg_type: u8,
         /// The segment image to stream, when the segment carries `<Data>` (or a
         /// computed table image replaces it); `None` for an allocate-only record.
         image: Option<ImageRef>,
@@ -963,6 +967,10 @@ pub struct FlashPlan {
     /// the executor checks the security program against them, reading any
     /// that is missing from the device, before the first step.
     security_capacity: crate::security::TableCapacity,
+    /// Whether the application leaves `SupportsExtendedMemoryServices` unset,
+    /// so memory above `0xFFFF` is written and read with `A_UserMemory_*`
+    /// as ETS does (issue #472). `false` on System 7 and property plans.
+    user_memory_above_64k: bool,
 }
 
 /// The System 7 execution context attached to a [`FlashPlan`] for a mask
@@ -1144,6 +1152,14 @@ impl FlashPlan {
     /// [`set_security_capacity`](Self::set_security_capacity)).
     pub fn security_capacity(&self) -> crate::security::TableCapacity {
         self.security_capacity
+    }
+
+    /// Whether memory above `0xFFFF` goes over `A_UserMemory_*` for this
+    /// plan: the application does not announce extended memory services
+    /// (issue #472). The executor sets it on the session before the first
+    /// step.
+    pub fn user_memory_above_64k(&self) -> bool {
+        self.user_memory_above_64k
     }
 
     /// The entries the plan writes into the group key table (PID 53) and
