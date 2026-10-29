@@ -77,6 +77,16 @@ pub enum TypedValue {
         /// Human label for the value under this subtype.
         label: &'static str,
     },
+    /// A 1-bit controlled value (DPT 2.xxx, 03_07_02 §3.2): the control bit
+    /// forces the value, without it the sender releases control.
+    Control {
+        /// `true` = control (the value is forced), `false` = no control.
+        control: bool,
+        /// The value bit, read like the matching 1.xxx sub-type.
+        value: bool,
+        /// Label of `value` under the matching 1.xxx sub-type.
+        label: &'static str,
+    },
     /// A percentage (DPT 5.001), 0–100 %.
     Percent(f32),
     /// An unsigned integer with an optional unit.
@@ -119,7 +129,9 @@ pub enum TypedValue {
     Step {
         /// Direction bit label (e.g. `"Increase"`/`"Decrease"`, `"Up"`/`"Down"`).
         direction: &'static str,
-        /// The 3-bit step code (0 = break, 1..7 = number of intervals).
+        /// The 3-bit step code: 0 = break, 1..=7 divide the 0..100 % range
+        /// into `2^(code-1)` intervals (03_07_02 §3.3), so code 1 is one
+        /// 100 % step and code 7 is 64 steps of 1.5625 %.
         step: u8,
     },
     /// A time of day with weekday (DPT 10.001).
@@ -146,13 +158,16 @@ pub enum TypedValue {
     DateTime(DateTime),
     /// A text string (DPT 16.x), up to 14 characters.
     Text(String),
-    /// A scene number (DPT 17.001), 0-based.
+    /// A scene number (DPT 17.001): the transmitted field `0..=63`.
+    ///
+    /// Displayed and parsed counted from 1, the way ETS and Home Assistant
+    /// number scenes (03_07_02 §3.19 NOTE 9): field 2 is `scene 3 (raw 2)`.
     Scene(u8),
     /// A scene control (DPT 18.001): activate or learn a scene.
     SceneControl {
         /// `true` = learn the scene, `false` = activate it.
         learn: bool,
-        /// Scene number 0–63.
+        /// The transmitted scene field `0..=63`; displayed as `scene + 1`.
         scene: u8,
     },
     /// An HVAC operating mode (DPT 20.102).
@@ -344,6 +359,13 @@ impl fmt::Display for TypedValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TypedValue::Bool { label, .. } => write!(f, "{label}"),
+            TypedValue::Control { control, label, .. } => {
+                if *control {
+                    write!(f, "Control: {label}")
+                } else {
+                    write!(f, "No control")
+                }
+            }
             TypedValue::Percent(p) => write!(f, "{p:.1} %"),
             TypedValue::Unsigned { value, unit } => match unit {
                 Some(u) => write!(f, "{value} {u}"),
@@ -362,13 +384,10 @@ impl fmt::Display for TypedValue {
                 decimals,
                 unit,
             } => write!(f, "{} {unit}", format_fixed(*count, *decimals)),
-            TypedValue::Step { direction, step } => {
-                if *step == 0 {
-                    write!(f, "{direction} break")
-                } else {
-                    write!(f, "{direction} step {step}")
-                }
-            }
+            TypedValue::Step { direction, step } => match step_percent(*step) {
+                Some(pct) => write!(f, "{direction} {pct} %"),
+                None => write!(f, "{direction} break"),
+            },
             TypedValue::Time {
                 weekday,
                 hour,
@@ -390,13 +409,12 @@ impl fmt::Display for TypedValue {
             TypedValue::Date { day, month, year } => write!(f, "{year:04}-{month:02}-{day:02}"),
             TypedValue::DateTime(dt) => write!(f, "{dt}"),
             TypedValue::Text(s) => write!(f, "{s:?}"),
-            TypedValue::Scene(n) => write!(f, "scene {n}"),
+            // Scene numbers count from 1 on screen and the transmitted field
+            // from 0 (03_07_02 §3.19 NOTE 9); show both.
+            TypedValue::Scene(n) => write!(f, "scene {} (raw {n})", u16::from(*n) + 1),
             TypedValue::SceneControl { learn, scene } => {
-                if *learn {
-                    write!(f, "learn scene {scene}")
-                } else {
-                    write!(f, "activate scene {scene}")
-                }
+                let verb = if *learn { "learn" } else { "activate" };
+                write!(f, "{verb} scene {} (raw {scene})", u16::from(*scene) + 1)
             }
             TypedValue::HvacMode(m) => write!(f, "{m}"),
             TypedValue::Rgb { r, g, b } => write!(f, "#{r:02X}{g:02X}{b:02X}"),
@@ -423,6 +441,71 @@ impl TypedValue {
             _ => None,
         }
     }
+}
+
+/// The size of one step of a 3.007/3.008 step code, in percent of the full
+/// range: `100 / 2^(code-1)` (03_07_02 §3.3). `None` for code 0 (break) and
+/// for codes above 7, which the 3-bit field cannot carry.
+fn step_percent(code: u8) -> Option<f64> {
+    (1..=7)
+        .contains(&code)
+        .then(|| 100.0 / f64::from(1u32 << (code - 1)))
+}
+
+/// The `(bit 0, bit 1)` direction labels of a DPT 3.x sub-type: 3.008 is
+/// `Up`/`Down`, every other 3.x reads as 3.007 `Decrease`/`Increase`.
+fn step_labels(sub: Option<u16>) -> (&'static str, &'static str) {
+    match sub {
+        Some(8) => ("Up", "Down"),
+        _ => ("Decrease", "Increase"),
+    }
+}
+
+/// Parses a 3.007/3.008 step: a direction word, then an optional amount.
+///
+/// Directions: `increase`/`decrease`, `up`/`down` (3.007 reads `up` as
+/// increase, `dim up`/`dim down` too; 3.008 has `up` = bit 0, `down` = bit 1).
+/// Amounts: a step size in percent that is one of 100, 50, 25, 12.5, 6.25,
+/// 3.125 and 1.5625 (`25%`), a bare step code `0`-`7` (`3`, `step 3`), or
+/// `break`/`stop`. No amount means code 1, one step over the whole range.
+/// A bare `break`/`stop` is code 0 with the bit-0 direction.
+fn parse_step(input: &str, sub: Option<u16>) -> Option<(bool, u8)> {
+    let lower = input.trim().to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let (dir_words, rest): (usize, Option<bool>) = match words.as_slice() {
+        ["dim", "up" | "brighter", ..] => (2, Some(true)),
+        ["dim", "down" | "darker", ..] => (2, Some(false)),
+        ["increase" | "brighter", ..] => (1, Some(true)),
+        ["decrease" | "darker", ..] => (1, Some(false)),
+        // 3.008: Up is bit 0, Down bit 1; on 3.007 `up` means brighter.
+        ["up", ..] => (1, Some(sub != Some(8))),
+        ["down", ..] => (1, Some(sub == Some(8))),
+        ["break" | "stop"] => return Some((false, 0)),
+        _ => (0, None),
+    };
+    let up = rest?;
+    let amount: Vec<&str> = words[dir_words..]
+        .iter()
+        .copied()
+        .filter(|w| *w != "step")
+        .collect();
+    let code = match amount.as_slice() {
+        [] => 1,
+        ["break" | "stop"] => 0,
+        [one] => parse_step_amount(one)?,
+        [n, "%"] => parse_step_amount(&format!("{n}%"))?,
+        _ => return None,
+    };
+    Some((up, code))
+}
+
+/// A step amount: `25%` (a step size) or a bare code `0`-`7`.
+fn parse_step_amount(word: &str) -> Option<u8> {
+    if let Some(p) = word.strip_suffix('%') {
+        let p: f64 = p.trim().parse().ok()?;
+        return (1..=7u8).find(|c| step_percent(*c).is_some_and(|s| (s - p).abs() < 1e-6));
+    }
+    word.parse::<u8>().ok().filter(|c| *c <= 7)
 }
 
 /// Renders `count * 10^-decimals` exactly, e.g. `(5000, 2)` as `50.00`.
@@ -573,6 +656,9 @@ fn bool_labels(sub: Option<u16>) -> (&'static str, &'static str) {
         Some(8) => ("Up", "Down"),
         Some(9) => ("Open", "Closed"),
         Some(10) => ("Stop", "Start"),
+        // 1.022 DPT_Scene_AB: shown as scenes 1 and 2 (03_07_02 §3.1
+        // footnote 2), with the transmitted bit next to it.
+        Some(22) => ("scene 1 (raw 0)", "scene 2 (raw 1)"),
         _ => ("0", "1"),
     }
 }
@@ -648,40 +734,50 @@ const FLOAT16_MAX: f32 = 0.01 * 2046.0 * 32768.0;
 #[error("value is not representable as a KNX 2-byte float (DPT 9)")]
 pub struct Float16RangeError;
 
-/// Encodes a value into a KNX 2-byte float (DPT 9.x), big-endian.
+/// The raw 16-bit DPT 9 pattern nearest to `value`, or `None` when `value` is
+/// not finite or lies outside the two octets' raw range.
 ///
-/// This is the single DPT-9 encoder in the workspace: `bussard-prod` places
-/// `<TypeFloat Encoding="DPT 9">` parameter values into device images with it,
-/// so an image byte and a bus byte can never disagree.
-pub fn encode_float16(value: f32) -> Result<[u8; 2], Float16RangeError> {
-    // Reject non-finite (NaN/±Inf) and anything outside the representable range
-    // *before* any integer math: `(value * 100.0).round() as i32` otherwise
-    // saturates to `i32::MAX`/`i32::MIN` for huge inputs and the mantissa-
-    // halving loop below then overflows on `mantissa ± 1` (panic in debug).
-    if !value.is_finite() || !(FLOAT16_MIN..=FLOAT16_MAX).contains(&value) {
-        return Err(Float16RangeError);
+/// 03_07_02 §3.10 defines the value as `0.01 * M * 2^E`, `M` in
+/// `-2048..=2047`, `E` in `0..=15`. The code is the smallest exponent whose
+/// mantissa fits, with the mantissa `value * 100 / 2^E` rounded once, ties to
+/// even. A larger exponent only has a coarser grid, so the smallest fitting
+/// one holds the nearest code; rounding once (issue #493) is what keeps it
+/// nearest, where halving an already rounded mantissa per exponent step drifted
+/// up to two resolution steps. Ties go to even like ETS does for parameter
+/// images (issue #89), so a group value and a parameter octet pair agree.
+///
+/// This does not refuse `7F FF` (the group-value "invalid data" marker):
+/// [`encode_float16`] does, and `bussard-prod` decides it per parameter type.
+/// It is the single DPT 9 rounding rule in the workspace.
+pub fn encode_float16_raw(value: f64) -> Option<u16> {
+    if !value.is_finite() {
+        return None;
     }
-    // Representable range of DPT 9: mantissa in -2048..=2047, exponent 0..=15.
-    let mut mantissa = (value * 100.0).round() as i32;
-    let mut exponent = 0i32;
-    while !(-2048..=2047).contains(&mantissa) {
-        if exponent >= 15 {
-            return Err(Float16RangeError);
-        }
-        // Round-halves-away division by two to keep precision reasonable.
-        mantissa = if mantissa >= 0 {
-            (mantissa + 1) / 2
-        } else {
-            (mantissa - 1) / 2
-        };
-        exponent += 1;
-    }
-    let (sign, mant_bits) = if mantissa < 0 {
+    let scaled = value * 100.0;
+    let (exponent, mantissa) = (0u16..=15).find_map(|e| {
+        let m = (scaled / f64::from(1u32 << e)).round_ties_even();
+        (-2048.0..=2047.0).contains(&m).then_some((e, m as i32))
+    })?;
+    let (sign, bits) = if mantissa < 0 {
         (0x8000u16, (mantissa + 2048) as u16)
     } else {
         (0u16, mantissa as u16)
     };
-    let raw = sign | ((exponent as u16) << 11) | (mant_bits & 0x07ff);
+    Some(sign | (exponent << 11) | (bits & 0x07ff))
+}
+
+/// Encodes a value into a KNX 2-byte float (DPT 9.x), big-endian.
+///
+/// The code is the nearest representable one (see [`encode_float16_raw`],
+/// which `bussard-prod` shares for `<TypeFloat Encoding="DPT 9">` parameter
+/// images, so an image byte and a bus byte can never disagree).
+pub fn encode_float16(value: f32) -> Result<[u8; 2], Float16RangeError> {
+    // Reject non-finite (NaN/±Inf) and anything above the largest valid value
+    // up front: the top raw pattern 0x7FFF is the "invalid data" marker.
+    if !value.is_finite() || !(FLOAT16_MIN..=FLOAT16_MAX).contains(&value) {
+        return Err(Float16RangeError);
+    }
+    let raw = encode_float16_raw(f64::from(value)).ok_or(Float16RangeError)?;
     // Defence in depth: 0x7FFF is the DPT 9 "invalid data" marker, never a value.
     // The `FLOAT16_MAX` cap above (mantissa <= 2046) already makes this pattern
     // unreachable for in-range inputs, but guard explicitly so a future change to
@@ -689,7 +785,7 @@ pub fn encode_float16(value: f32) -> Result<[u8; 2], Float16RangeError> {
     if raw == 0x7FFF {
         return Err(Float16RangeError);
     }
-    Ok([(raw >> 8) as u8, (raw & 0xff) as u8])
+    Ok(raw.to_be_bytes())
 }
 
 /// Decodes a group-value payload into a [`TypedValue`] under the given DPT.
@@ -713,28 +809,28 @@ fn decode_inner(dpt: &Dpt, payload: &[u8]) -> Option<TypedValue> {
                 label: if value { t } else { f },
             })
         }
+        2 => {
+            // B2 (03_07_02 §3.2): bit 1 the control flag, bit 0 the value of
+            // the 1.xxx sub-type with the same number (2.001 follows 1.001).
+            let b = payload.first()?;
+            let value = (b & 0x01) != 0;
+            let (f, t) = bool_labels(dpt.sub);
+            Some(TypedValue::Control {
+                control: (b & 0x02) != 0,
+                value,
+                label: if value { t } else { f },
+            })
+        }
         3 => {
-            // 4-bit control: bit 3 direction, bits 0..2 step.
+            // 4-bit control (03_07_02 §3.3): bit 3 direction, bits 0..2 the
+            // step code.
             let b = payload.first()? & 0x0f;
-            let direction_bit = (b & 0x08) != 0;
-            let step = b & 0x07;
-            let direction = match dpt.sub {
-                Some(8) => {
-                    if direction_bit {
-                        "Down"
-                    } else {
-                        "Up"
-                    }
-                }
-                _ => {
-                    if direction_bit {
-                        "Increase"
-                    } else {
-                        "Decrease"
-                    }
-                }
-            };
-            Some(TypedValue::Step { direction, step })
+            let (zero, one) = step_labels(dpt.sub);
+            let direction = if (b & 0x08) != 0 { one } else { zero };
+            Some(TypedValue::Step {
+                direction,
+                step: b & 0x07,
+            })
         }
         5 => {
             let b = *payload.first()?;
@@ -1000,6 +1096,13 @@ fn decode_inner(dpt: &Dpt, payload: &[u8]) -> Option<TypedValue> {
 /// - **1.x** — `on`/`off`, `true`/`false`, `1`/`0`, and subtype words:
 ///   `up`/`down` (1.008), `open`/`closed` (1.009), `start`/`stop` (1.010),
 ///   `enable`/`disable` (1.003), `alarm`/`no-alarm` (1.005).
+/// - **2.x** — `control <value>` (or `force <value>`) with the matching 1.x
+///   word (`control on`, 2.008 `control down`), and `release` or
+///   `no control` to drop the control bit.
+/// - **3.007 / 3.008** — a direction and an optional step: `increase 25%`,
+///   `up`, `dim up`, `down 50%`, `decrease 3` (the step code), `break`,
+///   `stop`. The step is the size of one step in percent (100, 50, 25,
+///   12.5, 6.25, 3.125, 1.5625) or the code 1-7; no step means 100 %.
 /// - **5.001** — a percentage: `75%` or a bare `0`–`100`.
 /// - **5.003** — an angle `0`–`360` (bare number).
 /// - **5.x** (other) — an integer `0`–`255`.
@@ -1016,8 +1119,12 @@ fn decode_inner(dpt: &Dpt, payload: &[u8]) -> Option<TypedValue> {
 /// - **12.x** — an unsigned integer `0`–`4294967295`.
 /// - **13.x** — a signed 32-bit integer, optional unit suffix.
 /// - **14.x** — a decimal (IEEE float), optional unit suffix.
-/// - **17.001 / 18.001** — a scene number `0`–`63` (18.001 accepts a leading
-///   `learn ` prefix).
+/// - **17.001 / 18.001** — a scene number `1`–`64` counted like ETS and Home
+///   Assistant (`scene 3` sends field 2, 03_07_02 §3.19 NOTE 9), or the field
+///   itself as `raw 0`–`raw 63`; 18.001 accepts a leading `learn` or
+///   `activate`.
+/// - **1.022** — scene `1` or `2` (`scene a`/`scene b`, or the bit as
+///   `raw 0`/`raw 1`).
 /// - **20.102** — a mode name: `auto`, `comfort`, `standby`, `economy`,
 ///   `building-protection` (aliases `frost`, `protection`).
 ///
@@ -1076,6 +1183,37 @@ pub fn parse_value(dpt: &Dpt, input: &str) -> Result<TypedValue, ParseValueError
             Ok(TypedValue::Bool {
                 value,
                 label: if value { true_label } else { false_label },
+            })
+        }
+        2 => {
+            let (false_label, true_label) = bool_labels(dpt.sub);
+            let (control, value) = parse_control(raw, dpt.sub).ok_or_else(|| {
+                invalid(&format!(
+                    "`control <value>` with {} or {} (or on/off), or `release`/`no control`",
+                    true_label.to_lowercase(),
+                    false_label.to_lowercase()
+                ))
+            })?;
+            Ok(TypedValue::Control {
+                control,
+                value,
+                label: if value { true_label } else { false_label },
+            })
+        }
+        3 => {
+            let (zero, one) = step_labels(dpt.sub);
+            let (bit, step) = parse_step(raw, dpt.sub).ok_or_else(|| {
+                invalid(&format!(
+                    "a direction ({} or {}) and an optional step size \
+                     (100%, 50%, 25%, 12.5%, 6.25%, 3.125%, 1.5625%) or code 1-7, \
+                     or `break`/`stop`",
+                    one.to_lowercase(),
+                    zero.to_lowercase()
+                ))
+            })?;
+            Ok(TypedValue::Step {
+                direction: if bit { one } else { zero },
+                step,
             })
         }
         5 => match dpt.sub {
@@ -1184,10 +1322,9 @@ pub fn parse_value(dpt: &Dpt, input: &str) -> Result<TypedValue, ParseValueError
             Ok(TypedValue::Float { value: v, unit })
         }
         17 => {
-            let v = parse_scene(raw).ok_or_else(|| invalid("a scene number 0-63"))?;
-            if v > 63 {
-                return Err(out_of_range("0-63"));
-            }
+            let v = parse_scene(raw)
+                .ok_or_else(|| invalid("a scene number 1-64, or `raw 0`-`raw 63`"))?
+                .map_err(|()| out_of_range("scene 1-64 (raw 0-63)"))?;
             Ok(TypedValue::Scene(v))
         }
         18 => {
@@ -1196,11 +1333,15 @@ pub fn parse_value(dpt: &Dpt, input: &str) -> Result<TypedValue, ParseValueError
                 Some(r) => (true, r.trim()),
                 None => (false, lower.as_str()),
             };
+            let rest = rest.strip_prefix("activate").map_or(rest, str::trim);
             let v = parse_scene(rest)
-                .ok_or_else(|| invalid("a scene number 0-63 (optionally prefixed `learn`)"))?;
-            if v > 63 {
-                return Err(out_of_range("0-63"));
-            }
+                .ok_or_else(|| {
+                    invalid(
+                        "a scene number 1-64 or `raw 0`-`raw 63`, optionally prefixed \
+                         `learn` or `activate`",
+                    )
+                })?
+                .map_err(|()| out_of_range("scene 1-64 (raw 0-63)"))?;
             Ok(TypedValue::SceneControl { learn, scene: v })
         }
         20 if dpt.sub == Some(102) => {
@@ -1233,6 +1374,17 @@ pub fn parse_value(dpt: &Dpt, input: &str) -> Result<TypedValue, ParseValueError
 /// Parses a boolean from human text, honoring the DPT 1.x subtype's word pair.
 fn parse_bool(input: &str, sub: Option<u16>) -> Option<bool> {
     let s = input.trim().to_lowercase();
+    // 1.022 numbers its two scenes 1 and 2 (03_07_02 §3.1 footnote 2), so a
+    // bare number is a scene number, not the bit; `raw 0`/`raw 1` is the bit.
+    if sub == Some(22) {
+        let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        match compact.as_str() {
+            "1" | "scene 1" | "a" | "scene a" | "raw 0" => return Some(false),
+            "2" | "scene 2" | "b" | "scene b" | "raw 1" => return Some(true),
+            "0" => return None,
+            _ => {}
+        }
+    }
     // Universal forms first.
     match s.as_str() {
         "on" | "true" | "1" | "yes" => return Some(true),
@@ -1255,6 +1407,25 @@ fn parse_bool(input: &str, sub: Option<u16>) -> Option<bool> {
         return Some(false);
     }
     None
+}
+
+/// Parses a 2.x controlled value into `(control, value)`.
+///
+/// `control on`, `force down`, `forced off` set the control bit with the
+/// 1.x value word; `release`, `no control`, `uncontrolled` clear both bits.
+fn parse_control(input: &str, sub: Option<u16>) -> Option<(bool, bool)> {
+    let s = input.trim().to_lowercase();
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if matches!(
+        s.as_str(),
+        "release" | "released" | "no control" | "no-control" | "uncontrolled"
+    ) {
+        return Some((false, false));
+    }
+    let rest = ["control:", "control", "forced", "force"]
+        .iter()
+        .find_map(|p| s.strip_prefix(p))?;
+    Some((true, parse_bool(rest, sub)?))
 }
 
 /// A human description of the accepted words for a 1.x subtype.
@@ -1284,11 +1455,40 @@ fn parse_int_with_unit(input: &str, unit: Option<&str>) -> Option<i64> {
     s.trim().parse::<i64>().ok()
 }
 
-/// Parses a scene number, tolerating a leading `scene ` word.
-fn parse_scene(input: &str) -> Option<u8> {
+/// Parses a scene as the transmitted field `0..=63`.
+///
+/// `3` and `scene 3` are scene numbers counted from 1, as ETS and Home
+/// Assistant show them (03_07_02 §3.19 NOTE 9), and travel as field 2;
+/// `raw 2` (or `scene raw 2`) is the field itself. `None` for text that is
+/// not a scene, `Some(Err(()))` for a number out of range. The display form
+/// `scene 3 (raw 2)` parses too, when its two numbers agree.
+fn parse_scene(input: &str) -> Option<Result<u8, ()>> {
+    let lower = input.trim().to_lowercase();
+    if let Some((head, tail)) = lower.split_once('(') {
+        let field = parse_scene_number(&format!(
+            "raw {}",
+            tail.strip_suffix(')')?.trim().strip_prefix("raw")?
+        ))?;
+        let number = parse_scene_number(head)?;
+        return (field == number).then_some(field);
+    }
+    parse_scene_number(&lower)
+}
+
+/// [`parse_scene`] without the display form's `(raw N)` suffix.
+fn parse_scene_number(input: &str) -> Option<Result<u8, ()>> {
     let s = input.trim().to_lowercase();
     let s = s.strip_prefix("scene").map(str::trim).unwrap_or(s.as_str());
-    s.trim().parse::<u8>().ok()
+    if let Some(field) = s.strip_prefix("raw") {
+        let n = field.trim().parse::<u16>().ok()?;
+        return Some(u8::try_from(n).ok().filter(|n| *n <= 63).ok_or(()));
+    }
+    let n = s.trim().parse::<u16>().ok()?;
+    Some(if (1..=64).contains(&n) {
+        Ok((n - 1) as u8)
+    } else {
+        Err(())
+    })
 }
 
 /// Parses a float, tolerating a trailing known unit suffix (`21.5°C` → `21.5`).
@@ -1398,6 +1598,32 @@ pub fn encode(dpt: &Dpt, value: &TypedValue) -> Result<Vec<u8>, EncodeError> {
     match dpt.main {
         1 => match value {
             TypedValue::Bool { value, .. } => Ok(vec![*value as u8]),
+            _ => Err(mismatch()),
+        },
+        2 => match value {
+            TypedValue::Control { control, value, .. } => {
+                Ok(vec![(u8::from(*control) << 1) | u8::from(*value)])
+            }
+            _ => Err(mismatch()),
+        },
+        3 => match value {
+            TypedValue::Step { direction, step } => {
+                let (zero, one) = step_labels(dpt.sub);
+                let bit = if *direction == one {
+                    0x08
+                } else if *direction == zero {
+                    0x00
+                } else {
+                    return Err(mismatch());
+                };
+                if *step > 7 {
+                    return Err(EncodeError::OutOfRange {
+                        dpt: dpt.to_string(),
+                        value: value.to_string(),
+                    });
+                }
+                Ok(vec![bit | step])
+            }
             _ => Err(mismatch()),
         },
         5 => match (dpt.sub, value) {
@@ -1642,6 +1868,105 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_dpt2_control() {
+        assert_eq!(
+            decode(&dpt("2.001"), &[0b11]),
+            TypedValue::Control {
+                control: true,
+                value: true,
+                label: "On"
+            }
+        );
+        assert_eq!(decode(&dpt("2.001"), &[0b11]).to_string(), "Control: On");
+        assert_eq!(decode(&dpt("2.001"), &[0b00]).to_string(), "No control");
+        assert_eq!(decode(&dpt("2.008"), &[0b11]).to_string(), "Control: Down");
+        assert_eq!(decode(&dpt("2.008"), &[0b10]).to_string(), "Control: Up");
+    }
+
+    #[test]
+    fn test_parse_value_dpt2_control_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        let d1 = dpt("2.001");
+        for (input, byte) in [
+            ("control on", 0b11),
+            ("control off", 0b10),
+            ("force on", 0b11),
+            ("Control: On", 0b11),
+            ("release", 0b00),
+            ("no control", 0b00),
+        ] {
+            let v = parse_value(&d1, input)?;
+            assert_eq!(encode(&d1, &v)?, vec![byte], "{input}");
+        }
+        for byte in 0u8..=3 {
+            let v = decode(&d1, &[byte]);
+            // Without control the value bit carries nothing; it encodes as 0.
+            let want = if byte & 0b10 == 0 { 0 } else { byte };
+            assert_eq!(encode(&d1, &parse_value(&d1, &v.to_string())?)?, vec![want]);
+        }
+        let d8 = dpt("2.008");
+        assert_eq!(encode(&d8, &parse_value(&d8, "control down")?)?, vec![0b11]);
+        assert_eq!(encode(&d8, &parse_value(&d8, "control up")?)?, vec![0b10]);
+        assert!(parse_value(&d8, "control sideways").is_err());
+        assert!(parse_value(&d1, "on").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_value_dpt3_step_forms() -> Result<(), Box<dyn std::error::Error>> {
+        let step = |direction, step| TypedValue::Step { direction, step };
+        let d7 = dpt("3.007");
+        assert_eq!(parse_value(&d7, "increase 25%")?, step("Increase", 3));
+        assert_eq!(parse_value(&d7, "increase 100%")?, step("Increase", 1));
+        assert_eq!(parse_value(&d7, "up 1")?, step("Increase", 1));
+        assert_eq!(parse_value(&d7, "up")?, step("Increase", 1));
+        assert_eq!(parse_value(&d7, "dim up")?, step("Increase", 1));
+        assert_eq!(parse_value(&d7, "Decrease 1.5625 %")?, step("Decrease", 7));
+        assert_eq!(parse_value(&d7, "decrease step 2")?, step("Decrease", 2));
+        assert_eq!(parse_value(&d7, "break")?, step("Decrease", 0));
+        assert_eq!(parse_value(&d7, "stop")?, step("Decrease", 0));
+        assert_eq!(parse_value(&d7, "increase stop")?, step("Increase", 0));
+        let d8 = dpt("3.008");
+        assert_eq!(parse_value(&d8, "down 50%")?, step("Down", 2));
+        assert_eq!(parse_value(&d8, "up")?, step("Up", 1));
+        // A step size the 3-bit code cannot express is refused.
+        assert!(parse_value(&d7, "increase 30%").is_err());
+        assert!(parse_value(&d7, "increase 8").is_err());
+        assert!(parse_value(&d7, "sideways").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_dpt3_step() -> Result<(), Box<dyn std::error::Error>> {
+        let d7 = dpt("3.007");
+        let v = TypedValue::Step {
+            direction: "Increase",
+            step: 3,
+        };
+        assert_eq!(encode(&d7, &v)?, vec![0x0B]);
+        assert_eq!(encode(&d7, &parse_value(&d7, "break")?)?, vec![0x00]);
+        let d8 = dpt("3.008");
+        assert_eq!(encode(&d8, &parse_value(&d8, "down 50%")?)?, vec![0x0A]);
+        // A 3.007 label under 3.008 is a mismatch, not a guess.
+        assert!(matches!(encode(&d8, &v), Err(EncodeError::Mismatch { .. })));
+        // Round trip over every code.
+        for b in 0u8..=0x0F {
+            assert_eq!(encode(&d7, &decode(&d7, &[b]))?, vec![b]);
+            assert_eq!(encode(&d8, &decode(&d8, &[b]))?, vec![b]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_display_dpt3_step_percent() {
+        let d7 = dpt("3.007");
+        assert_eq!(decode(&d7, &[0x0B]).to_string(), "Increase 25 %");
+        assert_eq!(decode(&d7, &[0x09]).to_string(), "Increase 100 %");
+        assert_eq!(decode(&d7, &[0x07]).to_string(), "Decrease 1.5625 %");
+        assert_eq!(decode(&d7, &[0x00]).to_string(), "Decrease break");
+        assert_eq!(decode(&dpt("3.008"), &[0x0A]).to_string(), "Down 50 %");
+    }
+
+    #[test]
     fn percent_scaling() {
         assert_eq!(decode(&dpt("5.001"), &[0]), TypedValue::Percent(0.0));
         assert_eq!(decode(&dpt("5.001"), &[255]), TypedValue::Percent(100.0));
@@ -1695,6 +2020,72 @@ mod tests {
             let back = decode_float16(bytes[0], bytes[1]);
             let tol = 0.1_f32.max(t.abs() * 0.001);
             assert!((back - t).abs() <= tol, "roundtrip {t} -> {back}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_float16_nearest_code_examples() -> Result<(), Float16RangeError> {
+        // Issue #493: halving a rounded mantissa per exponent step drifted.
+        // 50.01: M = 1250, E = 2 (50.00), not 1251 (50.04). The issue text
+        // gives 0x0CE2, which is E = 1 (25.00); E = 2 is 0x14E2.
+        assert_eq!(encode_float16(50.01)?, [0x14, 0xE2]);
+        // 1000.33: M = 1563, E = 6 (1000.32), not 1564 (1000.96).
+        assert_eq!(encode_float16(1000.33)?, [0x36, 0x1B]);
+        // -2621.45: M = -2048, E = 7 (-2621.44), not M = -1025, E = 8.
+        assert_eq!(encode_float16(-2621.45)?, [0xB8, 0x00]);
+        // A tie goes to the even mantissa, like ETS's parameter images (#89):
+        // 1000 lux is 100000 / 64 = 1562.5 -> 1562.
+        assert_eq!(encode_float16(1000.0)?, [0x36, 0x1A]);
+        Ok(())
+    }
+
+    /// The distance from `x` to the nearest valid DPT 9 code, found by trying
+    /// the two mantissas around `x` at every exponent (independent of the
+    /// encoder's smallest-exponent search).
+    fn nearest_float16_distance(x: f64) -> f64 {
+        let mut best = f64::INFINITY;
+        for e in 0..=15u32 {
+            let step = f64::from(1u32 << e) / 100.0;
+            let q = x / step;
+            for m in [q.floor(), q.ceil()] {
+                let m = m.clamp(-2048.0, 2047.0);
+                if e == 15 && m == 2047.0 {
+                    continue; // 0x7FFF, the invalid marker
+                }
+                best = best.min((m * step - x).abs());
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn test_encode_float16_never_further_than_nearest_code() -> Result<(), Float16RangeError> {
+        // Deterministic pseudo-random inputs over every exponent's range.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for i in 0..200_000u32 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let unit = (state >> 11) as f64 / (1u64 << 53) as f64; // 0..1
+            let e = i % 16;
+            let mag = unit * 2048.0 * f64::from(1u32 << e) / 100.0;
+            let v = if state & 1 == 0 { mag } else { -mag } as f32;
+            if !(FLOAT16_MIN..=FLOAT16_MAX).contains(&v) {
+                continue;
+            }
+            let b = encode_float16(v)?;
+            let got = f64::from(decode_float16(b[0], b[1]));
+            let x = f64::from(v);
+            let want = nearest_float16_distance(x);
+            // Tolerance for the f32 decode of large values only.
+            let tol = 1e-6 * x.abs().max(1.0);
+            assert!(
+                (got - x).abs() <= want + tol,
+                "{v}: encoded {:02X}{:02X} = {got}, nearest is {want} away",
+                b[0],
+                b[1]
+            );
         }
         Ok(())
     }
@@ -1788,6 +2179,60 @@ mod tests {
                 scene: 3
             }
         );
+    }
+
+    #[test]
+    fn test_decode_scene_displays_one_based_and_raw() {
+        // 03_07_02 §3.19 NOTE 9: field 2 is ETS's scene 3.
+        assert_eq!(
+            decode(&dpt("18.001"), &[0x02]).to_string(),
+            "activate scene 3 (raw 2)"
+        );
+        assert_eq!(
+            decode(&dpt("18.001"), &[0x80]).to_string(),
+            "learn scene 1 (raw 0)"
+        );
+        assert_eq!(
+            decode(&dpt("17.001"), &[63]).to_string(),
+            "scene 64 (raw 63)"
+        );
+        assert_eq!(decode(&dpt("1.022"), &[0]).to_string(), "scene 1 (raw 0)");
+    }
+
+    #[test]
+    fn test_parse_value_scene_one_based() -> Result<(), Box<dyn std::error::Error>> {
+        let d18 = dpt("18.001");
+        assert_eq!(encode(&d18, &parse_value(&d18, "scene 3")?)?, vec![0x02]);
+        assert_eq!(encode(&d18, &parse_value(&d18, "3")?)?, vec![0x02]);
+        assert_eq!(encode(&d18, &parse_value(&d18, "raw 2")?)?, vec![0x02]);
+        assert_eq!(
+            encode(&d18, &parse_value(&d18, "learn scene 1")?)?,
+            vec![0x80]
+        );
+        assert_eq!(
+            encode(&d18, &parse_value(&d18, "activate scene 64")?)?,
+            vec![0x3F]
+        );
+        assert!(matches!(
+            parse_value(&d18, "scene 0"),
+            Err(ParseValueError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            parse_value(&d18, "raw 64"),
+            Err(ParseValueError::OutOfRange { .. })
+        ));
+        let d17 = dpt("17.001");
+        assert_eq!(encode(&d17, &parse_value(&d17, "scene 1")?)?, vec![0x00]);
+        assert_eq!(encode(&d17, &parse_value(&d17, "raw 0")?)?, vec![0x00]);
+        // The display form parses back to the same field.
+        let shown = decode(&d17, &[7]).to_string();
+        assert_eq!(encode(&d17, &parse_value(&d17, &shown)?)?, vec![7]);
+        let d22 = dpt("1.022");
+        assert_eq!(encode(&d22, &parse_value(&d22, "scene 2")?)?, vec![1]);
+        assert_eq!(encode(&d22, &parse_value(&d22, "1")?)?, vec![0]);
+        assert_eq!(encode(&d22, &parse_value(&d22, "raw 1")?)?, vec![1]);
+        assert!(parse_value(&d22, "0").is_err());
+        Ok(())
     }
 
     #[test]
@@ -2075,24 +2520,26 @@ mod tests {
 
     #[test]
     fn parse_scene_and_scene_control() -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(parse_value(&dpt("17.001"), "5")?, TypedValue::Scene(5));
+        // Scene numbers count from 1 (03_07_02 §3.19 NOTE 9).
+        assert_eq!(parse_value(&dpt("17.001"), "5")?, TypedValue::Scene(4));
         assert_eq!(
             parse_value(&dpt("17.001"), "scene 5")?,
-            TypedValue::Scene(5)
+            TypedValue::Scene(4)
         );
-        assert!(parse_value(&dpt("17.001"), "64").is_err());
+        assert!(parse_value(&dpt("17.001"), "65").is_err());
+        assert!(parse_value(&dpt("17.001"), "0").is_err());
         assert_eq!(
             parse_value(&dpt("18.001"), "3")?,
             TypedValue::SceneControl {
                 learn: false,
-                scene: 3
+                scene: 2
             }
         );
         assert_eq!(
             parse_value(&dpt("18.001"), "learn 3")?,
             TypedValue::SceneControl {
                 learn: true,
-                scene: 3
+                scene: 2
             }
         );
         Ok(())
