@@ -799,7 +799,16 @@ fails under one key ETS retries it under the other (tool key ↔ FDSK, `[KNX
 3/5/2 §4.1 NOTE 18]`): that is how a device somebody reset to default is
 found again. bussard's retry policy (three attempts, 1 s then 2 s backoff,
 issue #166) is a deliberate deviation for devices that T_ACK before their
-security layer is up; it never falls back to the FDSK (#532).
+security layer is up. After those attempts, when the key store holds the
+device's FDSK, bussard sends one more Sync_Req (a fresh challenge, same
+connection) under the FDSK (#532). A Sync_Res that verifies there means the
+device was reset to default (erase code 02h or the local reset drop the tool
+key and make the FDSK active again, `[KNX 3/5/1 §6.1.4, §6.3.10.4 NOTE 108;
+AN194 §2.3.2.12]`): the session ends with `MgmtError::FactoryKeyActive`,
+which names the state and the next step, and nothing is read or written
+under the FDSK outside an explicit activation. The converse, a device the
+model does not mark activated that refuses plain access, is tried under the
+FDSK too (`describe`), before the "export a keyring" advice.
 
 bussard: `DataSecureSession::sync_request` builds the request with a fresh
 challenge; `unwrap` applies a verified Sync_Res (send sequence =
@@ -1245,7 +1254,7 @@ telegram and confirms every secured group transmission negatively, while the
 tool key and the security mode stay valid `[KNX 3/5/1 §6.3.4 NOTE 97, §6.3.7.4,
 §6.3.8.4, §6.3.10.4; KNX 3/3/7 §5.5.2 items 2 and 3]`; so between bussard's
 `Unload` and `LoadCompleted`, and after an apply that failed in between, the
-device is deaf and mute on its secured group addresses (the read-back does not yet check that state, #534). Master reset
+device is deaf and mute on its secured group addresses. The read-back after every apply and flash therefore reads the state (`A_FunctionPropertyExt_State_Read` PID 5, falling back to `A_PropertyExtValue_Read` element 1, `[KNX 3/5/1 §4.23.2.3.1]`) and is not verified unless it answers Loaded; a write that fails after the `Unload` names that consequence (#534). Master reset
 `[AN194 §2.3.2.13]`: erase codes 02h, 07h and the local reset clear PID 52, 53,
 54, 60, 61 and the load state and reset PID 55, 57, 58; 02h and the local
 reset also drop the tool key (FDSK active again), switch the security mode
@@ -1340,6 +1349,18 @@ The key tables (PID 53, PID 56) are never read: knx-sim refuses those reads
 with count 0, as a real device is expected to. Whether a real device serves
 multi-element reads of PID 61 and PID 54 has not been observed yet; the halving
 falls back to single elements if it does not.
+
+**Diagnostics (PID 55, 57, 58)** `[KNX 3/5/1 §6.3.9, §6.3.11, §6.3.12; bussard + knx-sim, no capture yet; issue #533]`.
+`bussard secure diag <ia>`, `status <ia>` and `knx_describe_device` read
+the security failures log with `A_FunctionPropertyExt_State_Read` PID 55
+(`00 00 00`: the counters; `00 01 00`: the latest failure), the report
+(PID 57) and the report control (PID 58) with `A_PropertyExtValue_Read`;
+`--clear` sends `A_FunctionPropertyExt_Command` PID 55 `00 00 00` and writes
+PID 57 := 0, then reads both back. What counts is in KNX 3/3/7 §5.4 and KNX
+3/5/1 §6.3.15.3 Table 108: an unlisted sender is dropped without a count
+(KNX 3/3/7 §5.2.1.1), a MAC failure counts cryptographic, a stale sequence
+SeqNr, a flag mismatch access. knx-sim models those counts; the layout of a
+real device's answer is not captured yet.
 
 ### 11.2 Switching one group address's security off or on `[issue #331; the write shape follows §11.1, the removal is VERIFIED against the 2026-10-24 capture `1-1-5-no-secure-ga.pcapng`, see SAFETY.md]`
 
@@ -1525,8 +1546,10 @@ greppable.
    2026-09-25: 60 s on the Jung interface (idle probe, alive at 45 s,
    `STATUS_TIMEOUT` at 59.97 s, 3 of 3); the 30 s keepalive is CONFIRMED
    adequate.
-7. **`A_PropertyExtDescription_Response` layout**: not in any capture; bussard
-   follows KNX 3/3/7 (`crates/bussard-mgmt/src/property_ext.rs`), INFERRED.
+7. ~~**`A_PropertyExtDescription_Response` layout**~~ **Settled by the
+   standard** (#197): `[KNX 3/3/7 §3.4.3.2 Figures 44, 45]` give the layout
+   bussard encodes and decodes (`crates/bussard-mgmt/src/property_ext.rs`),
+   with `max_nr_of_elem` as two full octets. No capture holds one yet.
 8. **FDSK QR/label string encoding** - only if commissioning from a scanned label
    (a non-goal, §1.4). `[research §2.6, UNKNOWN]`; the standard does not define
    it either (`[KNX 3/5/1 §6.1.3]`: no standardised access to the FDSK).

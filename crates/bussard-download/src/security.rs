@@ -178,8 +178,11 @@ pub fn sender_table_bytes(entries: &[SecureSenderEntry]) -> Vec<u8> {
 /// - `extra` adds more senders with sequence 0 (bussard's own tunnel address
 ///   via `--secure-sender`), unless already listed or equal to `device`.
 ///
-/// The entries are in ascending individual address, packed like the other
-/// tables of the security object. Evidence (issue #197): all eight decrypted
+/// The entries are in ascending individual address, the order the standard
+/// asks of the tool: the MaC sorts the table by the numerical value of the IA
+/// and rewrites the whole table when an entry changes (KNX 3/5/1 §6.3.8.3,
+/// §6.3.8.5; issue #197), which the count-0 clear before the entries does.
+/// Capture evidence (issue #197): all eight decrypted
 /// ETS downloads (`secure-1-1-{5,7,9,12,16,47,48}.pcapng`,
 /// `secure-1-1-12-group.pcapng`) write PID 54 as the count-0 clear at element
 /// 0 and then at most ONE entry at element 1 (1.1.5: `1110 000000000000`,
@@ -188,9 +191,9 @@ pub fn sender_table_bytes(entries: &[SecureSenderEntry]) -> Vec<u8> {
 /// has no GA with two secured senders. ETS writes the group key table (PID 53)
 /// of the same object in ascending element order, packed to the APDU budget
 /// (CONFIRMED, module docs), and the multi-entry PID 54 follows that shape:
-/// ascending IA, 26 entries per telegram at `PID_MAX_APDU_LENGTH` 233. The
-/// order of several entries stays INFERRED until a device with two secured
-/// senders is captured.
+/// ascending IA, 26 entries per telegram at `PID_MAX_APDU_LENGTH` 233. Only
+/// that packing stays INFERRED until a device with two secured senders is
+/// captured.
 pub fn secured_senders(
     model: Option<&Model>,
     device: IndividualAddress,
@@ -545,7 +548,8 @@ impl SecurityInputs {
         };
         format!(
             "Data Secure: the security object is reprogrammed too (unload, security individual \
-             address table: {}, group key table: {}, group-object flags: {}, complete)",
+             address table: {}, group key table: {}, group-object flags: {}, complete; the \
+             read-back checks it ends Loaded)",
             if senders.is_empty() {
                 "no secured senders".to_string()
             } else {
@@ -895,19 +899,57 @@ pub async fn program_security_object<Ch: L4Channel>(
         senders: inputs.senders.clone(),
         ..program
     };
-    security_transition(l4, LoadControl::Unload).await?;
-    security_transition(l4, LoadControl::StartLoading).await?;
-    clear_security_address_table(l4).await?;
-    write_security_address_table(l4, &program.senders).await?;
-    write_group_key_table(l4, &program.group_keys).await?;
-    write_go_security_flags(l4, &program.go_flags, |_| {}).await?;
-    security_transition(l4, LoadControl::LoadCompleted).await?;
+    // From the `Unload` on, a failure leaves the object out of `Loaded`, and
+    // the device deaf and mute on its secured group addresses (issue #534):
+    // the error says so.
+    let written: Result<(), WriteError> = async {
+        security_transition(l4, LoadControl::Unload).await?;
+        security_transition(l4, LoadControl::StartLoading).await?;
+        clear_security_address_table(l4).await?;
+        write_security_address_table(l4, &program.senders).await?;
+        write_group_key_table(l4, &program.group_keys).await?;
+        write_go_security_flags(l4, &program.go_flags, |_| {}).await?;
+        security_transition(l4, LoadControl::LoadCompleted).await
+    }
+    .await;
+    written.map_err(|err| left_not_loaded(l4.target(), err))?;
     Ok(program)
+}
+
+/// Wraps `err`, a failure between the security object's `Unload` and its
+/// `LoadCompleted`, into [`WriteError::SecurityObjectNotLoaded`] (issue
+/// #534); an error that already carries the consequence is kept as it is.
+pub fn left_not_loaded(address: IndividualAddress, err: WriteError) -> WriteError {
+    match err {
+        already @ WriteError::SecurityObjectNotLoaded { .. } => already,
+        other => WriteError::SecurityObjectNotLoaded {
+            address,
+            cause: Box::new(other),
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_left_not_loaded_names_the_consequence_once() -> Result<(), Box<dyn std::error::Error>> {
+        let address: IndividualAddress = "1.1.10".parse()?;
+        let step = WriteError::SecurityObjectState {
+            address,
+            control: LoadControl::LoadCompleted,
+            expected: LoadState::Loaded,
+            actual: LoadState::Error,
+        };
+        let wrapped = left_not_loaded(address, left_not_loaded(address, step));
+        let text = wrapped.to_string();
+        assert!(text.contains("did not reach Loaded after LoadCompleted (device reports Error)"));
+        assert!(text.contains("drops every secured group telegram"));
+        assert!(text.contains("Run `bussard apply 1.1.10` again"));
+        assert_eq!(text.matches("drops every").count(), 1, "{text}");
+        Ok(())
+    }
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
