@@ -100,6 +100,7 @@ use std::collections::BTreeMap;
 mod execute;
 mod execute_props;
 mod execute_sys7;
+mod knxnet_ip;
 mod labels;
 mod load_records;
 mod partial;
@@ -115,6 +116,10 @@ mod verify;
 
 pub(crate) use execute::probe_object_types;
 pub use execute::{discover_application_object, flash};
+pub use knxnet_ip::{
+    ETS_PROJECT_INSTALLATION_ID, ETS_ROUTING_MULTICAST, ETS_ROUTING_TTL, KnxnetIpProgram,
+    KnxnetIpWrite, knxnet_ip_program, write_knxnet_ip,
+};
 use labels::step_label;
 pub use labels::trace;
 pub use load_records::{LoadControlForm, LoadControlRecord};
@@ -551,7 +556,8 @@ pub enum FlashStep {
     /// `binaereingang-6fach`, `meteodata-1-1-202-new`). The device then boots
     /// with no application running and the download starts on a fresh stack. A
     /// parameter-only download keeps the restart and unloads nothing
-    /// (`unload` empty). An LSM the device does not have is skipped with a
+    /// (`unload` empty). A device without a loaded application gets no pass
+    /// ([`FlashPlan::skip_sys7_prelude`], issue #488). An LSM the device does not have is skipped with a
     /// warning. A session that cannot reconnect (a mock built from one open
     /// connection) runs the unloads and skips the restart.
     Sys7PreDownloadRestart {
@@ -565,6 +571,14 @@ pub enum FlashStep {
     /// back with the bit set only when the bit is clear; a device without the
     /// property is left alone.
     Sys7EnableVerifyMode,
+    /// The KNXnet/IP parameter object writes ETS makes after the application
+    /// of a device with a KNX IP interface built in (issue #455), from the
+    /// device file's `[knxnet]` table; each write is read back. Added by
+    /// [`FlashPlan::add_knxnet_ip`] before the closing restart.
+    KnxnetIpParameters {
+        /// The object and the writes, in ETS's order.
+        program: KnxnetIpProgram,
+    },
 }
 
 /// The origin of the bytes a memory-write step streams, resolved at plan time so
@@ -822,6 +836,12 @@ pub enum PlanError {
         /// The LSM index the product data named.
         lsm: u32,
     },
+
+    /// A device with a KNX IP interface built in, whose KNXnet/IP parameters
+    /// a full download writes (issue #455), lacks a value for one of them in
+    /// its device file's `[knxnet]` table.
+    #[error("{0}")]
+    KnxnetIpUnsourced(String),
 }
 
 /// Identity of the application being flashed, for the pre-flight display and the
@@ -998,6 +1018,45 @@ impl FlashPlan {
         {
             insert_factory_reset(&mut self.steps);
         }
+    }
+
+    /// Adds the KNXnet/IP parameter writes of a device with a KNX IP interface
+    /// built in (issue #455) where ETS makes them: after the application
+    /// (its `LoadCompleted` and MCB checks), before the closing restart. A
+    /// no-op on a property-only plan, whose own procedure writes the object
+    /// (issue #390), and when the plan already carries them.
+    pub fn add_knxnet_ip(&mut self, program: KnxnetIpProgram) {
+        if self.is_property_only() || self.knxnet_ip().is_some() {
+            return;
+        }
+        let at = self
+            .steps
+            .iter()
+            .rposition(|s| matches!(s, FlashStep::Restart | FlashStep::MasterReset { .. }))
+            .unwrap_or(self.steps.len());
+        self.steps
+            .insert(at, FlashStep::KnxnetIpParameters { program });
+    }
+
+    /// The KNXnet/IP parameter writes the plan carries (issue #455).
+    pub fn knxnet_ip(&self) -> Option<&KnxnetIpProgram> {
+        self.steps.iter().find_map(|s| match s {
+            FlashStep::KnxnetIpParameters { program } => Some(program),
+            _ => None,
+        })
+    }
+
+    /// Removes ETS's System 7 pre-download pass ([`FlashStep::Sys7PreDownloadRestart`]:
+    /// unload LSMs 1 to 4, basic restart, reconnect) for a device that holds
+    /// no loaded application (issue #488). ETS skips the pass on such a
+    /// device: in all 31 System 7 downloads of the ETS sweep (22 on 0705, 9
+    /// on 0701, a factory-fresh knx-sim device each) the procedure's own
+    /// unloads follow the connect, with no unload of LSM 4 and no restart
+    /// (`captures/ets-sweep/<app>/plain-defaults/ops.txt`, ops 9 to 11).
+    /// The procedure's own unloads stay. A no-op on a System B plan.
+    pub fn skip_sys7_prelude(&mut self) {
+        self.steps
+            .retain(|s| !matches!(s, FlashStep::Sys7PreDownloadRestart { .. }));
     }
 
     /// Removes the [`FlashStep::FactoryReset`] step (`flash --no-factory-reset`).
@@ -1541,6 +1600,57 @@ mod tests {
     // ---------------------------------------------------------------------
     // Issue #53: address-arithmetic bounds at plan pre-flight.
     // ---------------------------------------------------------------------
+
+    /// Issue #455: the KNXnet/IP parameter writes go after the application,
+    /// right before the closing restart, as ETS writes them (ALLinBOX 1612
+    /// capture: after the MCB read of op 1925, before the restart of op
+    /// 1935), once.
+    #[test]
+    fn test_add_knxnet_ip_goes_before_the_closing_restart() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use super::{FlashStep, KnxnetIpProgram, KnxnetIpWrite, PropObject};
+        let app = fabricated_app();
+        let mut plan = plan_flash(
+            &app,
+            "1.1.4",
+            0x07B0,
+            &no_overrides(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        let restart = plan
+            .steps
+            .iter()
+            .rposition(|s| matches!(s, FlashStep::Restart | FlashStep::MasterReset { .. }))
+            .ok_or("the plan restarts")?;
+        let program = KnxnetIpProgram {
+            object: PropObject::Index(6),
+            writes: vec![KnxnetIpWrite {
+                prop_id: 55,
+                start: 1,
+                count: 1,
+                value: vec![4],
+            }],
+        };
+        plan.add_knxnet_ip(program.clone());
+        plan.add_knxnet_ip(program.clone());
+        assert!(matches!(
+            &plan.steps[restart],
+            FlashStep::KnxnetIpParameters { program: p } if *p == program
+        ));
+        assert!(matches!(
+            plan.steps[restart + 1],
+            FlashStep::Restart | FlashStep::MasterReset { .. }
+        ));
+        let blocks = plan
+            .steps
+            .iter()
+            .filter(|s| matches!(s, FlashStep::KnxnetIpParameters { .. }))
+            .count();
+        assert_eq!(blocks, 1);
+        Ok(())
+    }
 
     /// The security steps land where ETS runs them (issue #156): the unload
     /// right before the first `StartLoading`, the load bracket after the last

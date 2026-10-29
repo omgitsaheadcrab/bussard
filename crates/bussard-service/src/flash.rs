@@ -49,6 +49,12 @@ pub struct FlashInputs<'a> {
     table_images: BTreeMap<u32, Vec<u8>>,
     /// The project flags of the linked objects.
     object_flags: BTreeMap<u16, Flags>,
+    /// The device file's `[knxnet]` table: the KNXnet/IP parameters a full
+    /// download into a device with a KNX IP interface built in writes (issue
+    /// #455).
+    knxnet: Option<bussard_model::knxnet::KnxnetConfig>,
+    /// The device being downloaded into.
+    target: IndividualAddress,
 }
 
 impl<'a> FlashInputs<'a> {
@@ -70,6 +76,9 @@ impl<'a> FlashInputs<'a> {
         let template_ops = bussard_download::template_ops_for(product, app);
         let table_images = bussard_download::build_table_images(model, target, app, &overrides);
         let object_flags = bussard_download::linked_object_flags(model, target);
+        let knxnet = model
+            .and_then(|m| m.devices.get(&target))
+            .and_then(|d| d.device.knxnet.clone());
         (
             FlashInputs {
                 app,
@@ -79,6 +88,8 @@ impl<'a> FlashInputs<'a> {
                 template_ops,
                 table_images,
                 object_flags,
+                knxnet,
+                target,
             },
             malformed,
         )
@@ -116,13 +127,16 @@ impl<'a> FlashInputs<'a> {
     }
 
     /// The pre-flight plan against `mask`: the System B gate, the mask
-    /// match and the unsupported-op refusal all happen here.
+    /// match and the unsupported-op refusal all happen here. A device with a
+    /// KNX IP interface built in also gets its KNXnet/IP parameter writes
+    /// from the `[knxnet]` table (issue #455).
     ///
     /// # Errors
     ///
-    /// The plan is refused (another mask, an unsupported device or op).
+    /// The plan is refused (another mask, an unsupported device or op, a
+    /// KNXnet/IP parameter without a value in `[knxnet]`).
     pub fn plan(&self, mask: u16) -> Result<FlashPlan, PlanError> {
-        bussard_download::plan_flash_with_object_flags(
+        let mut plan = bussard_download::plan_flash_with_object_flags(
             self.app,
             &self.device,
             mask,
@@ -131,7 +145,21 @@ impl<'a> FlashInputs<'a> {
             self.template_ops.as_deref(),
             &self.table_images,
             &self.object_flags,
-        )
+        )?;
+        // A property-only procedure (an IP interface, issue #390) writes the
+        // object itself; `apply` keeps its `[knxnet]` table (issue #391).
+        if !plan.is_property_only()
+            && let Some(program) = bussard_download::knxnet_ip_program(
+                self.app,
+                mask,
+                self.target,
+                self.knxnet.as_ref(),
+            )
+            .map_err(PlanError::KnxnetIpUnsourced)?
+        {
+            plan.add_knxnet_ip(program);
+        }
+        Ok(plan)
     }
 
     /// Shapes a pre-flight plan into what is downloaded: the factory reset
@@ -285,6 +313,11 @@ pub fn com_object_words(app: &ApplicationProgram, number: u16) -> (Option<String
 /// before the download, on top of the reset the planner adds for a sparse,
 /// filled-segment download. `freshness` is `None` offline (a dry run), where
 /// only the planner's own reset shows. `no_factory_reset` waives it.
+///
+/// A System 7 device that holds no loaded application ([`Freshness::Fresh`])
+/// gets no pre-download unload-and-restart pass, as ETS gives none to a
+/// factory-fresh device (issue #488, [`FlashPlan::skip_sys7_prelude`]). A
+/// device with a loaded application keeps it; offline the plan keeps it too.
 pub fn apply_freshness(
     plan: &mut FlashPlan,
     freshness: Option<&Freshness>,
@@ -295,6 +328,9 @@ pub fn apply_freshness(
         Some(Freshness::Resident { .. } | Freshness::Unknown { .. })
     ) {
         plan.require_factory_reset();
+    }
+    if matches!(freshness, Some(Freshness::Fresh)) {
+        plan.skip_sys7_prelude();
     }
     if no_factory_reset {
         plan.skip_factory_reset();
@@ -583,6 +619,115 @@ mod tests {
         let on = BTreeMap::from([("P-1_R-2".to_string(), "1".to_string())]);
         assert_eq!(visible_objects(app, &off), BTreeSet::from([1]));
         assert_eq!(visible_objects(app, &on), BTreeSet::from([1, 2]));
+        Ok(())
+    }
+
+    /// Issue #455: an application with tunnelling addresses gets the
+    /// KNXnet/IP parameter writes from `[knxnet]`, read back by type 11; a
+    /// device file without the table is refused at plan time.
+    #[test]
+    fn test_flash_inputs_plan_writes_knxnet_ip_from_the_device_file() -> TestResult {
+        let (dir, model) = fixture("knxnet-ip")?;
+        let mut product = product()?;
+        let app = product
+            .applications
+            .first_mut()
+            .ok_or("the fixture product has no application")?;
+        app.additional_addresses_count = Some(2);
+        let app = product.applications[0].clone();
+        let target: IndividualAddress = "1.1.4".parse()?;
+        let (inputs, _) = FlashInputs::from_model(&product, &app, "1.1.4", Some(&model), target);
+        let refused = inputs.plan(0x07B0).err().ok_or("no [knxnet] table")?;
+        assert!(
+            matches!(&refused, PlanError::KnxnetIpUnsourced(why) if why.contains("[knxnet]")),
+            "{refused}"
+        );
+        let file = dir.join("devices").join("1.1.4.toml");
+        let mut toml = std::fs::read_to_string(&file)?;
+        toml.push_str(
+            "\n[knxnet]\nassignment = \"dhcp\"\nfriendly_name = \"Flash test\"\n\
+             tunnels = [\"1.1.250\", \"1.1.251\"]\n",
+        );
+        std::fs::write(&file, toml)?;
+        let model = Model::load(&dir)?;
+        let (inputs, _) = FlashInputs::from_model(&product, &app, "1.1.4", Some(&model), target);
+        let plan = inputs.plan(0x07B0)?;
+        let program = plan
+            .knxnet_ip()
+            .ok_or("the plan writes the KNXnet/IP object")?;
+        assert_eq!(program.object, bussard_download::PropObject::Index(6));
+        let expected = crate::verify::ExpectedProperty::from_flash_plan(&plan);
+        assert_eq!(expected.len(), program.writes.len());
+        assert!(expected.iter().all(|e| e.object
+            == bussard_download::PropObject::Type {
+                object_type: 11,
+                occurrence: 0
+            }));
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Issue #488: a System 7 device with no loaded application gets no
+    /// pre-download pass (ETS gives none to a factory-fresh device); one with
+    /// an application, an unreadable one and the offline plan keep it.
+    #[test]
+    fn test_apply_freshness_drops_the_sys7_prelude_on_a_fresh_device() -> TestResult {
+        let xml = r#"<KNX xmlns="http://knx.org/xml/project/23">
+         <ApplicationProgram PeiType="0" Id="M-0083_A-E" ApplicationNumber="14" ApplicationVersion="35"
+            MaskVersion="MV-0705" Name="MDT S7" LoadProcedureStyle="ProductProcedure">
+          <Static>
+           <Code>
+            <AbsoluteSegment Id="M-0083_A-E_AS-4" Size="2" Address="17408"><Data>BAU=</Data></AbsoluteSegment>
+           </Code>
+           <LoadProcedures>
+            <LoadProcedure>
+             <LdCtrlUnload LsmIdx="3" />
+             <LdCtrlLoad LsmIdx="3" />
+             <LdCtrlAbsSegment LsmIdx="3" Address="17408" Size="2" />
+             <LdCtrlTaskSegment LsmIdx="3" Address="17408" />
+             <LdCtrlLoadCompleted LsmIdx="3" />
+             <LdCtrlRestart />
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+         </ApplicationProgram></KNX>"#;
+        let app = bussard_prod::parse_application_program("M-0083_A-E", xml.as_bytes())?;
+        let planned = bussard_download::plan_flash(
+            &app,
+            "1.1.99",
+            0x0705,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        let prelude = |plan: &FlashPlan| {
+            plan.steps.iter().any(|s| {
+                matches!(
+                    s,
+                    bussard_download::FlashStep::Sys7PreDownloadRestart { .. }
+                )
+            })
+        };
+        assert!(prelude(&planned));
+        let resident = Freshness::Resident {
+            resident: None,
+            objects: vec!["LSM 3".to_string()],
+            reason: None,
+        };
+        let unknown = Freshness::Unknown {
+            reason: "unreadable".to_string(),
+        };
+        for (freshness, kept) in [
+            (Some(&Freshness::Fresh), false),
+            (Some(&resident), true),
+            (Some(&unknown), true),
+            (None, true),
+        ] {
+            let mut plan = planned.clone();
+            apply_freshness(&mut plan, freshness, true);
+            assert_eq!(prelude(&plan), kept, "{freshness:?}");
+        }
         Ok(())
     }
 }
