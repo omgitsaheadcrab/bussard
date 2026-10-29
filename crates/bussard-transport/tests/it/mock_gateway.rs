@@ -227,12 +227,11 @@ async fn out_of_window_sequence_is_silently_discarded_without_ack() -> TestResul
 }
 
 #[tokio::test]
-async fn retransmit_two_behind_is_acked_and_dropped_then_resyncs() -> TestResult {
-    // Issue #58: a gateway retransmitting a frame *two* behind the expected
-    // sequence (its ACK-timeout resend after several of our ACKs were lost) must
-    // be ACKed-and-dropped, not silently discarded. The old one-frame window
-    // dropped it silently, so the gateway kept retransmitting and the tunnel
-    // desynced. After ACK-and-drop the next in-order frame is still delivered.
+async fn test_handle_tunneling_request_two_behind_is_dropped_without_ack() -> TestResult {
+    // Tunnelling 3/8/4 §2.6.1 (issue #516): only the frame one behind the
+    // expected sequence is ACKed and dropped. A frame two behind cannot be a
+    // conforming server's repeat (it repeats once), so it is dropped without
+    // an ACK, and the next in-order frame is still delivered.
     let gw = RawGateway::bind().await?;
     let addr = gw.addr();
 
@@ -247,17 +246,18 @@ async fn retransmit_two_behind_is_acked_and_dropped_then_resyncs() -> TestResult
             gw.expect(ServiceType::TunnelingAck).await?;
         }
 
-        // Now retransmit seq 1, two behind the expected seq 3. It must be ACKed
-        // (its own seq) and dropped, NOT silently discarded.
+        // Seq 1 is two behind the expected 3: no ACK.
         gw.push(peer, 0x0A, 1, &frame(ga("1/2/4")?, 1)).await?;
-        let ack = gw.recv().await?;
-        assert_eq!(
-            ack.service,
-            ServiceType::TunnelingAck,
-            "2-behind retransmit is ACKed"
-        );
-        let (h, _st) = ack.tunneling_ack()?;
-        assert_eq!(h.seq, 1, "duplicate is ACKed with its own seq");
+        let got = gw.recv_within(Duration::from_millis(400)).await?;
+        assert!(got.is_none(), "a frame two behind must not be ACKed");
+
+        // Seq 2 is one behind: ACKed with its own sequence, not re-delivered.
+        gw.push(peer, 0x0A, 2, &frame(ga("1/2/5")?, 2)).await?;
+        let (h, _) = gw
+            .expect(ServiceType::TunnelingAck)
+            .await?
+            .tunneling_ack()?;
+        assert_eq!(h.seq, 2, "the seq-1 repeat is ACKed with its own seq");
 
         // A fresh seq 3 proves the window never desynced.
         gw.push(peer, 0x0A, 3, &frame(ga("12/3/45")?, 3)).await?;
@@ -268,20 +268,89 @@ async fn retransmit_two_behind_is_acked_and_dropped_then_resyncs() -> TestResult
     let config = ConnectionConfig::tunnel(addr);
     let mut conn = Transport::connect(&config).await?;
 
-    // The three in-order frames are delivered.
-    for expect in ["1/2/3", "1/2/4", "1/2/5"] {
-        let f = tokio::time::timeout(Duration::from_secs(2), conn.recv())
-            .await
-            .expect("in-order frame delivered")?;
+    for expect in ["1/2/3", "1/2/4", "1/2/5", "12/3/45"] {
+        let f = tokio::time::timeout(Duration::from_secs(2), conn.recv()).await??;
         assert_eq!(group_dest(&f.frame)?, expect);
     }
 
-    // The 2-behind retransmit is NOT re-delivered; the next delivered frame is the
-    // fresh 12/3/45.
-    let next = tokio::time::timeout(Duration::from_secs(2), conn.recv())
-        .await
-        .expect("fresh frame after the retransmit")?;
-    assert_eq!(group_dest(&next.frame)?, "12/3/45");
+    gw_task.await??;
+    let _ = conn.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_send_once_repeats_after_an_ack_error_status() -> TestResult {
+    // Tunnelling 3/8/4 §2.6.1 (issue #516): an ACK with an error status makes
+    // the client repeat the request once, with the same sequence.
+    let gw = RawGateway::bind().await?;
+    let addr = gw.addr();
+
+    let gw_task = tokio::spawn(async move {
+        gw.accept_connect(0x09).await?;
+        let first = gw.expect(ServiceType::TunnelingRequest).await?;
+        let tr1 = first.tunneling_request()?;
+        // E_DATA_CONNECTION (0x26) in the ACK.
+        gw.ack(first.peer, tr1.header.channel_id, tr1.header.seq, 0x26)
+            .await?;
+        let second = gw.expect(ServiceType::TunnelingRequest).await?;
+        let tr2 = second.tunneling_request()?;
+        assert_eq!(tr1.header.seq, tr2.header.seq, "the repeat keeps its seq");
+        gw.ack(second.peer, tr2.header.channel_id, tr2.header.seq, 0)
+            .await?;
+        TestResult::Ok(())
+    });
+
+    let config = ConnectionConfig::tunnel(addr);
+    let mut conn = Transport::connect(&config).await?;
+    conn.send(CemiFrame::group_write_packed(
+        ga("3/0/4")?,
+        ia("1.1.255")?,
+        &[1],
+    ))
+    .await?;
+
+    gw_task.await??;
+    let _ = conn.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_send_once_reestablishes_after_a_repeated_ack_error() -> TestResult {
+    // A second error ACK ends the connection as a missing ACK does (3/8/4
+    // §2.6.1, issue #516): the tunnel re-establishes and re-sends the frame.
+    let gw = RawGateway::bind().await?;
+    let addr = gw.addr();
+
+    let gw_task = tokio::spawn(async move {
+        gw.accept_connect(0x09).await?;
+        for _ in 0..2 {
+            let req = gw.expect(ServiceType::TunnelingRequest).await?;
+            let tr = req.tunneling_request()?;
+            gw.ack(req.peer, tr.header.channel_id, tr.header.seq, 0x26)
+                .await?;
+        }
+        // The client gives up on channel 9: DISCONNECT, then CONNECT again.
+        gw.expect(ServiceType::DisconnectRequest).await?;
+        gw.accept_connect(0x0B).await?;
+        let req = gw.expect(ServiceType::TunnelingRequest).await?;
+        let tr = req.tunneling_request()?;
+        assert_eq!(tr.header.channel_id, 0x0B, "re-sent on the new channel");
+        gw.ack(req.peer, tr.header.channel_id, tr.header.seq, 0)
+            .await?;
+        TestResult::Ok(())
+    });
+
+    let config = ConnectionConfig::tunnel(addr);
+    let mut conn = Transport::connect(&config).await?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        conn.send(CemiFrame::group_write_packed(
+            ga("3/0/4")?,
+            ia("1.1.255")?,
+            &[1],
+        )),
+    )
+    .await??;
 
     gw_task.await??;
     let _ = conn.close().await;
@@ -593,35 +662,35 @@ async fn inbound_burst_during_ack_wait_does_not_stall_the_tunnel() -> TestResult
 
 #[tokio::test]
 async fn non_zero_tunneling_ack_status_fails_the_send() -> TestResult {
-    // A TUNNELING_ACK carrying a non-zero status is a rejection, not a success:
-    // it must surface as GatewayStatus rather than resolving the send, and must
-    // not be retried (only a timeout is retried).
+    // A TUNNELING_ACK carrying a non-zero status is a rejection, not a success.
+    // The request is repeated once (3/8/4 §2.6.1, issue #516); a second
+    // rejection surfaces as GatewayStatus when re-establishing is off.
     let gw = RawGateway::bind().await?;
     let addr = gw.addr();
 
     let gw_task = tokio::spawn(async move {
         gw.accept_connect(0x1B).await?;
-
-        let req = gw.expect(ServiceType::TunnelingRequest).await?;
-        let tr = req.tunneling_request()?;
-        // 0x29 = E_TUNNELING_LAYER (a plausible refusal).
-        gw.ack(req.peer, tr.header.channel_id, tr.header.seq, 0x29)
-            .await?;
-
-        // The rejected request must NOT be retransmitted.
+        for _ in 0..2 {
+            let req = gw.expect(ServiceType::TunnelingRequest).await?;
+            let tr = req.tunneling_request()?;
+            // 0x29 = E_TUNNELING_LAYER (a plausible refusal).
+            gw.ack(req.peer, tr.header.channel_id, tr.header.seq, 0x29)
+                .await?;
+        }
+        // No third attempt.
         if let Some(next) = gw.recv_within(Duration::from_secs(2)).await? {
             assert_ne!(
                 next.service,
                 ServiceType::TunnelingRequest,
-                "a status-rejected request must not be retransmitted"
+                "a request is repeated once only"
             );
         }
         TestResult::Ok(())
     });
 
-    let config = ConnectionConfig::tunnel(addr);
+    let config = ConnectionConfig::tunnel(addr).with_reconnect(TunnelReconnect::disabled());
     let mut conn = Transport::connect(&config).await?;
-    let err = tokio::time::timeout(
+    let err = match tokio::time::timeout(
         Duration::from_secs(5),
         conn.send(CemiFrame::group_write_packed(
             ga("3/0/4")?,
@@ -629,9 +698,11 @@ async fn non_zero_tunneling_ack_status_fails_the_send() -> TestResult {
             &[1],
         )),
     )
-    .await
-    .expect("a rejected send must resolve promptly, not wait out the ACK timeout")
-    .expect_err("non-zero ACK status must fail the send");
+    .await?
+    {
+        Ok(()) => return Err("non-zero ACK status must fail the send".into()),
+        Err(err) => err,
+    };
     assert!(
         matches!(
             err,
@@ -784,7 +855,7 @@ async fn description_response_reports_tunnel_slots() -> TestResult {
     assert_eq!(description.max_apdu_length, Some(248));
     let slots = description.tunnel_slots.as_ref().expect("a tunnelling DIB");
     assert_eq!(slots.len(), 4);
-    assert!(slots.iter().all(|s| s.usable && s.authorized));
+    assert!(slots.iter().all(|s| s.usable && !s.authorisation_required));
     assert_eq!(slots.iter().filter(|s| s.free).count(), 1);
     assert_eq!(slots[0].individual_address, 0x10F1);
 
@@ -1248,5 +1319,194 @@ async fn test_tunnel_mock_gateway_with_data_port_serves_the_session() -> TestRes
     assert_eq!(stats.client_acks, 1);
     assert_eq!(stats.connects, 1);
     assert_eq!(stats.disconnects, 1);
+    Ok(())
+}
+
+// --- Tunnelling feature services (issue #514) ------------------------------
+
+/// The tunnel inside a [`Transport`] opened on a tunnelling config.
+fn tunnel_of(conn: &Transport) -> TestResult<&bussard_transport::Tunnel> {
+    match conn {
+        Transport::Tunnel(t) => Ok(t),
+        Transport::Router(_) => Err("expected a tunnel".into()),
+    }
+}
+
+#[tokio::test]
+async fn test_handle_inbound_acks_a_feature_info_between_requests() -> TestResult {
+    // Tunnelling 3/8/4 §3.1: a TUNNELLING_FEATURE_INFO is confirmed and
+    // sequence-counted like a TUNNELLING_REQUEST, so the request after it is
+    // still in sequence.
+    let gw = RawGateway::bind().await?;
+    let addr = gw.addr();
+
+    let gw_task = tokio::spawn(async move {
+        let peer = gw.accept_connect(0x0C).await?;
+        let src = ia("1.1.10")?;
+        gw.push(
+            peer,
+            0x0C,
+            0,
+            &CemiFrame::group_write_packed(ga("1/2/3")?, src, &[0]),
+        )
+        .await?;
+        let (h, _) = gw
+            .expect(ServiceType::TunnelingAck)
+            .await?
+            .tunneling_ack()?;
+        assert_eq!(h.seq, 0);
+        // Feature 03 (bus connection status) = 1, sequence 1.
+        let info = knxnet::frame(
+            ServiceType::TunnelingFeatureInfo,
+            &[0x04, 0x0C, 0x01, 0x00, 0x03, 0x00, 0x01],
+        );
+        gw.send_data(&info, peer).await?;
+        let (h, status) = gw
+            .expect(ServiceType::TunnelingAck)
+            .await?
+            .tunneling_ack()?;
+        assert_eq!(
+            (h.seq, status),
+            (1, 0),
+            "the FEATURE_INFO is ACKed in sequence"
+        );
+        gw.push(
+            peer,
+            0x0C,
+            2,
+            &CemiFrame::group_write_packed(ga("1/2/4")?, src, &[1]),
+        )
+        .await?;
+        let (h, _) = gw
+            .expect(ServiceType::TunnelingAck)
+            .await?
+            .tunneling_ack()?;
+        assert_eq!(h.seq, 2, "the next request is still in sequence");
+        TestResult::Ok(())
+    });
+
+    let mut conn = Transport::connect(&ConnectionConfig::tunnel(addr)).await?;
+    for expect in ["1/2/3", "1/2/4"] {
+        let f = tokio::time::timeout(Duration::from_secs(2), conn.recv()).await??;
+        assert_eq!(group_dest(&f.frame)?, expect);
+    }
+    gw_task.await??;
+    let _ = conn.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_feature_get_reads_the_value_over_udp() -> TestResult {
+    let gw = RawGateway::bind().await?;
+    let addr = gw.addr();
+
+    let gw_task = tokio::spawn(async move {
+        let peer = gw.accept_connect(0x0D).await?;
+        let get = gw.expect(ServiceType::TunnelingFeatureGet).await?;
+        assert_eq!(
+            &get.body[..],
+            &[0x04, 0x0D, 0x00, 0x00, 0x07, 0x00],
+            "GET of feature 07 under sequence 0"
+        );
+        gw.ack(get.peer, 0x0D, 0, 0).await?;
+        // The response carries the server's own sequence: 0.
+        let response = knxnet::frame(
+            ServiceType::TunnelingFeatureResponse,
+            &[0x04, 0x0D, 0x00, 0x00, 0x07, 0x00, 0x00, 0xFE],
+        );
+        gw.send_data(&response, peer).await?;
+        let (h, _) = gw
+            .expect(ServiceType::TunnelingAck)
+            .await?
+            .tunneling_ack()?;
+        assert_eq!(h.seq, 0, "the client ACKs the FEATURE_RESPONSE");
+        // The GET used sequence 0, so the next request is sequence 1.
+        let req = gw.expect(ServiceType::TunnelingRequest).await?;
+        let tr = req.tunneling_request()?;
+        assert_eq!(tr.header.seq, 1, "feature services share the counter");
+        gw.ack(req.peer, 0x0D, 1, 0).await?;
+        TestResult::Ok(())
+    });
+
+    let mut conn = Transport::connect(&ConnectionConfig::tunnel(addr)).await?;
+    assert_eq!(conn.max_apdu_length(), None, "no read without a probe");
+    let value = tunnel_of(&conn)?
+        .feature_get(bussard_transport::FEATURE_MAX_APDU_LENGTH)
+        .await?;
+    assert_eq!(value, Some(vec![0x00, 0xFE]));
+    conn.send(CemiFrame::group_write_packed(
+        ga("3/0/4")?,
+        ia("1.1.255")?,
+        &[1],
+    ))
+    .await?;
+    gw_task.await??;
+    let _ = conn.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_feature_get_tolerates_a_silent_interface() -> TestResult {
+    // No FEATURE_RESPONSE within 3 s: the GET is repeated once (3/8/4 §3.2),
+    // then the read reports `None` and the tunnel carries on.
+    let gw = RawGateway::bind().await?;
+    let addr = gw.addr();
+
+    let gw_task = tokio::spawn(async move {
+        gw.accept_connect(0x0E).await?;
+        for seq in [0u8, 1] {
+            let get = gw.expect(ServiceType::TunnelingFeatureGet).await?;
+            assert_eq!(get.body[2], seq);
+            gw.ack(get.peer, 0x0E, seq, 0).await?;
+        }
+        let req = gw.expect(ServiceType::TunnelingRequest).await?;
+        let tr = req.tunneling_request()?;
+        assert_eq!(tr.header.seq, 2);
+        gw.ack(req.peer, 0x0E, 2, 0).await?;
+        TestResult::Ok(())
+    });
+
+    let mut conn = Transport::connect(&ConnectionConfig::tunnel(addr)).await?;
+    let value = tunnel_of(&conn)?
+        .feature_get(bussard_transport::FEATURE_BUS_CONNECTION_STATUS)
+        .await?;
+    assert_eq!(value, None);
+    conn.send(CemiFrame::group_write_packed(
+        ga("3/0/4")?,
+        ia("1.1.255")?,
+        &[1],
+    ))
+    .await?;
+    gw_task.await??;
+    let _ = conn.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_feature_get_reports_a_refused_feature() -> TestResult {
+    let gw = RawGateway::bind().await?;
+    let addr = gw.addr();
+
+    let gw_task = tokio::spawn(async move {
+        let peer = gw.accept_connect(0x0F).await?;
+        let get = gw.expect(ServiceType::TunnelingFeatureGet).await?;
+        gw.ack(get.peer, 0x0F, 0, 0).await?;
+        // E_ADDRESS_VOID (0x22), no value (3/8/4 §3.5).
+        let response = knxnet::frame(
+            ServiceType::TunnelingFeatureResponse,
+            &[0x04, 0x0F, 0x00, 0x00, 0x09, 0x22],
+        );
+        gw.send_data(&response, peer).await?;
+        gw.expect(ServiceType::TunnelingAck).await?;
+        TestResult::Ok(())
+    });
+
+    let conn = Transport::connect(&ConnectionConfig::tunnel(addr)).await?;
+    match tunnel_of(&conn)?.feature_get(0x09).await {
+        Err(TransportError::GatewayStatus { status: 0x22, .. }) => {}
+        other => return Err(format!("expected E_ADDRESS_VOID, got {other:?}").into()),
+    }
+    gw_task.await??;
+    let _ = conn.close().await;
     Ok(())
 }

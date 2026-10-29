@@ -62,8 +62,7 @@ pub struct GatewayConfig {
     pub pcap: Option<String>,
 }
 
-/// A KNXnet/IP Secure tunnelling interface: TCP (and optionally UDP) on the
-/// gateway port, the session handshake, SECURE_WRAPPER traffic. SYNTHETIC
+/// A KNXnet/IP Secure tunnelling interface: TCP on the gateway port, the session handshake, SECURE_WRAPPER traffic. SYNTHETIC
 /// credentials only.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IpSecureConfig {
@@ -82,16 +81,17 @@ pub struct IpSecureConfig {
     /// refused).
     #[serde(default = "default_true")]
     pub tcp: bool,
-    /// Also serve secure sessions over UDP on the gateway port (bussard issue
-    /// #197; INFERRED from the KNX specification, no real UDP-only interface
-    /// captured yet). Default `false`.
-    #[serde(default)]
-    pub udp: bool,
-    /// End a secure session after this many milliseconds without a frame from
-    /// the client, with a wrapped SESSION_STATUS `STATUS_TIMEOUT` (the KNX
-    /// specification names 60 s). Absent: sessions never time out.
+    /// End an authenticated secure session after this many milliseconds
+    /// without a valid frame from the client, with a wrapped SESSION_STATUS
+    /// `STATUS_TIMEOUT`. Default 60 000, `timeoutSession` of KNX IP Secure
+    /// 3/8/9 §2.2.3.5.2.1.1.
     #[serde(default)]
     pub session_timeout_ms: Option<u64>,
+    /// End a session that has not authenticated this many milliseconds after
+    /// its SESSION_RESPONSE, with a wrapped `STATUS_TIMEOUT`. Default 10 000,
+    /// `timeoutAuthentication` of 3/8/9 §2.2.3.5.2.1.1 (bussard issue #521).
+    #[serde(default)]
+    pub authentication_timeout_ms: Option<u64>,
     /// The tunnelling users.
     pub users: Vec<IpSecureUserConfig>,
 }
@@ -332,6 +332,11 @@ pub struct KnxnetSimConfig {
     /// maximum element count; default: as many as `tunnels` lists).
     #[serde(default)]
     pub tunnel_slots: Option<u16>,
+    /// PID 79, the tunnelling addresses: 0 the interface's own address, n the
+    /// n-th entry of `tunnels` (default `1..=n`, every tunnel; bussard issue
+    /// #520).
+    #[serde(default)]
+    pub tunnelling_addresses: Option<Vec<u8>>,
     /// Whether the object appears in the object-index walk (default `true`).
     /// `false` serves it by object type and instance only, through the
     /// extended property services, as the Jung IPS 300 SREG does.
@@ -376,6 +381,15 @@ impl KnxnetSimConfig {
         }
         if let Some(name) = &self.friendly_name {
             p.friendly_name = name.clone();
+        }
+        if let Some(list) = &self.tunnelling_addresses {
+            if list.iter().any(|&i| usize::from(i) > p.tunnels.len()) {
+                return Err(format!(
+                    "tunnelling_addresses {list:?}: an index past the {} tunnels",
+                    p.tunnels.len()
+                ));
+            }
+            p.tunnelling_addresses = list.clone();
         }
         if let Some(slots) = self.tunnel_slots {
             p.tunnel_slots = p.tunnel_slots.max(slots);
