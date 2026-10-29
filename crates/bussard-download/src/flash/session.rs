@@ -367,6 +367,10 @@ pub struct DeviceFacts {
     /// conservative chunks without reading it again (issue #215). An
     /// unanswered read does not set this: the write phase asks once more.
     pub max_apdu_absent: bool,
+    /// The property data type of the association table's `PID_TABLE` the
+    /// pre-flight read (`PDT_GENERIC_04` for format 1, `PDT_GENERIC_02` for
+    /// format 0, Resources §4.17.5.2.5), when the device described it.
+    pub association_pdt: Option<u8>,
 }
 
 impl DeviceFacts {
@@ -1211,7 +1215,7 @@ impl<C: Connector> Session<C> {
     /// The device answered the `A_Restart_Response` and is rebooting, so the old
     /// connection is dropped without a `T_Disconnect` (the ETS capture sends none
     /// after the factory reset either). The session then waits `process_wait`
-    /// (the device's own process time, already capped by
+    /// (the device's own process time, a minimum per
     /// [`bussard_mgmt::restart_process_wait`]; never shortened, issue #212),
     /// stays quiet for [`CONFIRMED_RESTART_QUIET`] and finishes with the bounded
     /// liveness poll and reconnect of
@@ -1339,6 +1343,8 @@ pub enum RestartKind {
     /// The confirmed restart (`A_Restart` master reset, erase code 1) that ends
     /// it.
     Restart,
+    /// A load procedure's `LdCtrlMasterReset`, sent in the confirmed form.
+    MasterReset,
 }
 
 impl std::fmt::Display for RestartKind {
@@ -1346,6 +1352,7 @@ impl std::fmt::Display for RestartKind {
         match self {
             RestartKind::FactoryReset => write!(f, "factory reset"),
             RestartKind::Restart => write!(f, "restart"),
+            RestartKind::MasterReset => write!(f, "master reset"),
         }
     }
 }
@@ -1360,7 +1367,7 @@ impl std::fmt::Display for RestartKind {
 pub struct RebootReadiness {
     /// Which restart.
     pub kind: RestartKind,
-    /// The process time the device reported (capped, see
+    /// The process time the device reported (see
     /// [`bussard_mgmt::restart_process_wait`]).
     pub process_time: std::time::Duration,
     /// From the accepted restart to the first answered probe; `None` when no

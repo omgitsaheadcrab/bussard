@@ -124,6 +124,15 @@ pub struct ResidentState {
     /// reported a non-zero one. The all-zero placeholder is treated as absent:
     /// it is what an object carries when no download ever stamped it.
     pub app_id: Option<Vec<u8>>,
+    /// The property data type of the association table's `PID_TABLE` (System
+    /// B), when the device describes it: `PDT_GENERIC_04` for the four-octet
+    /// format 1 bussard writes, `PDT_GENERIC_02` for format 0, which the flash
+    /// refuses (Resources §4.17.5.2.5, issue #545).
+    pub association_pdt: Option<u8>,
+    /// The device's `PID_MANUFACTURER_ID` (object 0, PID 12) on System B, when
+    /// it answered: the manufacturer check of the download procedure
+    /// (Configuration Procedures §3.5.2 step 04, issue #547).
+    pub manufacturer_id: Option<u16>,
     /// Why nothing could be read, when the probe came back empty-handed.
     pub unreadable: Option<String>,
     /// Whether a connection death (a Layer-4 drop or a lost gateway link) cut
@@ -184,6 +193,16 @@ pub enum Freshness {
         /// [`assess_freshness`], which judges by the id alone.
         reason: Option<String>,
     },
+    /// The device is not one this plan can be written to, whatever it holds:
+    /// it reports another manufacturer than the application's (Configuration
+    /// Procedures §3.5.2 step 04), or its association table uses a format
+    /// bussard does not write. Refused
+    /// without `--force` before anything is unloaded; a forced flash still ends
+    /// in a read-back that refuses the format, so it cannot pass as verified.
+    Mismatch {
+        /// What does not match, for the refusal message.
+        reason: String,
+    },
     /// The device's load state could not be read at all, so freshness is
     /// undetermined. Refused without `--force`: unreadable is not evidence of an
     /// empty device.
@@ -197,6 +216,15 @@ impl Freshness {
     /// Whether flashing may proceed without `--force`.
     pub fn allows_flash(&self) -> bool {
         matches!(self, Freshness::Fresh | Freshness::SameApplication { .. })
+    }
+}
+
+/// A manufacturer id for a message: `Jung (M-0004)`, or `M-1234` when the
+/// name is unknown.
+fn manufacturer_label(id: u16) -> String {
+    match bussard_mgmt::manufacturers::name(id) {
+        Some(name) => format!("{name} (M-{id:04X})"),
+        None => format!("M-{id:04X}"),
     }
 }
 
@@ -353,6 +381,24 @@ async fn probe_system_b<Ch: L4Channel>(
         state.objects.sort_by_key(|o| o.index);
     }
 
+    // The manufacturer check of the download procedure (Configuration
+    // Procedures §3.5.2 step 04): PID_MANUFACTURER_ID of the device object,
+    // read before the flash unloads anything.
+    if !state.interrupted {
+        state.manufacturer_id = bussard_mgmt::read_manufacturer_id(l4).await.ok().flatten();
+    }
+
+    // The association table's entry format (Resources §4.17.5.2.5): one
+    // description read after the load states, tolerant of a device that does
+    // not describe it.
+    if !state.interrupted
+        && let Some(&(index, _)) = objects
+            .iter()
+            .find(|&&(_, object_type)| object_type == bussard_mgmt::tables::OT_ASSOCIATION_TABLE)
+    {
+        state.association_pdt = bussard_mgmt::tables::read_association_pdt(l4, index).await;
+    }
+
     if state.objects.is_empty() {
         state.unreadable = Some(format!(
             "no object reported a load state ({})",
@@ -456,6 +502,32 @@ async fn probe_sys7<Ch: L4Channel>(
 /// verdict whose [`allows_flash`](Freshness::allows_flash) is false unless
 /// `--force` was passed.
 pub fn assess_freshness(state: &ResidentState, identity: &AppIdentity) -> Freshness {
+    let expected = identity.expected_manufacturers();
+    if let Some(device) = state.manufacturer_id
+        && !expected.is_empty()
+        && !expected.contains(&device)
+    {
+        let names = expected
+            .iter()
+            .map(|&m| manufacturer_label(m))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        return Freshness::Mismatch {
+            reason: format!(
+                "the device reports manufacturer {} (PID_MANUFACTURER_ID), but {} is an \
+                 application of {names}",
+                manufacturer_label(device),
+                identity.id
+            ),
+        };
+    }
+    if state.association_pdt == Some(bussard_mgmt::tables::PDT_GENERIC_02) {
+        return Freshness::Mismatch {
+            reason: "its association table uses format 0 (PDT_GENERIC_02, one-octet TSAP and \
+                     ASAP); the download writes format 1 (PDT_GENERIC_04) only"
+                .to_string(),
+        };
+    }
     if let Some(reason) = &state.unreadable {
         return Freshness::Unknown {
             reason: reason.clone(),
@@ -493,6 +565,7 @@ mod tests {
             application_number: number,
             application_version: version,
             mask_version: "07B0".to_string(),
+            original_manufacturer: None,
         }
     }
 
@@ -508,6 +581,56 @@ mod tests {
             object_type: Some(object_type),
             state,
         }
+    }
+
+    #[test]
+    fn test_assess_freshness_format_0_association_table_is_a_mismatch() {
+        // Resources §4.17.5.2.5: a format-0 association table (PDT_GENERIC_02)
+        // does not take the four-octet entries the download writes (#545).
+        let state = ResidentState {
+            objects: vec![object(3, 3, LoadState::Unloaded)],
+            association_pdt: Some(bussard_mgmt::tables::PDT_GENERIC_02),
+            ..ResidentState::default()
+        };
+        let verdict = assess_freshness(&state, &da_tp());
+        assert!(matches!(verdict, Freshness::Mismatch { .. }), "{verdict:?}");
+        assert!(!verdict.allows_flash());
+        // Format 1 is what the download writes.
+        let state = ResidentState {
+            association_pdt: Some(bussard_mgmt::tables::PDT_GENERIC_04),
+            ..state
+        };
+        assert_eq!(assess_freshness(&state, &da_tp()), Freshness::Fresh);
+    }
+
+    #[test]
+    fn test_assess_freshness_other_manufacturer_is_a_mismatch() {
+        // Configuration Procedures §3.5.2 step 04 (#547): the device's
+        // PID_MANUFACTURER_ID must be the application's manufacturer.
+        let state = ResidentState {
+            objects: vec![object(3, 3, LoadState::Unloaded)],
+            manufacturer_id: Some(0x0004),
+            ..ResidentState::default()
+        };
+        let verdict = assess_freshness(&state, &da_tp());
+        assert!(matches!(verdict, Freshness::Mismatch { .. }), "{verdict:?}");
+        let same = ResidentState {
+            manufacturer_id: Some(0x00FA),
+            ..state.clone()
+        };
+        assert_eq!(assess_freshness(&same, &da_tp()), Freshness::Fresh);
+        // An application made by another manufacturer also matches that one.
+        let oem = AppIdentity {
+            original_manufacturer: Some("M-0004".to_string()),
+            ..da_tp()
+        };
+        assert_eq!(assess_freshness(&state, &oem), Freshness::Fresh);
+        // No answer: nothing to compare, the check does not refuse.
+        let silent = ResidentState {
+            manufacturer_id: None,
+            ..state
+        };
+        assert_eq!(assess_freshness(&silent, &da_tp()), Freshness::Fresh);
     }
 
     #[test]

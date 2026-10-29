@@ -66,8 +66,8 @@ differs per mask**; they are NOT identical at the wire level. The profile
 0104h / B6EAh) on 0700 and 0701; memory-mapped is optional on 0705, property
 optional on 0700. Both are standard; ETS picks memory on 0701 and property on
 0705, which two real-ETS download captures show (superseding the earlier
-"0701==0705" claim). bussard drives 0700 property-based today, the optional
-realisation there (#526).
+"0701==0705" claim). bussard drives 0700 memory-mapped, the mandatory
+realisation there (#526; no 0700 capture exists).
 
 - **Jung `0705`** (M2 issue #70, plus the binaereingang / automitschalter /
   schaltaktor 0705 analysis captures) drives load control **property-based** over
@@ -77,7 +77,7 @@ realisation there (#526).
   status read at `0xB6EA + (lsm - 1)`, with ZERO PID-5 traffic; see §5.
 
 So the download-path realisation branches on the mask (0705 → property,
-0701 → memory-mapped) via `Sys7Profile::corpus_default_for_mask`. The status
+0700 and 0701 → memory-mapped) via `Sys7Profile::corpus_default_for_mask`. The status
 octets of the memory-mapped form are the load states of object types 1 to 4:
 B6EAh address table, B6EBh association table, B6ECh application program, B6EDh
 PEI program `[MP §3.31.2, p. 134]`, so the "0xB6EC read" in the ETS captures is
@@ -439,9 +439,9 @@ endian, total 10 octets `[XKNX, CONFIRMED]`:
 | AllocAbsDataSeg | 0x00 | `[start:2][length:2][access attributes:1][memory type:1][memory attributes:1]` |
 | AllocAbsStackSeg | 0x01 | same as 0x00 (#487: send the product's `SegType`) |
 | AllocAbsTaskSeg ("Segment Control Record") | 0x02 | `[start:2][PEI type:1][manufacturer:2][application id:2][version:1]` (§4.3) |
-| TaskPtr | 0x03 | `[init address:2][save address:2][PEI handler:2][reserved:2]` (#527) |
+| TaskPtr | 0x03 | `[init address:2][save address:2][PEI handler:2][reserved:2]` |
 | TaskCtrl1 | 0x04 | `[interface object table address:2][object count:1]` (§4.4) |
-| TaskCtrl2 | 0x05 | `[callback address:2][com-object pointer:2][com-object segment pointer 1:2][pointer 2:2]` (#527) |
+| TaskCtrl2 | 0x05 | `[callback address:2][com-object pointer:2][com-object segment pointer 1:2][pointer 2:2]` |
 
 The property form is the same record without the leading state-machine octet
 (10 octets); the segment ID octet is 00 in every capture. Access attributes:
@@ -449,7 +449,13 @@ bits 0–3 write level, bits 4–7 read level (16 levels on BIM M112, `[Prof §4
 row 12]`). Memory type bits 0–2: 1 = zero-page RAM, 2 = RAM, 3 = EEPROM.
 Memory attributes bit 7 = checksum control. The profile requires types 00, 02,
 03, 04 and 05 on 0701 and 0705 `[Prof Annex A.2.4.1, Table 7]`; bussard
-refuses 03 and 05 today (#527).
+lowers all five (`encode_task_ptr` and `encode_task_ctrl2` for 03 and 05, #527;
+`LdCtrlTaskPtr` `InitPtr`/`SavePtr`/`SerialPtr` are the init, save and PEI
+handler addresses, `LdCtrlTaskCtrl2` `Callback`/`Address`/`Seg0`/`Seg1` the
+callback, group-object pointer and the two segment pointers). In the local
+corpus the two ops appear only on masks 0020, 0021 and 0025 (and the
+knx_master procedures of 0020/0021), which bussard does not flash; no ETS
+capture of either record exists yet.
 
 ### 4.2 AbsSegment: allocation record + payload
 
@@ -600,7 +606,7 @@ derives run-state from the loaded tables, ETS only checks `[corpus §5]`.
 
 ---
 
-## 5. LSM realisation, resolved: vendor / mask-family dependent
+## 5. LSM realisation, resolved: fixed per mask by the profile
 
 **This was the single most important open question. The profile answers it
 `[Prof §4.2 row 7, p. 37]`: Realisation Type 1 (property) is mandatory on 0701
@@ -627,8 +633,8 @@ real-ETS download captures show which one ETS picks where both are available.**
   [`LsmAccess::MemoryMapped`] is the `0701` default.
 
 The download path selects the realisation by mask family
-(`Sys7Profile::corpus_default_for_mask`: `0701` → memory-mapped, everything else
-→ property), overridable by `HawkConfigurationData` when a product carries a
+(`Sys7Profile::corpus_default_for_mask`: `0700` and `0701` → memory-mapped,
+`0705` → property), overridable by `HawkConfigurationData` when a product carries a
 usable block. This corrects the earlier claim that property was the default for
 ALL System 7; that regressed the memory-mapped Theben 0701.
 
@@ -681,9 +687,10 @@ e.g. `13 00 00 40 00 00 1d f2 03 80 00` (LSM1 alloc 0x4000 len 0x1D EEPROM),
 `bussard_mgmt::wrap_memory_lsm_record`, decoded by the sim's
 `decode_memory_lsm_record`.
 
-**Default:** mask-family dependent (`Sys7Profile::corpus_default_for_mask`):
-`0701` → `MemoryMapped { control 0x0104, status 0xB6EA }`; every other System 7
-mask → `Property`. A `HawkConfigurationData` block may still select `MemoryMapped`
+**Default:** the realisation the profile makes mandatory for the mask
+(`Sys7Profile::corpus_default_for_mask`): `0700` and `0701` →
+`MemoryMapped { control 0x0104, status 0xB6EA }`; `0705` → `Property`. knx-sim
+picks the same per mask when a device's config omits `lsm_access`. A `HawkConfigurationData` block may still select `MemoryMapped`
 for a product that carries a `StandardMemory` LoadControl (the 0701 Hawk block
 does; the 0705 Jung block also resolves there but is a pre-M2 false positive, so
 the normal Jung flash plans with the property default and does not feed a Hawk
@@ -839,11 +846,14 @@ descriptors like `07 5C DF 03`.
           (ETS "alarm"), 11 low [Res §4.18.3.1.2.1, p. 263]
   ```
   This on-device order differs from the ETS UI "C R W T U I"; I is not in this
-  byte, U is bit 7. The flash post-pass (`sys7_config_from_flags`) applies this;
-  the older public `sys7_config_byte` still forces bit 7 (#528).
+  byte, U is bit 7. `compute_sys7::sys7_config_byte(template, flags)` is the one
+  definition, used by the flash post-pass: the flag bits from the project,
+  bits 5, 1 and 0 from the product's template octet (#528).
 - **TYPE** = object size code `[Res §4.18.3.1.2.1, p. 264-265]`: 0..6 = 1..7
   bits, 7 = 1 octet, 8 = 2, 9 = 3, 10 = 4, 11 = 6, 12 = 8, 13 = 10, 14 = 14
-  octets; bits 7-6 reserved 0. `compute::size_code_from_object_size` matches.
+  octets; bits 7-6 reserved 0. `compute::object_size_code` matches and goes on
+  with Table 88 (`[Res §4.18.6.2.4.1.4]`, codes 15 to 255) for System B; a size
+  with no code refuses the plan (#545).
 - **RAM-flags table** `[Res §4.18.3.1.1.1, p. 262]`: four bits per object, two
   objects per octet (object 0 in the low nibble): bits 1-0 transmission status
   (00 idle/OK, 01 idle/error, 10 transmitting, 11 transmit request), bit 2

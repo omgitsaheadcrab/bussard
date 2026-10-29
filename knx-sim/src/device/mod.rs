@@ -283,6 +283,10 @@ pub struct Device {
     /// The process time (seconds) reported in the `A_Restart_Response` to a
     /// factory reset (erase code 7).
     restart_process_time_s: u16,
+    /// The largest segment an allocation may ask for before it fails
+    /// (Configuration Procedures §3.5.1.2); `None` allocates any size. See
+    /// [`Device::with_max_allocation`].
+    max_allocation: Option<u32>,
     events: std::sync::Arc<dyn EventSink>,
 }
 
@@ -333,8 +337,8 @@ impl Device {
     /// Build a device, selecting and tuning its mask profile from `overrides`.
     ///
     /// Returns `Err` with a human reason when the effective mask is a family the
-    /// simulator does not model (only System B `0x07B0` and System 7 `0x0705` /
-    /// `0x0701` are modelled), because a strict simulator refuses to pretend to
+    /// simulator does not model (only System B `0x07B0` and System 7 `0x0700` /
+    /// `0x0701` / `0x0705` are modelled), because a strict simulator refuses to pretend to
     /// be a device generation it does not implement.
     pub fn from_product_with_overrides(
         address: IndividualAddress,

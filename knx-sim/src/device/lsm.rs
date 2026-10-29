@@ -147,9 +147,23 @@ impl LoadStateMachine {
         self.allocated_size
     }
 
-    /// Apply a load event, enforcing the transition rules. On success returns
-    /// the new state; on a rule violation returns `Err(())` and moves to
-    /// `Error` (a real device reports `Error` on the next state read).
+    /// Apply a load event per KNX 3/5/1 Resources §4.23.2.3.3, Table 94 (the
+    /// recommended transition wherever the table offers a choice; the optional
+    /// intermediate states 4 and 5 are not modelled). On success returns the
+    /// new state, which is the old one for an event the table ignores; on a
+    /// transition to `Error` returns `Err` (a real device reports `Error` on
+    /// the next state read).
+    ///
+    /// | event \ state | Unloaded | Loaded | Loading | Error |
+    /// |---|---|---|---|---|
+    /// | StartLoading | Loading | Loading | Loading | Error |
+    /// | LoadCompleted | Unloaded (R) | Loaded (R) | Loaded | Error |
+    /// | Additional Load Controls | Unloaded (R) | Error | Loading | Error |
+    /// | Unload | Unloaded | Unloaded | Unloaded | Unloaded |
+    ///
+    /// An allocation is only performed in `Loading` (Configuration Procedures
+    /// §3.5.1.2); the caller checks [`LoadStateMachine::state`] before the
+    /// event to know whether to reserve memory.
     pub fn apply(&mut self, event: LoadEvent) -> Result<LoadState, TransitionError> {
         match (self.state, event) {
             // Unload is always accepted and returns to Unloaded.
@@ -163,6 +177,9 @@ impl LoadStateMachine {
                 self.state = LoadState::Loading;
                 self.allocated_size = None;
             }
+            // StartLoading while Loading stays Loading (mandatory) and keeps
+            // the allocation: a tool resuming a step re-issues it.
+            (LoadState::Loading, LoadEvent::StartLoading) => {}
             // Allocation is only valid while Loading.
             (LoadState::Loading, LoadEvent::AllocRelSegment { size }) => {
                 self.allocated_size = Some(size);
@@ -171,13 +188,26 @@ impl LoadStateMachine {
             (LoadState::Loading, LoadEvent::LoadCompleted) => {
                 self.state = LoadState::Loaded;
             }
-            // Anything else is an illegal transition.
+            // Client errors the table recommends ignoring: LoadCompleted or an
+            // allocation in Unloaded stays Unloaded, LoadCompleted in Loaded
+            // stays Loaded. Nothing is allocated.
+            (LoadState::Unloaded, LoadEvent::LoadCompleted | LoadEvent::AllocRelSegment { .. })
+            | (LoadState::Loaded, LoadEvent::LoadCompleted) => {}
+            // Anything else is an illegal transition: an allocation in Loaded,
+            // and every event but Unload in Error.
             (state, event) => {
                 self.state = LoadState::Error;
                 return Err(TransitionError { from: state, event });
             }
         }
         Ok(self.state)
+    }
+
+    /// Moves the object to `Error`: an allocation the device cannot satisfy
+    /// (Configuration Procedures §3.5.1.2).
+    pub fn fail_allocation(&mut self) {
+        self.state = LoadState::Error;
+        self.allocated_size = None;
     }
 }
 
@@ -199,7 +229,11 @@ pub struct TransitionError {
 /// A `TaskSegment` must be accepted in `Loading` (it commits the segment
 /// descriptor) and is a precondition for the following `LoadCompleted`; the
 /// device enforces that precondition. Any illegal event moves the LSM to
-/// `Error` (state 3), which fails the flash.
+/// `Error` (state 3), which fails the flash. The transitions follow Resources
+/// §4.23.2.3.3, Table 94, with the recommended choice where it offers one; the
+/// `requires_task_segment` precondition on `LoadCompleted` is a stricter sim
+/// rule than the table (which has no such precondition), kept so a tool that
+/// forgets the TaskSegment fails in the conformance loop.
 #[derive(Debug, Clone)]
 pub struct Sys7LoadStateMachine {
     state: LoadState,
@@ -252,6 +286,9 @@ pub enum Sys7Step {
     },
     /// A no-op event (NoOperation) — accepted, no state change.
     NoOp,
+    /// A client error Table 94 recommends ignoring: the state is unchanged and
+    /// nothing is allocated or committed.
+    Ignored,
 }
 
 /// A System 7 LSM transition was rejected.
@@ -332,10 +369,9 @@ impl Sys7LoadStateMachine {
                 self.task_committed = true;
                 Ok(Sys7Step::State(LoadState::Loading))
             }
-            // StartLoading while already Loading is idempotent: the post-restart
-            // LSM dance (Theben 0701 LSM 5, spec §3/§4.7) opens the LSM with a
-            // TaskSegment and then re-asserts StartLoading. Stay in Loading; keep
-            // the committed descriptor so a following LoadCompleted still holds.
+            // StartLoading while already Loading stays Loading (Table 94,
+            // mandatory); keep the committed descriptor so a following
+            // LoadCompleted still holds.
             (LoadState::Loading, E::StartLoading) => Ok(Sys7Step::State(LoadState::Loading)),
             // Absolute-segment allocation is valid while Loading. A subtype-0x02
             // (Task) record also commits the task descriptor.
@@ -356,29 +392,6 @@ impl Sys7LoadStateMachine {
                     subtype,
                 })
             }
-            // A subtype-0x02 (Task) segment record on an Unloaded LSM opens the
-            // post-restart descriptor dance (Theben 0701 LSM 5, spec §3/§4.7): the
-            // device opens the LSM to Loading to accept the task descriptor. Only
-            // the Task subtype takes this edge; a plain Data/Stack allocation from
-            // Unloaded stays illegal. LSMs 1/2/3 never reach here (their alloc
-            // records always arrive after a StartLoading), so the strict up-front
-            // ordering for the main tables is unchanged.
-            (
-                LoadState::Unloaded,
-                E::AllocAbsSegment {
-                    start,
-                    length,
-                    subtype: 0x02,
-                },
-            ) => {
-                self.state = LoadState::Loading;
-                self.task_committed = true;
-                Ok(Sys7Step::Alloc {
-                    start,
-                    length,
-                    subtype: 0x02,
-                })
-            }
             // TaskSegment commits the descriptor; valid while Loading.
             (LoadState::Loading, E::TaskSegment { address }) => {
                 self.task_committed = true;
@@ -389,6 +402,10 @@ impl Sys7LoadStateMachine {
             (LoadState::Loading, E::TaskCtrl1 { address, count }) => {
                 Ok(Sys7Step::TaskCtrl1 { address, count })
             }
+            // The Task Pointer Record and Task Control Record 2 (KNX 3/5/2
+            // §3.31.2), mandatory on 0701/0705 (Profiles Annex A.2.4.1):
+            // accepted while Loading, no memory side effect in the sim.
+            (LoadState::Loading, E::TaskPtr { .. } | E::TaskCtrl2 { .. }) => Ok(Sys7Step::NoOp),
             // LoadCompleted finalises to Loaded, but only after a committed task
             // descriptor (spec §4.3 precondition).
             (LoadState::Loading, E::LoadCompleted) => {
@@ -399,7 +416,24 @@ impl Sys7LoadStateMachine {
                 self.state = LoadState::Loaded;
                 Ok(Sys7Step::State(LoadState::Loaded))
             }
-            // Anything else is illegal.
+            // Client errors Table 94 recommends ignoring (Resources
+            // §4.23.2.3.3): an Additional Load Controls record or a
+            // LoadCompleted in Unloaded stays Unloaded, a LoadCompleted in
+            // Loaded stays Loaded. A record in Unloaded never opens Loading
+            // (#529), so a tool that sends one before StartLoading finds the
+            // LSM still Unloaded and its LoadCompleted ignored.
+            (
+                LoadState::Unloaded,
+                E::AllocAbsSegment { .. }
+                | E::TaskSegment { .. }
+                | E::TaskCtrl1 { .. }
+                | E::TaskPtr { .. }
+                | E::TaskCtrl2 { .. }
+                | E::LoadCompleted,
+            )
+            | (LoadState::Loaded, E::LoadCompleted) => Ok(Sys7Step::Ignored),
+            // Anything else is illegal: a record in Loaded, and every event
+            // but Unload and NoOperation in Error.
             (from, event) => {
                 self.state = LoadState::Error;
                 Err(Sys7TransitionError::Illegal { from, event })
@@ -445,19 +479,64 @@ mod tests {
         Ok(())
     }
 
+    // One test per Table 94 cell (Resources §4.23.2.3.3) that is not the
+    // happy path, with the recommended transition where the table offers one.
+
     #[test]
-    fn test_load_completed_without_start_is_rejected() {
+    fn test_apply_load_completed_in_unloaded_stays_unloaded() -> Result<(), TransitionError> {
         let mut lsm = LoadStateMachine::default();
-        let err = lsm.apply(LoadEvent::LoadCompleted);
-        assert!(err.is_err());
+        assert_eq!(lsm.apply(LoadEvent::LoadCompleted)?, LoadState::Unloaded);
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_alloc_in_unloaded_stays_unloaded() -> Result<(), TransitionError> {
+        let mut lsm = LoadStateMachine::default();
+        assert_eq!(
+            lsm.apply(LoadEvent::AllocRelSegment { size: 256 })?,
+            LoadState::Unloaded
+        );
+        assert_eq!(lsm.allocated_size(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_start_loading_in_loading_stays_loading() -> Result<(), TransitionError> {
+        let mut lsm = LoadStateMachine::default();
+        lsm.apply(LoadEvent::StartLoading)?;
+        lsm.apply(LoadEvent::AllocRelSegment { size: 16 })?;
+        assert_eq!(lsm.apply(LoadEvent::StartLoading)?, LoadState::Loading);
+        // The allocation survives the repeated StartLoading.
+        assert_eq!(lsm.allocated_size(), Some(16));
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_load_completed_in_loaded_stays_loaded() -> Result<(), TransitionError> {
+        let mut lsm = LoadStateMachine::new(LoadState::Loaded);
+        assert_eq!(lsm.apply(LoadEvent::LoadCompleted)?, LoadState::Loaded);
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_alloc_in_loaded_is_error() {
+        let mut lsm = LoadStateMachine::new(LoadState::Loaded);
+        assert!(lsm.apply(LoadEvent::AllocRelSegment { size: 16 }).is_err());
         assert_eq!(lsm.state(), LoadState::Error);
     }
 
     #[test]
-    fn test_alloc_before_start_is_rejected() {
-        let mut lsm = LoadStateMachine::default();
-        assert!(lsm.apply(LoadEvent::AllocRelSegment { size: 256 }).is_err());
+    fn test_apply_start_loading_in_error_stays_error() {
+        let mut lsm = LoadStateMachine::new(LoadState::Error);
+        assert!(lsm.apply(LoadEvent::StartLoading).is_err());
         assert_eq!(lsm.state(), LoadState::Error);
+    }
+
+    #[test]
+    fn test_apply_unload_from_error_is_unloaded() -> Result<(), TransitionError> {
+        let mut lsm = LoadStateMachine::new(LoadState::Error);
+        assert_eq!(lsm.apply(LoadEvent::Unload)?, LoadState::Unloaded);
+        Ok(())
     }
 
     mod sys7 {
@@ -569,17 +648,40 @@ mod tests {
         }
 
         #[test]
-        fn test_sys7_alloc_before_start_errors() {
+        fn test_sys7_alloc_before_start_is_ignored() {
+            // Table 94: an Additional Load Controls record in Unloaded stays
+            // Unloaded (recommended).
             let mut lsm = Sys7LoadStateMachine::default();
-            assert!(matches!(
+            assert_eq!(
                 lsm.apply(E::AllocAbsSegment {
                     start: 0x4000,
                     length: 8,
                     subtype: 0x00,
                 }),
+                Ok(Sys7Step::Ignored)
+            );
+            assert_eq!(lsm.state(), LoadState::Unloaded);
+        }
+
+        #[test]
+        fn test_sys7_record_in_loaded_errors() {
+            // Table 94: an Additional Load Controls record in Loaded is Error.
+            let mut lsm = Sys7LoadStateMachine::new(LoadState::Loaded);
+            assert!(matches!(
+                lsm.apply(E::TaskSegment { address: 0x4000 }),
                 Err(Sys7TransitionError::Illegal { .. })
             ));
             assert_eq!(lsm.state(), LoadState::Error);
+        }
+
+        #[test]
+        fn test_sys7_start_loading_in_loading_stays_loading() {
+            let mut lsm = Sys7LoadStateMachine::default();
+            assert!(lsm.apply(E::StartLoading).is_ok());
+            assert_eq!(
+                lsm.apply(E::StartLoading),
+                Ok(Sys7Step::State(LoadState::Loading))
+            );
         }
 
         #[test]
@@ -610,48 +712,46 @@ mod tests {
         }
 
         #[test]
-        fn test_sys7_post_restart_lsm5_task_then_start_opens_loading() {
-            // The Theben 0701 post-restart LSM-5 dance (spec §3/§4.7): a fresh
-            // (Unloaded) LSM receives a subtype-0x02 (Task) allocation record and
-            // then StartLoading, with no prior StartLoading and no LoadCompleted.
-            // The device opens it to Loading and stays there — never Error.
+        fn test_sys7_task_ptr_and_task_ctrl2_accepted_while_loading() {
             let mut lsm = Sys7LoadStateMachine::default();
-            assert_eq!(
-                lsm.apply(E::AllocAbsSegment {
-                    start: 0x43FE,
-                    length: 0,
-                    subtype: 0x02,
-                }),
-                Ok(Sys7Step::Alloc {
-                    start: 0x43FE,
-                    length: 0,
-                    subtype: 0x02,
+            assert!(lsm.apply(E::StartLoading).is_ok());
+            assert!(
+                lsm.apply(E::TaskPtr {
+                    init: 284,
+                    save: 285,
+                    pei_handler: 0,
                 })
+                .is_ok()
             );
-            assert_eq!(lsm.state(), LoadState::Loading);
-            // StartLoading while already Loading is idempotent (stays Loading).
-            assert_eq!(
-                lsm.apply(E::StartLoading),
-                Ok(Sys7Step::State(LoadState::Loading))
+            assert!(
+                lsm.apply(E::TaskCtrl2 {
+                    callback: 20609,
+                    com_objects: 282,
+                    segment_1: 208,
+                    segment_2: 208,
+                })
+                .is_ok()
             );
             assert_eq!(lsm.state(), LoadState::Loading);
         }
 
         #[test]
-        fn test_sys7_data_alloc_from_unloaded_still_errors() {
-            // Only the Task subtype (0x02) opens a post-restart LSM; a plain Data
-            // (0x00) allocation from Unloaded stays illegal, so the strict up-front
-            // ordering for LSMs 1/2/3 is unchanged.
+        fn test_sys7_task_record_in_unloaded_does_not_open_loading() {
+            // #529, Table 94: a Task allocation record in Unloaded leaves the
+            // LSM Unloaded; it never opens Loading, so the LoadCompleted that
+            // follows does not reach Loaded either.
             let mut lsm = Sys7LoadStateMachine::default();
-            assert!(matches!(
+            assert_eq!(
                 lsm.apply(E::AllocAbsSegment {
-                    start: 0x4000,
-                    length: 8,
-                    subtype: 0x00,
+                    start: 0x43FE,
+                    length: 0,
+                    subtype: 0x02,
                 }),
-                Err(Sys7TransitionError::Illegal { .. })
-            ));
-            assert_eq!(lsm.state(), LoadState::Error);
+                Ok(Sys7Step::Ignored)
+            );
+            assert_eq!(lsm.state(), LoadState::Unloaded);
+            assert_eq!(lsm.apply(E::LoadCompleted), Ok(Sys7Step::Ignored));
+            assert_eq!(lsm.state(), LoadState::Unloaded);
         }
     }
 }

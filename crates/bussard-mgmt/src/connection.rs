@@ -1172,6 +1172,32 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
         self.recv_response().await
     }
 
+    /// [`request`](Self::request) for an optional service a device may
+    /// acknowledge but never answer: `Ok(None)` when the device stayed silent
+    /// after its `T_ACK`. The response timeout marks the connection closed;
+    /// since the device acknowledged the request the peer is alive and the
+    /// sequence numbers agree, so the connection is reopened, as
+    /// [`authorize`](Self::authorize) does for a device without authorize.
+    pub(crate) async fn request_optional(
+        &mut self,
+        apci: u16,
+        data: &[u8],
+    ) -> Result<Option<(u16, Vec<u8>)>> {
+        let exchanges_before = self.numbered_exchanges;
+        match self.request(apci, data).await {
+            Ok(pair) => Ok(Some(pair)),
+            Err(MgmtError::NoResponse { .. })
+            | Err(MgmtError::MidSessionSilence {
+                kind: SilenceKind::NoResponse,
+                ..
+            }) if self.numbered_exchanges > exchanges_before => {
+                self.closed = false;
+                Ok(None)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// Presents an access `key` with `A_Authorize_Request` and returns the
     /// authorization outcome (issue #52 finding #1).
     ///
@@ -2396,15 +2422,17 @@ mod tests {
     }
 
     #[test]
-    fn test_restart_process_wait_is_bounded() -> std::result::Result<(), Box<dyn std::error::Error>>
-    {
-        let huge = crate::apci::RestartResponse {
+    fn test_restart_process_wait_is_at_least_the_process_time()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // KNX 3/5/2 §3.7.1.2.2: the process time is a minimum wait; above
+        // MAX_RESTART_PROCESS_WAIT it is logged, not clamped.
+        let long = crate::apci::RestartResponse {
             error_code: 0,
-            process_time_s: u16::MAX,
+            process_time_s: 90,
         };
         assert_eq!(
-            crate::load::restart_process_wait(&huge),
-            crate::load::MAX_RESTART_PROCESS_WAIT
+            crate::load::restart_process_wait(&long),
+            Duration::from_secs(90)
         );
         Ok(())
     }

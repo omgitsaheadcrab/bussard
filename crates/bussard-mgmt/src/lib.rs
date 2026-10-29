@@ -85,9 +85,10 @@ pub use load::{
     LD_CTRL_REL_SEGMENT, LoadControl, LoadState, LoadStateContext, MAX_RESTART_PROCESS_WAIT,
     MCB_ENTRY_LEN, McbEntry, PID_LOAD_STATE_CONTROL, PID_MCB_TABLE, PID_PROGRAM_VERSION,
     SegmentAllocation, WriteError, allocate_segment, compare_property, compare_rel_mem,
-    crc16_ccitt, encode_rel_segment, is_connection_death, master_reset, mcb_entry, read_load_state,
-    read_mcb_table, read_program_version, read_property_elements, read_table_reference,
-    restart_process_wait, write_load_control, write_property,
+    crc16_ccitt, encode_rel_segment, is_connection_death, master_reset, mcb_entry,
+    process_time_wait, read_load_state, read_manufacturer_id, read_mcb_table, read_program_version,
+    read_property_elements, read_table_reference, restart_process_wait, write_load_control,
+    write_property,
 };
 // The memory primitives moved out of `load` into their own module (issue #80);
 // every historical `bussard_mgmt::…` and `bussard_mgmt::load::…` path still
@@ -108,7 +109,7 @@ pub use secure::SecureLayer;
 pub use sys7::{
     DEVICE_CONTROL_VERIFY_MODE, LsmAccess, PID_DEVICE_CONTROL, Sys7TaskIdentity, VerifyModeOutcome,
     alloc_attr_octets, enable_verify_mode, encode_alloc_segment, encode_task_ctrl1,
-    encode_task_segment, lsm_access_from_profile,
+    encode_task_ctrl2, encode_task_ptr, encode_task_segment, lsm_access_from_profile,
 };
 pub use tables::{
     DeviceTables, ResolvedLink, TableSource, TablesError, discover_interface_objects, read_tables,
