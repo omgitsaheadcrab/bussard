@@ -812,6 +812,10 @@ enum Command {
         /// bench device: process arguments are visible to other users.
         #[arg(long, value_name = "HEX")]
         tool_key: Option<String>,
+        /// Write the address although another device already answers at it
+        /// (the check is step 1 of the standard's address write, issue #530).
+        #[arg(long)]
+        force: bool,
     },
     /// Read a device's tables back over the bus and diff them against the model,
     /// or (with `--line`) sweep a whole line and synthesize a fresh model.
@@ -936,6 +940,10 @@ enum Command {
         /// it without (identity and links by number) and say where to get it.
         #[arg(long)]
         no_download: bool,
+        /// Write the address although another device already answers at it
+        /// (the check is step 1 of the standard's address write, issue #530).
+        #[arg(long)]
+        force: bool,
     },
     /// Download the full application program into a device (a fresh device, or
     /// one whose application changes). Everyday changes go through `apply`.
@@ -984,9 +992,11 @@ enum Command {
         #[arg(long)]
         no_factory_reset: bool,
         /// Rewrite only the parameter memory of a device that already runs this
-        /// application (issue #119): no unload, no segment allocation, no table
-        /// write. Only the octets that differ from what the device holds are
-        /// written, then the load completes and the device restarts. Refused when
+        /// application (issue #119): no table write. On System B it runs the
+        /// standard's partial download (unload, load, Mode 0 re-allocation that
+        /// keeps the memory, issue #543). Only the octets that differ from what
+        /// the device holds are written, then the load completes and the device
+        /// restarts. Refused when
         /// the device runs another application or is not Loaded, and when a
         /// changed parameter shows or hides a com-object (that needs a full flash).
         /// The parameter memory is backed up first. With `--dry-run`, prints the
@@ -1670,12 +1680,16 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
             address,
             yes,
             tool_key,
+            force,
         } => assign_cmd::run(
             address.as_deref(),
             dir,
-            yes,
-            g.allow_remote_gateway,
-            json,
+            assign_cmd::AssignFlags {
+                yes,
+                allow_remote_gateway: g.allow_remote_gateway,
+                json,
+                force,
+            },
             // `--tool-key` overrides the keyring's device entries; the keyring
             // still opens a KNXnet/IP Secure tunnel (issue #203).
             secure_key::ToolKeySource {
@@ -1758,11 +1772,13 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
             yes,
             yes_download,
             no_download,
+            force,
         } => adopt_cmd::run(
             adopt_cmd::AdoptOptions {
                 address: address.as_deref(),
                 product: product.as_deref(),
                 yes,
+                force,
                 consent: product_fetch::Consent {
                     yes_download,
                     no_download,

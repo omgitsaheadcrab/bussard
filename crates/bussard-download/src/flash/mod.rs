@@ -132,7 +132,9 @@ pub use plan_sys7::{
 };
 pub use props::{compare_property_value, read_property_value, write_property_value};
 pub use restart_form::{RestartForm, restart_form};
-pub use session::{Connector, DeviceFacts, RebootReadiness, RestartKind, Session, SingleConnector};
+pub use session::{
+    Connector, DeviceFacts, RebootReadiness, RestartKind, Session, SingleConnector, VerifyEchoes,
+};
 
 /// How a property step names its interface object (issue #390).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -872,6 +874,12 @@ pub struct FlashPlan {
     /// although the model's image differs there (issue #290): per segment,
     /// each octet's offset and the model's byte. Empty for a full flash.
     unwritten: BTreeMap<String, Vec<(usize, u8)>>,
+    /// The address each [`Self::baseline`] region was read at before the
+    /// download (segment id → absolute address, issue #543). A System B
+    /// parameter-only download re-allocates the segment and writes at the base
+    /// the device reports then; the diff against the baseline only holds when
+    /// that base is this one. Empty for every full flash.
+    baseline_address: BTreeMap<String, u32>,
 }
 
 /// The System 7 execution context attached to a [`FlashPlan`] for a mask
@@ -1040,6 +1048,26 @@ impl FlashPlan {
             FlashStep::Sys7StartLoading { lsm } if self.is_parameters_only() => {
                 format!("[S7] check LSM {lsm} is Loaded, then open it for loading (no allocation)")
             }
+            FlashStep::Unload { target } if self.is_parameters_only() => format!(
+                "check obj{} is Loaded, then unload it (partial download, kept memory)",
+                target.unwrap_or(0)
+            ),
+            FlashStep::AllocateSegment { size, target, .. } if self.is_parameters_only() => {
+                format!(
+                    "re-allocate the {size}-octet segment of obj{} in Mode 0 (keeps its contents)",
+                    target.unwrap_or(0)
+                )
+            }
+            FlashStep::WriteRelMem { offset, image, .. } if self.is_parameters_only() => {
+                let before = self
+                    .baseline_address(&image.segment_id)
+                    .map_or(String::new(), |a| format!(", {a:#06X} before the download"));
+                format!(
+                    "write the differing parameter octets (segment of {} bytes) at the allocated \
+                     base + {offset:#X}{before}",
+                    image.len
+                )
+            }
             FlashStep::WriteMem { address, image } if self.is_parameters_only() => {
                 let how = if self.sys7_read_compare() {
                     ", read-compare"
@@ -1141,6 +1169,12 @@ impl FlashPlan {
     /// against, when this plan is one (see [`FlashPlan::parameters_only`]).
     pub fn baseline(&self, segment_id: &str) -> Option<&[u8]> {
         self.baseline.get(segment_id).map(Vec::as_slice)
+    }
+
+    /// The address the baseline of `segment_id` was read at before the
+    /// download (issue #543), `None` for a full flash.
+    pub fn baseline_address(&self, segment_id: &str) -> Option<u32> {
+        self.baseline_address.get(segment_id).copied()
     }
 
     /// Whether this plan programs a KNX Virtual device: its application comes
@@ -1351,6 +1385,9 @@ pub struct FlashOutcome {
     /// confirmed (issue #212), for `flash -v`'s timing line. Empty when the
     /// plan restarts nothing the device confirms.
     pub reboot_readiness: Vec<RebootReadiness>,
+    /// The verify-mode echoes a System 7 download compared (issue #524), for
+    /// `flash -v`. `None` when the download ran without verify mode.
+    pub verify_echoes: Option<VerifyEchoes>,
     /// The plan was property-only (issue #390): it loads no object, so
     /// [`Self::load_state`] and [`Self::object_states`] say nothing (`Loaded`
     /// and empty), and [`Self::spot_checks_match`] is the read-back of every

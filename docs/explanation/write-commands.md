@@ -195,9 +195,16 @@ resume; run them again. A pending group write goes out up to a minute late.
 ## `flash --parameters-only` patches parameters
 
 - **Writes** only the parameter octets that differ, on a device that already
-  runs the application, then completes the load and restarts the device. It
-  never unloads, allocates, factory-resets or touches the link tables. `apply`
-  runs the same download after the tables.
+  runs the application, then completes the load and restarts the device. On
+  System B it runs the standard's partial download (Configuration Procedures
+  03_05_03 §3.5.3), as ETS runs the product's `par` procedure: it unloads the
+  parameter object, opens it, re-allocates its segment in Mode 0 (the device
+  keeps the memory and the base), and writes at the base the device reports
+  after the allocation. Where the device moved the segment it writes the whole
+  image there; where the reference reads zero it stops. On System 7 it opens
+  and completes the load-state machine without an allocation. It never
+  factory-resets or touches the link tables. `apply` runs the same download
+  after the tables.
 - **Backs up** the parameter memory to
   `<dir>/captures/backups/parameters/<ia>-<unix time>.json` after showing the
   changes and confirming.
@@ -231,6 +238,10 @@ application still reads `Loaded`, re-run it; if not, use `flash --force`.
 - **Writes** the individual address: the optional `ADDRESS`, else the next
   free one on the line. `adopt` also writes the device file and prints the
   `flash` command; it does not flash.
+- **Refuses** a new address another device already answers at, before
+  anything is broadcast (a connect and a descriptor read, step 1 of the
+  standard's address write), unless `--force`. Two devices on one address
+  answer the same connection, so a later write could land on the wrong one.
 - **Verifies** by reading the device at its new address.
 
 **A Data Secure device** answers a plain read with mask `FFFF`, so `assign`
@@ -262,7 +273,9 @@ keyring does not list fails before any file is written.
 naming the gateway and the number of devices. Each device still gets every
 single-device rail: `apply --line` backs up and verifies each one, and
 `commission` refuses to address a device whose order number does not match
-the model. A failed device is reported and the run moves on. `apply --line`
+the model. An address that already answers counts as commissioned only when
+the device there reports the model's order number; any other answer refuses
+that device as an address in use. A failed device is reported and the run moves on. `apply --line`
 records each outcome in `<dir>/captures/apply-line-<line>.json`, so `--resume`
 skips finished devices after an interruption; a clean run deletes the file.
 
