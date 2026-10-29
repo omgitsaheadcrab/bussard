@@ -114,12 +114,14 @@ pub mod rc {
 /// 12-bit `max_elements` field can describe.
 pub const FALLBACK_MAX_GROUP_OBJECTS: u16 = 4095;
 
-/// Capacity of the group key table (rows). A plausible device limit; the real
-/// Jung device's capacity is not captured.
+/// Capacity of the group key table (rows) when the product declares none
+/// (`MaxSecurityGroupKeyTableEntries`, bussard issue #537). A plausible
+/// device limit.
 pub const MAX_GROUP_KEY_ROWS: u16 = 1024;
 
-/// Capacity of the security individual address table (rows). A plausible device
-/// limit; the real device's capacity is not captured.
+/// Capacity of the security individual address table (rows) when the product
+/// declares none (`MaxSecurityIndividualAddressEntries`). A plausible device
+/// limit.
 pub const MAX_IA_TABLE_ROWS: u16 = 64;
 
 /// Size of one group key table row: address-table index (2) + key (16).
@@ -132,10 +134,11 @@ const GO_FLAG: usize = 1;
 const TOOL_KEY_LEN: usize = 16;
 /// Size of the sending sequence number.
 const SEQ_LEN: usize = 6;
-/// The highest valid group-object security flag: bit 0 and bit 1 are the
-/// authentication and confidentiality flags; ETS writes 0x03 for a secured
+/// The used bits of a group-object security flag octet: bit 0 and bit 1 are
+/// the authentication and confidentiality flags, b7..b2 are reserved and
+/// ignored (KNX 3/5/1 §6.3.15.2 Figure 81). ETS writes 0x03 for a secured
 /// group object and 0x00 for a plain one.
-const MAX_GO_FLAG: u8 = 0x03;
+const GO_FLAG_MASK: u8 = 0x03;
 
 /// PDT codes for the property descriptions.
 const PDT_CONTROL: u8 = 0x00;
@@ -347,6 +350,10 @@ pub struct SecurityObject {
     report: u8,
     /// The security report control (PID 58): 1 = broadcast on a failure.
     report_control: u8,
+    /// Rows the group key table (PID 53) holds.
+    group_key_capacity: u16,
+    /// Rows the security individual address table (PID 54) holds.
+    ia_capacity: u16,
 }
 
 impl std::fmt::Debug for SecurityObject {
@@ -386,7 +393,23 @@ impl SecurityObject {
             failures: FailuresLog::default(),
             report: 0,
             report_control: 0,
+            group_key_capacity: MAX_GROUP_KEY_ROWS,
+            ia_capacity: MAX_IA_TABLE_ROWS,
         }
+    }
+
+    /// Takes the table capacities from the product data (bussard issue #537):
+    /// a declared figure replaces [`MAX_GROUP_KEY_ROWS`] or
+    /// [`MAX_IA_TABLE_ROWS`]. The writes refuse rows beyond them and the
+    /// property descriptions report them.
+    pub fn with_capacity(mut self, capacity: crate::prod::SecurityCapacity) -> Self {
+        if let Some(rows) = capacity.group_key_rows {
+            self.group_key_capacity = rows;
+        }
+        if let Some(rows) = capacity.ia_rows {
+            self.ia_capacity = rows;
+        }
+        self
     }
 
     /// A security object in factory state for a device that takes Data Secure
@@ -450,10 +473,11 @@ impl SecurityObject {
         self.go_flags.count()
     }
 
-    /// The security flags of group object `n` (1-based), if written.
+    /// The security flags of group object `n` (1-based), if written: the
+    /// authentication and confidentiality bits, the reserved bits cleared.
     pub fn go_flag(&self, n: u16) -> Option<u8> {
         let off = usize::from(n).checked_sub(1)?;
-        self.go_flags.bytes.get(off).copied()
+        self.go_flags.bytes.get(off).map(|f| f & GO_FLAG_MASK)
     }
 
     /// How many times the tool key was written.

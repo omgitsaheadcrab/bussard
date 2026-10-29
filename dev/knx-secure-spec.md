@@ -88,8 +88,8 @@ download` path.
 Phase A delivers:
 
 1. **Importer stops dropping secure material** (`bussard-ets` / `bussard-prod`):
-   preserve `IsSecureEnabled` and `MaxSecurity*` sizing attrs (currently
-   dropped, zero references in any crate `[corpus §1]`); surface FDSK-certificate
+   preserve `IsSecureEnabled` and `MaxSecurity*` sizing attrs (both kept
+   now; the sizing since #537, see §11); surface FDSK-certificate
    presence and `<Security>` seqnum state from the knxproj import. **Flags and
    structure only in the committed model files** - key values must NEVER touch `knx/` (a
    reviewable, committed tree). See §2 and §11.
@@ -492,8 +492,10 @@ tunnel management path, secure-1-1-12 capture, 2026-09-23]`. The inner APDU
 starts with `000000b` in the six bits above the APCI; after a positive MAC
 check the receiver also verifies those six bits are zero and drops the frame
 otherwise, without a failure count and with the sequence still accepted
-(§5.2.1.4, `[TSS J §3.1.12]`). bussard's decoder masks the bits instead of
-checking them (`asdu.rs` `parse_inner_apdu`); harmless for a tool, a sim gap (#535).
+(§5.2.1.4, `[TSS J §3.1.12]`). bussard's decoder and knx-sim's check them
+(`AsduError::ReservedBits`, `SecureError::ReservedBits`, #535): the frame is
+refused, its sequence still moves the freshness table, the sim logs the drop
+without a failure count.
 The Sync services reuse this frame with a different body, see §6.3.
 
 ### 5.4 CCM nonce (block_0) for TP frames `[XKNX data_secure_asdu.py, CONFIRMED]`
@@ -649,7 +651,14 @@ device stores it as PID 59 `[KNX 3/5/1 §6.3.13]`, the tool-access counter it
 accepts from ETS/bussard separately and outside any property (§6.2, readable
 only through the Sync). The millisecond clock is what ETS writes into PID 59
 at activation and into PID 54 entries, and what bussard uses for its own
-counter (§5.9); any strictly increasing value would do.
+counter (§5.9); any strictly increasing value would do. bussard never lowers
+the counter: it writes `max(clock, the device's next sequence)`, the latter
+from the Sync_Res and every frame the device sent since (#535; the tool syncs
+first and then sets, `[KNX 3/3/7 §5.3.1]`). The device protects the
+confirmation of that write already with the value written `[KNX 3/5/1
+§6.3.13.3 NOTE 110]`, so bussard moves its freshness floor for the device to
+it before the request goes out (`bussard_mgmt::ip_secure::write_sequence_number`,
+the one PID 59 write path; the end-device activation of #201 reuses it).
 
 ### 5.9 Sequence seeding (no persistence)
 
@@ -1190,9 +1199,16 @@ together (a bigger change). `[research §6.2, CONFIRMED crate licenses/versions]
 Cheap, independent of the crypto, do first `[corpus §5]`:
 
 - `bussard-prod`/`bussard-ets`: preserve `ApplicationProgram/@IsSecureEnabled`
-  and the `MaxSecurity{IndividualAddress,GroupKeyTable,P2PKey}Entries` sizing
-  attrs (currently dropped). Surface them as a `secure` flag + sizing on the
-  model.
+  and the `MaxSecurity{GroupKeyTable,IndividualAddress,P2PKeyTable}Entries`
+  sizing attrs. Done (#537): `ApplicationProgram::security_capacity`, the
+  product model's `data_secure:` (format 9) and `describe`'s `tables`. A
+  download checks the group key table (PID 53) and the security individual
+  address table (PID 54) against them before anything is opened; when the
+  product gives no figure, it reads the property description's
+  `max_nr_of_elem` over the tool-key connection (`[AN193 §2.2.4.4]`; the
+  capacity is the device's, `[KNX 3/5/1 §6.3.7, §6.3.8]`) and checks that.
+  `apply`, `flash` and the MCP plan refuse with the product figures before
+  they connect.
 - knxproj import: surface `<DeviceCertificate>` **presence** (a boolean "has
   FDSK") and the `<Security SequenceNumber SequenceNumberTimestamp>` state per
   device.

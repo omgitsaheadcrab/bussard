@@ -536,3 +536,81 @@ fn test_secure_group_unlisted_sender_and_table_sequence_refused() -> TestResult 
     assert_eq!(rig.object_value(1), Some(vec![0x01]));
     Ok(())
 }
+
+/// TSS J §3.1.12: an authentic telegram with a reserved bit above the inner
+/// APCI is dropped with a log line and no failure count, and its sequence
+/// still counts as received (KNX 3/3/7 §5.2.1.4, bussard issue #535).
+#[test]
+fn test_secure_group_reserved_bits_dropped_without_count() -> TestResult {
+    let mut rig = Rig::programmed()?;
+    let key = Key16::new(GROUP_KEY);
+    assert!(
+        rig.secure_group(&key, SecAlgorithm::AuthEnc, 2001, &[0x40, 0x81])
+            .is_empty()
+    );
+    assert_eq!(rig.object_value(1), Some(vec![]));
+    assert!(
+        rig.has_line("REJECTED SECURE group recv 1.1.1 -> 1/2/3: reserved bits set"),
+        "{:#?}",
+        rig.secure_lines()
+    );
+    rig.diag(
+        "01d5 0011 001037 000000",
+        "01d6 0011 001037 00 000000 00 0000 0000 0000",
+    )?;
+    // The dropped frame's sequence is spent.
+    rig.secure_group(&key, SecAlgorithm::AuthEnc, 2001, &[0x00, 0x81]);
+    assert_eq!(rig.object_value(1), Some(vec![]));
+    rig.secure_group(&key, SecAlgorithm::AuthEnc, 2002, &[0x00, 0x81]);
+    assert_eq!(rig.object_value(1), Some(vec![0x01]));
+    Ok(())
+}
+
+/// KNX 3/3/7 §5.5.3.2 step 1.1.1: a group telegram with the
+/// tool-access flag is an attack and counts an access error; §5.2.1.1: the
+/// sequence is checked before the MAC, so a stale frame under a wrong key
+/// counts a SeqNr error, not a cryptographic one.
+#[test]
+fn test_secure_group_tool_flag_and_check_order() -> TestResult {
+    let mut rig = Rig::programmed()?;
+    let key = Key16::new(GROUP_KEY);
+    let mut tpdu = vec![0x03, 0xF1];
+    let mut asdu = seal_group(
+        &key,
+        SecAlgorithm::AuthEnc,
+        2001,
+        PEER,
+        GA_SECURE,
+        &[0x00, 0x81],
+    );
+    asdu[0] |= 0x80;
+    tpdu.extend_from_slice(&asdu);
+    let replies: Vec<CemiLData> = rig
+        .bus
+        .deliver_from_tool(&cemi(PEER, GA_SECURE, true, tpdu))
+        .into_iter()
+        .filter(|r| r.source == IndividualAddress(DEV))
+        .collect();
+    assert!(replies.is_empty());
+    assert!(
+        rig.has_line("tool access flag on a group telegram (access error)"),
+        "{:#?}",
+        rig.secure_lines()
+    );
+    rig.diag(
+        "01d5 0011 001037 000000",
+        "01d6 0011 001037 00 000000 00 0000 0000 0001",
+    )?;
+    // At or below the PID 54 entry (1500) under a wrong key: SeqNr, no MAC check.
+    let wrong = Key16::new([0xEE; 16]);
+    assert!(
+        rig.secure_group(&wrong, SecAlgorithm::AuthEnc, 1500, &[0x00, 0x81])
+            .is_empty()
+    );
+    rig.diag(
+        "01d5 0011 001037 000000",
+        "01d6 0011 001037 00 000000 00 0001 0000 0001",
+    )?;
+    assert_eq!(rig.object_value(1), Some(vec![]));
+    Ok(())
+}
