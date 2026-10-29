@@ -540,7 +540,8 @@ pub struct LinkedObject {
 /// Every com-object ref the evaluation reached gets a descriptor at its ASAP:
 /// the com-object's `Number`, plus, for a module com-object, the module
 /// instance's value for the argument its `BaseNumber` names. A com-object behind
-/// a branch that is not taken gets none. The flags are the ref merged onto the
+/// a branch that is not taken gets none, and so does an unlinked one whose
+/// flags are all disabled (issue #474). The flags are the ref merged onto the
 /// base, with Communication set exactly when the ASAP is linked (ETS registers
 /// a shown but unlinked object with Communication cleared, e.g. the F50's
 /// parameter-enabled object 7 as `1300`). The size code comes from the ref's
@@ -590,18 +591,31 @@ pub fn dynamic_group_object_descriptors(
         let Some((base, cref)) = app.resolve(&active.com_object_ref_id) else {
             continue;
         };
-        let offset = base
-            .base_number_ref
-            .as_deref()
-            .map(|arg| arg.strip_prefix(&format!("{}_", app.id)).unwrap_or(arg))
-            .and_then(|arg| config.module_args(active.module)?.get(arg).copied())
-            .unwrap_or(0);
+        // A `BaseNumber` its instance has no value for (issue #449) gets no
+        // descriptor here; the parameter image refuses the configuration.
+        let offset = match base.base_number_ref.as_deref() {
+            Some(arg) => match bussard_prod::module_argument(app, config, active.module, arg) {
+                Some(v) => v,
+                None => continue,
+            },
+            None => 0,
+        };
         let Some(asap) = u16::try_from(i64::from(base.number) + offset)
             .ok()
             .filter(|&a| a != 0)
         else {
             continue;
         };
+        // An unlinked object whose product flags are all disabled gets no
+        // descriptor: ETS leaves it out of the table (issue #474, the Zennio
+        // Flat push buttons' "dummy" objects behind `Flat_AlwaysFALSE`, which
+        // ETS writes as `00 00`). The full sweep oracle separates this from a
+        // `<choose>` rule: ETS takes the same default-only branch on a
+        // read-only, never-shown parameter in the Busch-Jaeger `A-A072` and
+        // ABB `A-A00F`, whose objects carry flags.
+        if !linked.contains_key(&asap) && base.flags.merge(cref.flags).to_flags().is_empty() {
+            continue;
+        }
         by_asap.insert(asap, descriptor(asap, base, cref));
     }
     for (&asap, link) in linked {

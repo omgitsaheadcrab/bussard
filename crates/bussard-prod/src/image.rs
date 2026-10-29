@@ -277,10 +277,12 @@ pub fn compute_parameter_image_placed_with(
         // ref-id overrides (step 4) are applied in a second pass so a module
         // parameter's default lands at its declared offset while each overridden
         // instance lands at its own instance offset.
-        let value: Option<String> = ref_value
-            .get(param.id.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| param.default.clone());
+        let value: Option<String> = param.initial_value.clone().or_else(|| {
+            ref_value
+                .get(param.id.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| param.default.clone())
+        });
 
         let ptype = param
             .parameter_type
@@ -322,7 +324,19 @@ pub fn compute_parameter_image_placed_with(
                     .unwrap_or(base_arg);
                 let mut offsets = Vec::new();
                 for instance in &app.module_instances {
-                    let base = instance.arg_values.get(rel_arg).copied().unwrap_or(0);
+                    // An argument without a value (an allocator's) refuses
+                    // rather than placing the parameter at base 0 (issue #449).
+                    let Some(base) = instance.arg_values.get(rel_arg).copied() else {
+                        return Err(param_err(
+                            app,
+                            pname,
+                            &format!(
+                                "module instance {} has no value for the BaseOffset \
+                                 argument {rel_arg}",
+                                instance.id
+                            ),
+                        ));
+                    };
                     let effective = i64::from(offset).checked_add(base).and_then(|v| {
                         if v >= 0 {
                             usize::try_from(v).ok()
@@ -399,10 +413,12 @@ pub fn compute_parameter_image_placed_with(
         let pname = param.name.as_deref().unwrap_or(&param.id);
 
         // The member's default value (a ref override may also target it).
-        let value: Option<String> = ref_value
-            .get(param.id.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| param.default.clone());
+        let value: Option<String> = param.initial_value.clone().or_else(|| {
+            ref_value
+                .get(param.id.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| param.default.clone())
+        });
         let ptype = param
             .parameter_type
             .as_deref()
@@ -687,7 +703,10 @@ fn dynamic_image(
                     ValueSource::VendorDefault
                 },
             ),
-            None => (slot.parameter.default.clone(), ValueSource::VendorDefault),
+            None => (
+                slot.parameter.starting_value().map(str::to_string),
+                ValueSource::VendorDefault,
+            ),
         };
         let range = write_slot(app, &mut images, &slot, value.as_deref(), source)?;
         mark(placed, slot.segment, range);
@@ -808,9 +827,14 @@ fn dynamic_parameter_slots_with<'a>(
     config: &bussard_ets::dynamic::DynamicConfig,
     union_of: &UnionIndex<'_>,
 ) -> Result<Vec<ParameterSlot<'a>>> {
+    check_object_bases(app, config)?;
     let mut slots = Vec::new();
     if app.downloads_invisible_parameters() {
-        invisible_parameter_slots(app, config, union_of, &mut slots)?;
+        invisible_parameter_slots(app, config, union_of, &mut slots, |_| true)?;
+    } else {
+        // ETS writes a hidden `LegacyPatchAlways` parameter at its default
+        // regardless (issue #450).
+        invisible_parameter_slots(app, config, union_of, &mut slots, |p| p.legacy_patch_always)?;
     }
     for active in &config.parameters {
         let full_ref = format!("{}_{}", app.id, active.param_ref_id);
@@ -836,8 +860,52 @@ fn dynamic_parameter_slots_with<'a>(
     Ok(slots)
 }
 
+/// The value of the module argument `arg` (a full or app-relative id) in the
+/// module instance `module` of `config`, `None` when the instance has none
+/// (or there is no instance).
+pub fn module_argument(
+    app: &ApplicationProgram,
+    config: &bussard_ets::dynamic::DynamicConfig,
+    module: Option<usize>,
+    arg: &str,
+) -> Option<i64> {
+    let rel = arg.strip_prefix(&format!("{}_", app.id)).unwrap_or(arg);
+    config.module_args(module)?.get(rel).copied()
+}
+
+/// Refuses a configuration that reaches a module com-object whose
+/// `BaseNumber` argument has no value in its instance (issue #449): an
+/// allocator-fed argument past its allocator, or one ETS computes in a way
+/// bussard does not model. Placing the object at base 0 would give it
+/// another object's number.
+fn check_object_bases(
+    app: &ApplicationProgram,
+    config: &bussard_ets::dynamic::DynamicConfig,
+) -> Result<()> {
+    for active in &config.com_objects {
+        let Some((base, _)) = app.resolve(&active.com_object_ref_id) else {
+            continue;
+        };
+        if let Some(arg) = base.base_number_ref.as_deref()
+            && module_argument(app, config, active.module, arg).is_none()
+        {
+            return Err(ProdError::ParameterImage {
+                parameter: format!("com-object {}", active.com_object_ref_id),
+                reason: format!(
+                    "its module instance has no value for the BaseNumber argument {}; \
+                     refusing rather than numbering the object from 0",
+                    arg.strip_prefix(&format!("{}_", app.id)).unwrap_or(arg)
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Resolves `at` to a slot, the byte offset shifted by the module instance's
-/// `BaseOffset` argument.
+/// `BaseOffset` argument. A `BaseOffset` the instance has no value for
+/// refuses (issue #449): resolving it to 0 laid an MDT logic module over the
+/// application's own parameters.
 fn slot_at<'a>(
     app: &'a ApplicationProgram,
     config: &bussard_ets::dynamic::DynamicConfig,
@@ -847,11 +915,20 @@ fn slot_at<'a>(
     param_ref_id: Option<String>,
 ) -> Result<ParameterSlot<'a>> {
     let pname = param.name.as_deref().unwrap_or(&param.id);
-    let base = at
-        .base
-        .map(|b| b.strip_prefix(&format!("{}_", app.id)).unwrap_or(b))
-        .and_then(|rel| config.module_args(module)?.get(rel).copied())
-        .unwrap_or(0);
+    let base = match at.base {
+        Some(arg) => module_argument(app, config, module, arg).ok_or_else(|| {
+            param_err(
+                app,
+                pname,
+                &format!(
+                    "its module instance has no value for the BaseOffset argument {}; \
+                     refusing rather than placing the parameter at base 0",
+                    arg.strip_prefix(&format!("{}_", app.id)).unwrap_or(arg)
+                ),
+            )
+        })?,
+        None => 0,
+    };
     let offset = usize::try_from(at.offset + base).map_err(|_| {
         param_err(
             app,
@@ -910,7 +987,10 @@ fn parameter_type_of<'a>(
 
 /// The slots of the parameters the configuration does not show, for an
 /// application whose download carries them
-/// ([`ApplicationProgram::downloads_invisible_parameters`]).
+/// ([`ApplicationProgram::downloads_invisible_parameters`]), or of those of
+/// them `include` picks (the `LegacyPatchAlways` ones ETS writes in any
+/// case, issue #450: the Zennio DALI-BOX v2's 128 hidden group limits, the
+/// ABB Data Logging's hidden thresholds).
 ///
 /// Every application-level parameter with a location that the walk did not
 /// reach gets its default, the parameter's own `Value`: ETS does not write a
@@ -926,6 +1006,7 @@ fn invisible_parameter_slots<'a>(
     config: &bussard_ets::dynamic::DynamicConfig,
     union_of: &UnionIndex<'_>,
     slots: &mut Vec<ParameterSlot<'a>>,
+    include: impl Fn(&bussard_ets::application::Parameter) -> bool,
 ) -> Result<()> {
     let prefix = format!("{}_", app.id);
     // The application-level parameters the walk reached, and the unions they
@@ -946,6 +1027,7 @@ fn invisible_parameter_slots<'a>(
     let mut params: Vec<_> = app
         .parameters
         .values()
+        .filter(|p| include(p))
         .filter(|p| !reached.contains(p.id.as_str()))
         .filter(|p| {
             !p.id
@@ -3734,13 +3816,84 @@ mod tests {
         for replacement in [
             r#"<Options DownloadInvisibleParameters="None" />"#,
             r#"<Options DownloadInvisibleParameters="Background" />"#,
-            r#"<Options PreferPartialDownloadIfApplicationLoaded="true" />"#,
         ] {
             let xml = HIDDEN_XML.replace(options, replacement);
             let app = parse_application_program("A", xml.as_bytes())?;
             assert!(!app.downloads_invisible_parameters(), "{replacement}");
             let images = compute_parameter_image(&app, &no_overrides(), &BTreeMap::new())?;
             assert_eq!(images["A_RS-1"], [0, 0, 0, 1], "{replacement}");
+        }
+        Ok(())
+    }
+
+    /// Issue #450: a hidden `LegacyPatchAlways` parameter is written at its
+    /// default even when the application keeps hidden parameters at the
+    /// template (`Background`, `None`, or System 7); a hidden parameter
+    /// without the flag keeps the template. The read-back decoder walks the
+    /// same slots.
+    #[test]
+    fn test_compute_parameter_image_dynamic_writes_hidden_legacy_patch_always() -> Result<()> {
+        let options = r#"<Options TextParameterEncoding="utf-8" Comparable="false" Reconstructable="false" />"#;
+        let cycle = r#"Name="cycle" ParameterType="A_PT-2" Value="600""#;
+        for (mask, replacement) in [
+            (
+                "MV-07B0",
+                r#"<Options DownloadInvisibleParameters="Background" />"#,
+            ),
+            (
+                "MV-07B0",
+                r#"<Options DownloadInvisibleParameters="None" />"#,
+            ),
+            ("MV-0705", options),
+        ] {
+            let xml = HIDDEN_XML
+                .replace(options, replacement)
+                .replace("MV-07B0", mask)
+                .replace(cycle, &format!("{cycle} LegacyPatchAlways=\"true\""));
+            let app = parse_application_program("A", xml.as_bytes())?;
+            assert!(
+                !app.downloads_invisible_parameters(),
+                "{mask} {replacement}"
+            );
+            let images = compute_parameter_image(&app, &no_overrides(), &BTreeMap::new())?;
+            // The hidden cycle carries its default 600; the hidden union
+            // keeps the template.
+            assert_eq!(images["A_RS-1"], [0x02, 0x58, 0, 1], "{mask} {replacement}");
+            let config = bussard_ets::dynamic::evaluate_dynamic(&app, &no_overrides());
+            let slots = dynamic_parameter_slots(&app, &config)?;
+            assert!(
+                slots
+                    .iter()
+                    .any(|s| s.param_ref_id.is_none()
+                        && s.parameter.name.as_deref() == Some("cycle")),
+                "{mask} {replacement}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Issue #448: a System 7 program without `DownloadInvisibleParameters`
+    /// keeps the template for hidden parameters (Steinel HPD 2, Busch-Jaeger
+    /// `A-FF11-15`), where the same System B program writes their defaults;
+    /// a System B one that prefers a partial download keeps the template too
+    /// (Zennio DALI-BOX `A-3311`).
+    #[test]
+    fn test_compute_parameter_image_dynamic_hidden_defaults_follow_the_system() -> Result<()> {
+        let options = r#"<Options TextParameterEncoding="utf-8" Comparable="false" Reconstructable="false" />"#;
+        let partial = HIDDEN_XML.replace(
+            options,
+            r#"<Options PreferPartialDownloadIfApplicationLoaded="true" />"#,
+        );
+        let app = parse_application_program("A", partial.as_bytes())?;
+        assert!(!app.downloads_invisible_parameters());
+        let images = compute_parameter_image(&app, &no_overrides(), &BTreeMap::new())?;
+        assert_eq!(images["A_RS-1"], [0, 0, 0, 1]);
+        for mask in ["MV-0705", "MV-0701"] {
+            let system7 = HIDDEN_XML.replace("MV-07B0", mask);
+            let app = parse_application_program("A", system7.as_bytes())?;
+            assert!(!app.downloads_invisible_parameters(), "{mask}");
+            let images = compute_parameter_image(&app, &no_overrides(), &BTreeMap::new())?;
+            assert_eq!(images["A_RS-1"], [0, 0, 0, 1], "{mask}");
         }
         Ok(())
     }

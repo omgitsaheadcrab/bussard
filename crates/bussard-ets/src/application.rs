@@ -28,8 +28,8 @@ use crate::flags::FlagSet;
 use crate::translation::TranslationCollector;
 use bussard_model::Dpt;
 pub use bussard_model::dynamic::{
-    BlockRef, ChannelRef, CompareOp, DynamicNode, DynamicWhen, EnumValue, LabelMatch, Memory,
-    Union, UnionMember, WhenTest, enum_member_by_label, flatten_containers,
+    Allocator, BlockRef, ChannelRef, CompareOp, ComputedArg, DynamicNode, DynamicWhen, EnumValue,
+    LabelMatch, Memory, Union, UnionMember, WhenTest, enum_member_by_label, flatten_containers,
 };
 
 /// A base `<ComObject>` from the application program.
@@ -367,6 +367,28 @@ pub struct Parameter {
     /// writes the value these parameters compose (issue #390).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub property: Option<PropertyLocation>,
+    /// Whether the parameter declares `LegacyPatchAlways="true"`: ETS writes
+    /// it at its default even while the configuration hides it, whatever
+    /// the application's `DownloadInvisibleParameters` says (issue #450).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_patch_always: bool,
+    /// For a `TypeText` parameter, the `InitialValue` ETS starts a new device
+    /// with, in the language the program was parsed in (its
+    /// `<Translation AttributeName="InitialValue">`, else the untranslated
+    /// attribute). It wins over the parameter's and its refs' `Value` as the
+    /// default (issue #473: the Busch-Wächter PRO 2800's device name is
+    /// "Busch-Wächter Pro" in a German project). `None` for any other type
+    /// and for a text parameter without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_value: Option<String>,
+}
+
+impl Parameter {
+    /// The value ETS gives the parameter on a new device: its
+    /// [`Self::initial_value`], else its `Value`.
+    pub fn starting_value(&self) -> Option<&str> {
+        self.initial_value.as_deref().or(self.default.as_deref())
+    }
 }
 
 /// Where a property-located parameter sits: the interface object (by index or
@@ -943,6 +965,15 @@ pub struct ApplicationProgram {
     /// `ArgBeschriftung` → `MD-1_A-3`), used to resolve `{{Arg…}}` placeholders
     /// in channel and com-object texts against a module instance's values.
     pub argument_ids: HashMap<String, String>,
+    /// The `Allocates` of every module `<Argument>` that declares one, keyed
+    /// by app-relative argument id (issue #449): how far an allocator-fed
+    /// value of the argument advances its allocator.
+    #[serde(default)]
+    pub argument_allocates: HashMap<String, i64>,
+    /// The `<Allocator>`s of the application's and the module definitions'
+    /// `<Static>`, keyed by app-relative id (`L-2`, `MD-1_L-1`) (issue #449).
+    #[serde(default)]
+    pub allocators: HashMap<String, Allocator>,
     /// Dynamic-section `<Module>` instantiations, in document order. Each is one
     /// channel's set of argument values; empty for a non-module application.
     pub module_instances: Vec<ModuleInstance>,
@@ -964,21 +995,39 @@ impl ApplicationProgram {
     /// Whether a download writes the parameters the configuration does not
     /// show, with their defaults.
     ///
-    /// ETS does when `<Options>` declares neither `DownloadInvisibleParameters`
-    /// nor `PreferPartialDownloadIfApplicationLoaded="true"` (issue #89),
-    /// established from full-download captures:
+    /// ETS does for a System B program (mask `xxB0`) whose `<Options>`
+    /// declares neither `DownloadInvisibleParameters` nor
+    /// `PreferPartialDownloadIfApplicationLoaded="true"`; every other program
+    /// keeps the segment template for them (issues #89 and #448). Established
+    /// from full-download captures of the defaults sweep (#422), compared on
+    /// a build that has the sweep's other fixes:
     ///
-    /// * Busch-Jaeger Busch-Wächter PRO 280 (`M-0007_A-6179-82`) and Steinel
-    ///   ControlPro (`M-008E_A-7188-31`), neither attribute: hidden parameters
-    ///   carry their defaults (the Busch-Jaeger's sending cycle 600 behind
-    ///   "Enable group object In operation = No").
-    /// * Jung 230021SU, 390041SR, F50 (`None`) and ABB BE/S16 (`Background`),
-    ///   all with partial download preferred: hidden parameters keep the
-    ///   segment template (the ABB hides the same sending cycle and gets 0).
-    /// * Jung System 7 2116REG, 3181, 3361 (no `DownloadInvisibleParameters`,
-    ///   partial download preferred): the template too.
+    /// * System B, neither attribute, defaults written: Busch-Wächter PRO
+    ///   280 / 2800 (`M-0007_A-6179-82`), Steinel ControlPro
+    ///   (`M-008E_A-7188-31`), ABB Modbus RTU Gateway (`M-0002_A-3002-11`).
+    /// * System B, partial download preferred, template kept: Busch-Jaeger
+    ///   DALI gateways `A-A0AC`, `A-A0AD`, Zennio DALI-BOX `A-3131`,
+    ///   `A-3311`, `A-3331` (each loses its ETS-identical image when the
+    ///   hidden defaults are written), Jung 230021SU, 390041SR, F50, ABB
+    ///   BE/S16.
+    /// * System 7, neither attribute, template kept: Steinel HPD 2 and
+    ///   TruePresence, ekinex, B.E.G. DIM, Zennio Sensato and the Elsner
+    ///   sensors (project/11), Busch-Jaeger `A-FF11-15` (project/20, empty
+    ///   `<Options/>`); the schema version plays no part.
+    /// * Declared `None` or `Background`, template kept on both systems.
     pub fn downloads_invisible_parameters(&self) -> bool {
-        self.download_invisible_parameters.is_none() && !self.prefer_partial_download
+        self.download_invisible_parameters.is_none()
+            && !self.prefer_partial_download
+            && self.is_system_b()
+    }
+
+    /// Whether the program is a System B one: its `MaskVersion` is `xxB0`
+    /// (`07B0` on TP, `27B0`/`57B0` on other media).
+    pub fn is_system_b(&self) -> bool {
+        self.mask_version
+            .as_deref()
+            .and_then(|m| u16::from_str_radix(m.trim(), 16).ok())
+            .is_some_and(|m| m & 0x0FFF == 0x07B0)
     }
 
     /// Whether this is a `PeiProgram` (a second loadable program, not an
@@ -1291,6 +1340,18 @@ pub fn parse_application_program_in(
     }
 
     apply_translations(&mut app, &translations);
+    // `InitialValue` is the starting value of a text parameter only.
+    let types = &app.parameter_types;
+    for param in app.parameters.values_mut() {
+        let text = param
+            .parameter_type
+            .as_deref()
+            .and_then(|t| types.get(t))
+            .is_some_and(|d| matches!(d.kind, ParameterType::Text { .. }));
+        if !text {
+            param.initial_value = None;
+        }
+    }
     Ok(app)
 }
 
@@ -1421,6 +1482,7 @@ fn handle_start(
         b"ComObjectRef" => insert_com_object_ref(app, m),
         b"Channel" => insert_channel(app, m),
         b"Argument" => insert_argument(app, m),
+        b"Allocator" => insert_allocator(app, m),
         b"ParameterType" => {
             state.pt_id = get(m, b"Id").map(str::to_string);
             state.pt_name = get(m, b"Name").map(str::to_string);
@@ -1581,6 +1643,7 @@ fn handle_empty(
         b"ComObjectRef" => insert_com_object_ref(app, m),
         b"Channel" => insert_channel(app, m),
         b"Argument" => insert_argument(app, m),
+        b"Allocator" => insert_allocator(app, m),
         b"Options" => insert_options(app, m),
         b"Extension" => insert_extension(app, m),
         b"ComObjectTable" => insert_com_object_table(app, m),
@@ -1728,7 +1791,7 @@ fn handle_empty(
 }
 
 /// The attributes a translation may replace.
-const TRANSLATED: &[&str] = &["Name", "Text", "FunctionText"];
+const TRANSLATED: &[&str] = &["Name", "Text", "FunctionText", "InitialValue"];
 
 /// Applies the collected translations to names, texts, function texts and
 /// enumeration texts.
@@ -1772,6 +1835,9 @@ fn apply_translations(app: &mut ApplicationProgram, translations: &TranslationCo
         if let Some(t) = translations.get(id, "Text") {
             param.text = Some(t.to_string());
         }
+        if let Some(t) = translations.get(id, "InitialValue") {
+            param.initial_value = Some(t.to_string());
+        }
     }
     for (id, pref) in app.parameter_refs.iter_mut() {
         if let Some(t) = translations.get(id, "Text") {
@@ -1807,6 +1873,9 @@ fn apply_translations(app: &mut ApplicationProgram, translations: &TranslationCo
                     for w in whens {
                         translate_tree(&mut w.children, full, translations);
                     }
+                }
+                DynamicNode::Repeat { children, .. } => {
+                    translate_tree(children, full, translations);
                 }
                 DynamicNode::ParameterRefRef(_)
                 | DynamicNode::ComObjectRefRef(_)
@@ -1917,16 +1986,38 @@ fn insert_channel(app: &mut ApplicationProgram, m: &Attrs) {
     );
 }
 
-/// Records a module `<Argument>`'s name → app-relative id (first wins).
+/// Records a module `<Argument>`'s name → app-relative id (first wins) and
+/// its `Allocates`.
 fn insert_argument(app: &mut ApplicationProgram, m: &Attrs) {
-    let (Some(id), Some(name)) = (get(m, b"Id"), get(m, b"Name")) else {
+    let Some(rel) = get(m, b"Id").and_then(|id| app_relative_id(id, &app.id)) else {
         return;
     };
-    if let Some(rel) = app_relative_id(id, &app.id) {
+    if let Some(allocates) = get(m, b"Allocates").and_then(|v| v.trim().parse::<i64>().ok()) {
+        app.argument_allocates.insert(rel.to_string(), allocates);
+    }
+    if let Some(name) = get(m, b"Name") {
         app.argument_ids
             .entry(name.to_string())
             .or_insert_with(|| rel.to_string());
     }
+}
+
+/// Records an `<Allocator Id Start maxInclusive>` (issue #449).
+fn insert_allocator(app: &mut ApplicationProgram, m: &Attrs) {
+    let (Some(rel), Some(start)) = (
+        get(m, b"Id").and_then(|id| app_relative_id(id, &app.id)),
+        get(m, b"Start").and_then(|v| v.trim().parse::<i64>().ok()),
+    ) else {
+        return;
+    };
+    let max_inclusive = get(m, b"maxInclusive").and_then(|v| v.trim().parse::<i64>().ok());
+    app.allocators.insert(
+        rel.to_string(),
+        Allocator {
+            start,
+            max_inclusive,
+        },
+    );
 }
 
 /// Inserts a parameter, returning its id so the caller can attach a later
@@ -1946,6 +2037,8 @@ fn insert_parameter_start(app: &mut ApplicationProgram, m: &Attrs) -> Option<Str
             memory: None,
             base_value: get(m, b"BaseValue").map(str::to_string),
             property: None,
+            legacy_patch_always: get(m, b"LegacyPatchAlways").is_some_and(parse_xml_bool),
+            initial_value: get(m, b"InitialValue").map(str::to_string),
         },
     );
     Some(id)
@@ -2082,8 +2175,10 @@ struct ParseState {
 /// each `<ModuleDef>`'s Dynamic section from streaming events.
 #[derive(Debug, Default)]
 struct DynTreeBuilder {
-    /// The app-relative id of the `<ModuleDef>` currently open, if any.
-    module_def: Option<String>,
+    /// The app-relative ids of the open `<ModuleDef>`s, outermost first: a
+    /// `<SubModuleDefs>` nests one module definition in another (issue
+    /// #449), and the outer definition's `<Dynamic>` follows the inner ones.
+    module_defs: Vec<String>,
     /// The open frames, outermost first; non-empty exactly while inside a
     /// `<Dynamic>` element.
     frames: Vec<DynFrame>,
@@ -2106,6 +2201,14 @@ enum DynFrame {
         id: String,
         module_def: String,
         args: HashMap<String, i64>,
+        computed_args: Vec<ComputedArg>,
+    },
+    /// An open `<Repeat>` and its children so far.
+    Repeat {
+        id: String,
+        param_ref_id: Option<String>,
+        count: Option<u32>,
+        children: Vec<DynamicNode>,
     },
     /// An open `<Channel>` and its children so far.
     Channel(ChannelRef, Vec<DynamicNode>),
@@ -2120,7 +2223,8 @@ impl DynTreeBuilder {
             Some(DynFrame::Root(children))
             | Some(DynFrame::When(DynamicWhen { children, .. }))
             | Some(DynFrame::Channel(_, children))
-            | Some(DynFrame::Block(_, children)) => {
+            | Some(DynFrame::Block(_, children))
+            | Some(DynFrame::Repeat { children, .. }) => {
                 children.push(node);
             }
             // A node directly under `<choose>` or `<Module>` is not valid
@@ -2160,7 +2264,7 @@ impl DynTreeBuilder {
         };
         if self.frames.is_empty() {
             match name {
-                b"ModuleDef" => self.module_def = Some(rel(b"Id")),
+                b"ModuleDef" => self.module_defs.push(rel(b"Id")),
                 b"Dynamic" => self.frames.push(DynFrame::Root(Vec::new())),
                 _ => {}
             }
@@ -2179,6 +2283,13 @@ impl DynTreeBuilder {
                 id: rel(b"Id"),
                 module_def: rel(b"RefId"),
                 args: HashMap::new(),
+                computed_args: Vec::new(),
+            }),
+            b"Repeat" => self.frames.push(DynFrame::Repeat {
+                id: rel(b"Id"),
+                param_ref_id: relative_attr(m, b"ParameterRefId", app_id),
+                count: get(m, b"Count").and_then(|v| v.trim().parse().ok()),
+                children: Vec::new(),
             }),
             b"Channel" => self.frames.push(DynFrame::Channel(
                 ChannelRef {
@@ -2213,16 +2324,37 @@ impl DynTreeBuilder {
         }
         match name {
             b"NumericArg" => {
-                if let Some(DynFrame::Module { args, .. }) = self.frames.last_mut()
-                    && let (Some(arg), Some(value)) = (
-                        get(m, b"RefId").map(|id| app_relative_id(id, app_id).unwrap_or(id)),
-                        get(m, b"Value").and_then(|v| v.trim().parse::<i64>().ok()),
-                    )
+                let rel = |key: &[u8]| {
+                    get(m, key).map(|id| app_relative_id(id, app_id).unwrap_or(id).to_string())
+                };
+                if let Some(DynFrame::Module {
+                    args,
+                    computed_args,
+                    ..
+                }) = self.frames.last_mut()
+                    && let Some(arg) = rel(b"RefId")
                 {
-                    args.insert(arg.to_string(), value);
+                    let value = get(m, b"Value").and_then(|v| v.trim().parse::<i64>().ok());
+                    let allocator = rel(b"AllocatorRefId");
+                    let base = rel(b"BaseValue");
+                    match (value, &allocator, &base) {
+                        (Some(value), None, None) => {
+                            args.insert(arg, value);
+                        }
+                        // An allocator or a base makes the value the
+                        // instance's to compute (issue #449); a bare
+                        // argument without a value stays absent.
+                        (_, Some(_), _) | (_, _, Some(_)) => computed_args.push(ComputedArg {
+                            arg,
+                            allocator,
+                            value,
+                            base,
+                        }),
+                        (None, None, None) => {}
+                    }
                 }
             }
-            b"when" | b"choose" | b"Module" | b"Channel" | b"ParameterBlock" => {
+            b"when" | b"choose" | b"Module" | b"Channel" | b"ParameterBlock" | b"Repeat" => {
                 // An empty branch, choose, argument-less module or empty
                 // container: open and close it at once.
                 self.start(name, m, app_id);
@@ -2237,7 +2369,9 @@ impl DynTreeBuilder {
     /// An end event. `app` receives a finished `<Dynamic>` tree.
     fn end(&mut self, name: &[u8], app: Option<&mut ApplicationProgram>) {
         match name {
-            b"ModuleDef" if self.frames.is_empty() => self.module_def = None,
+            b"ModuleDef" if self.frames.is_empty() => {
+                self.module_defs.pop();
+            }
             b"when" => {
                 if let Some(DynFrame::When(_)) = self.frames.last()
                     && let Some(DynFrame::When(branch)) = self.frames.pop()
@@ -2265,12 +2399,32 @@ impl DynTreeBuilder {
                         id,
                         module_def,
                         args,
+                        computed_args,
                     }) = self.frames.pop()
                 {
                     self.push_node(DynamicNode::Module {
                         id,
                         module_def,
                         args,
+                        computed_args,
+                    });
+                }
+            }
+            b"Repeat" => {
+                if let Some(DynFrame::Repeat { .. }) = self.frames.last()
+                    && let Some(DynFrame::Repeat {
+                        id,
+                        param_ref_id,
+                        count,
+                        children,
+                    }) = self.frames.pop()
+                    && !children.is_empty()
+                {
+                    self.push_node(DynamicNode::Repeat {
+                        id,
+                        param_ref_id,
+                        count,
+                        children,
                     });
                 }
             }
@@ -2310,7 +2464,7 @@ impl DynTreeBuilder {
                     self.frames.pop();
                 }
                 if let (Some(DynFrame::Root(children)), Some(app)) = (self.frames.pop(), app) {
-                    match &self.module_def {
+                    match self.module_defs.last() {
                         Some(md) => {
                             app.module_dynamics.insert(md.clone(), children);
                         }
@@ -2787,7 +2941,7 @@ mod tests {
     fn test_parse_application_program_download_invisible_parameters() -> Result<()> {
         let xml = |options: &str| {
             format!(
-                r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t"><Static>{options}</Static></ApplicationProgram></KNX>"#
+                r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t" MaskVersion="MV-07B0"><Static>{options}</Static></ApplicationProgram></KNX>"#
             )
         };
         for (options, declared, partial, writes) in [
@@ -3365,6 +3519,7 @@ mod tests {
             id,
             module_def,
             args,
+            ..
         } = &inner[0].children[0]
         else {
             panic!("expected a module");

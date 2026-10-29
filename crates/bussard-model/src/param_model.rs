@@ -64,6 +64,15 @@ pub struct ProductModel {
     /// its parameter, its `Value` where it matters and whether it is internal
     /// (the `refs:` of each parameter, format 5).
     pub parameter_refs: BTreeMap<String, RefDef>,
+    /// The application's and the module definitions' `<Allocator>`s, keyed
+    /// by app-relative id (`L-2`, `MD-1_L-1`) (`allocators:`, format 10,
+    /// issue #449).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub allocators: BTreeMap<String, crate::dynamic::Allocator>,
+    /// The `Allocates` of every module `<Argument>` that declares one, keyed
+    /// by app-relative argument id (`argument_allocates:`, format 10).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub argument_allocates: BTreeMap<String, i64>,
     /// The ETS parameter pages and channels, derived from [`Self::dynamic`]
     /// on first use ([`Self::blocks`]).
     #[serde(skip)]
@@ -142,8 +151,11 @@ pub struct ObjectDef {
 /// parameter's own default, issue #345; format 7 a text type's
 /// `encoding:`, issue #401; format 8 a com-object's `priority:` where it is
 /// not Low, issue #541; format 9 a Data-Secure-capable application's table
-/// capacities, `data_secure:`, issue #537).
-pub const MODEL_FORMAT: u32 = 9;
+/// capacities, `data_secure:`, issue #537; format 10 `<Repeat>` nodes, a
+/// module's computed arguments, `allocators:` and `argument_allocates:`,
+/// issue #449, and a text
+/// parameter's `initial_value:`, issue #473).
+pub const MODEL_FORMAT: u32 = 10;
 
 /// Whether the model file at `path` is of the current [`MODEL_FORMAT`]. Reads
 /// only the head of the file, where the emitter puts the key.
@@ -192,6 +204,11 @@ pub struct ParamDef {
     /// For an enumeration, its members (code and label): what an override
     /// written as a label is matched against. Empty for other kinds.
     pub enum_values: Vec<crate::dynamic::EnumValue>,
+    /// A text parameter's `InitialValue` in the model's language
+    /// (`initial_value:`, format 10, issue #473): the value a new device
+    /// starts with, which wins over the `Value`s as the default.
+    #[serde(default)]
+    pub initial_value: Option<String>,
 }
 
 /// A parameter's type, mirroring the `type:` tag in the model YAML.
@@ -250,6 +267,10 @@ struct RawModel {
     unions: Vec<crate::dynamic::Union>,
     #[serde(default)]
     data_secure: Option<DataSecureCapacity>,
+    #[serde(default)]
+    allocators: BTreeMap<String, crate::dynamic::Allocator>,
+    #[serde(default)]
+    argument_allocates: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -285,6 +306,8 @@ struct RawParam {
     bits: Option<u32>,
     #[serde(default)]
     signed: bool,
+    #[serde(default)]
+    initial_value: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -418,6 +441,7 @@ impl ProductModel {
                     base_value: p.base_value,
                     integer_width: p.bits.map(|bits| (bits, p.signed)),
                     enum_values,
+                    initial_value: p.initial_value,
                 },
             );
         }
@@ -449,6 +473,8 @@ impl ProductModel {
             module_dynamics: raw.module_dynamics,
             unions: raw.unions,
             parameter_refs,
+            allocators: raw.allocators,
+            argument_allocates: raw.argument_allocates,
             pages: std::sync::OnceLock::new(),
         })
     }
@@ -460,20 +486,24 @@ impl ProductModel {
         self.pages.get_or_init(|| crate::blocks::pages_of(self))
     }
 
-    /// The vendor default of app-relative parameter ref `reference`: the
-    /// ref's own `Value` when the model records one, else the parameter's
-    /// default. This is the value ETS shows, and a download writes, when
-    /// nothing is stored (issue #326).
+    /// The vendor default of app-relative parameter ref `reference`: a text
+    /// parameter's `InitialValue` (issue #473), else the ref's own `Value`
+    /// when the model records one, else the parameter's default. This is the
+    /// value ETS shows, and a download writes, when nothing is stored (issue
+    /// #326).
     pub fn ref_default(&self, reference: &str) -> Option<&str> {
         match self.parameter_refs.get(reference) {
-            Some(r) => r
-                .value
-                .as_deref()
-                .or_else(|| self.parameters.get(&r.parameter)?.default.as_deref()),
+            Some(r) => {
+                let def = self.parameters.get(&r.parameter);
+                // A text parameter's `InitialValue` comes first (issue #473).
+                def.and_then(|d| d.initial_value.as_deref())
+                    .or(r.value.as_deref())
+                    .or_else(|| def?.default.as_deref())
+            }
             None => self
                 .parameters
                 .get(crate::blocks::ref_param_id(reference))
-                .and_then(|d| d.default.as_deref()),
+                .and_then(|d| d.initial_value.as_deref().or(d.default.as_deref())),
         }
     }
 
@@ -579,6 +609,18 @@ impl crate::dynamic::DynamicSource for ProductModel {
 
     fn unions(&self) -> &[crate::dynamic::Union] {
         &self.unions
+    }
+
+    fn allocator(&self, allocator_id: &str) -> Option<crate::dynamic::Allocator> {
+        self.allocators.get(allocator_id).copied()
+    }
+
+    fn argument_allocates(&self, arg_id: &str) -> Option<i64> {
+        self.argument_allocates.get(arg_id).copied()
+    }
+
+    fn initial_value(&self, param_id: &str) -> Option<&str> {
+        self.parameters.get(param_id)?.initial_value.as_deref()
     }
 }
 

@@ -520,3 +520,234 @@ fn test_product_model_round_trips_the_dynamic_tree_on_the_corpus() -> TestResult
     assert!(programs > 0, "no program compared");
     Ok(())
 }
+
+/// The issue #449 fixture: allocator-fed module arguments and `<Repeat>`.
+const ALLOCATORS: &[u8] = include_bytes!("../fixtures/allocators.app.xml");
+/// Its program id.
+const ALLOCATORS_ID: &str = "M-00FA_A-0449-10-0000";
+
+/// The octets at `offsets` of the fixture's one parameter segment.
+fn segment_octets(
+    image: &BTreeMap<String, Vec<u8>>,
+    offsets: &[usize],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let seg = image
+        .get(&format!("{ALLOCATORS_ID}_RS-04-00000"))
+        .ok_or("no parameter segment")?;
+    offsets
+        .iter()
+        .map(|&o| seg.get(o).copied().ok_or_else(|| "offset outside".into()))
+        .collect()
+}
+
+#[test]
+fn test_evaluate_dynamic_repeat_instantiates_allocator_fed_modules() -> TestResult {
+    let app = parse_application_program(ALLOCATORS_ID, ALLOCATORS)?;
+    let config = bussard_prod::dynamic::evaluate_dynamic(&app, &BTreeMap::new());
+    let modules: Vec<(&str, Option<i64>, Option<i64>)> = config
+        .modules
+        .iter()
+        .map(|m| {
+            let arg = |a: &str| m.args.get(a).copied();
+            (
+                m.id.as_str(),
+                arg("MD-1_A-1").or(arg("MD-1_SM-1_A-1")),
+                arg("MD-1_A-2"),
+            )
+        })
+        .collect();
+    // Two channels from L-1 (16, then 16 + 16) and L-2 (2, then 4); two
+    // scenes in each, from the channel's own MD-1_L-1 (4, 5) plus the
+    // channel's base (BaseValue).
+    assert_eq!(
+        modules,
+        vec![
+            ("MD-1_M-1", Some(16), Some(2)),
+            ("MD-1_M-1_MI-1_SM-1_M-1_MI-1", Some(20), None),
+            ("MD-1_M-1_MI-1_SM-1_M-1_MI-2", Some(21), None),
+            ("MD-1_M-1_MI-2", Some(32), Some(4)),
+            ("MD-1_M-1_MI-2_SM-1_M-1_MI-1", Some(36), None),
+            ("MD-1_M-1_MI-2_SM-1_M-1_MI-2", Some(37), None),
+        ]
+    );
+    let image = bussard_prod::compute_dynamic_parameter_image(&app, &BTreeMap::new())?;
+    assert_eq!(
+        segment_octets(&image, &[0, 1, 16, 17, 20, 21, 32, 33, 36, 37])?,
+        vec![0xFF, 7, 5, 2, 9, 9, 5, 2, 9, 9]
+    );
+    // The objects: the application's 1, each channel's 0 and 1 on its base.
+    let mut numbers = Vec::new();
+    for active in &config.com_objects {
+        let (base, _) = app
+            .resolve(&active.com_object_ref_id)
+            .ok_or("unresolved object")?;
+        let offset = match base.base_number_ref.as_deref() {
+            Some(arg) => bussard_prod::module_argument(&app, &config, active.module, arg)
+                .ok_or("no object base")?,
+            None => 0,
+        };
+        numbers.push(i64::from(base.number) + offset);
+    }
+    numbers.sort_unstable();
+    assert_eq!(numbers, vec![1, 2, 3, 4, 5]);
+    Ok(())
+}
+
+#[test]
+fn test_evaluate_dynamic_repeat_values_are_keyed_per_instance() -> TestResult {
+    let app = parse_application_program(ALLOCATORS_ID, ALLOCATORS)?;
+    // The second channel's level and its first scene; the first channel
+    // keeps its defaults.
+    let values: BTreeMap<String, String> = [
+        ("MD-1_M-1_MI-2_P-1_R-1", "33"),
+        ("MD-1_M-1_MI-2_SM-1_M-1_MI-1_P-1_R-1", "44"),
+        ("MD-1_M-1_MI-1_P-2_R-2", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let image = bussard_prod::compute_dynamic_parameter_image(&app, &values)?;
+    // Channel 1 now has one scene (at 20; 21 keeps the erased fill).
+    assert_eq!(
+        segment_octets(&image, &[16, 17, 20, 21, 32, 36, 37])?,
+        vec![5, 1, 9, 0xFF, 33, 44, 9]
+    );
+    Ok(())
+}
+
+#[test]
+fn test_compute_dynamic_parameter_image_refuses_an_exhausted_allocator() -> TestResult {
+    let app = parse_application_program(ALLOCATORS_ID, ALLOCATORS)?;
+    // A third channel would start at 48, past L-1's maxInclusive 47: its
+    // base has no value, and the image refuses instead of writing the
+    // channel at base 0 over the application's parameters.
+    let values = BTreeMap::from([("P-1_R-1".to_string(), "3".to_string())]);
+    let err = bussard_prod::compute_dynamic_parameter_image(&app, &values)
+        .err()
+        .ok_or("expected a refusal")?;
+    assert!(err.to_string().contains("BaseOffset"), "{err}");
+    Ok(())
+}
+
+/// The issues #563 and #474 fixture: the activity of a `<choose>`.
+const CHOOSE_ACTIVITY: &[u8] = include_bytes!("../fixtures/choose_activity.app.xml");
+/// Its program id.
+const CHOOSE_ACTIVITY_ID: &str = "M-00FA_A-0563-10-0000";
+
+/// The objects and parameter refs the evaluation reaches with `values`.
+fn reached(
+    app: &ApplicationProgram,
+    values: &[(&str, &str)],
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let values: BTreeMap<String, String> = values
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let config = bussard_prod::dynamic::evaluate_dynamic(app, &values);
+    (
+        config
+            .com_objects
+            .iter()
+            .map(|c| c.com_object_ref_id.clone())
+            .collect(),
+        config
+            .parameters
+            .iter()
+            .map(|p| p.param_ref_id.clone())
+            .collect(),
+    )
+}
+
+#[test]
+fn test_evaluate_dynamic_choose_on_an_unreached_ref_selects_no_branch() -> TestResult {
+    let app = parse_application_program(CHOOSE_ACTIVITY_ID, CHOOSE_ACTIVITY)?;
+    let (objects, refs) = reached(&app, &[]);
+    // R-1 of "Changeover" is shown, R-2 is not: the choose on R-2 takes no
+    // branch. The union member is shown through R-4 only: the choose on R-5
+    // takes none either, though R-5 reads the shared memory's 0.
+    for absent in ["O-2_R-2", "O-3_R-3"] {
+        assert!(!objects.contains(absent), "{absent} reached: {objects:?}");
+    }
+    for absent in ["P-3_R-3", "P-6_R-6"] {
+        assert!(!refs.contains(absent), "{absent} reached: {refs:?}");
+    }
+    assert!(objects.contains("O-1_R-1"), "{objects:?}");
+    // Once "Selector" shows R-5, the choose on it is active and its branch
+    // (the shared memory's 0) is taken.
+    let (objects, refs) = reached(&app, &[("P-5_R-5", "0")]);
+    assert!(objects.contains("O-3_R-3"), "{objects:?}");
+    assert!(refs.contains("P-6_R-6"), "{refs:?}");
+    Ok(())
+}
+
+#[test]
+fn test_evaluate_dynamic_never_shown_steering_parameter_takes_its_default_branch() -> TestResult {
+    let app = parse_application_program(CHOOSE_ACTIVITY_ID, CHOOSE_ACTIVITY)?;
+    let (objects, refs) = reached(&app, &[]);
+    // ETS takes the default branch on a never-shown steering parameter,
+    // read-only or not, typed or `TypeNone` (issue #474: the sweep oracle
+    // over the Busch-Jaeger A-A072 and ABB A-A00F). The Flat "dummy" objects
+    // are left out by the table builder, not the walk.
+    for present in ["O-4_R-4", "O-5_R-5", "O-6_R-6", "O-7_R-7", "O-8_R-8"] {
+        assert!(objects.contains(present), "{present} missing: {objects:?}");
+    }
+    assert!(refs.contains("P-8_R-8"), "{refs:?}");
+    // "Dummy" is written at its default.
+    let image = bussard_prod::compute_dynamic_parameter_image(&app, &BTreeMap::new())?;
+    let seg = image
+        .get(&format!("{CHOOSE_ACTIVITY_ID}_RS-04-00000"))
+        .ok_or("no parameter segment")?;
+    assert_eq!(seg.get(5), Some(&51));
+    Ok(())
+}
+
+/// The issue #473 fixture: a text parameter's translated `InitialValue`.
+const INITIAL_VALUE: &[u8] = include_bytes!("../fixtures/initial_value.app.xml");
+/// Its program id.
+const INITIAL_VALUE_ID: &str = "M-00FA_A-0473-10-0000";
+
+/// The fixture's parameter segment under `values`, parsed in `language`.
+fn initial_value_image(
+    language: &str,
+    values: &[(&str, &str)],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let app = bussard_prod::application::parse_application_program_in(
+        INITIAL_VALUE_ID,
+        INITIAL_VALUE,
+        language,
+    )?;
+    let values: BTreeMap<String, String> = values
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let mut image = bussard_prod::compute_dynamic_parameter_image(&app, &values)?;
+    image
+        .remove(&format!("{INITIAL_VALUE_ID}_RS-04-00000"))
+        .ok_or_else(|| "no parameter segment".into())
+}
+
+#[test]
+fn test_compute_dynamic_parameter_image_text_starts_from_the_translated_initial_value() -> TestResult
+{
+    // German: the translated InitialValue, in UTF-8, over the ref's Value.
+    let de = initial_value_image("de-DE", &[])?;
+    assert_eq!(&de[..10], "Wächter\0\0".as_bytes());
+    // English (the default language): the untranslated InitialValue.
+    let en = initial_value_image("en-US", &[])?;
+    assert_eq!(&en[..10], b"Watchdog\0\0");
+    // A number's InitialValue is not its default.
+    assert_eq!((de[10], en[10]), (5, 5));
+    // An explicit value still wins.
+    let set = initial_value_image("de-DE", &[("P-1_R-1", "Hall")])?;
+    assert_eq!(&set[..10], b"Hall\0\0\0\0\0\0");
+    // The product model gives the view the same default.
+    let app = bussard_prod::application::parse_application_program_in(
+        INITIAL_VALUE_ID,
+        INITIAL_VALUE,
+        "de-DE",
+    )?;
+    let model = product_model(&app)?;
+    assert_eq!(model.ref_default("P-1_R-1"), Some("Wächter"));
+    assert_eq!(model.ref_default("P-2_R-2"), Some("5"));
+    Ok(())
+}

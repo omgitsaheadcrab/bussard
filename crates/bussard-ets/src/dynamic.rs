@@ -81,6 +81,18 @@ impl DynamicSource for ApplicationProgram {
     fn unions(&self) -> &[Union] {
         &self.unions
     }
+
+    fn allocator(&self, allocator_id: &str) -> Option<Allocator> {
+        self.allocators.get(allocator_id).copied()
+    }
+
+    fn argument_allocates(&self, arg_id: &str) -> Option<i64> {
+        self.argument_allocates.get(arg_id).copied()
+    }
+
+    fn initial_value(&self, param_id: &str) -> Option<&str> {
+        self.parameters.get(param_id)?.initial_value.as_deref()
+    }
 }
 
 #[cfg(test)]

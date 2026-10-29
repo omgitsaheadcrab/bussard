@@ -428,6 +428,12 @@ struct Model<'a> {
         serialize_with = "bussard_model::dynamic_compact::unions::serialize"
     )]
     unions: Vec<Union>,
+    /// The `<Allocator>`s by app-relative id (issue #449).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    allocators: BTreeMap<&'a str, bussard_model::dynamic::Allocator>,
+    /// The module arguments' `Allocates` by app-relative id (issue #449).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    argument_allocates: BTreeMap<&'a str, i64>,
     /// The application's Dynamic section (issue #345), appended by
     /// [`serialize_model`] one flow-style node per line.
     #[serde(skip)]
@@ -492,6 +498,9 @@ struct ParameterModel {
     default: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     memory: Option<MemoryModel>,
+    /// A text parameter's `InitialValue`, translated (issue #473).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_value: Option<String>,
     /// The `BaseValue` argument, app-relative (issue #126).
     #[serde(skip_serializing_if = "Option::is_none")]
     base_value: Option<String>,
@@ -610,6 +619,16 @@ fn build_model<'a>(app: &'a ApplicationProgram, product: &ProductData) -> Model<
         load_procedure: load_procedure_summary(&app.load_procedures),
         com_object_refs,
         unions: unions_for(app),
+        allocators: app
+            .allocators
+            .iter()
+            .map(|(id, a)| (id.as_str(), *a))
+            .collect(),
+        argument_allocates: app
+            .argument_allocates
+            .iter()
+            .map(|(id, n)| (id.as_str(), *n))
+            .collect(),
         dynamic: &app.dynamic,
         module_dynamics: app
             .module_dynamics
@@ -731,7 +750,8 @@ fn dynamic_object_refs(nodes: &[DynamicNode]) -> Vec<String> {
             match node {
                 DynamicNode::ComObjectRefRef(reference) => out.push(reference.clone()),
                 DynamicNode::Channel { children, .. }
-                | DynamicNode::ParameterBlock { children, .. } => stack.push(children),
+                | DynamicNode::ParameterBlock { children, .. }
+                | DynamicNode::Repeat { children, .. } => stack.push(children),
                 DynamicNode::Choose { whens, .. } => {
                     stack.extend(whens.iter().map(|w| w.children.as_slice()));
                 }
@@ -804,6 +824,7 @@ fn parameters_for(app: &ApplicationProgram) -> Vec<ParameterModel> {
                     offset: m.offset,
                     bit_offset: m.bit_offset,
                 }),
+                initial_value: param.initial_value.clone(),
                 base_value: param
                     .base_value
                     .as_deref()
