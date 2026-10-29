@@ -22,6 +22,7 @@ Behaviour:
 - With a keyring, a secured group telegram is verified and decrypted with the group key of its destination GA, decoded like a plain one and marked `[secured]`.
 - A MAC failure shows `[secured (MAC failed) seq=… raw=…]`, and a GA without a key shows `[secured (no group key) …]`.
 - A sequence number that does not increase per sender adds a warning. Nothing is dropped.
+- A payload a conforming receiver ignores still decodes, with a note saying why (KNX 03_07_01 §2.4): a reserved bit set (`45` on `18.001`), a field out of range (hour 24 on `10.001`, month 0 on `11.001`, `24:30` on `19.001`), tariff 255 on `5.006`, or a reserved enumeration code (`05` on `20.102`). This is the answer to "the bus says X but nothing happened".
 
 ??? note "Details"
     A secured group telegram is `A_SecureData` with the tool-access bit clear.
@@ -102,6 +103,9 @@ $ bussard write 3/0/4 on
 ```
 
 The value is human-typed: `on`/`off`, `up`/`down`, a number, or a percentage like `75%`.
+A `1.xxx` value also takes the word pair of its sub-type (KNX 03_07_02 §3.1, and `1.100`):
+`occupied` on `1.018`, `night` on `1.024`, `heating` on `1.100`, `closed`/`open` on `1.019`
+(0 = closed) and `open`/`close` on `1.009` (0 = open); `read` and `monitor` print the same words.
 A forced-operation value (`2.001`-`2.012`, KNX 03_07_02 §3.2) is `control` plus the word of the
 matching `1.xxx` sub-type, `control on` or `control down` on `2.008`, or `release` to drop the
 control bit; `read` and `monitor` show `Control: On` or `No control`.
@@ -114,10 +118,29 @@ A scene number (`17.001`, `18.001`, and scenes A/B of `1.022`) counts from 1, as
 Assistant show it (KNX 03_07_02 Datapoint Types §3.19 NOTE 9, §3.1 footnote 2): `scene 3` sends
 the field 2, so ETS scene 3 is `scene 3` here. `raw 2` sends the field itself. `read` and
 `monitor` show both: `activate scene 3 (raw 2)`.
+Text, time and date have their own forms: `"Hello"` on a `16.000` address (ASCII, up to 14
+characters, padded with `00`; `16.001` takes Latin-1) and any UTF-8 text on `28.001`;
+`12:30` or `Mon 07:30:00` on `10.001`; `2026-10-29` on `11.001` (1990-2089, KNX 03_07_02
+§3.12); `2026-10-29 12:30:00` on `19.001`, with an optional weekday and the flags `summer`,
+`fault`, `working-day`, `bank-day`, `sync` and `reliable`. A `19.001` value without a weekday
+sends the date's own one.
+A colour is `#FF8000` or `rgb(255, 128, 0)` on `232.600`, and `#FF800010`, `#FF8000` or
+`rgbw(255, 128, 0, -)` on `251.600`, where a channel left out (or `-`) is sent marked invalid
+(KNX 03_07_02 §6.18). `read` and `monitor` decode `242.600` to x, y and brightness, and
+`249.600`, `250.600`, `252.600` and `254.600` to their named fields.
+An enumeration (`20.xxx`, KNX 03_07_02 §3.21, §4.3, §6.3) takes its label or code: `cool` or `3`
+on `20.105`; `read` and `monitor` print the label, and `Unknown(18)` for a reserved code. A bit
+set (`21.xxx`, `22.xxx`) reads as the names of its set bits, `0A` on `21.001` is
+`Fault, InAlarm`, and takes the same list or `none`. A `6.020` status shows its five status
+fields (0 = set, §3.7) and the active mode.
 A scaled sub-type takes the scaled value, never the raw count: `50 %` on an `8.010` address
 sends `13 88`, `1.5 s` (or `1500 ms`) on `7.004` sends `00 0F`, `1.5 m3/h` on `13.002` sends
 `00 00 3A 98` (KNX 03_07_02 §3.8.2, §3.9.1, §3.9.2, §3.14.1). A value outside the range or finer
 than the resolution is refused; `read` and `monitor` show these values with their unit.
+Every integer and float sub-type with a unit in KNX 03_07_02 §3.5-§3.15 shows it and takes it
+as a suffix: `6500 K` on `7.600`, `3600 s` on `13.100` or `7.005`, `2 K` on `9.002`, `50 %` on
+`5.004`; ASCII spellings work too (`1 m3/h`). A `5.003` angle keeps one decimal, so `80` reads
+`180.7 °` and `22.5` is a valid input.
 
 | Flag / arg | Default | Meaning |
 |---|---|---|
