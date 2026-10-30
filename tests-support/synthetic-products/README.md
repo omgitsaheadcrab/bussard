@@ -21,6 +21,7 @@ next to it, and zips it on demand.
 <!-- catalogue:begin (generate.py --catalogue) -->
 | product | order number | mask | construct | issues |
 | --- | --- | --- | --- | --- |
+| [`syn-choose-partial-segment`](syn-choose-partial-segment/product.toml) | `NEST-HALF` | 07B0 | load-procedure choose writing half the segment | #411 |
 | [`syn-hidden-default`](syn-hidden-default/product.toml) | `NEST-EGGHEAT` | 07B0 | hidden parameter, default differs from template | #448 |
 | [`syn-le-order`](syn-le-order/product.toml) | `NEST-ALTI` | 07B0 | ParameterByteOrder LittleEndian with integers and floats | #403 |
 | [`syn-master-reset`](syn-master-reset/product.toml) | `NEST-RESET` | 07B0 | Master Reset erase code 1 in the load procedure | #546, #611 |
@@ -83,7 +84,9 @@ One `product.toml` per directory. Tables and keys:
 
 Load ops: `LdCtrlRelSegment` (`lsm`, `size`, `mode`, `fill`),
 `LdCtrlWriteRelMem` (`object`, `offset`, `size`, `verify`) and
-`LdCtrlMasterReset` (`erase_code`, `channel`).
+`LdCtrlMasterReset` (`erase_code`, `channel`). `{ op = "choose", parameter,
+when = [{ test, ops }, { default = true, ops }] }` renders a `<choose
+ParamRefId>` with its `<when>` branches inside the procedure (#411).
 
 The schema reaches further than the generator does. These are reserved for
 the catalogue products that need them (step 4 of #596), and a spec that uses
