@@ -281,6 +281,7 @@ fn parse_application_program(
     let mut app_number: u32 = 0;
     let mut app_version: u32 = 0;
     let mut mask_version = String::new();
+    let mut security_capacity = super::model::SecurityCapacity::default();
     let mut in_app = false;
 
     let mut has_address_table = false;
@@ -349,6 +350,14 @@ fn parse_application_program(
                     app_number = parse_u32(&e, "ApplicationNumber")?.unwrap_or(0);
                     app_version = parse_u32(&e, "ApplicationVersion")?.unwrap_or(0);
                     mask_version = attr(&e, "MaskVersion").unwrap_or_default();
+                    // The Data Secure table capacities (bussard issue #537).
+                    let rows = |key: &str| -> Result<Option<u16>, ProdError> {
+                        Ok(parse_u32(&e, key)?.map(|n| u16::try_from(n).unwrap_or(u16::MAX)))
+                    };
+                    security_capacity = super::model::SecurityCapacity {
+                        group_key_rows: rows("MaxSecurityGroupKeyTableEntries")?,
+                        ia_rows: rows("MaxSecurityIndividualAddressEntries")?,
+                    };
                     in_app = true;
                 }
                 b"Parameter" if in_app => {
@@ -586,10 +595,30 @@ fn parse_application_program(
     // select (issue #400).
     let hardware_type_marker = defaults.pick(&marker_cands).pop().map(|((), v)| v);
     let device_compare_props = defaults.pick(&device_cands);
+    // A program-id compare (PID 13, `mfr:2 app:2 version:1`) with a mask
+    // compares only the application number (`Mask="0000FFFF00"`), so its
+    // InlineData leaves the manufacturer at 0000. ETS checks the manufacturer
+    // apart from the compare and refused "a device of another manufacturer"
+    // (ABB A-A001, 2026-10-28): a device of that hardware holds its own, the
+    // application id's `M-xxxx`, and the version.
+    let manufacturer = app_id
+        .strip_prefix("M-")
+        .and_then(|m| m.get(..4))
+        .and_then(|m| u16::from_str_radix(m, 16).ok());
     let object_compare_props: Vec<(u8, u8, Vec<u8>)> = defaults
         .pick(&object_cands)
         .into_iter()
-        .map(|((o, p), v)| (o, p, v))
+        .map(|((o, p), mut v)| {
+            if p == 13 && v.len() == 5 && v[..2] == [0, 0] {
+                if let Some(m) = manufacturer {
+                    v[..2].copy_from_slice(&m.to_be_bytes());
+                }
+                if v[4] == 0 {
+                    v[4] = u8::try_from(app_version).unwrap_or(0);
+                }
+            }
+            (o, p, v)
+        })
         .collect();
     for ((object_type, pid), value) in defaults.pick(&typed_cands) {
         if let Some(t) = typed_props
@@ -657,6 +686,7 @@ fn parse_application_program(
         typed_props,
         object_types,
         property_only: property_ops && !other_ops,
+        security_capacity,
     }))
 }
 
@@ -907,12 +937,28 @@ mod tests {
         assert_eq!(pd.device_compare_props, vec![(12, vec![0x00, 0x04])]);
         assert_eq!(
             pd.object_compare_props,
-            vec![(3, 13, vec![0x00, 0x00, 0xA0, 0x42, 0x00])]
+            // Masked compare: the manufacturer and version filled in.
+            vec![(3, 13, vec![0x00, 0x04, 0xA0, 0x42, 0x10])]
         );
         assert_eq!(pd.typed_props.len(), 2);
         assert!(pd.typed_props.iter().all(|t| t.written));
         assert_eq!(pd.typed_props[0].object_type, 11);
         assert_eq!(pd.typed_props[1].object_type, 50001);
+        Ok(())
+    }
+
+    /// Bussard issue #537: the Data Secure table capacities of the application.
+    #[test]
+    fn test_reader_records_security_capacity() -> Result<(), Box<dyn std::error::Error>> {
+        let xml = r#"<KNX><ManufacturerData><Manufacturer RefId="M-0004"><ApplicationPrograms>
+          <ApplicationProgram Id="M-0004_A-2" ApplicationNumber="1" ApplicationVersion="1" MaskVersion="MV-07B0"
+            IsSecureEnabled="true" MaxSecurityGroupKeyTableEntries="1500" MaxSecurityIndividualAddressEntries="70000">
+           <Static />
+          </ApplicationProgram>
+         </ApplicationPrograms></Manufacturer></ManufacturerData></KNX>"#;
+        let pd = parse_application_program(xml, None)?.ok_or("parsed")?;
+        assert_eq!(pd.security_capacity.group_key_rows, Some(1500));
+        assert_eq!(pd.security_capacity.ia_rows, Some(u16::MAX));
         Ok(())
     }
 }

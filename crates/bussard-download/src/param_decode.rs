@@ -71,6 +71,13 @@ pub struct DecodedParameters {
     /// plan lists it as a change. Sorted, keyed like `overrides`. Always
     /// empty for an application without a Dynamic-built image.
     pub unshown: Vec<String>,
+    /// The shown parameters placed in octets the load procedure leaves as
+    /// the device holds them (issue #411, [`crate::KeptOctets`]): a download
+    /// does not write them, so what the device holds there carries no
+    /// verdict against the model. `old` is the device's value (`Unknown`
+    /// when unreadable), `new` the model's. Never in `differences`, sorted
+    /// by key.
+    pub kept: Vec<ParamChange>,
 }
 
 /// Decodes `current` (the parameter segments read off a device, keyed by
@@ -110,12 +117,23 @@ pub fn decode_parameters_with(
         placements_of(app, values, base_offsets, &keys, memo)
     };
 
+    // The octets the download leaves as the device holds them (issue #411).
+    let kept_octets = crate::flash::kept_octets(app, overrides, memo);
+    let is_kept = |p: &Placed<'_>| {
+        kept_octets
+            .iter()
+            .any(|k| k.segment == p.segment && k.contains(p.offset))
+    };
+
     // The device's configuration: iterate until the decoded values settle.
+    // A kept parameter is not fed in: no download writes it, so what the
+    // device holds there (after a fresh allocation, whatever the allocation
+    // left) says nothing about the configuration it was downloaded with.
     let mut values = overrides.clone();
     let mut device = placements(&values);
     for _ in 0..MAX_PASSES {
         let mut changed = false;
-        for p in device.iter().filter(|p| p.reported(app)) {
+        for p in device.iter().filter(|p| p.reported(app) && !is_kept(p)) {
             let Some(held) = p.decode(app, current) else {
                 continue;
             };
@@ -163,12 +181,25 @@ pub fn decode_parameters_with(
     device_managed.dedup_by(|a, b| a.key == b.key);
 
     let mut differences = Vec::new();
+    let mut kept = Vec::new();
     let mut unknown = 0usize;
     for p in placements(overrides).iter().filter(|p| p.reported(app)) {
         let ptype = parameter_type(app, p.param);
         let Some(desired) = p.desired.as_deref() else {
             continue;
         };
+        if is_kept(p) {
+            kept.push(ParamChange {
+                key: p.key.clone(),
+                name: display_name(p.param),
+                old: p.decode(app, current).map_or(ParamValue::Unknown, |held| {
+                    ParamValue::Known(render(&held, ptype))
+                }),
+                new: ParamValue::Known(render(desired, ptype)),
+                unit: p.param.suffix_text.clone(),
+            });
+            continue;
+        }
         let old = match p.decode(app, current) {
             Some(held) if held == desired => continue,
             Some(held) => ParamValue::Known(render(&held, ptype)),
@@ -189,6 +220,8 @@ pub fn decode_parameters_with(
     }
     differences.sort_by(|a, b| a.key.cmp(&b.key));
     differences.dedup_by(|a, b| a.key == b.key);
+    kept.sort_by(|a, b| a.key.cmp(&b.key));
+    kept.dedup_by(|a, b| a.key == b.key);
 
     DecodedParameters {
         values,
@@ -197,6 +230,7 @@ pub fn decode_parameters_with(
         device_managed,
         unknown,
         unshown: unshown_overrides(app, overrides, &keys, memo),
+        kept,
     }
 }
 
@@ -758,7 +792,7 @@ fn dynamic_placements<'a>(
                     canonical(config.vendor_default(app, slot.module, ref_id)),
                 ),
                 None => {
-                    let d = canonical(slot.parameter.default.clone());
+                    let d = canonical(slot.parameter.starting_value().map(str::to_string));
                     (relative_id(app, &slot.parameter.id), false, d.clone(), d)
                 }
             };
@@ -852,10 +886,12 @@ fn static_placements<'a>(
         }
     }
     let default_of = |param: &Parameter| -> Option<String> {
-        ref_value
-            .get(param.id.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| param.default.clone())
+        param.initial_value.clone().or_else(|| {
+            ref_value
+                .get(param.id.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| param.default.clone())
+        })
     };
     let mut placed = Vec::new();
 
@@ -1099,6 +1135,7 @@ fn bit_width(ptype: Option<&ParameterType>) -> Option<u32> {
             },
         ),
         ParameterType::None => None,
+        ParameterType::Color { space } => u32::try_from(space.octets() * 8).ok(),
         ParameterType::Other { kind, .. } if kind == "TypeRawData" => None,
         ParameterType::Other { size_bits, .. } => size_bits.filter(|b| *b > 0),
     }

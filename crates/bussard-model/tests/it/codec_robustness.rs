@@ -140,11 +140,12 @@ fn float32_nan_inf_decode_lenient_but_encode_rejects_non_finite() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn text_embedded_nul_truncates_and_high_bytes_are_latin1() {
-    // Embedded NUL truncates.
+fn text_embedded_nul_kept_and_high_bytes_are_latin1() {
+    // Only the trailing 00h padding is trimmed (03_07_02 §3.17, #503); an
+    // embedded NUL stays visible.
     assert_eq!(
         decode(&dpt("16.000"), b"AB\0CD"),
-        TypedValue::Text("AB".to_string())
+        TypedValue::Text("AB\0CD".to_string())
     );
     // Only first 14 bytes consumed.
     let long = vec![b'x'; 30];
@@ -330,8 +331,11 @@ fn parse_value_integer_ranges_reject_out_of_range() {
         ("7.001", "65536"),
         ("8.001", "32768"),
         ("8.001", "-32769"),
-        ("17.001", "64"),
-        ("18.001", "64"),
+        // Scene numbers count from 1 (03_07_02 §3.19 NOTE 9, #495).
+        ("17.001", "65"),
+        ("17.001", "0"),
+        ("18.001", "65"),
+        ("18.001", "raw 64"),
         ("5.001", "101"),
         ("5.001", "-1"),
         ("5.003", "361"),
@@ -378,27 +382,11 @@ fn dpt_5003_angle_above_255_encodes() {
         vec![255]
     );
 
-    // Round-trip both directions within the quantization: encode(decode(raw)) is
-    // stable to within one raw step, and decode(encode(deg)) preserves degrees to
-    // within the ~1.41°/step resolution.
+    // Round-trip: decode keeps one decimal (#501), so encode(decode(raw)) is
+    // exact, and decode(encode(deg)) is within the ~1.41°/step resolution.
     for raw in 0u8..=255 {
-        if let TypedValue::Unsigned { value: deg, .. } = decode(&dpt("5.003"), &[raw]) {
-            let re = encode(
-                &dpt("5.003"),
-                &TypedValue::Unsigned {
-                    value: deg,
-                    unit: Some("°"),
-                },
-            )
-            .expect("re-encode angle");
-            assert!(
-                (re[0] as i16 - raw as i16).abs() <= 1,
-                "raw {raw} -> {deg}° -> {} not within one step",
-                re[0]
-            );
-        } else {
-            panic!("5.003 decode should be Unsigned");
-        }
+        let re = encode(&dpt("5.003"), &decode(&dpt("5.003"), &[raw])).expect("re-encode angle");
+        assert_eq!(re, vec![raw], "raw {raw} did not round-trip");
     }
     for deg in [0u32, 45, 90, 180, 270, 360] {
         let bytes = encode(
@@ -409,13 +397,13 @@ fn dpt_5003_angle_above_255_encodes() {
             },
         )
         .expect("encode angle");
-        if let TypedValue::Unsigned { value: back, .. } = decode(&dpt("5.003"), &bytes) {
+        if let TypedValue::Float { value: back, .. } = decode(&dpt("5.003"), &bytes) {
             assert!(
-                (back as i64 - deg as i64).abs() <= 2,
+                (f64::from(back) - f64::from(deg)).abs() <= 1.0,
                 "{deg}° -> {back}° round-trip drifted"
             );
         } else {
-            panic!("expected unsigned angle");
+            panic!("expected float angle");
         }
     }
 }
@@ -458,9 +446,10 @@ fn parse_encode_decode_roundtrip_spread() {
         ("12.001", "4294967295"),
         ("13.013", "-2147483648"),
         ("13.013", "2147483647"),
-        ("17.001", "0"),
-        ("17.001", "63"),
-        ("18.001", "learn 63"),
+        ("17.001", "1"),
+        ("17.001", "64"),
+        ("17.001", "raw 0"),
+        ("18.001", "learn 64"),
         ("20.102", "auto"),
     ];
     for (d, input) in cases {

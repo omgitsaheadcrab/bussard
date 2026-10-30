@@ -53,9 +53,11 @@ $ bussard assign 1.1.47
 | `--json` | off | Print `{"schema", "from", "to", "gateway", "mask", "manufacturer_id", "serial", "secure", "programming_mode_cleared", "device_file"}`. |
 | `--keyring <FILE>` | the key store | Its tunnelling users open the KNXnet/IP Secure tunnel, and its tool key for the new (else the old) address verifies a Data Secure-activated device. Password from `BUSSARD_KEYRING_PASSWORD`. |
 | `--tool-key <HEX>` | | A raw 16-byte tool key (32 hex characters) for the verification of a Data Secure-activated device. Overrides the keyring's device entries; the keyring still opens the tunnel. For test or bench devices only: process arguments are visible to other users. |
+| `--force` | off | Write the address although another device already answers at it. |
 
 Behaviour:
 
+- Checks on the bus that the address is free before anything is broadcast: it connects to the address and reads the device descriptor (step 1 of the standard's address write, Management Procedures 03_05_02 §2.3). An answer, or a disconnect, refuses the run and names the mask, manufacturer and order number of the device there, unless `--force`.
 - Refuses when more than one device is in programming mode.
 - A non-loopback gateway needs `--allow-remote-gateway`.
 - Confirms on a terminal, naming the gateway. Without a terminal it refuses before loading the model unless `--yes` is given. An explicit address is not consent.
@@ -98,8 +100,8 @@ Behaviour:
 | `unsecured_management` | refused walk, no key | `"refused"`: the device answered the descriptor read but not the plain walk. |
 | `secured_management` | refused walk, with a key | `"unanswered"`: the secured walk returned no interface object. |
 | `error` | refused walk | The error message, with the KNX Secure hint. |
-| `secure.model` | the model has a security block | What the import recorded: `secure_capable`, `activated`, `has_fdsk_certificate`. An export made before ETS activated the device says `activated: false`. |
-| `secure.device` | model security, a tool key, or a refused walk | What the device did in this run: `plain_management` (`answered`, `refused`, or `not_attempted` with a key) and `secured_management` (`used`, `not_attempted` without a key, or `unanswered`). |
+| `secure.model` | the model has a security block | What the import recorded: `secure_capable`, `activated`, `has_fdsk_certificate`. An export made before ETS activated the device says `activated: false`. `tables` (a Data-Secure-capable product) holds the capacities the product declares: `max_group_key_table_entries`, `max_individual_address_entries`, `max_p2p_key_table_entries`; a download that does not fit is refused before anything is unloaded. |
+| `secure.device` | model security, a tool key, or a refused walk | What the device did in this run: `plain_management` (`answered`, `refused`, or `not_attempted` with a key) and `secured_management` (`used`, `not_attempted` without a key, `unanswered`, or `factory_key` when the device refused plain access and answered under its FDSK from the key store, issue #532). |
 
 ??? note "Details"
     `describe` sends `A_DeviceDescriptor_Read`, `A_PropertyValue_Read` (object discovery) and `A_PropertyDescription_Read`, never a write. Reusing the facts takes the descriptor read plus one property read: on a KNX Data Secure device about 4 requests instead of about 110. An activated device still answers the plain descriptor read and the PID 56 read, then refuses the interface-object walk.
@@ -155,9 +157,11 @@ $ bussard adopt 1.1.47
 | `--yes` | off | Skip the confirmation prompt. Without a terminal the command is refused unless this is given. |
 | `--yes-download` | off | Download missing vendor product data without asking. Without a terminal and without this flag nothing is downloaded; the missing order numbers are listed. |
 | `--no-download` | off | Never download product data; adopt without it and say where to get it. |
+| `--force` | off | Write the address although another device already answers at it. |
 
 Behaviour:
 
+- Before writing a new address it checks on the bus that the address is free, as `assign` does, and refuses when a device answers there, unless `--force`.
 - A non-loopback gateway needs `--allow-remote-gateway`.
 - Confirms the address write on a terminal. Without one it refuses before loading the model unless `--yes` is given, and the wizard's choices take their defaults (the first application of a multi-application product).
 - A device already at the target address gets no address write.

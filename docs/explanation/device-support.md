@@ -66,6 +66,15 @@ interface, and ends with a read-back of every property it wrote.
   where the group-object table is: `plan` names each newly linked object whose
   flag it could not check. A device that refuses the read of its group-object
   table is handled the same way; its tables are still read.
+- **System B communication flags.** The same holds on System B: a full flash
+  clears the flag of every object the model does not link. With the device's
+  product data, `plan` reads the group-object table and compares it with the
+  table a full flash would write; when they differ, `apply` reloads the table
+  before the link tables and reads it back, and `plan` names each object whose
+  descriptor changes. `apply --line` does the same. Without product data `plan`
+  names each newly linked object whose flag it could not check. No ETS capture
+  of such a partial download exists yet, so the order follows the KNX
+  standard's partial download of the group-object table.
 - **System 7 restart.** Like ETS, `apply` restarts a System 7 device after
   writing its tables (a basic restart). It waits for the device to answer
   again, then reads the tables back, so the read-back also shows that the
@@ -196,8 +205,8 @@ after 2 seconds.
 - **Secure session keepalive.** Some interfaces drop a session idle for 60
   seconds, so bussard sends a keepalive every 30 seconds
   (`BUSSARD_SECURE_KEEPALIVE_SECS` changes it; `bussard test --secure-idle
-  <secs>` measures an interface read-only). An interface without a TCP
-  endpoint gets a UDP session only with `--secure-transport udp`.
+  <secs>` measures an interface read-only). The session runs over TCP only,
+  as the KNX standard requires.
 - **Calculated parameters.** Some programs compute parameter values with a
   small script instead of storing what you set, such as a thermostat's fan
   settings or a dimmer's dimming curve. bussard runs these scripts (the

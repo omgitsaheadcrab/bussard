@@ -95,13 +95,16 @@
 //! [`read_mcb_table`]: bussard_mgmt::load::read_mcb_table
 
 use bussard_mgmt::load::LoadState;
+pub use bussard_prod::SegmentFill;
 use std::collections::BTreeMap;
 
 mod execute;
 mod execute_props;
 mod execute_sys7;
+mod knxnet_ip;
 mod labels;
 mod load_records;
+mod par_procedure;
 mod partial;
 mod plan;
 mod plan_props;
@@ -115,15 +118,20 @@ mod verify;
 
 pub(crate) use execute::probe_object_types;
 pub use execute::{discover_application_object, flash};
+pub use knxnet_ip::{
+    ETS_PROJECT_INSTALLATION_ID, ETS_ROUTING_MULTICAST, ETS_ROUTING_TTL, KnxnetIpProgram,
+    KnxnetIpWrite, knxnet_ip_program, write_knxnet_ip,
+};
 use labels::step_label;
 pub use labels::trace;
 pub use load_records::{LoadControlForm, LoadControlRecord};
 pub use partial::PartialPlanError;
 use plan::{MAX_MEMORY_END, insert_factory_reset, manufacturer_from_app_id};
 pub use plan::{
-    plan_flash, plan_flash_with_memo, plan_flash_with_object_flags, same_program,
+    kept_octets, plan_flash, plan_flash_with_memo, plan_flash_with_object_flags, same_program,
     select_application,
 };
+pub use plan_sys7::allocation_change;
 pub(crate) use plan_sys7::sys7_lsm_override;
 pub use plan_sys7::{
     Sys7PlanTables, Sys7TableBases, Sys7TableImage, linked_flags_from_system_b,
@@ -132,7 +140,9 @@ pub use plan_sys7::{
 };
 pub use props::{compare_property_value, read_property_value, write_property_value};
 pub use restart_form::{RestartForm, restart_form};
-pub use session::{Connector, DeviceFacts, RebootReadiness, RestartKind, Session, SingleConnector};
+pub use session::{
+    Connector, DeviceFacts, RebootReadiness, RestartKind, Session, SingleConnector, VerifyEchoes,
+};
 
 /// How a property step names its interface object (issue #390).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -180,8 +190,39 @@ impl std::fmt::Display for PropObject {
 }
 
 /// The KNX manufacturer id of the KNX Association, which KNX Virtual devices
-/// report (`M-00FA_…` application ids).
+/// report (`M-00FA_…` application ids). Not KNX Virtual on its own: OpenKNX
+/// products and bussard's synthetic catalogue (#596) use it too; see
+/// [`is_knx_virtual_application`].
 pub const KNX_VIRTUAL_MANUFACTURER: u16 = 0x00FA;
+
+/// The Master Reset erase code "ResetIA" (KNX 3/5/2 §3.7.1.2.3 Table 4): it
+/// resets the individual address and no loaded object.
+const ERASE_CODE_RESET_IA: u8 = 0x03;
+
+/// The high octet of every KNX Virtual application number: the `A-25xx`
+/// programs of [`KNX_VIRTUAL_MANUFACTURER`] (DA.tp `A-2500`, KliX `A-2504`),
+/// the KNX Virtual catalogue section `M-00FA_CS-25` ("KNX Virtual", number 25).
+pub const KNX_VIRTUAL_APPLICATION_SECTION: u8 = 0x25;
+
+/// Whether the application id `id` is a KNX Virtual application: manufacturer
+/// [`KNX_VIRTUAL_MANUFACTURER`] and an application number whose high octet is
+/// [`KNX_VIRTUAL_APPLICATION_SECTION`] (`M-00FA_A-25xx-…`).
+///
+/// Evidence (issue #605): the KNX Virtual product file
+/// (`knx-sim/tests/fixtures/KNX_Virtual_M-00FA.knxprod`) holds one catalogue
+/// section, `M-00FA_CS-25` "KNX Virtual" number 25, whose hardware serial
+/// numbers are `00FA0025xxxx` and whose applications are `M-00FA_A-2500-10-51CB`
+/// (DA.tp) and `M-00FA_A-2504-10-C071` (KliX). Other `M-00FA` applications
+/// (OpenKNX, the synthetic `A-26xx` clone and `A-27xx` products of #596/#604)
+/// are not KNX Virtual and take the normal write path.
+pub fn is_knx_virtual_application(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("M-00FA_A-") else {
+        return false;
+    };
+    rest.get(..4)
+        .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+        .is_some_and(|number| (number >> 8) as u8 == KNX_VIRTUAL_APPLICATION_SECTION)
+}
 
 /// A step of a validated flash, ready to render for the pre-flight display and
 /// to execute in order. Each corresponds to one supported [`LoadOp`](bussard_prod::application::LoadOp).
@@ -195,6 +236,13 @@ pub enum FlashStep {
         /// application-program object — preserving the single-object behaviour a
         /// conformant ProductDefault procedure (thelsing) relies on.
         target: Option<u32>,
+        /// The procedure maps the refusal of this unload to success
+        /// (`LdCtrlMapError`, issue #614): the unload goes to `target` as
+        /// named, never to the application object in its place, and a device
+        /// that answers it with element count 0 (it has no such object, the
+        /// negative answer, issue #178) completes the step. Any other failure
+        /// still fails it.
+        absent_ok: bool,
     },
     /// Open a loadable object for writing (`LdCtrlLoad`).
     StartLoading {
@@ -211,14 +259,13 @@ pub enum FlashStep {
         /// allocation runs against — and reads `PID_TABLE_REFERENCE` (PID7,
         /// the per-object base) from — this object.
         target: Option<u32>,
-        /// The device-side pre-fill the allocation requests, from the source
-        /// `LdCtrlRelSegment`'s fill (`Mode`/`Fill`) (see
-        /// [`bussard_ets::LoadOp::RelSegment::fill`]). `Some(b)` sets the
-        /// relative-segment structure's fill flag with byte `b`; `None` (the
-        /// DA.tp default) leaves it clear, byte-identical to the historical
-        /// no-fill allocation. Threaded into
-        /// [`bussard_mgmt::encode_rel_segment`]'s `fill_byte` argument.
-        fill: Option<u8>,
+        /// The source `LdCtrlRelSegment`'s `Mode` and `Fill` octets (see
+        /// [`bussard_ets::LoadOp::RelSegment::fill`]), sent verbatim by
+        /// [`bussard_mgmt::encode_rel_segment`] as ETS does. Its
+        /// [`SegmentFill::prefill`] is the byte the device pre-fills the
+        /// segment with; [`SegmentFill::NONE`] (the DA.tp default and every
+        /// table object) sends `00 00`.
+        fill: SegmentFill,
     },
     /// Write a relative-memory image at `segment base + offset` (`LdCtrlWriteRelMem`).
     WriteRelMem {
@@ -281,6 +328,8 @@ pub enum FlashStep {
         expected: Option<Vec<u8>>,
         /// The comparison mask (decoded `Mask`); `None` compares every byte.
         mask: Option<Vec<u8>>,
+        /// The 1-based array element read (`StartElement`, 1 when absent).
+        start_element: u16,
     },
     /// Verify relative (segment-relative) memory against expected data
     /// (`LdCtrlCompareRelMem`) — the read-only precondition check that is the
@@ -353,6 +402,13 @@ pub enum FlashStep {
     /// confirmed master reset with erase code 1 that ETS ends a System B download
     /// with (issue #117 captures).
     Restart,
+    /// Pause for `milliseconds` before the next step (`LdCtrlDelay`, issue
+    /// #615). Nothing goes on the wire; the executor logs the pause at info
+    /// level, so it shows in the `-v` trace between the frames around it.
+    Delay {
+        /// The pause in milliseconds, the op's `MilliSeconds`.
+        milliseconds: u32,
+    },
     /// Factory-reset the device before the download (issue #117, #89).
     ///
     /// A confirmed master-reset `A_Restart` (APCI `0x381`, `[erase_code, 0]`)
@@ -462,14 +518,21 @@ pub enum FlashStep {
         /// The memory type for the allocation (`3` = EEPROM, `2` = RAM): the op's
         /// `MemType`, or derived from the address via the mask profile.
         mem_type: u8,
-        /// The allocation record's access-attribute octet: the op's `Access`
-        /// (`0xF2`/`0xF3` on the Jung System 7 apps), else `0xF2`.
+        /// The allocation record's access-attributes octet (octet 6): the op's
+        /// `Access` (`0xF2`/`0xF3` on the Jung System 7 apps, the product's own
+        /// attribute), else `0xF2`.
+        access: u8,
+        /// The allocation record's memory-attributes octet (octet 8, bit 7
+        /// checksum control, KNX 3/5/2 §3.31.2): the op's `SegFlags` (`0x80`
+        /// checksum-controlled, `0x00` runtime-writable), else derived from
+        /// `mem_type`. A `0x00` segment is not spot-checked after the restart:
+        /// the application rewrites it (issue #89, 1.1.36 `0x4916`). The field
+        /// names were swapped until #482.
         seg_flags: u8,
-        /// The allocation record's checksum-control octet: the op's `SegFlags`
-        /// (`0x80` checksum-controlled, `0x00` runtime-writable), else derived
-        /// from `mem_type`. A `0x00` segment is not spot-checked after the
-        /// restart: the application rewrites it (issue #89, 1.1.36 `0x4916`).
-        checksum_ctrl: u8,
+        /// The Additional Load Controls segment type the allocation goes out
+        /// as: the op's `SegType`, `0x00` AllocAbsDataSeg (absent) or `0x01`
+        /// AllocAbsStackSeg (KNX 3/5/2 §3.31.2; issue #487).
+        seg_type: u8,
         /// The segment image to stream, when the segment carries `<Data>` (or a
         /// computed table image replaces it); `None` for an allocate-only record.
         image: Option<ImageRef>,
@@ -497,6 +560,32 @@ pub enum FlashStep {
         /// The repeat count.
         count: u32,
     },
+    /// Write the Task Pointer Record on `lsm` (`LdCtrlTaskPtr`, Additional
+    /// Load Controls segment type 03h, KNX 3/5/2 §3.31.2).
+    Sys7TaskPtr {
+        /// The 1-based LSM index.
+        lsm: u32,
+        /// The init address (`InitPtr`).
+        init: u16,
+        /// The save address (`SavePtr`).
+        save: u16,
+        /// The PEI handler address (`SerialPtr`).
+        pei_handler: u16,
+    },
+    /// Write Task Control Record 2 on `lsm` (`LdCtrlTaskCtrl2`, Additional
+    /// Load Controls segment type 05h, KNX 3/5/2 §3.31.2).
+    Sys7TaskCtrl2 {
+        /// The 1-based LSM index.
+        lsm: u32,
+        /// The callback address (`Callback`).
+        callback: u16,
+        /// The group-object table pointer (`Address`).
+        com_objects: u16,
+        /// The first group-object segment pointer (`Seg0`).
+        segment_1: u16,
+        /// The second group-object segment pointer (`Seg1`).
+        segment_2: u16,
+    },
     /// Persist and activate System 7 load-state machine `lsm` → `Loaded`
     /// (`LdCtrlLoadCompleted`).
     Sys7LoadCompleted {
@@ -523,7 +612,8 @@ pub enum FlashStep {
     /// `binaereingang-6fach`, `meteodata-1-1-202-new`). The device then boots
     /// with no application running and the download starts on a fresh stack. A
     /// parameter-only download keeps the restart and unloads nothing
-    /// (`unload` empty). An LSM the device does not have is skipped with a
+    /// (`unload` empty). A device without a loaded application gets no pass
+    /// ([`FlashPlan::skip_sys7_prelude`], issue #488). An LSM the device does not have is skipped with a
     /// warning. A session that cannot reconnect (a mock built from one open
     /// connection) runs the unloads and skips the restart.
     Sys7PreDownloadRestart {
@@ -537,6 +627,14 @@ pub enum FlashStep {
     /// back with the bit set only when the bit is clear; a device without the
     /// property is left alone.
     Sys7EnableVerifyMode,
+    /// The KNXnet/IP parameter object writes ETS makes after the application
+    /// of a device with a KNX IP interface built in (issue #455), from the
+    /// device file's `[knxnet]` table; each write is read back. Added by
+    /// [`FlashPlan::add_knxnet_ip`] before the closing restart.
+    KnxnetIpParameters {
+        /// The object and the writes, in ETS's order.
+        program: KnxnetIpProgram,
+    },
 }
 
 /// The origin of the bytes a memory-write step streams, resolved at plan time so
@@ -665,6 +763,18 @@ pub enum PlanError {
         op: String,
     },
 
+    /// A com-object declares an `ObjectSize` without a value field type code
+    /// (KNX 3/5/1 Resources Table 88), so its group-object descriptor cannot
+    /// be written; the plan is refused rather than describe it as 1 bit.
+    #[error(
+        "application program declares com-object size(s) with no KNX value field type code \
+         (Resources Table 88): {sizes}"
+    )]
+    UnknownObjectSize {
+        /// The offending com-objects, `id: size`, comma-joined.
+        sizes: String,
+    },
+
     /// A `WriteRelMem`/`WriteMem` op names an image bussard cannot resolve.
     #[error(
         "load procedure step {step} references a segment or image that cannot be resolved: {reason}"
@@ -782,6 +892,12 @@ pub enum PlanError {
         /// The LSM index the product data named.
         lsm: u32,
     },
+
+    /// A device with a KNX IP interface built in, whose KNXnet/IP parameters
+    /// a full download writes (issue #455), lacks a value for one of them in
+    /// its device file's `[knxnet]` table.
+    #[error("{0}")]
+    KnxnetIpUnsourced(String),
 }
 
 /// Identity of the application being flashed, for the pre-flight display and the
@@ -798,9 +914,30 @@ pub struct AppIdentity {
     pub application_version: Option<u32>,
     /// The mask version, e.g. `"07B0"`.
     pub mask_version: String,
+    /// The application's `OriginalManufacturer` (`M-0002`), when another
+    /// manufacturer made it: a device of that manufacturer also matches the
+    /// download's manufacturer check.
+    pub original_manufacturer: Option<String>,
 }
 
 impl AppIdentity {
+    /// The manufacturer ids a device this application is downloaded to may
+    /// report in `PID_MANUFACTURER_ID` (object 0, PID 12): the manufacturer of
+    /// the application id and, for an application made by another
+    /// manufacturer, its `OriginalManufacturer`. Empty when neither parses.
+    pub fn expected_manufacturers(&self) -> Vec<u16> {
+        let mut out: Vec<u16> = manufacturer_from_app_id(&self.id).into_iter().collect();
+        if let Some(original) = self
+            .original_manufacturer
+            .as_deref()
+            .and_then(manufacturer_from_app_id)
+            && !out.contains(&original)
+        {
+            out.push(original);
+        }
+        out
+    }
+
     /// The 5-octet `PID_PROGRAM_VERSION` value a completed flash of this
     /// application stamps on the device (`[manufacturer:2][number:2][version:1]`),
     /// or `None` when the identity is too incomplete to build one.
@@ -872,6 +1009,106 @@ pub struct FlashPlan {
     /// although the model's image differs there (issue #290): per segment,
     /// each octet's offset and the model's byte. Empty for a full flash.
     unwritten: BTreeMap<String, Vec<(usize, u8)>>,
+    /// The address each [`Self::baseline`] region was read at before the
+    /// download (segment id → absolute address, issue #543). A System B
+    /// parameter-only download re-allocates the segment and writes at the base
+    /// the device reports then; the diff against the baseline only holds when
+    /// that base is this one. Empty for every full flash.
+    baseline_address: BTreeMap<String, u32>,
+    /// The Data Secure table capacities the product declares (issue #537):
+    /// the executor checks the security program against them, reading any
+    /// that is missing from the device, before the first step.
+    security_capacity: crate::security::TableCapacity,
+    /// Whether the application leaves `SupportsExtendedMemoryServices` unset,
+    /// so memory above `0xFFFF` is written and read with `A_UserMemory_*`
+    /// as ETS does (issue #472). `false` on System 7 and property plans.
+    user_memory_above_64k: bool,
+    /// The allocations the product's `AppliesTo="par"` load procedure makes
+    /// (object index to size and `Mode`/`Fill`), recorded by the planner so a full
+    /// download onto a device that already holds this application can run
+    /// that procedure instead of the `full` one (issue #490,
+    /// [`FlashPlan::use_par_procedure`]). Empty when the product declares no
+    /// `par` allocation.
+    par_allocations: BTreeMap<Option<u32>, (u32, SegmentFill)>,
+    /// Whether [`FlashPlan::use_par_procedure`] shaped this plan.
+    par_procedure: bool,
+    /// The allocated octets the load procedure's taken `<choose>` branches
+    /// leave as the device holds them (issue #411, [`KeptOctets`]). Empty
+    /// for every plan whose writes cover what they allocate.
+    kept: Vec<KeptOctets>,
+}
+
+/// A run of octets of a segment a download does not write, because the load
+/// procedure's taken `<choose>` branch writes or allocates only part of the
+/// segment (issue #411): the device keeps what it holds there.
+///
+/// - **System B**: the branch allocates the whole relative segment and its
+///   `LdCtrlWriteRelMem` writes only part of it.
+/// - **System 7**: the branch allocates the absolute segment in parts
+///   (`LdCtrlAbsSegment` records that leave a gap, issue #413), so the gap is
+///   neither allocated nor written. ETS's download of `syn-s7-choose-split`
+///   (`captures/synthetic/syn-s7-choose-split/defaults/ops.txt`, ops 33 to
+///   41, ETS 6.4.1, 2026-10-30) allocates `0x4440` (1 octet) and `0x4443`
+///   (61 octets), streams each part, and never writes or reads
+///   `0x4441..0x4442`, where the parameter `delay` is placed.
+///
+/// ETS does the same on System B. Its download of the synthetic product
+/// `syn-choose-partial-segment` (`captures/synthetic/syn-choose-partial-segment/defaults/`,
+/// ETS 6.4.1, 2026-10-30) allocates the 256-octet segment, writes octets
+/// 0..128 only, reads nothing in 128..256 and runs no check over it, and the
+/// download completes. After a fresh allocation the gap holds whatever the
+/// allocation left; after a re-download it holds what was there before, which
+/// is the point of a keep-data branch (MDT JTA-01 `M-0083_A-00A2`, parameter
+/// `P-324`: the switching times stored in the device).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptOctets {
+    /// The load-state machine (object index on System B, LSM index on
+    /// System 7) the segment is allocated on.
+    pub object: u32,
+    /// The code-segment id of the segment.
+    pub segment: String,
+    /// The octets the allocation holds (System B), or the octets of the
+    /// segment's image the parts are cut from (System 7).
+    pub allocated: usize,
+    /// The half-open `[start, end)` octet ranges left as the device holds
+    /// them, sorted and inside [`Self::allocated`], as offsets into the
+    /// segment.
+    pub ranges: Vec<(usize, usize)>,
+    /// The segment's absolute base address on System 7, `None` on System B
+    /// (the device places a relative segment).
+    pub address: Option<u32>,
+}
+
+impl KeptOctets {
+    /// The ranges as `128..256` (comma-separated when there are several).
+    pub fn ranges_text(&self) -> String {
+        self.ranges
+            .iter()
+            .map(|(start, end)| format!("{start}..{end}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The gap as the plan and the image dump name it:
+    /// `object 4 octets 128..256 kept` (System B),
+    /// `LSM 3 segment 0x4440 octets 1..3 kept` (System 7).
+    pub fn label(&self) -> String {
+        match self.address {
+            Some(base) => format!(
+                "LSM {} segment {base:#06X} octets {} kept",
+                self.object,
+                self.ranges_text()
+            ),
+            None => format!("object {} octets {} kept", self.object, self.ranges_text()),
+        }
+    }
+
+    /// Whether `octet` of [`Self::segment`] is kept.
+    pub fn contains(&self, octet: usize) -> bool {
+        self.ranges
+            .iter()
+            .any(|&(start, end)| (start..end).contains(&octet))
+    }
 }
 
 /// The System 7 execution context attached to a [`FlashPlan`] for a mask
@@ -907,6 +1144,46 @@ impl FlashPlan {
             .any(|s| matches!(s, FlashStep::FactoryReset { .. }))
     }
 
+    /// Whether a step of the plan erases loaded objects on the device: a
+    /// [`FlashStep::FactoryReset`], or a product [`FlashStep::MasterReset`]
+    /// whose erase code resets a loadable resource (issue #623).
+    ///
+    /// The executor's resident-MCB skip ([`FlashOptions::skip_matching_mcb`])
+    /// is not taken on such a plan: an object it skipped because its stored
+    /// image matched would be erased by the reset and never loaded again,
+    /// and the read-back would find the device short of the model. So the
+    /// rule is that an object a reset in the plan erases is re-downloaded,
+    /// as a fresh download does. ETS does the same on a re-download of a
+    /// same-application device: a procedure without `AppliesTo` is also its
+    /// `par` procedure, so the reset is sent again, and ETS re-writes the
+    /// application object (object 4) on every same-application download
+    /// (the house captures of `par_procedure`). Not sending the reset
+    /// instead would change the product's procedure, which no capture
+    /// supports.
+    ///
+    /// The erase codes are those of KNX 3/5/2 §3.7.1.2.3 Table 4. Only the
+    /// confirmed restart (01h, "No Resource value shall be reset") and the
+    /// individual-address reset (03h) leave every object as it is. Codes
+    /// 04h to 06h reset the application program, its parameters or the
+    /// links, 02h and 07h are factory resets, and which objects 08h and the
+    /// reserved codes touch is implementation dependent, so all of those
+    /// count as erasing. Which objects a partial reset hits on a real device
+    /// is not captured (no vendor product uses `LdCtrlMasterReset`), so the
+    /// skip is dropped for the whole plan rather than per object; the cost
+    /// is a full download, the result of a fresh one. Evidence: the
+    /// synthetic product `syn-master-reset-code4` re-flashed onto knx-sim,
+    /// whose erase code 4 unloads the loaded application object (#600).
+    pub fn erases_resident_objects(&self) -> bool {
+        self.steps.iter().any(|s| match s {
+            FlashStep::FactoryReset { .. } => true,
+            FlashStep::MasterReset { erase_code, .. } => !matches!(
+                *erase_code,
+                bussard_mgmt::apci::ERASE_CODE_CONFIRMED_RESTART | ERASE_CODE_RESET_IA
+            ),
+            _ => false,
+        })
+    }
+
     /// Adds a [`FlashStep::FactoryReset`] (erase code 7) before the first
     /// `Unload`, unless the plan already has one. The CLI calls this when the
     /// device is not factory-fresh. A no-op on a System 7 plan, whose download
@@ -927,6 +1204,72 @@ impl FlashPlan {
         {
             insert_factory_reset(&mut self.steps);
         }
+    }
+
+    /// Adds the KNXnet/IP parameter writes of a device with a KNX IP interface
+    /// built in (issue #455) where ETS makes them: after the application
+    /// (its `LoadCompleted` and MCB checks), before the closing restart. A
+    /// no-op on a property-only plan, whose own procedure writes the object
+    /// (issue #390), and when the plan already carries them.
+    pub fn add_knxnet_ip(&mut self, program: KnxnetIpProgram) {
+        if self.is_property_only() || self.knxnet_ip().is_some() {
+            return;
+        }
+        let at = self
+            .steps
+            .iter()
+            .rposition(|s| matches!(s, FlashStep::Restart | FlashStep::MasterReset { .. }))
+            .unwrap_or(self.steps.len());
+        self.steps
+            .insert(at, FlashStep::KnxnetIpParameters { program });
+    }
+
+    /// The KNXnet/IP parameter writes the plan carries (issue #455).
+    pub fn knxnet_ip(&self) -> Option<&KnxnetIpProgram> {
+        self.steps.iter().find_map(|s| match s {
+            FlashStep::KnxnetIpParameters { program } => Some(program),
+            _ => None,
+        })
+    }
+
+    /// Removes ETS's System 7 pre-download pass ([`FlashStep::Sys7PreDownloadRestart`]:
+    /// unload LSMs 1 to 4, basic restart, reconnect) for a device that holds
+    /// no loaded application (issue #488). ETS skips the pass on such a
+    /// device: in all 31 System 7 downloads of the ETS sweep (22 on 0705, 9
+    /// on 0701, a factory-fresh knx-sim device each) the procedure's own
+    /// unloads follow the connect, with no unload of LSM 4 and no restart
+    /// (`captures/ets-sweep/<app>/plain-defaults/ops.txt`, ops 9 to 11).
+    /// The procedure's own unloads stay. A no-op on a System B plan.
+    pub fn skip_sys7_prelude(&mut self) {
+        self.steps
+            .retain(|s| !matches!(s, FlashStep::Sys7PreDownloadRestart { .. }));
+    }
+
+    /// Keeps ETS's System 7 pre-download pass only when the device's resident
+    /// state calls for it (issue #488): some load-state machine the pre-flight
+    /// probe read reports anything but `Unloaded` (Loaded, Loading, Error), or
+    /// the probe read a resident application id (`PID_PROGRAM_VERSION`), or the
+    /// probe could not read the state at all. A device whose every LSM answers
+    /// `Unloaded` gets no pass ([`FlashPlan::skip_sys7_prelude`]).
+    ///
+    /// Evidence: ETS gives a factory-fresh device no pass, in all 31 System 7
+    /// downloads of the ETS sweep and in the synthetic captures
+    /// `captures/synthetic/syn-s7-0705/defaults` (0705) and
+    /// `captures/synthetic/syn-s7-0701/defaults` (0701): the procedure's own
+    /// unloads of LSMs 1 to 3 follow the connect, with no unload of LSM 4 and
+    /// no restart. On a programmed device ETS's choice is not settled by the
+    /// captures: the house full downloads `jung-1131` (1.1.31) and
+    /// `automitschalter-standard-110` (1.1.46) run the full pass (unload LSMs
+    /// 1 to 4, restart), `bad-eg-pm-1-1-18-new` (1.1.32, same application as
+    /// 1.1.31) only the restart, and the EK-E72 partial downloads
+    /// (`captures/ets-sweep/M-00B6_A-4537-03-DE59/b-partial-add-32` and on)
+    /// none. A device that holds anything therefore keeps the pass as before.
+    /// A no-op on a System B plan.
+    pub fn fit_sys7_prelude(&mut self, resident: &crate::preflight::ResidentState) {
+        if !self.is_sys7() || sys7_prelude_wanted(resident) {
+            return;
+        }
+        self.skip_sys7_prelude();
     }
 
     /// Removes the [`FlashStep::FactoryReset`] step (`flash --no-factory-reset`).
@@ -1004,6 +1347,41 @@ impl FlashPlan {
         );
     }
 
+    /// Sets the Data Secure table capacities the product declares (issue
+    /// #537), checked against the security program before the flash starts.
+    pub fn set_security_capacity(&mut self, capacity: crate::security::TableCapacity) {
+        self.security_capacity = capacity;
+    }
+
+    /// The Data Secure table capacities the product declares (see
+    /// [`set_security_capacity`](Self::set_security_capacity)).
+    pub fn security_capacity(&self) -> crate::security::TableCapacity {
+        self.security_capacity
+    }
+
+    /// Whether memory above `0xFFFF` goes over `A_UserMemory_*` for this
+    /// plan: the application does not announce extended memory services
+    /// (issue #472). The executor sets it on the session before the first
+    /// step.
+    pub fn user_memory_above_64k(&self) -> bool {
+        self.user_memory_above_64k
+    }
+
+    /// The entries the plan writes into the group key table (PID 53) and
+    /// the security individual address table (PID 54).
+    pub fn security_table_counts(&self) -> (usize, usize) {
+        let mut keys = 0;
+        let mut senders = 0;
+        for step in &self.steps {
+            match step {
+                FlashStep::SecurityGroupKeys { entries } => keys += entries.len(),
+                FlashStep::SecuritySenders { entries } => senders += entries.len(),
+                _ => {}
+            }
+        }
+        (keys, senders)
+    }
+
     /// Whether the plan programs the security object (see
     /// [`add_security_program`](Self::add_security_program)).
     pub fn has_security_program(&self) -> bool {
@@ -1039,6 +1417,26 @@ impl FlashPlan {
             ),
             FlashStep::Sys7StartLoading { lsm } if self.is_parameters_only() => {
                 format!("[S7] check LSM {lsm} is Loaded, then open it for loading (no allocation)")
+            }
+            FlashStep::Unload { target, .. } if self.is_parameters_only() => format!(
+                "check obj{} is Loaded, then unload it (partial download, kept memory)",
+                target.unwrap_or(0)
+            ),
+            FlashStep::AllocateSegment { size, target, .. } if self.is_parameters_only() => {
+                format!(
+                    "re-allocate the {size}-octet segment of obj{} in Mode 0 (keeps its contents)",
+                    target.unwrap_or(0)
+                )
+            }
+            FlashStep::WriteRelMem { offset, image, .. } if self.is_parameters_only() => {
+                let before = self
+                    .baseline_address(&image.segment_id)
+                    .map_or(String::new(), |a| format!(", {a:#06X} before the download"));
+                format!(
+                    "write the differing parameter octets (segment of {} bytes) at the allocated \
+                     base + {offset:#X}{before}",
+                    image.len
+                )
             }
             FlashStep::WriteMem { address, image } if self.is_parameters_only() => {
                 let how = if self.sys7_read_compare() {
@@ -1117,6 +1515,13 @@ impl FlashPlan {
         self.images.get(segment_id).map(Vec::as_slice)
     }
 
+    /// The allocated octets this download leaves as the device holds them
+    /// (issue #411, [`KeptOctets`]): written by no step, compared by no
+    /// read-back. Empty for every plan whose writes cover what they allocate.
+    pub fn kept(&self) -> &[KeptOctets] {
+        &self.kept
+    }
+
     /// The System 7 per-octet write mask for `segment_id`, when the segment
     /// carries one (`0xFF` = written, anything else = device-owned, skipped):
     /// the product's `<Mask>` with every octet a parameter is placed in set to
@@ -1143,15 +1548,24 @@ impl FlashPlan {
         self.baseline.get(segment_id).map(Vec::as_slice)
     }
 
-    /// Whether this plan programs a KNX Virtual device: its application comes
-    /// from the KNX Association's manufacturer id `0x00FA` (the KNX Virtual
-    /// DA.tp application `M-00FA_A-2500-10-51CB`).
+    /// The address the baseline of `segment_id` was read at before the
+    /// download (issue #543), `None` for a full flash.
+    pub fn baseline_address(&self, segment_id: &str) -> Option<u32> {
+        self.baseline_address.get(segment_id).copied()
+    }
+
+    /// Whether this plan programs a KNX Virtual device: its application is one
+    /// of the KNX Virtual `M-00FA_A-25xx` programs
+    /// ([`is_knx_virtual_application`]; DA.tp `M-00FA_A-2500-10-51CB`, whose
+    /// ETS capture shows the bare restart). Manufacturer `0x00FA` alone is not
+    /// enough: OpenKNX and the synthetic catalogue (#596) use it too (#605).
     ///
     /// KNX Virtual is the device class that drops a long-held L4 connection after
     /// a bounded number of exchanges (issue #80), so only its flashes cycle the
-    /// connection proactively by default (issue #116).
+    /// connection proactively by default (issue #116), and only it gets the bare
+    /// `A_Restart` for `LdCtrlMasterReset`.
     pub fn targets_knx_virtual(&self) -> bool {
-        manufacturer_from_app_id(&self.identity.id) == Some(KNX_VIRTUAL_MANUFACTURER)
+        is_knx_virtual_application(&self.identity.id)
     }
 
     /// Whether this is a parameter-only download (issue #119): it rewrites only
@@ -1351,6 +1765,9 @@ pub struct FlashOutcome {
     /// confirmed (issue #212), for `flash -v`'s timing line. Empty when the
     /// plan restarts nothing the device confirms.
     pub reboot_readiness: Vec<RebootReadiness>,
+    /// The verify-mode echoes a System 7 download compared (issue #524), for
+    /// `flash -v`. `None` when the download ran without verify mode.
+    pub verify_echoes: Option<VerifyEchoes>,
     /// The plan was property-only (issue #390): it loads no object, so
     /// [`Self::load_state`] and [`Self::object_states`] say nothing (`Loaded`
     /// and empty), and [`Self::spot_checks_match`] is the read-back of every
@@ -1372,6 +1789,25 @@ impl FlashOutcome {
             && self.load_state == LoadState::Loaded
             && self.spot_checks_match
     }
+}
+
+/// Whether a System 7 device needs ETS's pre-download pass
+/// ([`FlashPlan::fit_sys7_prelude`], issue #488): `false` only for a device
+/// whose every probed load-state machine answers `Unloaded` and that reported
+/// no application id. An unreadable or interrupted probe, or one that read no
+/// LSM, is no evidence of a fresh device and keeps the pass.
+fn sys7_prelude_wanted(resident: &crate::preflight::ResidentState) -> bool {
+    resident.unreadable.is_some()
+        || resident.interrupted
+        || resident.objects.is_empty()
+        || resident
+            .objects
+            .iter()
+            .any(|o| o.state != LoadState::Unloaded)
+        || resident
+            .app_id
+            .as_deref()
+            .is_some_and(|id| id.iter().any(|b| *b != 0))
 }
 
 #[cfg(test)]
@@ -1414,6 +1850,57 @@ mod tests {
     // ---------------------------------------------------------------------
     // Issue #53: address-arithmetic bounds at plan pre-flight.
     // ---------------------------------------------------------------------
+
+    /// Issue #455: the KNXnet/IP parameter writes go after the application,
+    /// right before the closing restart, as ETS writes them (ALLinBOX 1612
+    /// capture: after the MCB read of op 1925, before the restart of op
+    /// 1935), once.
+    #[test]
+    fn test_add_knxnet_ip_goes_before_the_closing_restart() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use super::{FlashStep, KnxnetIpProgram, KnxnetIpWrite, PropObject};
+        let app = fabricated_app();
+        let mut plan = plan_flash(
+            &app,
+            "1.1.4",
+            0x07B0,
+            &no_overrides(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        let restart = plan
+            .steps
+            .iter()
+            .rposition(|s| matches!(s, FlashStep::Restart | FlashStep::MasterReset { .. }))
+            .ok_or("the plan restarts")?;
+        let program = KnxnetIpProgram {
+            object: PropObject::Index(6),
+            writes: vec![KnxnetIpWrite {
+                prop_id: 55,
+                start: 1,
+                count: 1,
+                value: vec![4],
+            }],
+        };
+        plan.add_knxnet_ip(program.clone());
+        plan.add_knxnet_ip(program.clone());
+        assert!(matches!(
+            &plan.steps[restart],
+            FlashStep::KnxnetIpParameters { program: p } if *p == program
+        ));
+        assert!(matches!(
+            plan.steps[restart + 1],
+            FlashStep::Restart | FlashStep::MasterReset { .. }
+        ));
+        let blocks = plan
+            .steps
+            .iter()
+            .filter(|s| matches!(s, FlashStep::KnxnetIpParameters { .. }))
+            .count();
+        assert_eq!(blocks, 1);
+        Ok(())
+    }
 
     /// The security steps land where ETS runs them (issue #156): the unload
     /// right before the first `StartLoading`, the load bracket after the last
@@ -1559,5 +2046,21 @@ mod tests {
                 .any(|l| l.contains("PID 54, 1 secured sender(s): 1.1.16 seq 0"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_is_knx_virtual_application_keys_on_the_a25xx_ids() {
+        // The KNX Virtual applications (catalogue section 25 of its product file).
+        assert!(super::is_knx_virtual_application("M-00FA_A-2500-10-51CB"));
+        assert!(super::is_knx_virtual_application("M-00FA_A-2504-10-C071"));
+        // Other M-00FA applications: the synthetic DA.tp clone and catalogue
+        // (#596), OpenKNX-style ids.
+        assert!(!super::is_knx_virtual_application("M-00FA_A-2600-10-731A"));
+        assert!(!super::is_knx_virtual_application("M-00FA_A-2700-01-0000"));
+        assert!(!super::is_knx_virtual_application("M-00FA_A-0001-11-ABCD"));
+        // Another manufacturer with the same application number.
+        assert!(!super::is_knx_virtual_application("M-0083_A-2500-10-51CB"));
+        assert!(!super::is_knx_virtual_application("M-00FA_A-25"));
+        assert!(!super::is_knx_virtual_application(""));
     }
 }

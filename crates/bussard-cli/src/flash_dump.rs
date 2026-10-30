@@ -18,7 +18,12 @@
 //!   (`0x<addr>.bin` for an absolute write, `obj<N>_<segment>.bin` for a
 //!   relative one), and a `.mask.bin` beside it when a System 7 segment masks
 //!   device-owned octets;
-//! - `table-obj<N>.bin` (System B) or `table-lsm<N>.bin` (System 7).
+//! - `table-obj<N>.bin` (System B) or `table-lsm<N>.bin` (System 7);
+//! - `kept` in `plan.json`: the allocated octets a load-procedure `<choose>`
+//!   branch does not write (issue #411), named `object 4 octets 128..256
+//!   kept` (System B) or `LSM 3 segment 0x4440 octets 1..3 kept` (System 7,
+//!   a segment allocated in parts); the image records stream only the
+//!   written parts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -320,6 +325,11 @@ pub fn write_dump(
             } => {
                 let obj = target.map_or_else(|| "app".to_string(), |t| t.to_string());
                 let stem = format!("obj{obj}_{}", file_safe(&image.segment_id));
+                // A write of part of a segment (issue #411) streams only its
+                // part; the rest of the allocation is `kept` (below).
+                let whole = plan.image_bytes(&image.segment_id).map_or(0, <[u8]>::len);
+                let part =
+                    (image.offset != 0 || image.len != whole).then_some((image.offset, image.len));
                 let rec = image_record(
                     dir,
                     &mut used,
@@ -330,7 +340,7 @@ pub fn write_dump(
                     None,
                     *target,
                     Some(*offset),
-                    None,
+                    part,
                 )?;
                 if image.kind == bussard_download::ImageKind::Table
                     && let Some(t) = target
@@ -359,9 +369,10 @@ pub fn write_dump(
                 address,
                 size,
                 mem_type,
+                access,
                 seg_flags,
-                checksum_ctrl,
                 image,
+                ..
             } => {
                 allocations.push(json!({
                     "step": n,
@@ -370,8 +381,8 @@ pub fn write_dump(
                     "address": address,
                     "size": size,
                     "mem_type": mem_type,
-                    "access": seg_flags,
-                    "checksum_ctrl": checksum_ctrl,
+                    "access": access,
+                    "seg_flags": seg_flags,
                 }));
                 if let Some(image) = image {
                     let stem = format!("0x{address:06X}");
@@ -409,8 +420,9 @@ pub fn write_dump(
                     "kind": "rel-segment",
                     "object": target,
                     "size": size,
-                    "fill": fill.is_some(),
-                    "fill_byte": fill,
+                    "fill": fill.prefill().is_some(),
+                    "mode": fill.mode,
+                    "fill_byte": fill.fill,
                 }));
             }
             // ETS's verify-mode write (issue #116): on a device that holds 00,
@@ -456,6 +468,45 @@ pub fn write_dump(
                 prop["verify"] = json!(verify);
                 prop["source"] = json!("load-procedure");
                 record["property"] = prop;
+            }
+            // The KNXnet/IP parameters of an IP-enabled device (issue #455),
+            // one record per write as the executor sends them: plain at the
+            // index ETS uses, or by type 11 on the extended services. The
+            // values are configuration (tunnel addresses, the name), no key
+            // material.
+            FlashStep::KnxnetIpParameters { program } => {
+                let records: Vec<Value> = program
+                    .writes
+                    .iter()
+                    .map(|w| {
+                        let mut prop = match program.object {
+                            bussard_download::PropObject::Index(index) => {
+                                json!({ "object": index })
+                            }
+                            bussard_download::PropObject::Type {
+                                object_type,
+                                occurrence,
+                            } => json!({
+                                "object_type": object_type,
+                                "instance": u32::from(occurrence) + 1,
+                            }),
+                        };
+                        prop["pid"] = json!(w.prop_id);
+                        prop["start_element"] = json!(w.start);
+                        prop["count"] = json!(w.count);
+                        prop["length"] = json!(w.value.len());
+                        prop["data"] = json!(
+                            w.value
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>()
+                        );
+                        prop["verify"] = json!(true);
+                        prop["source"] = json!("knxnet");
+                        prop
+                    })
+                    .collect();
+                record["properties"] = json!(records);
             }
             FlashStep::SecurityLoadControl { .. }
             | FlashStep::SecurityClearAddressTable
@@ -533,6 +584,9 @@ pub fn write_dump(
             "mask": plan.identity.mask_version,
         },
         "write_bytes": plan.total_write_bytes(),
+        // Which of the product's load procedures the plan runs (issue #490):
+        // `par` on a device that already holds the application.
+        "load_procedure": if plan.is_par_procedure() { "par" } else { "full" },
         // How many load-control records the steps carry (issue #419); its
         // presence tells the oracle the dump lists them at all.
         "load_control_records": load_control_count,
@@ -540,6 +594,16 @@ pub fn write_dump(
         "steps": steps,
         "allocations": allocations,
         "tables": tables,
+        // The allocated octets no step writes (issue #411): the device keeps
+        // what it holds there, so they are neither streamed nor placed.
+        "kept": plan.kept().iter().map(|k| json!({
+            "object": k.object,
+            "segment_id": k.segment,
+            "allocated": k.allocated,
+            "address": k.address,
+            "ranges": k.ranges.iter().map(|(s, e)| [s, e]).collect::<Vec<_>>(),
+            "label": k.label(),
+        })).collect::<Vec<_>>(),
     });
     let path = dir.join("plan.json");
     std::fs::write(&path, serde_json::to_string_pretty(&doc)? + "\n")

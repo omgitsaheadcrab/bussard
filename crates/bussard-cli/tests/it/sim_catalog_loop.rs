@@ -29,7 +29,10 @@
 //! binary always gets an explicit `127.0.0.1` gateway.
 //!
 //! Gated on `BUSSARD_PRODUCT_CORPUS` and `BUSSARD_KNX_SIM_BIN`; without
-//! either the shards skip green. `scripts/sim-catalog-loop.sh` builds both
+//! either the shards skip green. The synthetic source
+//! (`test_sim_catalog_loop_synthetic_catalogue_shard_*`, epic #596) runs the same loop
+//! over `tests-support/synthetic-products/` and needs only
+//! `BUSSARD_KNX_SIM_BIN`. `scripts/sim-catalog-loop.sh` builds both
 //! binaries and runs the shards. The applications are split over
 //! [`SHARDS`] test functions that nextest runs in parallel, and further over
 //! runners with `BUSSARD_SIM_LOOP_SHARD=<k>/<n>`. Known failures live in
@@ -91,6 +94,188 @@ shard_tests!(
     test_sim_catalog_loop_shard_6 = 6,
     test_sim_catalog_loop_shard_7 = 7,
 );
+
+/// The loop over the synthetic product catalogue (epic #596): every product
+/// under `tests-support/synthetic-products/`, its committed `xml/` zipped
+/// with the stub `knx_master.xml`, through the same flash, plan, seeded
+/// configuration and apply steps as the corpus shards. Gated only on
+/// `BUSSARD_KNX_SIM_BIN` (the `sim-conformance` CI job sets it), not on the
+/// corpus; every product must run and pass, except a refusal listed in
+/// `tests-support/synthetic-products/sim-loop-refusals.json` (the finding a
+/// product exists for, #604) and a failure listed with the step it fails at
+/// in `tests-support/synthetic-products/sim-loop-baseline.json` (the evidence
+/// of an open bussard bug, like an `expect=differs` oracle row).
+///
+/// The catalogue grows to about forty products at roughly 10 s each, so the
+/// products are split over [`SYNTHETIC_SHARDS`] test functions by the hash of
+/// their application id, as the corpus shards are; nextest runs them side by
+/// side. A shard that draws no product passes.
+fn run_synthetic_shard(slot: usize) -> TestResult {
+    let Some(sim) = std::env::var_os("BUSSARD_KNX_SIM_BIN").map(PathBuf::from) else {
+        eprintln!("BUSSARD_KNX_SIM_BIN unset; skipping the synthetic sim loop.");
+        return Ok(());
+    };
+    if !sim.is_file() {
+        return Err(format!("BUSSARD_KNX_SIM_BIN={} is not a file", sim.display()).into());
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "bussard-sim-loop-synthetic-{}-{slot}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let products = synthetic_knxprods(&dir)?;
+    assert!(
+        products.iter().any(|p| p == "syn-minimal"),
+        "the baseline product is missing: {products:?}"
+    );
+    let settings = Settings {
+        corpus: dir.canonicalize()?,
+        sim,
+        configs: 2,
+        seed: 346,
+        filter: Vec::new(),
+        runner: (0, 1),
+        report: None,
+        cache: None,
+        work: None,
+    };
+    let reports = run_files(
+        &settings,
+        SYNTHETIC_SHARDS,
+        slot,
+        &read_baseline_at("../../tests-support/synthetic-products/sim-loop-baseline.json")?,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let reports = reports?;
+    let refusals = read_synthetic_refusals()?;
+    let not_run: Vec<String> = reports
+        .iter()
+        .filter(|r| r.outcome == "skip")
+        .filter(|r| {
+            // A product whose refusal is the finding it exists for (#604).
+            let detail = r.detail.as_deref().unwrap_or("");
+            !refusals
+                .get(&r.application)
+                .is_some_and(|needle| detail.contains(needle.as_str()))
+        })
+        .map(|r| format!("{}: {}", r.application, r.detail.as_deref().unwrap_or("")))
+        .collect();
+    assert!(
+        not_run.is_empty(),
+        "synthetic products the loop skipped:\n{}",
+        not_run.join("\n")
+    );
+    let now_run: Vec<&String> = refusals
+        .keys()
+        .filter(|app| {
+            reports
+                .iter()
+                .any(|r| &r.application == *app && r.outcome != "skip")
+        })
+        .collect();
+    assert!(
+        now_run.is_empty(),
+        "synthetic products bussard flashes now; drop them from sim-loop-refusals.json: {now_run:?}"
+    );
+    judge(&reports)
+}
+
+/// How many test functions split the synthetic catalogue.
+const SYNTHETIC_SHARDS: usize = 4;
+
+macro_rules! synthetic_shard_tests {
+    ($($name:ident = $index:expr),* $(,)?) => {
+        $(
+            /// One shard of the synthetic catalogue loop
+            /// ([`run_synthetic_shard`]).
+            #[test]
+            fn $name() -> TestResult {
+                run_synthetic_shard($index)
+            }
+        )*
+    };
+}
+
+synthetic_shard_tests!(
+    test_sim_catalog_loop_synthetic_catalogue_shard_0 = 0,
+    test_sim_catalog_loop_synthetic_catalogue_shard_1 = 1,
+    test_sim_catalog_loop_synthetic_catalogue_shard_2 = 2,
+    test_sim_catalog_loop_synthetic_catalogue_shard_3 = 3,
+);
+
+/// The synthetic products bussard is known to refuse, from
+/// `tests-support/synthetic-products/sim-loop-refusals.json`: application id
+/// to a phrase the refusal must contain. Each one is the finding its product
+/// exists for, and names the open issue.
+fn read_synthetic_refusals() -> Result<BTreeMap<String, String>, BoxError> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests-support/synthetic-products/sim-loop-refusals.json");
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let mut out = BTreeMap::new();
+    if let Some(map) = value.get("refusals").and_then(|v| v.as_object()) {
+        for (app, entry) in map {
+            let needle = entry
+                .get("contains")
+                .and_then(|s| s.as_str())
+                .ok_or_else(|| format!("sim-loop-refusals.json: {app} has no `contains`"))?;
+            out.insert(app.clone(), needle.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Zips every synthetic product's `xml/` with the stub master into `dir` as
+/// `<product>.knxprod`; returns the product names.
+fn synthetic_knxprods(dir: &Path) -> Result<Vec<String>, BoxError> {
+    use std::io::Write as _;
+    let catalogue =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests-support/synthetic-products");
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(&catalogue)? {
+        let product = entry?.path();
+        let xml = product.join("xml");
+        let Some(name) = product
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        if !product.join("product.toml").is_file() || !xml.is_dir() {
+            continue;
+        }
+        let mut files = Vec::new();
+        for manufacturer in std::fs::read_dir(&xml)? {
+            let manufacturer = manufacturer?.path();
+            let Some(m) = manufacturer
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            for file in std::fs::read_dir(&manufacturer)? {
+                let file = file?.path();
+                if let Some(f) = file.file_name().map(|n| n.to_string_lossy().into_owned()) {
+                    files.push((format!("{m}/{f}"), std::fs::read(&file)?));
+                }
+            }
+        }
+        files.sort();
+        let mut zip =
+            zip::ZipWriter::new(std::fs::File::create(dir.join(format!("{name}.knxprod")))?);
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("knx_master.xml", opts)?;
+        zip.write_all(b"<KNX/>")?;
+        for (path, data) in files {
+            zip.start_file(path, opts)?;
+            zip.write_all(&data)?;
+        }
+        zip.finish()?;
+        names.push(name);
+    }
+    names.sort();
+    Ok(names)
+}
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -245,6 +430,18 @@ fn run_shard(index: usize) -> TestResult {
     let total = settings.runner.1 * SHARDS;
     let slot = settings.runner.0 * SHARDS + index;
     let baseline = read_baseline()?;
+    let reports = run_files(&settings, total, slot, &baseline)?;
+    judge(&reports)
+}
+
+/// Runs every application of the `.knxprod` files in `settings.corpus` whose
+/// id hashes to `slot` of `total`; returns one report per application.
+fn run_files(
+    settings: &Settings,
+    total: usize,
+    slot: usize,
+    baseline: &BTreeMap<String, String>,
+) -> Result<Vec<AppReport>, BoxError> {
     let files = knxprod_files(&settings.corpus);
     if files.is_empty() {
         return Err(format!("{} holds no .knxprod files", settings.corpus.display()).into());
@@ -323,7 +520,7 @@ fn run_shard(index: usize) -> TestResult {
                 continue;
             }
             seen.insert(app.id.clone(), archive.clone());
-            let report = run_application(&settings, file, &archive, app, &mut seed, &baseline);
+            let report = run_application(settings, file, &archive, app, &mut seed, baseline);
             eprintln!(
                 "sim-loop {:<44} {:<4} {:<5} {:>2} cfg {:>6.1}s {}{}",
                 report.application,
@@ -356,6 +553,11 @@ fn run_shard(index: usize) -> TestResult {
         count("skip"),
         started.elapsed().as_secs_f64()
     );
+    Ok(reports)
+}
+
+/// Fails on any failure the baseline does not list.
+fn judge(reports: &[AppReport]) -> TestResult {
     let new: Vec<String> = reports
         .iter()
         .filter(|r| r.outcome == "fail" && !r.known)
@@ -410,8 +612,13 @@ fn first_line(text: &str) -> &str {
 /// The checked-in known failures: application id to the step that fails.
 /// A known application that fails at another step is a regression.
 fn read_baseline() -> Result<BTreeMap<String, String>, BoxError> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests-support/product-corpus/sim-loop-baseline.json");
+    read_baseline_at("../../tests-support/product-corpus/sim-loop-baseline.json")
+}
+
+/// The known failures of a baseline file, relative to this crate's manifest
+/// directory; a missing file lists none.
+fn read_baseline_at(relative: &str) -> Result<BTreeMap<String, String>, BoxError> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Ok(BTreeMap::new());
     };
@@ -422,7 +629,7 @@ fn read_baseline() -> Result<BTreeMap<String, String>, BoxError> {
             let step = entry
                 .get("step")
                 .and_then(|s| s.as_str())
-                .ok_or_else(|| format!("sim-loop-baseline.json: {app} has no step"))?;
+                .ok_or_else(|| format!("{relative}: {app} has no step"))?;
             out.insert(app.clone(), step.to_string());
         }
     }
@@ -568,7 +775,15 @@ fn run_loop(
     // a full flash of the same model must change nothing the plan sees.
     let partial = last.partial_change(app, &mut rng);
     bench.write_device(&partial).map_err(infra("setup"))?;
-    bench.apply("apply partial change")?;
+    // Issue #540: a link to an object the flash left unlinked changes the
+    // group-object table on System B. The plan names the reload, `apply`
+    // runs it, and the plan after it (which compares the table) is a no-op.
+    let reload = bench.object_table_reload("plan before apply")?;
+    eprintln!(
+        "sim-loop: {}: the partial change reloads the group-object table: {reload}",
+        app.id
+    );
+    bench.apply("apply partial change", reload)?;
     bench.plan_noop("plan after apply")?;
     bench.flash("flash after apply")?;
     bench.plan_noop("plan after flash after apply")?;
@@ -937,11 +1152,15 @@ impl Configuration {
     }
 
     /// The partial change set: up to three shown parameters take another
-    /// value that keeps the object table, one link is added and one removed.
+    /// value that keeps the object table and the load procedure's
+    /// allocations (issue #411: a System 7 `<choose>` that allocates a
+    /// segment in parts needs a full download), one link is added on an
+    /// object that had none and one removed.
     fn partial_change(&self, app: &ApplicationProgram, rng: &mut SplitMix64) -> Configuration {
         let mut out = self.clone();
         out.label = format!("{} + partial change", self.label);
         let shape = object_shape(app, &self.values);
+        let memo = bussard_prod::dynamic::DynamicMemo::new(app);
         let config = evaluate_dynamic(app, &self.values);
         let mut refs: Vec<(String, String)> = visible_parameter_refs(app, &config)
             .into_iter()
@@ -965,20 +1184,25 @@ impl Configuration {
             }
             let mut trial = out.values.clone();
             trial.insert(key, value);
-            if object_shape(app, &trial) == shape {
+            if object_shape(app, &trial) == shape
+                && bussard_download::allocation_change(app, &out.values, &trial, &memo).is_none()
+            {
                 out.values = trial;
                 changed += 1;
             }
         }
-        // One link out (when another stays), one in.
-        if out.links.len() > 1 {
-            let keys: Vec<u16> = out.links.keys().copied().collect();
-            let i = rng.below(keys.len() as u64) as usize;
-            if let Some(k) = keys.get(i) {
+        // One link in, on an object the flashed configuration leaves
+        // unlinked (issue #540: the flash cleared its communication flag, so
+        // `apply` must reload the group-object table), then one of the old
+        // links out (when another stays).
+        let old: Vec<u16> = out.links.keys().copied().collect();
+        out.add_links(app, rng, 1);
+        if old.len() > 1 {
+            let i = rng.below(old.len() as u64) as usize;
+            if let Some(k) = old.get(i) {
                 out.links.remove(k);
             }
         }
-        out.add_links(app, rng, 1);
         out
     }
 
@@ -1107,6 +1331,34 @@ fn link_or_copy(target: &Path, link: &Path) -> std::io::Result<()> {
     }
 }
 
+/// How many tunnelling addresses the download of `app` writes to the
+/// device's KNXnet/IP parameter object (issue #455): its
+/// `AdditionalAddressesCount`, except on a property-only procedure (mask
+/// 0021), which writes the object itself.
+fn knxnet_tunnels(app: &ApplicationProgram, mask: &str) -> u16 {
+    if mask == "0021" {
+        return 0;
+    }
+    app.additional_addresses_count.unwrap_or(0)
+}
+
+/// The `[knxnet]` table ETS's project gives a device with a KNX IP interface
+/// built in (the ETS sweep, issue #455): DHCP, a friendly name, and the
+/// highest tunnelling addresses of the device's line. Empty for any other.
+fn knxnet_table(app: &ApplicationProgram, mask: &str) -> String {
+    let n = knxnet_tunnels(app, mask);
+    if n == 0 {
+        return String::new();
+    }
+    let tunnels: Vec<String> = (0..n)
+        .map(|i| format!("\"1.1.{}\"", 256 - u32::from(n) + u32::from(i)))
+        .collect();
+    format!(
+        "\n[knxnet]\nassignment = \"dhcp\"\nfriendly_name = \"sim loop\"\ntunnels = [{}]\n",
+        tunnels.join(", ")
+    )
+}
+
 /// A running knx-sim, killed on drop.
 struct Sim {
     child: Child,
@@ -1124,12 +1376,18 @@ impl Sim {
         // Theben's 0701 family drives its load-state machines memory-mapped;
         // bussard picks that from the mask, and the sim must match.
         let lsm = if mask == "0701" { "memory" } else { "property" };
-        let yaml = format!(
+        let mut yaml = format!(
             "gateway:\n  host: \"127.0.0.1\"\n  port: {port}\n\ndevices:\n  - address: \"{DEVICE}\"\n    \
              knxprod: \"{}\"\n    application: \"{}\"\n    initial_state: unloaded\n    lsm_access: {lsm}\n",
             work.archive.display(),
             app.id
         );
+        // A device with a KNX IP interface built in has the KNXnet/IP
+        // parameter object the download writes (issue #455), as the ETS sweep
+        // configures it.
+        if knxnet_tunnels(app, mask) > 0 {
+            yaml.push_str("    knxnet:\n      tunnel_slots: 16\n");
+        }
         let config = work.root.join("sim.yaml");
         std::fs::write(&config, yaml)?;
         let log = work.root.join("sim.log");
@@ -1288,16 +1546,15 @@ impl Bench<'_> {
     fn write_device(&self, config: &Configuration) -> std::io::Result<()> {
         // Kept next to the model so a failure can be replayed by hand.
         let keep = config.label.replace([' ', '+'], "-").replace("--", "-");
-        std::fs::write(
-            self.work.root.join(format!("device-{keep}.toml")),
-            config.device_toml(),
-        )?;
+        let mut toml = config.device_toml();
+        toml.push_str(&knxnet_table(self.app, self.mask));
+        std::fs::write(self.work.root.join(format!("device-{keep}.toml")), &toml)?;
         std::fs::write(
             self.work
                 .model
                 .join("devices")
                 .join(format!("{DEVICE}.toml")),
-            config.device_toml(),
+            toml,
         )?;
         std::fs::write(self.work.model.join("groups.toml"), config.groups_toml())
     }
@@ -1382,15 +1639,58 @@ impl Bench<'_> {
         }
     }
 
-    fn apply(&self, step: &str) -> Result<(), Stop> {
+    /// `apply`; with `reload`, its output must report the group-object
+    /// table reloaded and read back (issue #540).
+    fn apply(&self, step: &str, reload: bool) -> Result<(), Stop> {
         let run = self
             .bussard(&["apply", DEVICE, "--yes"])
             .map_err(infra(step))?;
-        if run.ok {
-            Ok(())
-        } else {
-            Err(Stop::Fail(step.to_string(), run.tail()))
+        if !run.ok {
+            return Err(Stop::Fail(step.to_string(), run.tail()));
         }
+        if reload && !run.stdout.contains("group-object table reloaded") {
+            return Err(Stop::Fail(
+                step.to_string(),
+                format!(
+                    "the plan named a group-object table reload, apply did not report one\n{}",
+                    run.tail()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `plan --json` before an `apply`: whether it reloads the System B
+    /// group-object table (issue #540). A plan that left a newly linked
+    /// object's communication flag unchecked fails the step: the loop has
+    /// product data, so the table must have been compared.
+    fn object_table_reload(&self, step: &str) -> Result<bool, Stop> {
+        let run = self
+            .bussard(&["plan", DEVICE, "--json"])
+            .map_err(infra(step))?;
+        if !run.ok {
+            return Err(Stop::Fail(step.to_string(), run.tail()));
+        }
+        let plan: serde_json::Value = serde_json::from_str(&run.stdout).map_err(|e| {
+            Stop::Fail(
+                step.to_string(),
+                format!("plan --json: {e}\n{}", run.tail()),
+            )
+        })?;
+        let unchecked = plan
+            .get("notes")
+            .and_then(|n| n.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n.as_str())
+            .find(|n| n.contains("communication flag not checked"));
+        if let Some(note) = unchecked {
+            return Err(Stop::Fail(step.to_string(), note.to_string()));
+        }
+        Ok(plan
+            .get("writes")
+            .and_then(|w| w.get("group_object_table"))
+            .is_some_and(|t| t.is_object()))
     }
 
     /// `plan --json` must be a no-op with the parameters decoded.
@@ -1420,7 +1720,14 @@ impl Bench<'_> {
         }
         if let Some(writes) = plan.get("writes").and_then(|w| w.as_object()) {
             for (what, n) in writes {
-                if n.as_u64().is_some_and(|n| n > 0) || n.as_bool() == Some(true) {
+                // A count, a flag, or a write described by an object or a
+                // list (the group-object table reload of issue #540, the
+                // System 7 communication flags, a full image).
+                if n.as_u64().is_some_and(|n| n > 0)
+                    || n.as_bool() == Some(true)
+                    || n.is_object()
+                    || n.as_array().is_some_and(|a| !a.is_empty())
+                {
                     problems.push(format!("writes {what}: {n}"));
                 }
             }
@@ -1544,6 +1851,7 @@ mod tests {
             mask: None,
             range: None,
             occurrence: None,
+            start_element: None,
         };
         let branches = vec![WhenTest::Values(vec![0]), WhenTest::Values(vec![1])];
         app.load_procedures.push(LoadProcedure {
@@ -1581,6 +1889,7 @@ mod tests {
                 }],
                 vec![],
             ],
+            applies_to: Vec::new(),
         });
         app
     }
@@ -1670,12 +1979,18 @@ mod tests {
     }
 
     /// A drawn text fits its field in the program's code page (#401): MDT's
-    /// eight-octet labels in ISO 8859-15, UTF-8, and ASCII when undeclared.
+    /// eight-octet labels in ISO 8859-15, UTF-8, ISO 8859-1 when undeclared
+    /// (#416), and ASCII for a declared name bussard does not know.
     #[test]
     fn test_draw_value_text_fits_the_field_and_the_code_page() -> TestResult {
         let mut rng = SplitMix64::new(401);
         let mut accented = 0;
-        for codec in [TextCodec::Latin9, TextCodec::Utf8, TextCodec::Undeclared] {
+        for codec in [
+            TextCodec::Latin9,
+            TextCodec::Utf8,
+            TextCodec::Undeclared,
+            TextCodec::Unknown,
+        ] {
             for bits in [8, 64, 160] {
                 let kind = ParameterType::Text {
                     size_bits: Some(bits),
@@ -1685,7 +2000,7 @@ mod tests {
                     let octets = codec.encode(&text, (bits / 8) as usize)?;
                     assert_eq!(codec.decode(&octets), text, "{codec:?}");
                     accented += usize::from(!text.is_ascii());
-                    if codec == TextCodec::Undeclared {
+                    if codec == TextCodec::Unknown {
                         assert!(text.is_ascii(), "{text}");
                     }
                 }

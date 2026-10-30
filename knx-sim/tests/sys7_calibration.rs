@@ -162,8 +162,9 @@ trait LsmDriver {
 }
 
 /// Memory-mapped: the 11-octet record at the control addr (Theben 0701 form).
-/// LSM folds into the high nibble of octet 0; the 2-octet abstract address is
-/// widened to 3 octets. This mirrors the tool-side `wrap_memory_lsm_record`.
+/// The state machine (object type, the LSM index) folds into the high nibble of
+/// octet 0, and the segment ID octet (0x00) follows the segment type. This
+/// mirrors the tool-side `wrap_memory_lsm_record`.
 struct MemMapped;
 impl LsmDriver for MemMapped {
     fn send_event(driver: &mut Driver, lsm: u8, event: &[u8; 10]) {
@@ -305,18 +306,15 @@ fn test_sys7_dd0_reports_true_mask() {
 
 #[test]
 fn test_sys7_load_completed_without_start_does_not_reach_loaded() {
-    // Negative: a write before StartLoading (LoadCompleted straight from
-    // Unloaded) must be rejected and must NOT reach Loaded.
+    // Negative: LoadCompleted straight from Unloaded must NOT reach Loaded.
+    // Table 94 (Resources §4.23.2.3.3) recommends ignoring it, so the LSM
+    // stays Unloaded.
     let mut d = Driver::new(LsmAccess::MemoryMapped);
     d.control(0x80);
     d.authorize_free();
     // LoadCompleted on LSM 1 with no StartLoading.
     MemMapped::send_event(&mut d, 1, &event::completed());
-    assert!(
-        !d.rejections().is_empty(),
-        "LoadCompleted-before-Start must be rejected"
-    );
-    assert_ne!(d.device().load_state(1), Some(LoadState::Loaded));
+    assert_eq!(d.device().load_state(1), Some(LoadState::Unloaded));
 }
 
 #[test]

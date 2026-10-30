@@ -61,6 +61,7 @@ fn synthetic_system_b_product() -> ProductData {
         typed_props: Vec::new(),
         object_types: Vec::new(),
         property_only: false,
+        security_capacity: Default::default(),
     }
 }
 
@@ -413,6 +414,82 @@ fn test_connect_and_authorize_over_udp() -> Result<(), Box<dyn std::error::Error
     assert_eq!(cemi.source, IndividualAddress::new(1, 1, 2));
 
     let _server = handle.join().expect("join");
+    Ok(())
+}
+
+#[test]
+fn test_distinct_data_port_carries_only_tunnelling_frames() -> Result<(), Box<dyn std::error::Error>>
+{
+    // Bussard issue #512: with a data port enabled, the CONNECT_RESPONSE names
+    // it as the data endpoint (KNXnet/IP Core 3/8/2 §5.2, §8.6.3.1).
+    // TUNNELLING_REQUEST/ACK travel through it only; CONNECTIONSTATE stays on
+    // the control port. A frame on the wrong port is dropped.
+    let mut server = build_synthetic_server();
+    let control = server.local_addr()?;
+    let data = server.enable_data_port("127.0.0.1:0".parse()?)?;
+    assert_ne!(control, data);
+    assert_eq!(server.data_addr(), Some(data));
+
+    let client = UdpSocket::bind("127.0.0.1:0")?;
+    client.set_read_timeout(Some(std::time::Duration::from_millis(300)))?;
+    let mut buf = [0u8; 1024];
+
+    // CONNECT on the control port; the response names the data port.
+    let connect = KnxnetIpFrame::encode(service::CONNECT_REQUEST, &[0x00; 10]);
+    client.send_to(&connect, control)?;
+    server.serve_n(1)?;
+    let (n, from) = client.recv_from(&mut buf)?;
+    assert_eq!(from, control);
+    let resp = KnxnetIpFrame::decode(&buf[..n])?;
+    assert_eq!(resp.service, service::CONNECT_RESPONSE);
+    let channel = resp.body[0];
+    assert_eq!(resp.body[1], 0x00, "connect accepted");
+    assert_eq!(
+        u16::from_be_bytes([resp.body[8], resp.body[9]]),
+        data.port(),
+        "the data HPAI names the data port"
+    );
+
+    // A TUNNELLING_REQUEST on the control port is dropped unanswered.
+    let write = group_write(GroupAddress(0x0805), 0x01);
+    send_tunnel(&client, control, channel, 0, &write)?;
+    server.serve_n(1)?;
+    assert!(
+        client.recv_from(&mut buf).is_err(),
+        "no answer on the control port"
+    );
+
+    // On the data port it is ACKed, and everything comes back from there.
+    send_tunnel(&client, data, channel, 0, &write)?;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    server.poll_data()?;
+    let mut services = Vec::new();
+    while let Ok((n, from)) = client.recv_from(&mut buf) {
+        assert_eq!(from, data, "tunnelling frames leave from the data port");
+        services.push(KnxnetIpFrame::decode(&buf[..n])?.service);
+    }
+    assert!(services.contains(&service::TUNNELLING_ACK), "{services:?}");
+
+    // CONNECTIONSTATE on the data port is dropped; on the control port it is
+    // answered from there.
+    let mut state = vec![channel, 0x00];
+    state.extend_from_slice(&[0x08, 0x01, 127, 0, 0, 1]);
+    state.extend_from_slice(&client.local_addr()?.port().to_be_bytes());
+    let state = KnxnetIpFrame::encode(service::CONNECTIONSTATE_REQUEST, &state);
+    client.send_to(&state, data)?;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    server.poll_data()?;
+    assert!(
+        client.recv_from(&mut buf).is_err(),
+        "no answer on the data port"
+    );
+    client.send_to(&state, control)?;
+    server.serve_n(1)?;
+    let (n, from) = client.recv_from(&mut buf)?;
+    assert_eq!(from, control);
+    let resp = KnxnetIpFrame::decode(&buf[..n])?;
+    assert_eq!(resp.service, service::CONNECTIONSTATE_RESPONSE);
+    assert_eq!(resp.body, vec![channel, 0x00]);
     Ok(())
 }
 
@@ -975,5 +1052,51 @@ fn flash_two_object_device(
     flash_object(bus, addr, 1, &mut seq, &addr_tbl)?;
     flash_object(bus, addr, 2, &mut seq, &assoc_tbl)?;
     flash_object(bus, addr, 3, &mut seq, &go_tbl)?;
+    Ok(())
+}
+
+#[test]
+fn test_feature_get_is_acked_and_answered_on_the_data_port()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Bussard issue #514: a TUNNELLING_FEATURE_GET belongs to the data
+    // connection like a TUNNELLING_REQUEST (Tunnelling 3/8/4 §3.1). It is
+    // ACKed under the client's sequence and answered with a
+    // TUNNELLING_FEATURE_RESPONSE under the server's own sequence.
+    let mut server = build_synthetic_server();
+    let control = server.local_addr()?;
+    let data = server.enable_data_port("127.0.0.1:0".parse()?)?;
+
+    let client = UdpSocket::bind("127.0.0.1:0")?;
+    client.set_read_timeout(Some(std::time::Duration::from_millis(300)))?;
+    let mut buf = [0u8; 1024];
+    let connect = KnxnetIpFrame::encode(service::CONNECT_REQUEST, &[0x00; 10]);
+    client.send_to(&connect, control)?;
+    server.serve_n(1)?;
+    let (n, _) = client.recv_from(&mut buf)?;
+    let channel = KnxnetIpFrame::decode(&buf[..n])?.body[0];
+
+    // GET feature 07 (max APDU length) under sequence 0, on the data port.
+    let get = KnxnetIpFrame::encode(
+        service::TUNNELLING_FEATURE_GET,
+        &[0x04, channel, 0x00, 0x00, 0x07, 0x00],
+    );
+    client.send_to(&get, data)?;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    server.poll_data()?;
+    let mut frames = Vec::new();
+    while let Ok((n, from)) = client.recv_from(&mut buf) {
+        assert_eq!(from, data, "feature frames leave from the data port");
+        frames.push(KnxnetIpFrame::decode(&buf[..n])?);
+    }
+    let ack = frames
+        .iter()
+        .find(|f| f.service == service::TUNNELLING_ACK)
+        .ok_or("no TUNNELLING_ACK")?;
+    assert_eq!(&ack.body[..], &[0x04, channel, 0x00, 0x00]);
+    let response = frames
+        .iter()
+        .find(|f| f.service == service::TUNNELLING_FEATURE_RESPONSE)
+        .ok_or("no TUNNELLING_FEATURE_RESPONSE")?;
+    assert_eq!(&response.body[4..], &[0x07, 0x00, 0x00, 0xFE]);
     Ok(())
 }

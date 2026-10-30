@@ -112,9 +112,36 @@ Behaviour:
 **Recovery.** If a switch stops half way, the device holds every step before the one named in the error, and the key store holds the credentials it was given and the FDSK. The previous store is `bussard.keys.bak`. Retry the command. If the device is unreachable with every credential the store holds, factory-reset it with its reset button: it returns to its FDSK and plain tunnelling, and `bussard interface secure on <ia>` sets it up again from the store. `bussard keys import` of an ETS keyring export restores the ETS credentials.
 
 ??? note "Details"
-    `on`, under the FDSK: the security mode on (object type 17, PID 51) and the tool key (PID 56). Then under the tool key: the send sequence (PID 59), routing not secured, the device authentication code (type 11 PID 92), the password hashes of the management user and the tunnelling users (PID 93), device management secured, the tunnelling users (PID 97, `user id, address index` per `[knxnet] tunnels` slot), tunnelling secured (PID 94), and a master reset.
+    `on`, under the FDSK: the security mode on (object type 17, PID 51) and the tool key (PID 56). Then under the tool key: the send sequence (PID 59), routing not secured, the device authentication code (type 11 PID 92), the password hashes of the management user and the tunnelling users (PID 93), device management secured, the tunnelling users (PID 97, `user id, address index` per `[knxnet] tunnels` slot; the index points into the interface's tunnelling addresses, PID 79, which the command reads first and which name the `[knxnet] tunnels` slots: a tunnel address that is not among them is refused, and an interface without PID 79 is taken to use the slots in order), tunnelling secured (PID 94), and a master reset.
 
     `off`, under the tool key: routing, device management and tunnelling not secured, the security mode off, the tool key back to the FDSK, a master reset. Then under the FDSK the three families again, and a master reset.
+
+## `bussard secure diag <ADDRESS>`
+
+Read a Data Secure device's security failures log, its security report and whether it broadcasts the report, with the device's tool key.
+
+```console
+$ bussard secure diag 1.1.5
+$ bussard secure diag 1.1.5 --clear
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `<ADDRESS>` | | The device's individual address. |
+| `--clear` | off | After a confirmation, clear the failures log and reset the security report, then read both back. |
+| `--yes` | off | Skip the confirmation of `--clear`. |
+| `--tool-key <HEX>` | none | A raw tool key for a test device; prefer `--keyring`. |
+| `--json` | off | Emit `address`, `cleared` and `diagnostics` (`counters`, `latest`, `report_failure`, `report_broadcast`, `notes`). |
+
+Over MCP the read is part of `knx_describe_device` and the clear is `knx_clear_security_log`, behind the same question (see [MCP tools](../mcp-tools.md)).
+
+What it reads:
+
+- the failure counters (PID 55): sequence number errors, cryptographic errors (a MAC that does not verify, a wrong or outdated key) and access errors (a group object's security flags that do not match the telegram);
+- the latest failure: its sender, its sequence number and the error type;
+- the security report (PID 57), set by the device on every failure until a tool resets it, and the report control (PID 58), which makes the device broadcast the report. `bussard monitor` names such a broadcast.
+
+`--clear` fails unless the read-back after the clear finds every counter at 0 and the report clear. `bussard status <ADDRESS>` shows the same lines for a device read with its tool key, and over MCP `knx_describe_device` returns them as `security_diagnostics`.
 
 ## Related
 

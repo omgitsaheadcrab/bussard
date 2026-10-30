@@ -134,6 +134,14 @@ to a device follows these rules, and the PR template asks for each one.
 - A silent success is a P1 bug: a result that says ok while the device does not
   match the model.
 
+## Issues and Labels
+
+Issues are edited in the body, never commented; every issue has one type label and
+the area labels that apply (`mcp`, `knx-sim`, `secure`, `oracle`, `performance`,
+`spec-review`, `ets-sweep`, `follow-up`), and `needs-capture` or `needs-decision`
+when it waits on the owner. The table of labels and when to use them is in
+`dev/agent-brief.md` ("Issues and labels").
+
 ## Rust Edition and Toolchain
 
 - Edition: **2024**, set once in `[workspace.package]` (do not set it per crate).
@@ -194,6 +202,10 @@ to a device follows these rules, and the PR template asks for each one.
   parser crates are compiled optimized even in the test profile (see the
   `[profile.test.package.*]` blocks in the root `Cargo.toml`) to keep them fast.
 - Mock external dependencies using trait objects, not concrete types.
+- How ETS, bussard and knx-sim check each other is in `dev/testing.md`
+  ("ETS, bussard and knx-sim: the triangle"). A parity question about what ETS
+  writes is answered by a capture (house, sweep or synthetic product), never by
+  guessing. Prefer a synthetic product (#596) when the construct can be fabricated.
 
 ## Memory Safety and Unsafe
 

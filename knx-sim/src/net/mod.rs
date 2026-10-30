@@ -20,13 +20,23 @@
 //! the extended search answer lists tunnelling as a secured service family.
 //! See [`crate::secure::ipsecure`] for the crypto.
 //!
-//! With `udp: true` (bussard issue #197) the same session runs over UDP,
-//! keyed by the client's endpoint: SESSION_REQUEST carries the client's UDP
-//! HPAI, and inside the session the tunnel uses TUNNELLING_ACK as a plain UDP
-//! tunnel does. `tcp: false` removes the TCP endpoint (a UDP-only interface).
-//! With `session_timeout_ms` an idle session ends with a wrapped
-//! `STATUS_TIMEOUT`. The UDP mode is INFERRED from the KNX specification; no
-//! real UDP-only interface has been captured.
+//! A unicast secure session runs over TCP only: a SESSION_REQUEST that
+//! arrives over UDP is discarded unanswered (KNX IP Secure 3/8/9 §2.2.3.3,
+//! §2.2.3.6.4; TSSK test 2.2.25; bussard issue #513). `tcp: false` removes the
+//! TCP endpoint (a TCP connect is refused).
+//!
+//! Each TCP connection runs the session state machine of KNX IP Secure 3/8/9
+//! §2.2.3.5.2 (bussard issue #521): a SESSION_REQUEST of exactly 46 octets
+//! with the TCP route-back HPAI opens an UNAUTHENTICATED session under a
+//! session id unique among the open sessions and never 0; it must
+//! authenticate within `authentication_timeout_ms` (10 s by default), and an
+//! authenticated session ends after `session_timeout_ms` (60 s by default)
+//! without a valid frame, both with a wrapped `STATUS_TIMEOUT`. A wrapper that
+//! fails to verify is ignored in every state. Before authentication a wrapped
+//! keepalive or any other wrapped frame ends the session with
+//! `STATUS_UNAUTHENTICATED`, a wrapped `STATUS_CLOSE` is answered with one,
+//! and a SESSION_AUTHENTICATE that is not 24 octets or has a non-zero
+//! reserved octet is discarded. A plain SESSION_STATUS is ignored.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -43,8 +53,7 @@ use crate::wire::knxnetip::{
     service,
 };
 
-/// Who a frame came from: a UDP endpoint, a secure TCP connection, or a
-/// secure session over UDP.
+/// Who a frame came from: a UDP endpoint or a TCP connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Peer {
     /// A plain UDP client.
@@ -52,8 +61,6 @@ pub enum Peer {
     /// A TCP connection (its id), whose traffic is wrapped once the secure
     /// session is authenticated.
     Tcp(usize),
-    /// A secure session over UDP with this client endpoint.
-    SecureUdp(SocketAddr),
 }
 
 /// The secure-gateway settings, with the password keys derived once.
@@ -67,22 +74,26 @@ struct SecureGateway {
     listener: Option<TcpListener>,
     next_id: usize,
     conns: BTreeMap<usize, TcpConn>,
-    /// Serve secure sessions over UDP too.
-    udp: bool,
-    /// The secure sessions over UDP, by client endpoint.
-    udp_sessions: BTreeMap<SocketAddr, UdpSession>,
-    /// The idle timeout of a secure session.
-    session_timeout: Option<Duration>,
+    /// `timeoutSession`: an authenticated session without a valid frame for
+    /// this long ends (3/8/9 §2.2.3.5.2.1.1).
+    session_timeout: Duration,
+    /// `timeoutAuthentication`: an unauthenticated session older than this
+    /// ends.
+    authentication_timeout: Duration,
+    /// The next secure session id to hand out (never 0, 3/8/9 §2.2.3.7.2).
+    next_session_id: u16,
 }
 
-/// One secure session over UDP.
-struct UdpSession {
-    state: SessionState,
-    /// The tunnelling channel granted on this session.
-    channel: u8,
-    /// When the client last sent a frame.
-    last_rx: Instant,
-}
+/// `timeoutSession` (KNX IP Secure 3/8/9 §2.2.3.5.2.1.1).
+const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+/// `timeoutAuthentication` (KNX IP Secure 3/8/9 §2.2.3.5.2.1.1).
+const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// The exact length of a SESSION_REQUEST (3/8/9 §2.2.3.6.4).
+const SESSION_REQUEST_LEN: usize = 46;
+/// The exact length of a SESSION_AUTHENTICATE (3/8/9 §2.2.3.8.5).
+const SESSION_AUTHENTICATE_LEN: usize = 24;
+/// The TCP route-back HPAI, the only one a SESSION_REQUEST may carry.
+const ROUTE_BACK_HPAI: [u8; 8] = [0x08, 0x02, 0, 0, 0, 0, 0, 0];
 
 /// One TCP connection's state.
 struct TcpConn {
@@ -96,21 +107,42 @@ struct TcpConn {
 }
 
 enum SessionState {
-    /// No secure session yet: only searches and SESSION_REQUEST.
+    /// IDLE: no secure session yet, only searches and SESSION_REQUEST.
     Plain,
-    /// SESSION_RESPONSE sent; waiting for the wrapped SESSION_AUTHENTICATE.
-    Authenticating(Handshake),
-    /// Authenticated as `user`.
+    /// UNAUTHENTICATED: SESSION_RESPONSE sent at `since`; waiting for the
+    /// wrapped SESSION_AUTHENTICATE.
+    Authenticating {
+        hs: Handshake,
+        session: SecureSession,
+        since: Instant,
+    },
+    /// AUTHENTICATED as `user`; `last_valid` is the last valid wrapper.
     Established {
         session: SecureSession,
         user: u8,
         tunnel_ia: u16,
+        last_valid: Instant,
     },
+}
+
+impl SessionState {
+    /// The secure session id, once a session exists.
+    fn session_id(&self) -> Option<u16> {
+        match self {
+            SessionState::Plain => None,
+            SessionState::Authenticating { hs, .. } => Some(hs.session_id),
+            SessionState::Established { session, .. } => Some(session.session_id()),
+        }
+    }
 }
 
 /// A blocking KNXnet/IP tunnelling gateway over UDP.
 pub struct KnxnetIpServer {
     socket: UdpSocket,
+    /// The distinct data endpoint of plain UDP tunnels, when
+    /// [`enable_data_port`](Self::enable_data_port) opened one (bussard issue
+    /// #512). Non-blocking; [`serve`](Self::serve) drains it every wake.
+    data_socket: Option<UdpSocket>,
     bus: Bus,
     channel: u8,
     /// Per-client sequence counters for TUNNELLING_REQUESTs we send toward each
@@ -172,6 +204,7 @@ impl KnxnetIpServer {
         let socket = UdpSocket::bind(addr)?;
         Ok(Self {
             socket,
+            data_socket: None,
             bus,
             channel: 1,
             tx_seqs: BTreeMap::new(),
@@ -186,6 +219,28 @@ impl KnxnetIpServer {
             mgmt: BTreeMap::new(),
             mgmt_transport: BTreeMap::new(),
         })
+    }
+
+    /// Serves the data connection of plain UDP tunnels on a second socket bound
+    /// to `addr` (port 0 picks one) and returns its address (bussard issue
+    /// #512). KNXnet/IP Core 3/8/2 §8.6.3.1 lets a server return any port as
+    /// the data endpoint of a CONNECT_RESPONSE; a conforming client then
+    /// sends its TUNNELLING_REQUESTs and ACKs there (§8.6.3.4) and keeps
+    /// CONNECTIONSTATE and DISCONNECT on the control endpoint (§8.6.3.3).
+    /// The server is strict about it: a TUNNELLING_REQUEST/ACK on the
+    /// control port, or any other plain frame on the data port, is dropped.
+    /// Secure sessions and device management connections are unaffected.
+    pub fn enable_data_port(&mut self, addr: SocketAddr) -> std::io::Result<SocketAddr> {
+        let socket = UdpSocket::bind(addr)?;
+        socket.set_nonblocking(true)?;
+        let local = socket.local_addr()?;
+        self.data_socket = Some(socket);
+        Ok(local)
+    }
+
+    /// The address of the distinct data port, if one is enabled.
+    pub fn data_addr(&self) -> Option<SocketAddr> {
+        self.data_socket.as_ref().and_then(|s| s.local_addr().ok())
     }
 
     /// Makes the gateway the KNXnet/IP server of the bus device `address`
@@ -283,6 +338,12 @@ impl KnxnetIpServer {
             users = state.users.len(),
             "interface {address:#06x}: KNXnet/IP Secure on, secure-only tunnelling"
         );
+        for (user, _, tunnel_ia) in &state.users {
+            tracing::info!(
+                "interface {address:#06x}: tunnelling user {user} on {}",
+                IndividualAddress(*tunnel_ia)
+            );
+        }
         self.secure = Some(SecureGateway {
             individual_address: address,
             device_key: state.device_key,
@@ -291,9 +352,9 @@ impl KnxnetIpServer {
             listener,
             next_id: 0,
             conns: BTreeMap::new(),
-            udp: false,
-            udp_sessions: BTreeMap::new(),
-            session_timeout: None,
+            session_timeout: SESSION_TIMEOUT,
+            authentication_timeout: AUTHENTICATION_TIMEOUT,
+            next_session_id: 1,
         });
     }
 
@@ -328,9 +389,13 @@ impl KnxnetIpServer {
             listener,
             next_id: 0,
             conns: BTreeMap::new(),
-            udp: cfg.udp,
-            udp_sessions: BTreeMap::new(),
-            session_timeout: cfg.session_timeout_ms.map(Duration::from_millis),
+            session_timeout: cfg
+                .session_timeout_ms
+                .map_or(SESSION_TIMEOUT, Duration::from_millis),
+            authentication_timeout: cfg
+                .authentication_timeout_ms
+                .map_or(AUTHENTICATION_TIMEOUT, Duration::from_millis),
+            next_session_id: 1,
         });
         Ok(())
     }
@@ -356,7 +421,10 @@ impl KnxnetIpServer {
         // stimulus periods while keeping the loop responsive to client traffic.
         // With a TCP side the loop also polls the secure connections, so it
         // wakes every few milliseconds instead.
-        let wake = if self.secure.is_some() || self.interface_device.is_some() {
+        let wake = if self.secure.is_some()
+            || self.interface_device.is_some()
+            || self.data_socket.is_some()
+        {
             5
         } else {
             100
@@ -390,10 +458,49 @@ impl KnxnetIpServer {
                 }
                 Err(e) => return Err(ServerError::Io(e)),
             }
+            self.poll_data()?;
             self.poll_tcp();
             self.pump_stimulus();
+            self.pump_transport();
             self.sync_interface_secure();
         }
+    }
+
+    /// Handles every datagram waiting on the data port, if one is enabled.
+    /// A refused datagram (ICMP from a client that went away) is transient,
+    /// as on the control port.
+    pub fn poll_data(&mut self) -> Result<(), ServerError> {
+        let mut buf = [0u8; 1024];
+        loop {
+            let Some(socket) = &self.data_socket else {
+                return Ok(());
+            };
+            match socket.recv_from(&mut buf) {
+                Ok((n, peer)) => self.handle_data_datagram(&buf[..n], peer)?,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                    ) => {}
+                Err(e) => return Err(ServerError::Io(e)),
+            }
+        }
+    }
+
+    /// Process one datagram that arrived on the data port: only a plain
+    /// TUNNELLING_REQUEST or TUNNELLING_ACK belongs there.
+    pub fn handle_data_datagram(
+        &mut self,
+        data: &[u8],
+        peer: SocketAddr,
+    ) -> Result<(), ServerError> {
+        self.record(data, Peer::Udp(peer), true);
+        if !is_data_service(data) {
+            tracing::debug!(?peer, "dropping a non-tunnelling frame on the data port");
+            return Ok(());
+        }
+        self.handle_frame(data, Peer::Udp(peer))
     }
 
     /// Tick the stimulus schedule and forward any produced telegrams to the
@@ -419,6 +526,23 @@ impl KnxnetIpServer {
         }
     }
 
+    /// Runs the devices' transport timers (the 3 s response repetition and the
+    /// 6 s connection timeout of 03_03_04 §5.4.3) and forwards what they send
+    /// to the connected tunnel client. Without a client the timers still run,
+    /// so a connection nobody uses closes; the frames have nowhere to go.
+    pub fn pump_transport(&mut self) {
+        let telegrams = self.bus.tick_transport(std::time::Instant::now());
+        let Some(peer) = self.peer else {
+            return;
+        };
+        for cemi in telegrams {
+            if self.send_tunnelling(&cemi, peer).is_err() {
+                self.peer = None;
+                break;
+            }
+        }
+    }
+
     /// Serve exactly `count` datagrams then return (used by tests to bound the
     /// loop).
     pub fn serve_n(&mut self, count: usize) -> Result<(), ServerError> {
@@ -434,31 +558,21 @@ impl KnxnetIpServer {
     /// appropriate replies. Public so a test harness can drive it directly.
     pub fn handle_datagram(&mut self, data: &[u8], peer: SocketAddr) -> Result<(), ServerError> {
         self.record(data, Peer::Udp(peer), true);
-        let udp_secure = self.secure.as_ref().is_some_and(|s| s.udp);
-        if udp_secure && data.len() >= 4 {
-            let svc = u16::from_be_bytes([data[2], data[3]]);
-            if svc == ipsecure::SESSION_REQUEST || svc == ipsecure::SECURE_WRAPPER {
-                if svc == ipsecure::SESSION_REQUEST
-                    && let Some(secure) = self.secure.as_mut()
-                {
-                    // A new session request replaces any older session of
-                    // this endpoint.
-                    secure.udp_sessions.insert(
-                        peer,
-                        UdpSession {
-                            state: SessionState::Plain,
-                            channel: 0x60u8.wrapping_add(secure.next_id as u8),
-                            last_rx: Instant::now(),
-                        },
-                    );
-                    secure.next_id += 1;
-                }
-                let key = Peer::SecureUdp(peer);
-                if !self.on_session_frame(key, data) {
-                    self.drop_session(key);
-                }
-                return Ok(());
-            }
+        if self.secure.is_some()
+            && data.len() >= 4
+            && u16::from_be_bytes([data[2], data[3]]) == ipsecure::SESSION_REQUEST
+        {
+            // A unicast secure session is TCP-only: a SESSION_REQUEST over
+            // UDP is discarded (3/8/9 §2.2.3.6.4; TSSK 2.2.25; bussard #513).
+            tracing::info!(
+                ?peer,
+                "SECURE session request over UDP discarded (TCP only)"
+            );
+            return Ok(());
+        }
+        if self.data_socket.is_some() && is_data_service(data) {
+            tracing::debug!(?peer, "dropping a tunnelling frame on the control port");
+            return Ok(());
         }
         self.handle_frame(data, Peer::Udp(peer))
     }
@@ -516,7 +630,7 @@ impl KnxnetIpServer {
                 // tunnelling connection before listing it, and the house
                 // interface answers with HPAI + device info + service families.
                 let mut body = match (peer, self.socket.local_addr()?) {
-                    (Peer::Udp(_) | Peer::SecureUdp(_), local) => hpai(local).to_vec(),
+                    (Peer::Udp(_), local) => hpai(local).to_vec(),
                     (Peer::Tcp(_), _) => vec![0x08, 0x02, 0, 0, 0, 0, 0, 0],
                 };
                 body.extend_from_slice(&self.dibs(false));
@@ -526,7 +640,7 @@ impl KnxnetIpServer {
             service::SEARCH_REQUEST_EXTENDED => {
                 // HPAI of the answer: the UDP endpoint, or TCP route-back.
                 let mut body = match (peer, self.socket.local_addr()?) {
-                    (Peer::Udp(_) | Peer::SecureUdp(_), local) => hpai(local).to_vec(),
+                    (Peer::Udp(_), local) => hpai(local).to_vec(),
                     (Peer::Tcp(_), _) => vec![0x08, 0x02, 0, 0, 0, 0, 0, 0],
                 };
                 body.extend_from_slice(&self.dibs(true));
@@ -574,17 +688,15 @@ impl KnxnetIpServer {
                     SessionState::Established { tunnel_ia, .. } => Some(tunnel_ia),
                     _ => None,
                 })
-                .chain(secure.udp_sessions.values().filter_map(|u| match u.state {
-                    SessionState::Established { tunnel_ia, .. } => Some(tunnel_ia),
-                    _ => None,
-                }))
                 .collect();
             out.push((4 + 4 * secure.users.len()) as u8);
             out.push(0x07); // TUNNELLING_INFO
             out.extend_from_slice(&248u16.to_be_bytes());
             for (_, _, tunnel_ia) in &secure.users {
-                // usable (0x04) | free (0x01); a secure slot is not
-                // pre-authorized (0x02), as on the real interface.
+                // usable (0x04) | free (0x01). Bit 1 (0x02) read outside a
+                // session means "no authorisation required" (Core 3/8/2
+                // §7.5.4.8); a secure slot needs credentials, so it is clear,
+                // as on the real interface.
                 let status: u16 = if in_use.contains(tunnel_ia) {
                     0x04
                 } else {
@@ -607,12 +719,6 @@ impl KnxnetIpServer {
                 .and_then(|s| s.conns.get(&id))
                 .map(|c| c.channel)
                 .unwrap_or(self.channel),
-            Peer::SecureUdp(addr) => self
-                .secure
-                .as_ref()
-                .and_then(|s| s.udp_sessions.get(&addr))
-                .map(|u| u.channel)
-                .unwrap_or(self.channel),
         }
     }
 
@@ -622,7 +728,6 @@ impl KnxnetIpServer {
         match peer {
             Peer::Udp(_) => None,
             Peer::Tcp(id) => secure.conns.get_mut(&id).map(|c| &mut c.state),
-            Peer::SecureUdp(addr) => secure.udp_sessions.get_mut(&addr).map(|u| &mut u.state),
         }
     }
 
@@ -630,7 +735,7 @@ impl KnxnetIpServer {
     /// secure peer.
     fn write_raw(&mut self, peer: Peer, bytes: &[u8]) -> std::io::Result<()> {
         match peer {
-            Peer::Udp(addr) | Peer::SecureUdp(addr) => self.socket.send_to(bytes, addr).map(|_| ()),
+            Peer::Udp(addr) => self.socket.send_to(bytes, addr).map(|_| ()),
             Peer::Tcp(id) => match self.secure.as_mut().and_then(|s| s.conns.get_mut(&id)) {
                 Some(conn) => write_all_nonblocking(&mut conn.stream, bytes),
                 None => Ok(()),
@@ -642,11 +747,17 @@ impl KnxnetIpServer {
     fn send_frame(&mut self, frame: &[u8], peer: Peer) -> Result<(), ServerError> {
         match peer {
             Peer::Udp(addr) => {
-                self.socket.send_to(frame, addr)?;
+                // Tunnelling frames leave from the data port when one is
+                // enabled (Core §8.6.3.4).
+                let socket = match &self.data_socket {
+                    Some(data) if is_data_service(frame) => data,
+                    _ => &self.socket,
+                };
+                socket.send_to(frame, addr)?;
                 self.record(frame, peer, false);
                 Ok(())
             }
-            Peer::Tcp(_) | Peer::SecureUdp(_) => {
+            Peer::Tcp(_) => {
                 let Some(state) = self.session_state(peer) else {
                     return Ok(());
                 };
@@ -705,51 +816,65 @@ impl KnxnetIpServer {
         }
     }
 
-    /// Ends every secure session idle for longer than the session timeout
-    /// with a wrapped `STATUS_TIMEOUT`.
+    /// Ends every secure session whose timer ran out (3/8/9 §2.2.3.5.2, E06,
+    /// A5) with a wrapped `STATUS_TIMEOUT`: an unauthenticated one after the
+    /// authentication timeout, an authenticated one after the session
+    /// timeout without a valid frame.
     fn expire_sessions(&mut self) {
         let Some(secure) = self.secure.as_ref() else {
             return;
         };
-        let Some(timeout) = secure.session_timeout else {
-            return;
-        };
+        let (auth, idle) = (secure.authentication_timeout, secure.session_timeout);
         let expired: Vec<Peer> = secure
             .conns
             .iter()
-            .filter(|(_, c)| c.last_rx.elapsed() >= timeout)
+            .filter(|(_, c)| match &c.state {
+                SessionState::Plain => false,
+                SessionState::Authenticating { since, .. } => since.elapsed() >= auth,
+                SessionState::Established { last_valid, .. } => last_valid.elapsed() >= idle,
+            })
             .map(|(id, _)| Peer::Tcp(*id))
-            .chain(
-                secure
-                    .udp_sessions
-                    .iter()
-                    .filter(|(_, u)| u.last_rx.elapsed() >= timeout)
-                    .map(|(addr, _)| Peer::SecureUdp(*addr)),
-            )
             .collect();
         for peer in expired {
             tracing::info!(?peer, "SECURE session timed out");
-            if let Some(SessionState::Established { session, .. }) = self.session_state(peer) {
-                let notice = session.seal(&ipsecure::session_status(ipsecure::STATUS_TIMEOUT));
+            let notice = match self.session_state(peer) {
+                Some(
+                    SessionState::Authenticating { session, .. }
+                    | SessionState::Established { session, .. },
+                ) => Some(session.seal(&ipsecure::session_status(ipsecure::STATUS_TIMEOUT))),
+                _ => None,
+            };
+            if let Some(notice) = notice {
                 let _ = self.write_raw(peer, &notice);
             }
             self.drop_session(peer);
         }
     }
 
-    /// Forgets a secure peer: a TCP connection (closed by either side) or a
-    /// UDP session.
+    /// A secure session id unique among the open sessions, never 0
+    /// (3/8/9 §2.2.3.5.1, §2.2.3.7.2).
+    fn allocate_session_id(secure: &mut SecureGateway) -> u16 {
+        loop {
+            let id = secure.next_session_id;
+            secure.next_session_id = id.wrapping_add(1).max(1);
+            if id != 0
+                && !secure
+                    .conns
+                    .values()
+                    .any(|c| c.state.session_id() == Some(id))
+            {
+                return id;
+            }
+        }
+    }
+
+    /// Forgets a secure peer: a TCP connection (closed by either side).
     fn drop_session(&mut self, peer: Peer) {
         if let Some(secure) = self.secure.as_mut() {
             match peer {
                 Peer::Tcp(id) => {
                     if secure.conns.remove(&id).is_some() {
                         tracing::info!(conn = id, "KNXnet/IP TCP connection closed");
-                    }
-                }
-                Peer::SecureUdp(addr) => {
-                    if secure.udp_sessions.remove(&addr).is_some() {
-                        tracing::info!(%addr, "KNXnet/IP Secure UDP session ended");
                     }
                 }
                 Peer::Udp(_) => {}
@@ -763,119 +888,193 @@ impl KnxnetIpServer {
         }
     }
 
-    /// One frame from a secure peer (a TCP connection, or a UDP session).
-    /// Returns `false` to end it.
+    /// One frame from a secure peer (a TCP connection): the session state
+    /// machine of KNX IP Secure 3/8/9 §2.2.3.5.2 (module docs). Returns
+    /// `false` to end the connection.
     fn on_session_frame(&mut self, peer: Peer, frame: &[u8]) -> bool {
         let Ok(parsed) = KnxnetIpFrame::decode(frame) else {
             return true;
+        };
+        let Peer::Tcp(id) = peer else {
+            return false;
         };
         let Some(secure) = self.secure.as_mut() else {
             return false;
         };
         let device_key = secure.device_key;
         let users: Vec<(u8, [u8; 16])> = secure.users.iter().map(|(i, k, _)| (*i, *k)).collect();
-        let tunnel_of = |user: u8, users: &[(u8, [u8; 16], u16)]| {
-            users
+        let all_users = secure.users.clone();
+        let tunnel_of = |user: u8| {
+            all_users
                 .iter()
                 .find(|(i, _, _)| *i == user)
                 .map(|(_, _, t)| *t)
         };
-        let all_users = secure.users.clone();
-        let now = Instant::now();
-        let state = match peer {
-            Peer::Udp(_) => None,
-            Peer::Tcp(id) => secure.conns.get_mut(&id).map(|c| {
-                c.last_rx = now;
-                &mut c.state
-            }),
-            Peer::SecureUdp(addr) => secure.udp_sessions.get_mut(&addr).map(|u| {
-                u.last_rx = now;
-                &mut u.state
-            }),
+        let fresh_id = match secure.conns.get(&id).map(|c| &c.state) {
+            Some(SessionState::Plain) if parsed.service == ipsecure::SESSION_REQUEST => {
+                Some(Self::allocate_session_id(secure))
+            }
+            Some(_) => None,
+            None => return false,
         };
-        let Some(state) = state else {
+        let now = Instant::now();
+        let Some(conn) = secure.conns.get_mut(&id) else {
             return false;
         };
-        // What to write back (raw) once the state is no longer borrowed.
-        let mut reply: Option<Vec<u8>> = None;
-        let keep = match (&mut *state, parsed.service) {
+        conn.last_rx = now;
+        let state = &mut conn.state;
+        // What to write back (raw) once the state is no longer borrowed, and
+        // whether the connection stays.
+        let (reply, keep) = match (&mut *state, parsed.service) {
             (SessionState::Plain, ipsecure::SESSION_REQUEST) => {
-                match Handshake::respond(&parsed.body, 0x0001, &device_key) {
+                // Exactly 46 octets with the TCP route-back HPAI, or
+                // discarded (3/8/9 §2.2.3.6.4).
+                if frame.len() != SESSION_REQUEST_LEN
+                    || parsed.body.get(..8) != Some(&ROUTE_BACK_HPAI[..])
+                {
+                    tracing::warn!(?peer, len = frame.len(), "SECURE session request discarded");
+                    return true;
+                }
+                let session_id = fresh_id.unwrap_or(1);
+                match Handshake::respond(&parsed.body, session_id, &device_key) {
                     Ok((hs, response)) => {
-                        tracing::info!(?peer, "SECURE session request answered");
-                        reply = Some(response);
-                        *state = SessionState::Authenticating(hs);
-                        true
+                        tracing::info!(?peer, session_id, "SECURE session request answered");
+                        let session = hs.session([0x00, 0xFA, 0x5E, 0xC0, 0x00, 0x01]);
+                        *state = SessionState::Authenticating {
+                            hs,
+                            session,
+                            since: now,
+                        };
+                        (Some(response), true)
                     }
                     Err(e) => {
                         tracing::warn!(?peer, "SECURE session request refused: {e}");
-                        false
+                        (None, false)
                     }
                 }
+            }
+            (SessionState::Plain, ipsecure::SECURE_WRAPPER) => {
+                // No session: the wrapper names none of ours (§2.2.1.3.3).
+                return true;
             }
             (SessionState::Plain, _) => {
                 // Searches over TCP (ETS does this) are answered in the clear.
                 let _ = self.handle_frame(frame, peer);
                 return true;
             }
-            (SessionState::Authenticating(hs), ipsecure::SECURE_WRAPPER) => {
-                let mut session = hs.session([0x00, 0xFA, 0x5E, 0xC0, 0x00, 0x01]);
+            (SessionState::Authenticating { hs, session, .. }, ipsecure::SECURE_WRAPPER) => {
                 let inner = match session.open(frame) {
                     Ok(inner) => inner,
                     Err(e) => {
-                        tracing::warn!(?peer, "SECURE authenticate wrapper refused: {e}");
-                        return false;
+                        // An invalid wrapper is ignored in every state.
+                        tracing::warn!(?peer, "SECURE wrapper ignored before authentication: {e}");
+                        return true;
                     }
                 };
-                match hs.authenticate(&inner, &users) {
-                    Ok(user) => {
-                        reply =
-                            Some(session.seal(&ipsecure::session_status(ipsecure::STATUS_SUCCESS)));
-                        tracing::info!(?peer, user, "SECURE session authenticated");
-                        *state = SessionState::Established {
-                            session,
-                            user,
-                            tunnel_ia: tunnel_of(user, &all_users).unwrap_or(0),
-                        };
-                        true
+                match inner_service(&inner) {
+                    Some(ipsecure::SESSION_AUTHENTICATE) => {
+                        if inner.len() != SESSION_AUTHENTICATE_LEN || inner[6] != 0 {
+                            tracing::warn!(?peer, "SECURE authenticate discarded (layout)");
+                            return true;
+                        }
+                        match hs.authenticate(&inner, &users) {
+                            Ok(user) => {
+                                // E01, A1.
+                                let status = ipsecure::session_status(ipsecure::STATUS_SUCCESS);
+                                let reply = session.seal(&status);
+                                tracing::info!(?peer, user, "SECURE session authenticated");
+                                let session = std::mem::replace(
+                                    session,
+                                    hs.session([0x00, 0xFA, 0x5E, 0xC0, 0x00, 0x01]),
+                                );
+                                *state = SessionState::Established {
+                                    session,
+                                    user,
+                                    tunnel_ia: tunnel_of(user).unwrap_or(0),
+                                    last_valid: now,
+                                };
+                                (Some(reply), true)
+                            }
+                            Err(e) => {
+                                // E02, A2.
+                                tracing::warn!(?peer, "SECURE authentication refused: {e}");
+                                let status = ipsecure::STATUS_AUTH_FAILED;
+                                (Some(session.seal(&ipsecure::session_status(status))), false)
+                            }
+                        }
                     }
-                    Err(e) => {
-                        let status =
-                            session.seal(&ipsecure::session_status(ipsecure::STATUS_AUTH_FAILED));
-                        tracing::warn!(?peer, "SECURE authentication refused: {e}");
-                        let _ = self.write_raw(peer, &status);
-                        return false;
+                    Some(ipsecure::SESSION_STATUS)
+                        if inner.get(6) == Some(&ipsecure::STATUS_CLOSE) =>
+                    {
+                        // E03, A3.
+                        tracing::info!(?peer, "SECURE session closed before authentication");
+                        let close = ipsecure::session_status(ipsecure::STATUS_CLOSE);
+                        (Some(session.seal(&close)), false)
+                    }
+                    Some(ipsecure::SESSION_STATUS)
+                        if inner.get(6) != Some(&ipsecure::STATUS_KEEPALIVE) =>
+                    {
+                        return true;
+                    }
+                    _ => {
+                        // E04 (keepalive) or E05 (any other frame), A6.
+                        tracing::warn!(
+                            ?peer,
+                            "SECURE frame before authentication: unauthenticated"
+                        );
+                        let status = ipsecure::STATUS_UNAUTHENTICATED;
+                        (Some(session.seal(&ipsecure::session_status(status))), false)
                     }
                 }
             }
-            (SessionState::Established { session, user, .. }, ipsecure::SECURE_WRAPPER) => {
+            (
+                SessionState::Established {
+                    session,
+                    user,
+                    last_valid,
+                    ..
+                },
+                ipsecure::SECURE_WRAPPER,
+            ) => {
                 let user = *user;
                 let inner = match session.open(frame) {
                     Ok(inner) => inner,
                     Err(e) => {
-                        tracing::warn!(?peer, user, "SECURE wrapper refused: {e}");
+                        tracing::warn!(?peer, user, "SECURE wrapper ignored: {e}");
                         return true;
                     }
                 };
-                if inner.len() >= 8
-                    && u16::from_be_bytes([inner[2], inner[3]]) == ipsecure::SESSION_STATUS
-                {
-                    return match inner[6] {
-                        ipsecure::STATUS_KEEPALIVE => {
-                            tracing::debug!(?peer, "SECURE keepalive");
-                            true
-                        }
-                        ipsecure::STATUS_CLOSE => {
+                *last_valid = now;
+                match inner_service(&inner) {
+                    Some(ipsecure::SESSION_AUTHENTICATE) => {
+                        // E01/E02 in AUTHENTICATED, A2.
+                        tracing::warn!(?peer, user, "SECURE authenticate inside a session");
+                        let status = ipsecure::STATUS_AUTH_FAILED;
+                        (Some(session.seal(&ipsecure::session_status(status))), false)
+                    }
+                    Some(ipsecure::SESSION_STATUS) => match inner.get(6) {
+                        Some(&ipsecure::STATUS_CLOSE) => {
+                            // E03, A3.
                             tracing::info!(?peer, "SECURE session closed by the client");
-                            false
+                            let close = ipsecure::session_status(ipsecure::STATUS_CLOSE);
+                            (Some(session.seal(&close)), false)
                         }
-                        _ => true,
-                    };
+                        // E04, A4 (the timer restarted above).
+                        _ => {
+                            tracing::debug!(?peer, "SECURE keepalive");
+                            return true;
+                        }
+                    },
+                    _ => {
+                        // E05, A4.
+                        let _ = self.handle_frame(&inner, peer);
+                        return true;
+                    }
                 }
-                let _ = self.handle_frame(&inner, peer);
-                return true;
             }
-            _ => true,
+            // A plain frame inside a session, a plain SESSION_STATUS included
+            // (TSSK: an unsecured status is ignored).
+            _ => return true,
         };
         match reply {
             Some(bytes) => self.write_raw(peer, &bytes).is_ok() && keep,
@@ -917,18 +1116,20 @@ impl KnxnetIpServer {
             Some(SessionState::Established { tunnel_ia, .. }) => *tunnel_ia,
             _ => plain,
         };
+        let control = self.socket.local_addr()?;
+        let data = self
+            .data_socket
+            .as_ref()
+            .map(UdpSocket::local_addr)
+            .transpose()?
+            .unwrap_or(control);
         let (hpai_bytes, tunnel_ia) = match peer {
-            Peer::Udp(_) => (hpai(self.socket.local_addr()?), plain),
+            // The data endpoint: the distinct data port when one is enabled.
+            Peer::Udp(_) => (hpai(data), plain),
             Peer::Tcp(_) => (
                 [0x08, 0x02, 0, 0, 0, 0, 0, 0],
                 session_ia(self.session_state(peer)),
             ),
-            // A secure session over UDP: the gateway's UDP endpoint, as on a
-            // plain UDP tunnel.
-            Peer::SecureUdp(_) => {
-                let local = hpai(self.socket.local_addr()?);
-                (local, session_ia(self.session_state(peer)))
-            }
         };
         body.extend_from_slice(&hpai_bytes);
         // CRD for tunnelling: length 4, TUNNEL_CONNECTION, KNX individual addr
@@ -977,7 +1178,7 @@ impl KnxnetIpServer {
         ) else {
             return Ok(());
         };
-        if matches!(peer, Peer::Udp(_) | Peer::SecureUdp(_)) {
+        if matches!(peer, Peer::Udp(_)) {
             let ack = KnxnetIpFrame::encode(
                 service::DEVICE_CONFIGURATION_ACK,
                 &ConnectionHeader {
@@ -1070,7 +1271,13 @@ impl KnxnetIpServer {
         };
         let mut request = tpdu.to_vec();
         if connected {
-            if !self.mgmt_transport.contains_key(&peer) {
+            // A Style 3 device closes a connection idle for 6 s (03_03_04
+            // §5.4.3 E16): open a fresh one when it did.
+            let open = self
+                .bus
+                .device(IndividualAddress(device))
+                .is_some_and(|d| d.l4_connected_to(IndividualAddress(0)));
+            if !open || !self.mgmt_transport.contains_key(&peer) {
                 self.bus.deliver_from_tool(&frame(vec![0x80]));
                 self.mgmt_transport.insert(peer, 0);
             }
@@ -1166,7 +1373,7 @@ impl KnxnetIpServer {
         // sequence, and the RESPONSE carries the server's own send sequence,
         // which the client acknowledges in turn. ETS 6 re-sends the GET after
         // one second and disconnects after two unacknowledged attempts.
-        if matches!(peer, Peer::Udp(_) | Peer::SecureUdp(_)) {
+        if matches!(peer, Peer::Udp(_)) {
             let ack = KnxnetIpFrame::encode(
                 service::TUNNELLING_ACK,
                 &ConnectionHeader {
@@ -1206,9 +1413,9 @@ impl KnxnetIpServer {
             return Ok(());
         }
         let own_channel = self.channel_of(peer);
-        // Over TCP the tunnelling layer has no TUNNELLING_ACK; over UDP,
-        // plain or secure, it has.
-        let acks = matches!(peer, Peer::Udp(_) | Peer::SecureUdp(_));
+        // Over TCP the tunnelling layer has no TUNNELLING_ACK; over UDP it
+        // has.
+        let acks = matches!(peer, Peer::Udp(_));
         // Strict: only frames naming the channel this gateway handed out at
         // CONNECT are served. A frame for any other channel is answered with a
         // TUNNELLING_ACK carrying E_CONNECTION_ID and is neither delivered to
@@ -1369,6 +1576,27 @@ fn write_all_nonblocking(stream: &mut TcpStream, mut bytes: &[u8]) -> std::io::R
         }
     }
     Ok(())
+}
+
+/// The service type of a plain KNXnet/IP frame, if it has a header.
+fn inner_service(frame: &[u8]) -> Option<u16> {
+    (frame.len() >= 6).then(|| u16::from_be_bytes([frame[2], frame[3]]))
+}
+
+/// Whether a plain KNXnet/IP frame belongs to a tunnel's data connection
+/// (TUNNELLING_REQUEST, TUNNELLING_ACK or a tunnelling feature service,
+/// Tunnelling 3/8/4 §3.1) rather than its control endpoint.
+fn is_data_service(frame: &[u8]) -> bool {
+    frame.len() >= 4
+        && matches!(
+            u16::from_be_bytes([frame[2], frame[3]]),
+            service::TUNNELLING_REQUEST
+                | service::TUNNELLING_ACK
+                | service::TUNNELLING_FEATURE_GET
+                | service::TUNNELLING_FEATURE_RESPONSE
+                | service::TUNNELLING_FEATURE_SET
+                | service::TUNNELLING_FEATURE_INFO
+        )
 }
 
 /// Serialize a HPAI (Host Protocol Address Information) block for a UDP

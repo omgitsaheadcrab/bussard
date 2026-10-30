@@ -238,8 +238,8 @@ pub fn build_table_images_with(
     memo: &DynamicMemo<'_, ApplicationProgram>,
 ) -> BTreeMap<u32, Vec<u8>> {
     use crate::compute::{
-        GroupObjectDescriptor, Priority, compute_group_object_table,
-        descriptors_for_linked_objects, size_code_from_object_size, table_image_with_count,
+        GroupObjectDescriptor, compute_group_object_table, descriptors_for_linked_objects,
+        size_code_from_object_size, table_image_with_count,
     };
 
     let mut out = BTreeMap::new();
@@ -331,7 +331,7 @@ pub fn build_table_images_with(
                     // Communication cleared: an unlinked com-object on a bare flash.
                     flags: c.flags() - bussard_model::Flags::COMMUNICATION,
                     size_code: size_code_from_object_size(c.object_size()),
-                    priority: Priority::default(),
+                    priority: c.priority(),
                 })
                 .collect();
             compute_group_object_table(&descriptors)
@@ -508,6 +508,7 @@ pub fn identity_gate(plan: &FlashPlan, resident: Option<&ResidentState>) -> Resu
         Freshness::Unknown { reason } => Err(format!(
             "the device's load state could not be read ({reason})"
         )),
+        Freshness::Mismatch { reason } => Err(format!("the device does not match: {reason}")),
         Freshness::Resident {
             resident: Some(id), ..
         } => Err(format!(
@@ -725,7 +726,9 @@ impl Sys7Identity {
                 reason: Some(reason.clone()),
             },
             Sys7Identity::Unknown { reason } => Freshness::Unknown {
-                reason: format!("System 7 has no readable application id and {reason}"),
+                reason: format!(
+                    "the System 7 application id did not identify the application and {reason}"
+                ),
             },
         }
     }
@@ -869,14 +872,14 @@ pub fn write_parameter_memory_backup(
 }
 
 /// The System 7 segments the running application rewrites after the restart
-/// (`checksum_ctrl == 0`, the Jung `0x4916` region, issue #89): their
+/// (`seg_flags == 0`, the Jung `0x4916` region, issue #89): their
 /// read-back proves nothing, so the verify skips them.
 pub fn runtime_segments(plan: &FlashPlan) -> std::collections::BTreeSet<String> {
     plan.steps
         .iter()
         .filter_map(|step| match step {
             FlashStep::Sys7AbsSegment {
-                checksum_ctrl: 0,
+                seg_flags: 0,
                 image: Some(image),
                 ..
             } => Some(image.segment_id.clone()),

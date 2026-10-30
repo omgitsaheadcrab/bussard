@@ -20,7 +20,7 @@ use crate::args::Parameters;
 use bussard_bus::ops;
 use bussard_model::{GroupAddress, IndividualAddress};
 use bussard_monitor::{CaptureStore, Filter, QueryFilter};
-use bussard_service::admission::{Admission, check_sender_admission};
+use bussard_service::admission::Admission;
 use bussard_service::describe::walk_objects;
 use bussard_service::secure::ToolKeySource;
 use bussard_service::{
@@ -55,6 +55,10 @@ pub struct BussardMcp {
     warm: crate::warm::WarmConnection,
     /// This session's model edits no device has received yet (issue #279).
     session_edits: crate::session_edits::SessionEdits,
+    /// The security individual address tables (PID 54) read for a secured
+    /// write or read without admission evidence, kept for the server's
+    /// lifetime so each device is read once (issue #316).
+    admission_tables: Arc<tokio::sync::Mutex<bussard_service::admission::LiveTables>>,
 }
 
 impl BussardMcp {
@@ -117,7 +121,37 @@ impl BussardMcp {
             tool_router,
             warm: crate::warm::WarmConnection::new(),
             session_edits: crate::session_edits::SessionEdits::new(),
+            admission_tables: Arc::default(),
         }
+    }
+
+    /// Resolves an unknown sender admission by reading the receivers' PID 54
+    /// once per server lifetime (issue #316, see
+    /// [`bussard_service::admission::resolve_unknown`]). The tables read are
+    /// recorded in the lock.
+    async fn resolve_admission(
+        &self,
+        service: &bussard_service::BusService,
+        verdict: impl Fn(&bussard_service::admission::LiveTables) -> Admission,
+    ) -> bussard_service::admission::Resolved {
+        let keys = bussard_service::secure::ToolKeys::load(ToolKeySource {
+            keyring: self.state.keyring.as_deref(),
+            tool_key: None,
+        })
+        .unwrap_or_default();
+        // Recorded as adopt and a verified apply record it: evidence about the
+        // device, not a model edit.
+        let dir = Some(self.state.dir.as_path());
+        // Management calls are sequential (issue #215): the read opens its
+        // own lease, so the warm connection is released first.
+        let mut warm = self.warm.lock().await;
+        warm.release().await;
+        let mut live = self.admission_tables.lock().await;
+        let resolved =
+            bussard_service::admission::resolve_unknown(service, dir, &keys, &mut live, verdict)
+                .await;
+        drop(warm);
+        resolved
     }
 
     /// The shared state (for tests and the runner).
@@ -164,7 +198,8 @@ pub struct WriteArgs {
     pub ga: String,
     /// The value to write, in human form: `on`/`off`, `up`/`down`, a number, a
     /// percentage like `75%`, a temperature like `21.5`, an HVAC mode name, etc.
-    /// Interpreted according to the resolved DPT.
+    /// Interpreted according to the resolved DPT; a scaled sub-type takes the
+    /// scaled value (8.010 `50 %`, 7.004 `1.5 s`), never the raw count.
     pub value: String,
     /// Override the DPT to encode as (e.g. `"1.001"`). Defaults to the GA's DPT
     /// from `groups.toml`.
@@ -177,6 +212,12 @@ pub struct WriteArgs {
 pub struct DeviceArgs {
     /// An individual (physical) address like `"1.1.4"`.
     pub address: String,
+    /// Also return the ETS-internal parameter values the device file does
+    /// not show (`hidden@<ref>`, `label@<ref>`) in `device.parameters`. Off
+    /// by default: they are not user settable, and `hidden_parameters`
+    /// counts them.
+    #[serde(default)]
+    pub technical: bool,
 }
 
 /// Arguments for `knx_show_device`.
@@ -304,7 +345,7 @@ impl BussardMcp {
 
     /// `knx_model_lookup`.
     #[tool(
-        description = "Search the KNX model by a case-insensitive substring. Matches group-address names and addresses, device names and individual addresses, room names, com objects (the name the device file gives a linked object, and for every object the device has, linked or not, the vendor text, function and key) and channels (vendor text, name, handle). Returns matches grouped by kind (groups, devices, objects, channels); an object or channel names its device (`device_ia`), channel handle and object numbers, ready for knx_show_device and knx_add_link. `capabilities` searches what the installed devices could do: the parameter texts and enum choice texts of their product models (every word of the query must appear; umlauts may be spelled out). Each names the device, the ETS page or channel (`block_or_channel`, `handle`), the parameter, the matching choice and whether that page is active; `provides` matches come first, then `could provide` ones on inactive pages (spare capacity, with `enable`: the parameters to set, and `needs`), then other choices of active pages. Read knx_show_device with the `handle` for the candidates."
+        description = "Search the KNX model by a case-insensitive substring. Matches group-address names and addresses, device names and individual addresses, room names, com objects (the name the device file gives a linked object, and for every object the device has, linked or not, the vendor text, function and key) and channels (vendor text, name, handle). Returns matches grouped by kind (groups, devices, objects, channels); an object or channel names its device (`device_ia`), channel handle and object numbers, ready for knx_show_device and knx_add_link. `capabilities` searches what the installed devices could do: the parameter texts and enum choice texts of their product models (every word of the query must appear; umlauts may be spelled out). Each names the device, the ETS page or channel (`block_or_channel`, `handle`), the parameter, the matching choice and whether that page is active; `provides` matches come first, then `could provide` ones on inactive pages and channels (spare capacity, with `enable`: the parameters to set, and `needs`), then other choices of active pages; within each, a device whose com-objects send the measured value the query names (9.004 for \"Helligkeit\") leads and its first entry lists them in `sends`. An entry repeated on several channels of a device is one entry with `channels`, and one repeated on devices of one application one entry with `also_on`. Read knx_show_device with the `handle` for the candidates."
     )]
     async fn knx_model_lookup(
         &self,
@@ -341,7 +382,7 @@ impl BussardMcp {
 
     /// `knx_get_device`.
     #[tool(
-        description = "Get the full definition of one device by its individual address: identity, product, location, channels and generated com-object table, plus every link (com-object -> group addresses) on it. This is the configured state; for what the device can do (inactive channels and pages, functions, choices) use knx_show_device."
+        description = "Get the full definition of one device by its individual address: identity, product, location, channels, its parameters (by the keys the device file uses) and generated com-object table, plus every link (com-object -> group addresses) on it. ETS-internal values the user cannot set are left out and counted in `hidden_parameters`; `technical: true` includes them. This is the configured state; for what the device can do (inactive channels and pages, functions, choices) use knx_show_device."
     )]
     async fn knx_get_device(
         &self,
@@ -351,7 +392,11 @@ impl BussardMcp {
             .address
             .parse()
             .map_err(|_| invalid(format!("invalid individual address {:?}", args.address)))?;
-        ok(tools::get_device(&self.state.model.current(), ia))
+        ok(tools::get_device(
+            &self.state.model.current(),
+            ia,
+            args.technical,
+        ))
     }
 
     /// `knx_show_device`.
@@ -706,10 +751,24 @@ impl BussardMcp {
                             );
                         }
                     };
-                Some(check_sender_admission(Some(&model), ga, sender, &evidence))
+                // An unknown verdict reads the responders' PID 54 first (#316).
+                Some(
+                    self.resolve_admission(service, |live| {
+                        bussard_service::admission::check_sender_admission_with(
+                            Some(&model),
+                            ga,
+                            sender,
+                            &evidence,
+                            live,
+                        )
+                    })
+                    .await,
+                )
             }
             None => None,
         };
+        let note = resolved_note(admission.as_ref());
+        let admission = admission.map(|r| r.admission);
         if let Some(refused) = admission.as_ref().filter(|a| a.is_refused()) {
             return ok(admission_refusal_json(ga, refused));
         }
@@ -752,7 +811,7 @@ impl BussardMcp {
                     "no response within timeout".to_string()
                 },
                 "admission": admission.as_ref().map(Admission::label),
-                "note": admission.as_ref().and_then(Admission::note),
+                "note": note,
             })),
             Err(err) => ok(json!({
                 "ga": ga.to_string(),
@@ -769,8 +828,15 @@ impl BussardMcp {
         known), data type, element count and read/write access levels. This is READ-ONLY on the \
         bus (it sends A_DeviceDescriptor_Read, A_PropertyValue_Read for object discovery, and \
         A_PropertyDescription_Read; it never writes). Use it to describe an unknown device's \
-        property set. Rate-limited and only available when the server is NOT in passive mode, \
-        since it actively transmits management traffic on the bus."
+        property set. On a KNX Data Secure device addressed with its tool key it also returns \
+        `security_diagnostics`: the security failures log (sequence, cryptographic and access \
+        error counts, the latest failure), the security report and whether the device \
+        broadcasts it; read it after a secured write that did nothing. A device without a \
+        tool key that refuses the plain walk and answers a secured read under its factory key \
+        (FDSK) from the key store is reported `ok: false, factory_key: true` with the reason, as \
+        `bussard describe` does: tell the human it needs commissioning in ETS. Rate-limited and only \
+        available when the server is NOT in passive mode, since it actively transmits \
+        management traffic on the bus."
     )]
     async fn knx_describe_device(
         &self,
@@ -815,7 +881,9 @@ impl BussardMcp {
             Some(self.state.model.current().as_ref()),
             target,
         );
-        let tool_key = match bussard_service::secure::resolve(
+        // The device's FDSK rides along: a device reset to default is named,
+        // not read under the factory key (issue #532).
+        let (tool_key, factory_key) = match bussard_service::secure::resolve_session_keys(
             target,
             ToolKeySource {
                 keyring: self.state.keyring.as_deref(),
@@ -843,6 +911,7 @@ impl BussardMcp {
         let options = L4Options {
             source: SourcePolicy::Known(ops::group_source(service.handle())),
             tool_key,
+            factory_key,
             ..L4Options::default()
         };
         // The warm connection (issue #215): a call to the device the previous
@@ -895,17 +964,46 @@ impl BussardMcp {
                 let _ = l4.disconnect().await;
             }
         }
-        if let Some(l4) = kept {
-            warm.keep(l4, target, secure, service.handle().link_losses());
+        // A walk that found no interface object, or failed, on a plain
+        // session: the device may refuse plain access (issue #155). The FDSK
+        // probe of `bussard describe` runs next (issues #532, #571), on a
+        // connection of its own, so the plain one is not kept.
+        let refused = result
+            .as_ref()
+            .map_or(true, |(objects, _)| objects.is_empty());
+        match kept {
+            Some(l4) if refused && options.factory_key.is_some() && !secure => {
+                let _ = l4.disconnect().await;
+            }
+            Some(l4) => warm.keep(l4, target, secure, service.handle().link_losses()),
+            None => {}
         }
+        let on_factory_key = bussard_service::identity::refused_walk_answers_under_factory_key(
+            service, target, &options, refused,
+        )
+        .await;
         drop(warm);
+        if on_factory_key {
+            return ok(json!({
+                "address": target.to_string(),
+                "ok": false,
+                "factory_key": true,
+                "reason": bussard_service::identity::factory_key_message(target),
+            }));
+        }
 
         match result {
-            Ok(objects) => ok(json!({
-                "address": target.to_string(),
-                "ok": true,
-                "objects": objects,
-            })),
+            Ok((objects, security)) => {
+                let mut out = json!({
+                    "address": target.to_string(),
+                    "ok": true,
+                    "objects": objects,
+                });
+                if let Some(security) = security {
+                    out["security_diagnostics"] = security;
+                }
+                ok(out)
+            }
             Err(reason) => ok(json!({
                 "address": target.to_string(),
                 "ok": false,
@@ -921,7 +1019,13 @@ impl BussardMcp {
         This has real-world effects: lights toggle, blinds and actuators MOVE, setpoints change. \
         Only available when the server was started with --allow-writes. The value is human-typed \
         (e.g. on/off, up/down, 75%, 21.5, a scene number, or an HVAC mode name) and is interpreted \
-        against the group address's DPT (override with `dpt`). Rate-limited (minimum 250ms between \
+        against the group address's DPT (override with `dpt`). Scene numbers (17.001, 18.001, \
+        1.022) count from 1 as ETS and Home Assistant show them (KNX 03_07_02 §3.19 NOTE 9): \
+        `scene 3` sends the field 2, `raw 2` sends the field directly; reads show both, \
+        `scene 3 (raw 2)`. Relative dimming/blind steps (3.007, 3.008) take a direction and a \
+        step size: `increase 25%`, `down 50%`, `up`, `break`. Forced operation (2.x) takes \
+        `control on` (the 1.x word, e.g. `control down` on 2.008) or `release`. Scaled sub-types take the scaled \
+        value, never the raw count: 8.010 `50 %`, 7.003/7.004/8.003/8.004 `1.5 s`, 13.002 `1.5 m3/h`. Rate-limited (minimum 250ms between \
         bus operations). Protected group addresses (safety-critical objects such as a wind alarm or \
         central functions) are REFUSED outright — there is no override via MCP. When you are \
         uncertain whether a write is safe or intended, ASK THE HUMAN before calling this tool. \
@@ -930,8 +1034,9 @@ impl BussardMcp {
         device confirmed or executed it. On a secured (KNX Data Secure) GA the devices accept \
         the telegram only if their security individual address table admits the tunnel \
         address: a write the evidence says they would discard is refused (`refused: true`, \
-        with a `hint` on admitting the tunnel addresses), and one sent without evidence carries \
-        `admission: unknown` and a `note` to pass on."
+        with a `hint` on admitting the tunnel addresses). Without evidence the server first \
+        reads the devices' table (PID 54) once and records it; a write still sent without \
+        evidence carries `admission: unknown` and a `note` to pass on."
     )]
     async fn knx_write_group(
         &self,
@@ -1018,16 +1123,25 @@ impl BussardMcp {
             let sender = bussard_bus::ops::group_source(service.handle());
             // E038 (issue #348): a tunnel-only secured GA whose devices admit
             // no tunnelling address is refused while admit_tunnel_senders is
-            // off.
-            Some(bussard_service::admission::check_tunnel_write(
-                Some(&model),
-                ga,
-                sender,
-                &evidence,
-            ))
+            // off. An unknown verdict reads the receivers' PID 54 first, and
+            // a "not listed" there refuses too (issue #316).
+            Some(
+                self.resolve_admission(service, |live| {
+                    bussard_service::admission::check_tunnel_write_with(
+                        Some(&model),
+                        ga,
+                        sender,
+                        &evidence,
+                        live,
+                    )
+                })
+                .await,
+            )
         } else {
             None
         };
+        let note = resolved_note(admission.as_ref());
+        let admission = admission.map(|r| r.admission);
         if let Some(refused) = admission.as_ref().filter(|a| a.is_refused()) {
             return ok(admission_refusal_json(ga, refused));
         }
@@ -1051,7 +1165,7 @@ impl BussardMcp {
                 },
                 "secured": sent.write.is_secured(),
                 "admission": admission.as_ref().map(Admission::label),
-                "note": admission.as_ref().and_then(Admission::note),
+                "note": note,
                 "written": {
                     "address": ga.to_string(),
                     "name": sent.write.name,
@@ -1062,6 +1176,12 @@ impl BussardMcp {
             Err(refusal) => ok(write_refusal_json(ga, &refusal)),
         }
     }
+}
+
+/// The note of a secured write or read sent without admission evidence, with
+/// the reasons a PID 54 read failed (issues #297, #316).
+fn resolved_note(resolved: Option<&bussard_service::admission::Resolved>) -> Option<String> {
+    resolved.and_then(bussard_service::admission::Resolved::note)
 }
 
 /// The result of a secured write or read refused for sender admission (issue
@@ -1139,14 +1259,31 @@ fn write_refusal_json(ga: GroupAddress, refusal: &WriteRefusal) -> Value {
 /// reason string (the tool surfaces it as `ok:false`), never a panic.
 async fn describe_over_l4<Ch: bussard_mgmt::L4Channel>(
     l4: &mut bussard_mgmt::Layer4Connection<Ch>,
-) -> Result<Vec<Value>, String> {
+) -> Result<(Vec<Value>, Option<Value>), String> {
     // Scale property reads to the device's max APDU when it exposes it.
     let _ = l4.negotiate_max_apdu().await;
     let objects = walk_objects(l4).await.map_err(|e| error_chain(&e))?;
-    Ok(objects
-        .iter()
-        .map(|o| tools::describe_object_json(o.index, o.object_type, &o.properties))
-        .collect())
+    // A Data Secure device read with its tool key: the security failures log,
+    // report and report control too (issue #533).
+    let security = if l4.is_secure() {
+        Some(
+            match bussard_download::read_security_diagnostics(l4).await {
+                Ok(diag) => json!(diag),
+                Err(err) => {
+                    json!({ "notes": [format!("Data Secure diagnostics not read: {err}")] })
+                }
+            },
+        )
+    } else {
+        None
+    };
+    Ok((
+        objects
+            .iter()
+            .map(|o| tools::describe_object_json(o.index, o.object_type, &o.properties))
+            .collect(),
+        security,
+    ))
 }
 
 /// Renders an error with its source chain on one line (`outer: inner: ...`),

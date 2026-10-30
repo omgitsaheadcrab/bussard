@@ -1,0 +1,5 @@
+{
+"about": "Synthetic products bussard refuses to flash, each the finding of an open issue (#604). The synthetic sim loop (crates/bussard-cli/tests/it/sim_catalog_loop.rs) accepts the refusal when its text contains `contains`, and fails once the product flashes, so the entry is dropped with the fix.",
+"refusals": {
+}
+}

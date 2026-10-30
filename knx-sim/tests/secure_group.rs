@@ -192,7 +192,19 @@ impl Rig {
         let apci10 = (u16::from(apdu[0] & 0x03) << 8) | u16::from(apdu[1]);
         let resp = self.mgmt(apci10, &apdu[2..])?;
         let [one] = resp.as_slice() else {
-            return Err(format!("expected one response to {req}, got {}", resp.len()).into());
+            let tail: Vec<String> = self
+                .sink
+                .events()
+                .into_iter()
+                .rev()
+                .take(6)
+                .map(|e| format!("{e:?}"))
+                .collect();
+            return Err(format!(
+                "expected one response to {req}, got {}: {tail:#?}",
+                resp.len()
+            )
+            .into());
         };
         let mut got = one.inner_tpdu.clone();
         got[0] &= 0x03;
@@ -200,12 +212,28 @@ impl Rig {
         Ok(())
     }
 
+    /// [`Rig::secobj`] on a fresh connection (the programming one is closed).
+    fn diag(&mut self, req: &str, want: &str) -> TestResult {
+        self.bus
+            .deliver_from_tool(&cemi(TOOL, DEV, false, vec![0x80]));
+        self.seq = 0;
+        let out = self.secobj(req, want);
+        self.bus
+            .deliver_from_tool(&cemi(TOOL, DEV, false, vec![0x81]));
+        out
+    }
+
     /// Load a table object through PID 5 + A_MemoryExtended_Write.
     fn load_table(&mut self, obj: u8, base: u32, image: &[u8]) -> TestResult {
-        self.mgmt(0x3D7, &[obj, 0x05, 0x10, 0x01, 0x01])?;
         self.mgmt(
             0x3D7,
-            &[obj, 0x05, 0x10, 0x01, 0x03, 0x0b, 0x00, 0x00, 0x01, 0x00],
+            &[obj, 0x05, 0x10, 0x01, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        )?;
+        self.mgmt(
+            0x3D7,
+            &[
+                obj, 0x05, 0x10, 0x01, 0x03, 0x0b, 0x00, 0x00, 0x01, 0x00, 0, 0, 0, 0,
+            ],
         )?;
         let mut write = vec![
             image.len() as u8,
@@ -215,7 +243,10 @@ impl Rig {
         ];
         write.extend_from_slice(image);
         self.mgmt(0x1FB, &write)?;
-        self.mgmt(0x3D7, &[obj, 0x05, 0x10, 0x01, 0x02])?;
+        self.mgmt(
+            0x3D7,
+            &[obj, 0x05, 0x10, 0x01, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        )?;
         Ok(())
     }
 
@@ -324,21 +355,30 @@ fn test_secure_group_write_then_read_answered_secured() -> TestResult {
     assert!(rig.has_line("SECURE group send 1.1.10 -> 1/2/3 scf=0x10[auth+enc] seq="));
     assert!(rig.has_line("inner=GroupValueResponse"));
 
-    // Auth-only is answered auth-only (SCF 0x00).
+    // Auth-only on an object flagged auth+conf (0x03) does not match the
+    // flags exactly: ignored, and counted as an access error (KNX 3/5/1
+    // §6.3.15.3 Table 108; bussard issue #533).
     let replies = rig.secure_group(&key, SecAlgorithm::AuthOnly, 2003, &[0x00, 0x00]);
-    let [reply] = replies.as_slice() else {
-        return Err(format!("expected one reply, got {replies:?}").into());
-    };
-    let un2 = open_reply(reply)?;
-    assert_eq!(un2.scf.to_byte(), 0x00);
+    assert!(replies.is_empty(), "{replies:?}");
     assert!(
-        u64::from_be_bytes([
-            0, 0, un2.seq[0], un2.seq[1], un2.seq[2], un2.seq[3], un2.seq[4], un2.seq[5]
-        ]) > u64::from_be_bytes([
-            0, 0, un.seq[0], un.seq[1], un.seq[2], un.seq[3], un.seq[4], un.seq[5]
-        ]),
-        "the device's send sequence increases"
+        rig.has_line("REJECTED SECURE group recv 1.1.1 -> 1/2/3: group object 1 security flags"),
+        "{:#?}",
+        rig.secure_lines()
     );
+    rig.diag(
+        "01d5 0011 001037 000000",
+        "01d6 0011 001037 00 000000 00 0000 0000 0001",
+    )?;
+    // The latest failure: sender 1.1.1, error type 04h (its sequence is
+    // not interpreted for an access error, the sim logs it anyway).
+    rig.diag(
+        "01d5 0011 001037 000100",
+        "01d6 0011 001037 00 0100 1101 000000 0000000007d3 04",
+    )?;
+    // The report flags it; the tool resets it (only 0 is taken).
+    rig.diag("01cc 0011 001039 01 0001", "01cd 0011 001039 01 0001 01")?;
+    rig.diag("01ce 0011 001039 01 0001 00", "01cf 0011 001039 01 0001 00")?;
+    rig.diag("01cc 0011 001039 01 0001", "01cd 0011 001039 01 0001 00")?;
     Ok(())
 }
 
@@ -358,6 +398,11 @@ fn test_secure_group_wrong_key_and_replay_refused() -> TestResult {
         "{:#?}",
         rig.secure_lines()
     );
+    // A cryptographic error in the failures log (bussard issue #533).
+    rig.diag(
+        "01d5 0011 001037 000000",
+        "01d6 0011 001037 00 000000 00 0000 0001 0000",
+    )?;
 
     let key = Key16::new(GROUP_KEY);
     assert!(
@@ -372,6 +417,10 @@ fn test_secure_group_wrong_key_and_replay_refused() -> TestResult {
     assert!(rig.has_line(
         "REJECTED SECURE group recv 1.1.1 -> 1/2/3: stale/replayed sequence 3001 (last seen 3001)"
     ));
+    rig.diag(
+        "01d5 0011 001037 000000",
+        "01d6 0011 001037 00 000000 00 0001 0001 0000",
+    )?;
     // Below the receive floor for a fresh source is stale too.
     assert!(
         rig.secure_group(&key, SecAlgorithm::AuthEnc, 42, &[0x00, 0x00])
@@ -475,6 +524,12 @@ fn test_secure_group_unlisted_sender_and_table_sequence_refused() -> TestResult 
         "{:#?}",
         rig.secure_lines()
     );
+    // An unlisted sender is dropped without a count (KNX 3/3/7 §5.2.1.1;
+    // bussard issue #533).
+    rig.diag(
+        "01d5 0011 001037 000000",
+        "01d6 0011 001037 00 000000 00 0000 0000 0000",
+    )?;
     // Above the receive floor (1000) but not above the peer's entry (1500).
     assert!(
         rig.secure_group(&key, SecAlgorithm::AuthEnc, 1200, &[0x00, 0x81])
@@ -487,5 +542,83 @@ fn test_secure_group_unlisted_sender_and_table_sequence_refused() -> TestResult 
     // Above it: accepted.
     rig.secure_group(&key, SecAlgorithm::AuthEnc, 1501, &[0x00, 0x81]);
     assert_eq!(rig.object_value(1), Some(vec![0x01]));
+    Ok(())
+}
+
+/// TSS J §3.1.12: an authentic telegram with a reserved bit above the inner
+/// APCI is dropped with a log line and no failure count, and its sequence
+/// still counts as received (KNX 3/3/7 §5.2.1.4, bussard issue #535).
+#[test]
+fn test_secure_group_reserved_bits_dropped_without_count() -> TestResult {
+    let mut rig = Rig::programmed()?;
+    let key = Key16::new(GROUP_KEY);
+    assert!(
+        rig.secure_group(&key, SecAlgorithm::AuthEnc, 2001, &[0x40, 0x81])
+            .is_empty()
+    );
+    assert_eq!(rig.object_value(1), Some(vec![]));
+    assert!(
+        rig.has_line("REJECTED SECURE group recv 1.1.1 -> 1/2/3: reserved bits set"),
+        "{:#?}",
+        rig.secure_lines()
+    );
+    rig.diag(
+        "01d5 0011 001037 000000",
+        "01d6 0011 001037 00 000000 00 0000 0000 0000",
+    )?;
+    // The dropped frame's sequence is spent.
+    rig.secure_group(&key, SecAlgorithm::AuthEnc, 2001, &[0x00, 0x81]);
+    assert_eq!(rig.object_value(1), Some(vec![]));
+    rig.secure_group(&key, SecAlgorithm::AuthEnc, 2002, &[0x00, 0x81]);
+    assert_eq!(rig.object_value(1), Some(vec![0x01]));
+    Ok(())
+}
+
+/// KNX 3/3/7 §5.5.3.2 step 1.1.1: a group telegram with the
+/// tool-access flag is an attack and counts an access error; §5.2.1.1: the
+/// sequence is checked before the MAC, so a stale frame under a wrong key
+/// counts a SeqNr error, not a cryptographic one.
+#[test]
+fn test_secure_group_tool_flag_and_check_order() -> TestResult {
+    let mut rig = Rig::programmed()?;
+    let key = Key16::new(GROUP_KEY);
+    let mut tpdu = vec![0x03, 0xF1];
+    let mut asdu = seal_group(
+        &key,
+        SecAlgorithm::AuthEnc,
+        2001,
+        PEER,
+        GA_SECURE,
+        &[0x00, 0x81],
+    );
+    asdu[0] |= 0x80;
+    tpdu.extend_from_slice(&asdu);
+    let replies: Vec<CemiLData> = rig
+        .bus
+        .deliver_from_tool(&cemi(PEER, GA_SECURE, true, tpdu))
+        .into_iter()
+        .filter(|r| r.source == IndividualAddress(DEV))
+        .collect();
+    assert!(replies.is_empty());
+    assert!(
+        rig.has_line("tool access flag on a group telegram (access error)"),
+        "{:#?}",
+        rig.secure_lines()
+    );
+    rig.diag(
+        "01d5 0011 001037 000000",
+        "01d6 0011 001037 00 000000 00 0000 0000 0001",
+    )?;
+    // At or below the PID 54 entry (1500) under a wrong key: SeqNr, no MAC check.
+    let wrong = Key16::new([0xEE; 16]);
+    assert!(
+        rig.secure_group(&wrong, SecAlgorithm::AuthEnc, 1500, &[0x00, 0x81])
+            .is_empty()
+    );
+    rig.diag(
+        "01d5 0011 001037 000000",
+        "01d6 0011 001037 00 000000 00 0001 0000 0001",
+    )?;
+    assert_eq!(rig.object_value(1), Some(vec![]));
     Ok(())
 }

@@ -24,7 +24,7 @@
 //! ETS 6 sweep captures of nine manufacturers.
 
 use crate::connection::{L4Channel, Layer4Connection, property_request, property_write_request};
-use crate::load::{LoadControl, LoadState, Result, WriteError, read_memory, write_memory};
+use crate::load::{LoadControl, LoadState, Result, WriteError, read_memory_strict, write_memory};
 
 /// The size of a standard KNX load-event record: 10 octets (`[XKNX
 /// LOAD_EVENT_SIZE=10]`, KNX 3/5/1 §4.23.2). Octet 0 is the event opcode; the
@@ -35,7 +35,8 @@ pub const LOAD_EVENT_SIZE: usize = 10;
 /// (subtype `0x00`, `[system7-spec §4.1]`).
 pub const S7_SUB_ALLOC_DATA: u8 = 0x00;
 /// `AdditionalLoadControls` sub-command — allocate an absolute **Stack** segment
-/// (subtype `0x01`). Not in the corpus; provided for completeness.
+/// (subtype `0x01`): an `LdCtrlAbsSegment SegType="1"`, about 229 corpus
+/// System 7 programs (KNX 3/5/2 §3.31.2; issue #487).
 pub const S7_SUB_ALLOC_STACK: u8 = 0x01;
 /// `AdditionalLoadControls` sub-command — allocate an absolute **Task** segment
 /// (subtype `0x02`); the default realisation of `LdCtrlTaskSegment`
@@ -44,13 +45,20 @@ pub const S7_SUB_ALLOC_TASK: u8 = 0x02;
 /// `AdditionalLoadControls` sub-command — **Task control 1** (subtype `0x04`),
 /// the realisation of `LdCtrlTaskCtrl1` (`[system7-spec §4.4]`).
 pub const S7_SUB_TASK_CTRL1: u8 = 0x04;
+/// `AdditionalLoadControls` sub-command: the Task Pointer Record (segment
+/// type 03h, KNX 3/5/2 §3.31.2).
+pub const S7_SUB_TASK_PTR: u8 = 0x03;
+/// `AdditionalLoadControls` sub-command: Task Control Record 2 (segment type
+/// 05h, KNX 3/5/2 §3.31.2).
+pub const S7_SUB_TASK_CTRL2: u8 = 0x05;
 
 /// Encodes the 10-octet `AdditionalLoadControls` load-event record for an
 /// **absolute segment allocation** (`LdCtrlAbsSegment`).
 ///
 /// Layout (`[system7-spec §4.2, M2 capture CONFIRMED]`):
-/// `[event=3][subtype][start:2 BE][length:2 BE][seg_flags][mem_type][checksum_ctrl]
-/// [reserved]`.
+/// `[event=3][subtype][start:2 BE][length:2 BE][access][mem_type][seg_flags]
+/// [reserved]` (`seg_flags` is the memory-attributes octet, bit 7 checksum
+/// control, KNX 3/5/2 §3.31.2).
 ///
 /// The M2 Jung 0705 capture (issue #70) pins the first six octets exactly: the
 /// `03`/subtype opcode, the big-endian `start` and `length` fields, and
@@ -75,18 +83,18 @@ pub fn encode_alloc_segment(
     subtype: u8,
     start: u16,
     length: u16,
-    seg_flags: u8,
+    access: u8,
     mem_type: u8,
-    checksum_ctrl: u8,
+    seg_flags: u8,
 ) -> [u8; LOAD_EVENT_SIZE] {
     let mut v = [0u8; LOAD_EVENT_SIZE];
     v[0] = LoadControl::AdditionalLoadControls.octet();
     v[1] = subtype;
     v[2..4].copy_from_slice(&start.to_be_bytes());
     v[4..6].copy_from_slice(&length.to_be_bytes());
-    v[6] = seg_flags;
+    v[6] = access;
     v[7] = mem_type;
-    v[8] = checksum_ctrl;
+    v[8] = seg_flags;
     // v[9] reserved 0 (observed 0x00 in every capture record).
     v
 }
@@ -103,9 +111,9 @@ pub fn encode_alloc_segment(
 /// (`13 00 00 40 00 00 1d f2 03 80 00` EEPROM, `33 00 00 1c 00 01 b0 f2 02 00 00`
 /// RAM).
 pub fn alloc_attr_octets(mem_type: u8) -> (u8, u8) {
-    let seg_flags = 0xF2;
-    let checksum_ctrl = if mem_type == 3 { 0x80 } else { 0x00 };
-    (seg_flags, checksum_ctrl)
+    let access = 0xF2;
+    let seg_flags = if mem_type == 3 { 0x80 } else { 0x00 };
+    (access, seg_flags)
 }
 
 /// The application identity a System 7 TaskSegment record carries
@@ -185,6 +193,42 @@ pub fn encode_task_ctrl1(address: u16, count: u8) -> [u8; LOAD_EVENT_SIZE] {
     v
 }
 
+/// Encodes the 10-octet `AdditionalLoadControls` record for the **Task
+/// Pointer Record** (`LdCtrlTaskPtr`, segment type 03h, KNX 3/5/2 §3.31.2):
+/// `[event=3][sub=0x03][init:2 BE][save:2 BE][PEI handler:2 BE][reserved:2]`.
+///
+/// The memory-mapped form ([`wrap_memory_lsm_record`]) inserts the segment ID
+/// octet after the sub-command, giving the 11-octet layout of the clause.
+pub fn encode_task_ptr(init: u16, save: u16, pei_handler: u16) -> [u8; LOAD_EVENT_SIZE] {
+    let mut v = [0u8; LOAD_EVENT_SIZE];
+    v[0] = LoadControl::AdditionalLoadControls.octet();
+    v[1] = S7_SUB_TASK_PTR;
+    v[2..4].copy_from_slice(&init.to_be_bytes());
+    v[4..6].copy_from_slice(&save.to_be_bytes());
+    v[6..8].copy_from_slice(&pei_handler.to_be_bytes());
+    v
+}
+
+/// Encodes the 10-octet `AdditionalLoadControls` record for **Task Control
+/// Record 2** (`LdCtrlTaskCtrl2`, segment type 05h, KNX 3/5/2 §3.31.2):
+/// `[event=3][sub=0x05][callback:2 BE][group-object pointer:2 BE]
+/// [group-object segment pointer 1:2 BE][segment pointer 2:2 BE]`.
+pub fn encode_task_ctrl2(
+    callback: u16,
+    com_objects: u16,
+    segment_1: u16,
+    segment_2: u16,
+) -> [u8; LOAD_EVENT_SIZE] {
+    let mut v = [0u8; LOAD_EVENT_SIZE];
+    v[0] = LoadControl::AdditionalLoadControls.octet();
+    v[1] = S7_SUB_TASK_CTRL2;
+    v[2..4].copy_from_slice(&callback.to_be_bytes());
+    v[4..6].copy_from_slice(&com_objects.to_be_bytes());
+    v[6..8].copy_from_slice(&segment_1.to_be_bytes());
+    v[8..10].copy_from_slice(&segment_2.to_be_bytes());
+    v
+}
+
 /// The width of the memory-mapped LSM control record: **11 octets**, written by
 /// `A_Memory_Write` to the LSM control address (default `0x0104`).
 ///
@@ -197,19 +241,24 @@ pub const MEMORY_LSM_RECORD_SIZE: usize = 11;
 /// Wraps a 10-octet abstract load event into the **11-octet** memory-mapped LSM
 /// control record written to the LSM control address (default `0x0104`).
 ///
-/// Encoding (`[system7-spec §5]`, Theben `0701` Meteodata capture CONFIRMED):
+/// Encoding (Management Procedures 03_05_02 §3.31.2, `[system7-spec §5]`,
+/// Theben `0701` Meteodata capture CONFIRMED):
 /// ```text
-/// [0]      (lsm_index << 4) | event_opcode   e.g. 0x13 = LSM1 + AdditionalLoadControls(3)
-/// [1]      subtype                           00 alloc / 02 task / 04 taskctrl1
-/// [2]      0x00                              high octet of the 3-octet start address
-/// [3..5]   start:2 BE                        the segment start address (low 16 bits)
+/// [0]      (state machine << 4) | event      e.g. 0x13 = address table + AdditionalLoadControls(3)
+/// [1]      segment type                      00 alloc / 02 task / 04 taskctrl1
+/// [2]      segment ID                        0x00
+/// [3..5]   start:2 BE                        the segment start address
 /// [5..11]  the event's octets 4..10          length/access/mem_type/seg_flags/reserved (alloc)
 ///                                            OR the 6-octet application identity (task segment)
 /// ```
-/// The LSM index is folded into the **high nibble of the event opcode byte**;
-/// there is NO separate `[lsm][00]` prefix. Relative to the abstract 10-octet
-/// event the address field is widened to 3 octets (a leading `0x00`), which is
-/// exactly the byte-for-byte transform that reproduces the captured records:
+/// The state machine is the object type of the loadable part (1 address
+/// table, 2 association table, 3 application program, 4 PEI program), which
+/// is the LSM index bussard numbers them by; it sits in the **high nibble of
+/// the event octet**, with NO separate `[lsm][00]` prefix. Relative to the
+/// abstract 10-octet event the record inserts the segment ID octet (`0x00`)
+/// after the segment type, which is exactly the byte-for-byte transform that
+/// reproduces the captured records (issue #482: octet 2 is the segment ID, not
+/// the high octet of a widened address):
 /// - alloc `13 00 00 40 00 00 1d f2 03 80 00` (LSM1, 0x4000 len 0x1D, EEPROM),
 /// - task  `13 02 00 40 00 00 00 48 14 0c 14` (LSM1, identity `00 00 48 14 0c 14`),
 /// - taskctrl1 `33 04 00 46 eb 01 00 00 00 00 00` (LSM3, addr 0x46EB count 1).
@@ -234,10 +283,10 @@ pub fn wrap_memory_lsm_record(
         "LSM index {lsm_index} is outside 1..=15"
     );
     v[0] = ((lsm_index & 0x0F) << 4) | (event[0] & 0x0F);
-    v[1] = event[1]; // subtype
-    v[2] = 0x00; // high octet of the widened 3-octet start address
-    // Widen the 2-octet address to 3 octets and copy the remaining event fields
-    // (length + tail) verbatim: event[2..10] -> record[3..11].
+    v[1] = event[1]; // segment type
+    v[2] = 0x00; // segment ID
+    // Copy the remaining event fields (start address, length and tail)
+    // verbatim after the segment ID: event[2..10] -> record[3..11].
     v[3..MEMORY_LSM_RECORD_SIZE].copy_from_slice(&event[2..LOAD_EVENT_SIZE]);
     v
 }
@@ -254,10 +303,12 @@ pub fn simple_event(control: LoadControl) -> [u8; LOAD_EVENT_SIZE] {
 
 /// The load-state-machine access seam for System 7 (`[system7-spec §5]`).
 ///
-/// System 7 devices realise their LSMs one of two ways, selected by mask family:
-/// the Jung `0705` family is **property-based** ([`LsmAccess::Property`], M2
-/// capture issue #70) and the Theben `0701` family is **memory-mapped**
-/// ([`LsmAccess::MemoryMapped`], Meteodata capture). Both realisations are
+/// System 7 devices realise their LSMs one of two ways, and the profile fixes
+/// which one each mask must offer (KNX 6 Profiles §4.2 row 7): memory mapped
+/// ([`LsmAccess::MemoryMapped`]) is mandatory on `0700` and `0701`, property
+/// ([`LsmAccess::Property`]) on `0701` and `0705`. ETS drives `0701` memory
+/// mapped (Meteodata capture) and `0705` property based (M2 capture, issue
+/// #70). Both realisations are
 /// implemented behind this seam and selected per mask
 /// ([`crate::Sys7Profile::corpus_default_for_mask`]) or from
 /// `HawkConfigurationData`. Each variant is independently testable against a mock
@@ -267,7 +318,8 @@ pub enum LsmAccess {
     /// ([`wrap_memory_lsm_record`]) to `control_addr` via `A_Memory_Write` and poll
     /// status at `status_addr + (lsm - 1)` via `A_Memory_Read`. Confirmed by the
     /// Theben 0701 Meteodata capture (11-octet writes to `0x0104`, status at
-    /// `0xB6EA+`). The Jung `0705` family uses `Property` instead.
+    /// `0xB6EA+`); the default for `0700` and `0701`. The `0705` default is
+    /// `Property`.
     MemoryMapped {
         /// The LSM-control write address (default `0x0104`).
         control_addr: u16,
@@ -370,7 +422,7 @@ impl LsmAccess {
         match self {
             LsmAccess::MemoryMapped { status_addr, .. } => {
                 let addr = status_addr.saturating_add(u16::from(lsm.saturating_sub(1)));
-                let data = read_memory(l4, u32::from(addr), 1).await?;
+                let data = read_memory_strict(l4, u32::from(addr), 1).await?;
                 let octet = data.first().copied().ok_or_else(|| {
                     WriteError::Mgmt(crate::MgmtError::MalformedResponse {
                         address: l4.target(),
@@ -550,7 +602,10 @@ pub enum VerifyModeOutcome {
 /// `bad-eg-pm-1-1-18`) reads `obj0/PID_DEVICE_CONTROL` (answer `00`) and writes
 /// back `04`, the verify-mode bit, right after the first allocation record. The
 /// device then answers each segment write with an `A_Memory_Response` echo,
-/// which [`Layer4Connection`] drains. Reads first and writes only when the bit
+/// which [`crate::write_memory_echoed`] compares with the chunk written. The
+/// device clears the bit when the transport connection closes (Resources
+/// 03_05_01 §4.2.14), so a caller runs this again on every connection it
+/// opens before the next write. Reads first and writes only when the bit
 /// is clear, keeping every other bit as the device holds it. The bit lives in
 /// RAM: the terminal restart clears it again.
 pub async fn enable_verify_mode<Ch: L4Channel>(
@@ -580,7 +635,14 @@ pub async fn enable_verify_mode<Ch: L4Channel>(
         &[written],
     )
     .await?;
-    if resp.count == 0 {
+    // DMP_MemWrite_RCoV (Management Procedures 03_05_02 §3.16.3): the
+    // response must carry the bit, a different or empty answer means the
+    // device did not take it.
+    let took = resp
+        .data
+        .first()
+        .is_none_or(|v| v & DEVICE_CONTROL_VERIFY_MODE != 0);
+    if resp.count == 0 || !took {
         return Ok(VerifyModeOutcome::Refused { previous });
     }
     Ok(VerifyModeOutcome::Enabled { previous, written })
@@ -619,10 +681,10 @@ mod tests {
     fn test_encode_alloc_segment_matches_capture_with_derived_attr_octets() {
         // binaereingang-6fach 0705 capture: LSM 3's EEPROM param segment at 0x43FE
         // was `03 00 43 fe 03 73 f2 03 80 00`. With the derived attribute octets
-        // (0xF2 seg_flags, 0x80 checksum for EEPROM) bussard now reproduces it
+        // (0xF2 access, 0x80 seg_flags for EEPROM) bussard now reproduces it
         // byte-for-byte.
-        let (sf, cc) = alloc_attr_octets(0x03);
-        let v = encode_alloc_segment(S7_SUB_ALLOC_DATA, 0x43FE, 0x0373, sf, 0x03, cc);
+        let (access, seg_flags) = alloc_attr_octets(0x03);
+        let v = encode_alloc_segment(S7_SUB_ALLOC_DATA, 0x43FE, 0x0373, access, 0x03, seg_flags);
         assert_eq!(
             v,
             [0x03, 0x00, 0x43, 0xFE, 0x03, 0x73, 0xF2, 0x03, 0x80, 0x00],
@@ -631,8 +693,8 @@ mod tests {
 
         // The 0x0700 low-RAM region is mem_type 2 (RAM), size 450 (0x01C2) —
         // capture `03 00 07 00 01 c2 f2 02 00 00`.
-        let (sf, cc) = alloc_attr_octets(0x02);
-        let ram = encode_alloc_segment(S7_SUB_ALLOC_DATA, 0x0700, 0x01C2, sf, 0x02, cc);
+        let (access, seg_flags) = alloc_attr_octets(0x02);
+        let ram = encode_alloc_segment(S7_SUB_ALLOC_DATA, 0x0700, 0x01C2, access, 0x02, seg_flags);
         assert_eq!(
             ram,
             [0x03, 0x00, 0x07, 0x00, 0x01, 0xC2, 0xF2, 0x02, 0x00, 0x00],
@@ -642,8 +704,8 @@ mod tests {
 
     #[test]
     fn test_alloc_attr_octets_derives_from_mem_type() {
-        // EEPROM (3) is checksum-controlled (0x80); RAM (2) is not (0x00). seg_flags
-        // is the dominant 0xF2 in both.
+        // EEPROM (3) is checksum-controlled (0x80); RAM (2) is not (0x00). The
+        // access octet is the dominant 0xF2 in both.
         assert_eq!(alloc_attr_octets(0x03), (0xF2, 0x80));
         assert_eq!(alloc_attr_octets(0x02), (0xF2, 0x00));
     }
@@ -781,5 +843,37 @@ mod tests {
         let v = simple_event(LoadControl::Unload);
         assert_eq!(v[0], 4);
         assert!(v[1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_encode_task_ptr_memory_layout() {
+        // KNX 3/5/2 §3.31.2: L3 03h 00h IIII SSSS PPPP 0000 (11 octets). The
+        // knx_master MV-0021 procedure: InitPtr 284, SavePtr 285, SerialPtr 0.
+        let record = wrap_memory_lsm_record(3, &encode_task_ptr(284, 285, 0));
+        assert_eq!(
+            record,
+            [
+                0x33, 0x03, 0x00, 0x01, 0x1C, 0x01, 0x1D, 0x00, 0x00, 0x00, 0x00
+            ]
+        );
+    }
+
+    #[test]
+    fn test_encode_task_ctrl2_memory_layout() {
+        // KNX 3/5/2 §3.31.2: L3 05h 00h CCCC OOOO 1111 2222 (11 octets). The
+        // knx_master MV-0021 procedure: Callback 20609, Address 282, Seg0 and
+        // Seg1 208.
+        let record = wrap_memory_lsm_record(3, &encode_task_ctrl2(20609, 282, 208, 208));
+        assert_eq!(
+            record,
+            [
+                0x33, 0x05, 0x00, 0x50, 0x81, 0x01, 0x1A, 0x00, 0xD0, 0x00, 0xD0
+            ]
+        );
+        // The property form is the same record without the segment ID octet.
+        assert_eq!(
+            encode_task_ctrl2(20609, 282, 208, 208),
+            [0x03, 0x05, 0x50, 0x81, 0x01, 0x1A, 0x00, 0xD0, 0x00, 0xD0]
+        );
     }
 }

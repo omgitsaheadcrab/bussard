@@ -201,10 +201,12 @@ impl DataSecureSession {
     ///
     /// This is what an activated device does (and what bussard's mock devices use
     /// to stand in for one): the response reports this session's own next send
-    /// sequence and the sequence it accepts next from the requester,
-    /// `max(request sequence, last accepted + 1)`. The Sync_Req itself does not
-    /// update the freshness table, so the requester's first S-A_Data may reuse
-    /// the request's sequence, as ETS does. `req_addr` is the request frame's
+    /// sequence and the sequence it accepts next from the requester. Like a
+    /// device, it raises its stored counter for the requester to
+    /// `max(stored, request sequence - 1)` and answers `stored + 1` (KNX 3/3/7
+    /// §5.3.2, KNX 3/5/1 §6.2 NOTE 94, issue #536): the requester's first
+    /// S-A_Data may reuse the request's sequence, as ETS does, and nothing
+    /// below it is accepted any more. `req_addr` is the request frame's
     /// addressing, `res_addr` the response frame's.
     ///
     /// # Errors
@@ -217,11 +219,14 @@ impl DataSecureSession {
         res_addr: &TpAddressing,
     ) -> Result<(u16, Vec<u8>), AsduError> {
         let (_, req) = asdu::decode_sync_req(&self.tool_key, asdu_bytes, req_addr)?;
-        let accepted_next = self
+        let requested = req.sequence.value().saturating_sub(1);
+        let stored = self
             .last_seen
             .get(&req_addr.source)
-            .map(|s| s.next())
-            .map_or(req.sequence, |n| n.max(req.sequence));
+            .map_or(requested, |s| s.value().max(requested));
+        self.last_seen
+            .insert(req_addr.source, Sequence::new(stored));
+        let accepted_next = Sequence::new(stored).next();
         let res = asdu::SyncResponse {
             responder_sequence: self.send_seq,
             requester_sequence: accepted_next,
@@ -236,6 +241,27 @@ impl DataSecureSession {
             res_addr,
         )?;
         Ok((asdu::A_SECURE_DATA, asdu))
+    }
+
+    /// The sequence the peer `source` (raw IA) is expected to send next: one
+    /// above the last one accepted from it, `None` before anything (or a
+    /// Sync_Res) was accepted from it.
+    pub fn peer_next_sequence(&self, source: u16) -> Option<Sequence> {
+        self.last_seen.get(&source).map(|s| s.next())
+    }
+
+    /// Sets the freshness floor of the peer `source` (raw IA) so that `next`
+    /// is the lowest sequence accepted from it.
+    ///
+    /// The step after a write of the peer's `PID_SEQUENCE_NUMBER_SENDING`
+    /// (issue #535): the device protects the confirmation of that write
+    /// already with the value written (KNX 3/5/1 §6.3.13.3 NOTE 110). The
+    /// caller writes a value at or above
+    /// [`peer_next_sequence`](Self::peer_next_sequence), so the floor never
+    /// moves down.
+    pub fn expect_peer_sequence(&mut self, source: u16, next: Sequence) {
+        self.last_seen
+            .insert(source, Sequence::new(next.value().saturating_sub(1)));
     }
 
     /// Wraps a plain management `(apci, data)` into an A_SecureData ASDU using the
@@ -296,10 +322,29 @@ impl DataSecureSession {
             }
             _ => {}
         }
-        let decoded = asdu::decode(&self.tool_key, asdu_bytes, addr)?;
+        let source = addr.source;
+        let decoded = match asdu::decode(&self.tool_key, asdu_bytes, addr) {
+            Ok(decoded) => decoded,
+            // Authentic, but a reserved bit is set (KNX 3/3/7 §5.2.1.4): the
+            // frame is dropped, its sequence still counts as received.
+            Err(AsduError::ReservedBits { octet, sequence }) => {
+                let sequence = Sequence::new(sequence);
+                if self
+                    .last_seen
+                    .get(&source)
+                    .is_none_or(|&last| sequence > last)
+                {
+                    self.last_seen.insert(source, sequence);
+                }
+                return Err(AsduError::ReservedBits {
+                    octet,
+                    sequence: sequence.value(),
+                });
+            }
+            Err(e) => return Err(e),
+        };
 
         // Freshness: strictly-greater than the last accepted from this source.
-        let source = addr.source;
         if let Some(&last) = self.last_seen.get(&source)
             && decoded.sequence <= last
         {
@@ -614,6 +659,104 @@ mod tests {
         assert!(tool.is_synced());
         assert_eq!(tool.send_sequence(), Sequence::new(501));
         // And the device accepts the tool's next data frame.
+        let (_, data) = tool.wrap(&to_dev, 0x300, &[0x00])?;
+        assert!(matches!(
+            device.unwrap(&to_dev, asdu::A_SECURE_DATA, &data)?,
+            UnwrapOutcome::Secured { .. }
+        ));
+        Ok(())
+    }
+
+    /// A frame with a reserved bit above the inner APCI is refused, and its
+    /// sequence still counts as received (KNX 3/3/7 §5.2.1.4).
+    #[test]
+    fn test_unwrap_reserved_bits_dropped_sequence_kept() -> Result<(), Box<dyn std::error::Error>> {
+        let key = [0x24; 16];
+        let a = addr(0x1101);
+        let mut device = DataSecureSession::new(Key16::new(key));
+        let scf = Scf::tool_data(SecurityAlgorithm::AuthenticationEncryption);
+        let bad = asdu::encode_apdu(&Key16::new(key), scf, Sequence::new(700), &a, &[0x40, 0x00])?;
+        let err = device
+            .unwrap(&a, asdu::A_SECURE_DATA, &bad)
+            .err()
+            .ok_or("expected an error")?;
+        assert_eq!(
+            err,
+            AsduError::ReservedBits {
+                octet: 0x40,
+                sequence: 700
+            }
+        );
+        assert_eq!(device.peer_next_sequence(0x1101), Some(Sequence::new(701)));
+        // The same sequence again is now stale.
+        let again =
+            asdu::encode_apdu(&Key16::new(key), scf, Sequence::new(700), &a, &[0x00, 0x00])?;
+        assert!(matches!(
+            device.unwrap(&a, asdu::A_SECURE_DATA, &again),
+            Err(AsduError::StaleSequence { .. })
+        ));
+        Ok(())
+    }
+
+    /// The floor set after a PID 59 write accepts the new value and refuses
+    /// anything below it (issue #535).
+    #[test]
+    fn test_expect_peer_sequence_moves_the_floor() -> Result<(), Box<dyn std::error::Error>> {
+        let key = [0x24; 16];
+        let a = addr(0x110A);
+        let mut tool = DataSecureSession::new(Key16::new(key));
+        assert_eq!(tool.peer_next_sequence(0x110A), None);
+        let mut device =
+            DataSecureSession::new(Key16::new(key)).with_send_sequence(Sequence::new(10));
+        let (_, first) = device.wrap(&a, 0x1CF, &[0x00])?;
+        tool.unwrap(&a, asdu::A_SECURE_DATA, &first)?;
+        assert_eq!(tool.peer_next_sequence(0x110A), Some(Sequence::new(11)));
+        tool.expect_peer_sequence(0x110A, Sequence::new(5_000));
+        let (_, old) = device.wrap(&a, 0x1CF, &[0x00])?;
+        assert!(matches!(
+            tool.unwrap(&a, asdu::A_SECURE_DATA, &old),
+            Err(AsduError::StaleSequence { .. })
+        ));
+        let mut device = device.with_send_sequence(Sequence::new(5_000));
+        let (_, new) = device.wrap(&a, 0x1CF, &[0x00])?;
+        assert!(matches!(
+            tool.unwrap(&a, asdu::A_SECURE_DATA, &new)?,
+            UnwrapOutcome::Secured { .. }
+        ));
+        Ok(())
+    }
+
+    /// The device role raises its stored counter on a Sync (issue #536): a
+    /// frame above the old counter but below the Sync's sequence is refused.
+    #[test]
+    fn test_answer_sync_request_raises_stored_counter() -> Result<(), AsduError> {
+        let key = [0x31u8; 16];
+        let to_dev = addr(0x1119);
+        let from_dev = TpAddressing {
+            source: 0x110A,
+            destination: 0x1119,
+            ..addr(0x110A)
+        };
+        let mut device = DataSecureSession::new(Key16::new(key));
+        let mut old = DataSecureSession::new(Key16::new(key)).with_send_sequence(Sequence::new(10));
+        let (_, first) = old.wrap(&to_dev, 0x300, &[0x00])?;
+        device.unwrap(&to_dev, asdu::A_SECURE_DATA, &first)?;
+
+        let mut tool =
+            DataSecureSession::new(Key16::new(key)).with_send_sequence(Sequence::new(5_000));
+        let (_, req) = tool.sync_request(&to_dev)?;
+        let (_, res) = device.answer_sync_request(&to_dev, &req, &from_dev)?;
+        tool.unwrap(&from_dev, asdu::A_SECURE_DATA, &res)?;
+        assert_eq!(tool.send_sequence(), Sequence::new(5_000));
+        assert_eq!(
+            device.peer_next_sequence(0x1119),
+            Some(Sequence::new(5_000))
+        );
+        let (_, replay) = old.wrap(&to_dev, 0x300, &[0x00])?;
+        assert!(matches!(
+            device.unwrap(&to_dev, asdu::A_SECURE_DATA, &replay),
+            Err(AsduError::StaleSequence { .. })
+        ));
         let (_, data) = tool.wrap(&to_dev, 0x300, &[0x00])?;
         assert!(matches!(
             device.unwrap(&to_dev, asdu::A_SECURE_DATA, &data)?,

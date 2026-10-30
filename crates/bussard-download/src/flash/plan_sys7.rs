@@ -7,7 +7,9 @@
 //! group-object descriptor post-pass that sets each object's communication flag
 //! from the association table.
 
-use super::{AppIdentity, FlashPlan, FlashStep, ImageKind, ImageRef, PlanError, Sys7Context};
+use super::{
+    AppIdentity, FlashPlan, FlashStep, ImageKind, ImageRef, KeptOctets, PlanError, Sys7Context,
+};
 use bussard_prod::application::{ApplicationProgram, LoadOp, SegmentKind, TableLocation};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,6 +49,21 @@ pub(super) fn check_sys7_u16(
             max: u64::from(SYS7_MAX_ADDRESS),
         })
     }
+}
+
+/// [`check_sys7_u16`] for a field the record carries as a `u16`.
+fn sys7_u16_field(
+    step: usize,
+    field: &'static str,
+    value: u32,
+) -> std::result::Result<u16, PlanError> {
+    let value = check_sys7_u16(step, field, value)?;
+    u16::try_from(value).map_err(|_| PlanError::Sys7FieldOutOfRange {
+        step,
+        field,
+        value: u64::from(value),
+        max: u64::from(u16::MAX),
+    })
 }
 
 /// Environment variable that overrides the System 7 LSM realisation the product
@@ -103,6 +120,35 @@ pub(super) fn sys7_procedure_end(ops: &[LoadOp]) -> usize {
     ops.iter()
         .rposition(|op| matches!(op, LoadOp::Restart))
         .map_or(ops.len(), |i| i + 1)
+}
+
+/// The load-state machines the memory-mapped form of a System 7 device has:
+/// one per object type, the address table (1), the association table (2), the
+/// application program (3) and the PEI program (4), with their states at
+/// `B6EAh` to `B6EDh` (KNX 3/5/2 §3.31.2, which supports "only one state
+/// machine of each type").
+///
+/// A record on another index names no machine. ETS sends none (issue #489):
+/// its full download of the synthetic `syn-s7-lsm5` (0701, an
+/// `LdCtrlTaskSegment LsmIdx="5"` inside LSM 3's load, the shape of the
+/// Busch-Jaeger 0701 applications such as `M-0002_A-A002-13`) executes no LSM 5
+/// op and writes no record with high nibble 5 to `0x0104`
+/// (`captures/synthetic/syn-s7-lsm5/defaults/requests.txt`: its 18 records
+/// name LSMs 1 to 3 only), and on the house binary input 1.1.44
+/// (`binaereingang-1-1-44.pcapng`) none of ETS's 23 records names LSM 5. knx-sim leaves an
+/// unopened machine Unloaded on such a record (#529), so sending it fails the
+/// flash. The property realisation (0705) is not settled by a capture yet
+/// (`syn-s7-lsm5-0705`, #604 row 32) and keeps the record.
+pub(super) const SYS7_MEMORY_MAPPED_LSMS: std::ops::RangeInclusive<u32> = 1..=4;
+
+/// Whether a System 7 Additional Load Controls record on `lsm` is sent: always
+/// under the property realisation, and under the memory-mapped one only for
+/// an LSM in [`SYS7_MEMORY_MAPPED_LSMS`] (issue #489).
+pub(super) fn sys7_lsm_record_sent(profile: &bussard_mgmt::Sys7Profile, lsm: u32) -> bool {
+    match profile.lsm {
+        bussard_mgmt::LsmRealisation::MemoryMapped { .. } => SYS7_MEMORY_MAPPED_LSMS.contains(&lsm),
+        bussard_mgmt::LsmRealisation::Property => true,
+    }
 }
 
 /// The load-state machines ETS unloads before a full System 7 download: LSMs 1
@@ -183,6 +229,7 @@ fn add_ets_prelude(steps: &mut Vec<FlashStep>, profile: &bussard_mgmt::Sys7Profi
 /// | `CompareMem{a,d,sz}` (Raw)| [`FlashStep::Sys7CompareMem`]                 |
 /// | `LoadImageProp{oi,pid}` | [`FlashStep::LoadImageProp`] (Jung A-A011 MCB)  |
 /// | `Restart`               | [`FlashStep::Restart`]                          |
+/// | `Delay{ms}`             | [`FlashStep::Delay`] (a pause, nothing sent)    |
 ///
 /// [`add_ets_prelude`] then adds ETS's pre-download restart pass and, on a
 /// `VerifyMode` mask, the verify-mode switch.
@@ -230,7 +277,7 @@ pub(super) fn plan_flash_sys7(
     // Resolve parameter images up front: each parameter segment's <Data> is only
     // the vendor's template, and the image streamed for it is that template with
     // the parameters laid over it.
-    let (param_images, placed) =
+    let (param_images, mut placed) =
         bussard_prod::compute_parameter_image_placed_with(app, overrides, base_offsets, memo)
             .map_err(|e| PlanError::UnresolvableImage {
                 step: 0,
@@ -275,33 +322,43 @@ pub(super) fn plan_flash_sys7(
     // A segment the taken branches allocate in parts (issue #413: the MDT
     // `A-0054` with `Switching times in the device` = 1 allocates `0x47E4` as
     // 899 + 2966 + 578 octets of its 5406): each allocation streams the part
-    // of the image it holds, never the whole image into the first one.
-    let allocations: Vec<(u32, u32)> = ops
-        .iter()
-        .filter_map(|op| match op {
-            LoadOp::AbsSegment {
-                address: Some(a),
-                size,
-                ..
-            } => Some((*a, size.unwrap_or(0))),
-            _ => None,
-        })
-        .collect();
-    let mut part_at: BTreeMap<u32, (&bussard_prod::CodeSegment, usize, usize)> = BTreeMap::new();
-    let mut gaps_of: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
-    for (&base, seg) in &seg_by_addr {
-        let len = param_images
+    // of the image it holds, never the whole image into the first one. The
+    // octets between and after the parts are kept on the device, as ETS
+    // keeps them (issue #411, [`sys7_kept_octets`]).
+    let splits = sys7_segment_splits(app, &ops, |seg| {
+        param_images
             .get(&seg.id)
             .filter(|b| !b.is_empty())
             .or(seg.data.as_ref())
-            .map_or(0, Vec::len);
-        let Some(split) = sys7_segment_parts(&allocations, base, len) else {
-            continue;
-        };
-        for &(addr, offset, part_len) in &split.parts {
-            part_at.entry(addr).or_insert((seg, offset, part_len));
+            .map_or(0, Vec::len)
+    });
+    let mut part_at: BTreeMap<u32, (&bussard_prod::CodeSegment, usize, usize)> = BTreeMap::new();
+    let mut gaps_of: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+    for split in &splits {
+        for &(addr, offset, part_len) in &split.parts.parts {
+            part_at.entry(addr).or_insert((split.seg, offset, part_len));
         }
-        gaps_of.insert(seg.id.clone(), split.gaps);
+        gaps_of.insert(split.seg.id.clone(), split.parts.gaps.clone());
+    }
+    let kept: Vec<KeptOctets> = splits.iter().filter_map(SegmentSplit::kept).collect();
+    // A split no `<choose>` makes has no capture: a parameter placed in its
+    // gap refuses, as before issue #411.
+    for split in splits.iter().filter(|s| !s.by_choose) {
+        let placed_here = placed.get(&split.seg.id);
+        if let Some(&(start, end)) =
+            split.parts.gaps.iter().find(|(start, end)| {
+                placed_here.is_some_and(|p| p.range(start..end).next().is_some())
+            })
+        {
+            return Err(PlanError::UnsupportedOp {
+                op: format!(
+                    "LdCtrlAbsSegment allocations outside any <choose> that leave octets \
+                     {start}..{end} of segment {} unallocated while the configuration places \
+                     a parameter there (no ETS capture shows what ETS writes there)",
+                    split.seg.id
+                ),
+            });
+        }
     }
 
     // With `DynamicTableManagement` ETS sizes the address-table segment to the
@@ -324,6 +381,7 @@ pub(super) fn plan_flash_sys7(
         match op {
             LoadOp::Connect | LoadOp::Disconnect => {}
             LoadOp::Restart => steps.push(FlashStep::Restart),
+            LoadOp::Delay { milliseconds } => steps.push(super::plan::lower_delay(*milliseconds)?),
             LoadOp::Unload { lsm_idx } => steps.push(FlashStep::Sys7Unload {
                 lsm: check_sys7_lsm(step_no, lsm_idx.unwrap_or(0))?,
             }),
@@ -340,6 +398,7 @@ pub(super) fn plan_flash_sys7(
                 access,
                 mem_type,
                 seg_flags,
+                seg_type,
             } => {
                 // Validate before anything is bound: the executor folds the LSM
                 // index into the record's opcode nibble and the address/size into
@@ -369,12 +428,11 @@ pub(super) fn plan_flash_sys7(
                 let mem_type = mem_type
                     .and_then(|m| u8::try_from(m).ok())
                     .unwrap_or_else(|| mem_type_for_addr(addr, &s7_profile));
-                let (default_flags, default_checksum) = bussard_mgmt::alloc_attr_octets(mem_type);
-                let op_seg_flags: Option<u32> = seg_flags.to_owned();
-                let checksum_ctrl = seg_flags_octet(op_seg_flags).unwrap_or(default_checksum);
-                let seg_flags = access
+                let (default_access, default_seg_flags) = bussard_mgmt::alloc_attr_octets(mem_type);
+                let seg_flags = seg_flags_octet(*seg_flags).unwrap_or(default_seg_flags);
+                let access = access
                     .and_then(|a| u8::try_from(a).ok())
-                    .unwrap_or(default_flags);
+                    .unwrap_or(default_access);
                 // A table LSM (1 = group addresses, 2 = associations) streams the
                 // table computed from the model, never the product's `<Data>`
                 // template: the Jung 3361-1MWW ships a 255-entry placeholder table
@@ -427,7 +485,7 @@ pub(super) fn plan_flash_sys7(
                             gaps_of.get(&seg.id).map(Vec::as_slice).unwrap_or(&[]),
                             &mut images,
                             &mut segment_masks,
-                        )?
+                        )
                     } else {
                         seg_by_addr.get(&addr).and_then(|seg| {
                             let bytes = param_images
@@ -452,18 +510,41 @@ pub(super) fn plan_flash_sys7(
                         })
                     }
                 };
+                // `SegType="1"` allocates a stack segment: ETS sends it as
+                // AllocAbsStackSeg (subtype 01), every other octet as for a
+                // data segment (issue #487, MDT `A-0222` LSM 3 record 4).
+                let seg_type = match seg_type.unwrap_or(0) {
+                    0 => bussard_mgmt::sys7::S7_SUB_ALLOC_DATA,
+                    1 => bussard_mgmt::sys7::S7_SUB_ALLOC_STACK,
+                    other => {
+                        return Err(PlanError::UnresolvableImage {
+                            step: step_no,
+                            reason: format!(
+                                "LdCtrlAbsSegment SegType {other} is not a data (0) or stack (1) segment"
+                            ),
+                        });
+                    }
+                };
                 steps.push(FlashStep::Sys7AbsSegment {
                     lsm,
                     address: addr,
                     size,
                     mem_type,
+                    access,
                     seg_flags,
-                    checksum_ctrl,
+                    seg_type,
                     image,
                 });
             }
             LoadOp::TaskSegment { lsm_idx, address } => {
                 let lsm = check_sys7_lsm(step_no, lsm_idx.unwrap_or(0))?;
+                // A TaskSegment on an LSM the memory-mapped form has no machine
+                // for (LsmIdx 5 on the Busch-Jaeger 0701 applications) is not
+                // sent: ETS sends no record for it
+                // (captures/synthetic/syn-s7-lsm5, issue #489).
+                if !sys7_lsm_record_sent(&s7_profile, lsm) {
+                    continue;
+                }
                 let addr = address.ok_or_else(|| PlanError::UnresolvableImage {
                     step: step_no,
                     reason: "LdCtrlTaskSegment has no Address".to_string(),
@@ -513,6 +594,60 @@ pub(super) fn plan_flash_sys7(
                     lsm,
                     address: addr,
                     count,
+                });
+            }
+            LoadOp::TaskPtr {
+                lsm_idx,
+                init_ptr,
+                save_ptr,
+                serial_ptr,
+            } => {
+                // The Task Pointer Record, mandatory on 0701/0705 (Profiles
+                // Annex A.2.4.1 Table 7), laid out per KNX 3/5/2 §3.31.2.
+                let lsm = check_sys7_lsm(step_no, lsm_idx.unwrap_or(0))?;
+                steps.push(FlashStep::Sys7TaskPtr {
+                    lsm,
+                    init: sys7_u16_field(step_no, "task pointer init", init_ptr.unwrap_or(0))?,
+                    save: sys7_u16_field(step_no, "task pointer save", save_ptr.unwrap_or(0))?,
+                    pei_handler: sys7_u16_field(
+                        step_no,
+                        "task pointer PEI handler",
+                        serial_ptr.unwrap_or(0),
+                    )?,
+                });
+            }
+            LoadOp::TaskCtrl2 {
+                lsm_idx,
+                callback,
+                address,
+                seg0,
+                seg1,
+            } => {
+                // Task Control Record 2, mandatory on 0701/0705 (Profiles
+                // Annex A.2.4.1 Table 7), laid out per KNX 3/5/2 §3.31.2.
+                let lsm = check_sys7_lsm(step_no, lsm_idx.unwrap_or(0))?;
+                steps.push(FlashStep::Sys7TaskCtrl2 {
+                    lsm,
+                    callback: sys7_u16_field(
+                        step_no,
+                        "task control 2 callback",
+                        callback.unwrap_or(0),
+                    )?,
+                    com_objects: sys7_u16_field(
+                        step_no,
+                        "task control 2 group-object pointer",
+                        address.unwrap_or(0),
+                    )?,
+                    segment_1: sys7_u16_field(
+                        step_no,
+                        "task control 2 segment 1",
+                        seg0.unwrap_or(0),
+                    )?,
+                    segment_2: sys7_u16_field(
+                        step_no,
+                        "task control 2 segment 2",
+                        seg1.unwrap_or(0),
+                    )?,
                 });
             }
             LoadOp::CompareProp { .. } => {
@@ -594,15 +729,29 @@ pub(super) fn plan_flash_sys7(
         .chain(linked.iter().copied())
         .max();
     let declared = app.com_object_table.as_ref();
-    apply_sys7_group_object_links(
-        &steps,
-        &mut images,
-        declared,
-        &linked,
-        linked_flags,
-        &default_flags,
-        last_object,
-    );
+    // An application that declares no com-object, no module object and no
+    // link has every descriptor past its last declared object: ETS writes the
+    // template unchanged (issue #475, COMIP2 `M-00E1_A-A00D-10-12FB-O00C5`,
+    // all 8 CONFIG octets kept at `df`). Only a declaration rewrites.
+    if let Some(last_object) = last_object {
+        apply_sys7_group_object_links(
+            &steps,
+            &mut images,
+            declared,
+            &linked,
+            linked_flags,
+            &default_flags,
+            Some(last_object),
+        );
+    }
+    // A kept octet is written by no step, so it is not placed: the dump's
+    // coverage, the parameter-only download and the restore leave it alone,
+    // and the read-back reports a parameter there as kept (issue #411).
+    for k in &kept {
+        if let Some(octets) = placed.get_mut(&k.segment) {
+            octets.retain(|&i| !k.contains(i));
+        }
+    }
     let code_segments = sys7_code_segments(&steps, &images, declared, &param_images, &placed);
 
     Ok(FlashPlan {
@@ -612,6 +761,7 @@ pub(super) fn plan_flash_sys7(
             application_number: app.application_number,
             application_version: app.application_version,
             mask_version: app_mask,
+            original_manufacturer: app.original_manufacturer.clone(),
         },
         device_mask,
         steps,
@@ -627,6 +777,12 @@ pub(super) fn plan_flash_sys7(
         baseline: BTreeMap::new(),
         placed,
         unwritten: BTreeMap::new(),
+        baseline_address: BTreeMap::new(),
+        security_capacity: Default::default(),
+        user_memory_above_64k: false,
+        par_allocations: BTreeMap::new(),
+        par_procedure: false,
+        kept,
     })
 }
 
@@ -653,9 +809,9 @@ fn sys7_code_segments(
             FlashStep::Sys7AbsSegment {
                 image: Some(image),
                 mem_type,
-                checksum_ctrl,
+                seg_flags,
                 ..
-            } if image.kind == ImageKind::Code && *mem_type != 2 && *checksum_ctrl != 0 => {
+            } if image.kind == ImageKind::Code && *mem_type != 2 && *seg_flags != 0 => {
                 Some(&image.segment_id)
             }
             _ => None,
@@ -730,21 +886,227 @@ pub(super) fn sys7_segment_parts(
     Some(SegmentParts { parts, gaps })
 }
 
+/// One absolute segment of a System 7 application the taken branches of its
+/// load procedure allocate in parts (issue #413), with the load-state
+/// machine of its first part.
+pub(super) struct SegmentSplit<'a> {
+    /// The segment.
+    seg: &'a bussard_prod::CodeSegment,
+    /// Its absolute base address.
+    base: u32,
+    /// The octets of its image.
+    len: usize,
+    /// The LSM the first part is allocated on.
+    lsm: Option<u32>,
+    /// The parts and the gaps.
+    parts: SegmentParts,
+    /// Whether a `<choose>` branch makes the split: the allocations outside
+    /// every `<choose>` do not split the segment. Only such a split is
+    /// planned as the `syn-s7-choose-split` capture shows (issue #411); a
+    /// procedure that always allocates a segment in part (the Jung
+    /// `M-0004_A-5015-13-7E56-O00F4`, `AS-5DAF`: 4 of 14 octets) has no
+    /// capture, and a parameter placed in its gap still refuses.
+    by_choose: bool,
+}
+
+impl SegmentSplit<'_> {
+    /// The octets of the segment no allocation holds, as [`KeptOctets`]
+    /// (issue #411); `None` when the parts cover the whole image.
+    fn kept(&self) -> Option<KeptOctets> {
+        (self.by_choose && !self.parts.gaps.is_empty()).then(|| KeptOctets {
+            object: self.lsm.unwrap_or(0),
+            segment: self.seg.id.clone(),
+            allocated: self.len,
+            ranges: self.parts.gaps.clone(),
+            address: Some(self.base),
+        })
+    }
+}
+
+/// The absolute segments of `app` the `LdCtrlAbsSegment` records of `ops`
+/// (the taken branches) allocate in parts ([`sys7_segment_parts`]), the
+/// image of each `image_len(segment)` octets long. A segment at an address
+/// another segment also declares is taken once, the last by id.
+pub(super) fn sys7_segment_splits<'a>(
+    app: &'a ApplicationProgram,
+    ops: &[LoadOp],
+    image_len: impl Fn(&bussard_prod::CodeSegment) -> usize,
+) -> Vec<SegmentSplit<'a>> {
+    let mut seg_by_addr: BTreeMap<u32, &bussard_prod::CodeSegment> = BTreeMap::new();
+    for seg in app.code_segments.values() {
+        if seg.kind == SegmentKind::Absolute
+            && let Some(addr) = seg.address_or_offset
+        {
+            seg_by_addr.insert(addr, seg);
+        }
+    }
+    let records: Vec<(Option<u32>, u32, u32)> = ops
+        .iter()
+        .filter_map(|op| match op {
+            LoadOp::AbsSegment {
+                lsm_idx,
+                address: Some(a),
+                size,
+                ..
+            } => Some((*lsm_idx, *a, size.unwrap_or(0))),
+            _ => None,
+        })
+        .collect();
+    let allocations: Vec<(u32, u32)> = records.iter().map(|&(_, a, s)| (a, s)).collect();
+    // The allocations no `<choose>` guards: a segment they split already is
+    // split by the procedure itself, not by a branch.
+    let unguarded: Vec<(u32, u32)> = super::plan::self_contained_blocks(app)
+        .into_iter()
+        .flat_map(|p| {
+            p.ops
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| p.guards_of(*i).is_empty())
+                .filter_map(|(_, op)| match op {
+                    LoadOp::AbsSegment {
+                        address: Some(a),
+                        size,
+                        ..
+                    } => Some((*a, size.unwrap_or(0))),
+                    _ => None,
+                })
+        })
+        .collect();
+    seg_by_addr
+        .into_iter()
+        .filter_map(|(base, seg)| {
+            let len = image_len(seg);
+            let parts = sys7_segment_parts(&allocations, base, len)?;
+            let first = parts.parts.first().map(|&(addr, _, _)| addr);
+            let lsm = records
+                .iter()
+                .find(|&&(_, a, _)| Some(a) == first)
+                .and_then(|&(lsm, _, _)| lsm);
+            let by_choose = sys7_segment_parts(&unguarded, base, len).is_none();
+            Some(SegmentSplit {
+                seg,
+                base,
+                len,
+                lsm,
+                parts,
+                by_choose,
+            })
+        })
+        .collect()
+}
+
+/// The octets of each absolute segment a System 7 download leaves as the
+/// device holds them (issue #411): the gaps the taken branches' allocations
+/// leave in a segment they allocate in parts, each segment's image
+/// `image_len(segment)` octets long.
+///
+/// The rule, from ETS: a branch that allocates a segment in parts is planned
+/// as ETS downloads it. Each `LdCtrlAbsSegment` record is sent as the
+/// product declares it, each part of the image is streamed into the
+/// allocation that holds it, and the octets no allocation holds are neither
+/// written nor read back; a parameter placed there is kept on the device,
+/// reported as kept (not written, no verdict). ETS's download of the
+/// synthetic `syn-s7-choose-split`
+/// (`captures/synthetic/syn-s7-choose-split/defaults/ops.txt`, ops 33 to 41)
+/// allocates `0x4440` (1 octet) and `0x4443` (61 octets), streams `0x4440`
+/// and `0x4443..0x447F`, and never writes or reads `0x4441..0x4442`, where
+/// the 16-bit parameter `delay` sits; the download completes. The MDT
+/// `A-0054-14` and `A-0255-21` with `P-203` = 1 have the same shape.
+pub(super) fn sys7_kept_octets(
+    app: &ApplicationProgram,
+    ops: &[LoadOp],
+    image_len: impl Fn(&bussard_prod::CodeSegment) -> usize,
+) -> Vec<KeptOctets> {
+    sys7_segment_splits(app, ops, image_len)
+        .iter()
+        .filter_map(SegmentSplit::kept)
+        .collect()
+}
+
+/// The `(LSM, address, size)` of every `LdCtrlAbsSegment` record a System 7
+/// download of `app` under `values` sends, `None` when the procedure cannot
+/// be decided (the planner refuses such a plan on its own).
+fn sys7_allocation_records(
+    app: &ApplicationProgram,
+    values: &BTreeMap<String, String>,
+    memo: &bussard_prod::dynamic::DynamicMemo<'_, ApplicationProgram>,
+) -> Option<BTreeSet<(u32, u32, u32)>> {
+    let config = memo.evaluate_for(app, values);
+    let mut ops = super::plan_props::guarded_ops(app, &config).ok()?;
+    ops.truncate(sys7_procedure_end(&ops));
+    Some(
+        ops.iter()
+            .filter_map(|op| match op {
+                LoadOp::AbsSegment {
+                    lsm_idx,
+                    address: Some(a),
+                    size,
+                    ..
+                } => Some((lsm_idx.unwrap_or(0), *a, size.unwrap_or(0))),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+/// Why a parameter-only download cannot take a System 7 device from the
+/// parameter values `before` (decoded off the device) to `after` (the
+/// model's): a load-procedure `<choose>` on a changed parameter allocates
+/// the absolute segments differently (issue #411), `None` when it does not,
+/// for an application that is not System 7, or when either side cannot be
+/// decided.
+///
+/// A parameter-only download sends no allocation record, so the device keeps
+/// the allocations of its last full download: writing the new layout's
+/// octets into memory the device never allocated is refused by the device
+/// (knx-sim answers `T_NAK`), and octets the new layout keeps would carry
+/// the old values. Only a full download allocates the new layout. The
+/// synthetic `syn-s7-choose-split` shows it: `mode` 1 allocates `0x4440` in
+/// two parts around `delay`, any other value all 64 octets.
+pub fn allocation_change(
+    app: &ApplicationProgram,
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+    memo: &bussard_prod::dynamic::DynamicMemo<'_, ApplicationProgram>,
+) -> Option<String> {
+    let is_sys7 = app
+        .mask_version
+        .as_deref()
+        .and_then(|m| u16::from_str_radix(m.trim(), 16).ok())
+        .map(bussard_mgmt::MaskProfile::from_mask)
+        .is_some_and(|p| p.is_system_7());
+    if !is_sys7 || app.load_procedures.iter().all(|p| p.chooses.is_empty()) {
+        return None;
+    }
+    let old = sys7_allocation_records(app, before, memo)?;
+    let new = sys7_allocation_records(app, after, memo)?;
+    if old == new {
+        return None;
+    }
+    let text = |records: Vec<&(u32, u32, u32)>| -> String {
+        records
+            .iter()
+            .map(|(lsm, addr, size)| format!("LSM {lsm} {addr:#06X} ({size} octets)"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Some(format!(
+        "the load procedure allocates {} instead of {}",
+        text(new.difference(&old).collect()),
+        text(old.difference(&new).collect())
+    ))
+}
+
 /// Binds the part `offset..offset + len` of `seg`'s image to the allocation
 /// that holds it (issue #413), registering the whole image and its write mask
 /// the first time the segment is met.
 ///
 /// The octets of the segment no allocation holds (`gaps`) are the device's:
-/// the mask marks them unwritten, so a parameter-only download, the diff
-/// against the device and the read-compare leave them alone, as ETS does.
-///
-/// # Errors
-///
-/// [`PlanError::UnsupportedOp`] when a gap holds an octet the configuration
-/// places a parameter in. The download would leave the device's octets
-/// there while the model sets them, and no read-back can make the two agree:
-/// the rule issue #402 set for a System B `<choose>` that writes a segment in
-/// part.
+/// the mask marks them unwritten, so the read-compare, a parameter-only
+/// download and the diff against the device leave them alone, as ETS does. A
+/// parameter placed there is kept on the device (issue #411,
+/// [`sys7_kept_octets`]), the octets it occupies masked off like the rest of
+/// the gap.
 #[allow(clippy::too_many_arguments)] // the segment, its part, and the plan's image tables.
 fn bind_segment_part(
     seg: &bussard_prod::CodeSegment,
@@ -755,34 +1117,16 @@ fn bind_segment_part(
     gaps: &[(usize, usize)],
     images: &mut BTreeMap<String, Vec<u8>>,
     segment_masks: &mut BTreeMap<String, Vec<u8>>,
-) -> std::result::Result<Option<ImageRef>, PlanError> {
-    let Some(data) = param_images
+) -> Option<ImageRef> {
+    let data = param_images
         .get(&seg.id)
         .filter(|b| !b.is_empty())
-        .or(seg.data.as_ref())
-    else {
-        return Ok(None);
-    };
+        .or(seg.data.as_ref())?;
     if !images.contains_key(&seg.id) {
-        let placed_here = placed.get(&seg.id);
-        if let Some(&(start, end)) = gaps
-            .iter()
-            .find(|(start, end)| placed_here.is_some_and(|p| p.range(start..end).next().is_some()))
-        {
-            return Err(PlanError::UnsupportedOp {
-                op: format!(
-                    "LdCtrlAbsSegment allocations that leave octets {start}..{end} of segment \
-                     {} unallocated while the configuration places a parameter there (ETS \
-                     keeps the device's octets there; bussard cannot verify a segment it \
-                     writes only in part)",
-                    seg.id
-                ),
-            });
-        }
         let mut mask = seg
             .mask
             .as_ref()
-            .map(|m| effective_mask(m, placed_here))
+            .map(|m| effective_mask(m, placed.get(&seg.id)))
             .unwrap_or_else(|| vec![0xFF; data.len()]);
         for &(start, end) in gaps {
             for byte in mask.iter_mut().take(end).skip(start) {
@@ -792,12 +1136,12 @@ fn bind_segment_part(
         images.insert(seg.id.clone(), data.clone());
         segment_masks.insert(seg.id.clone(), mask);
     }
-    Ok(Some(ImageRef {
+    Some(ImageRef {
         segment_id: seg.id.clone(),
         kind: ImageKind::Code,
         len,
         offset,
-    }))
+    })
 }
 
 /// The write mask of a parameter segment (issue #320): an octet is written
@@ -826,6 +1170,9 @@ pub(super) struct Sys7ObjectDefault {
     /// The TYPE octet (the size code of the ref's object size), `None` to keep
     /// the template's.
     type_code: Option<u8>,
+    /// The transmission priority the ref (else its base object) declares,
+    /// for CONFIG bits 1-0; `None` keeps the template's (issue #541).
+    priority: Option<bussard_model::Priority>,
 }
 
 /// The per-ASAP defaults the System 7 post-pass writes, from the Dynamic walk.
@@ -834,14 +1181,21 @@ pub(super) struct Sys7ObjectDefault {
 /// the flags of the visible ComObjectRef (the 3361-1MWW and 3181 captures of
 /// issue #117: the same object `Number` has refs with different flags under
 /// different `<when>` branches), and leaves an object no branch shows at the
-/// template (C cleared). An application without a Dynamic section (the walk
-/// reaches no com-object) falls back to the flat product defaults: every
-/// declared ref's flags, with the template's TYPE.
+/// template (C cleared). Only an application whose Dynamic section (module
+/// bodies included) holds no `<ComObjectRefRef>` at all falls back to the
+/// flat product defaults: every declared ref's flags, with the template's
+/// TYPE. One that has them but whose walk reaches none at these values gets
+/// no defaults, so every object keeps the template with C cleared (issue
+/// #562, ABB `A-A04C-13`: every object behind `Eingang_freigeben = 1`,
+/// default 0; ETS wrote `template & !C` on all 20 sweep rows).
 pub(super) fn sys7_object_defaults(
     app: &ApplicationProgram,
     config: &bussard_prod::dynamic::DynamicConfig,
 ) -> BTreeMap<u16, Sys7ObjectDefault> {
     if config.com_objects.is_empty() {
+        if dynamic_declares_com_objects(app) {
+            return BTreeMap::new();
+        }
         return app
             .resolved_com_objects()
             .iter()
@@ -851,6 +1205,7 @@ pub(super) fn sys7_object_defaults(
                     Sys7ObjectDefault {
                         flags: c.flags(),
                         type_code: None,
+                        priority: c.declared_priority(),
                     },
                 )
             })
@@ -861,12 +1216,15 @@ pub(super) fn sys7_object_defaults(
         let Some((base, cref)) = app.resolve(&active.com_object_ref_id) else {
             continue;
         };
-        let offset = base
-            .base_number_ref
-            .as_deref()
-            .map(|arg| arg.strip_prefix(&format!("{}_", app.id)).unwrap_or(arg))
-            .and_then(|arg| config.module_args(active.module)?.get(arg).copied())
-            .unwrap_or(0);
+        // A `BaseNumber` its instance has no value for (issue #449) gets no
+        // entry here; the parameter image refuses the configuration.
+        let offset = match base.base_number_ref.as_deref() {
+            Some(arg) => match bussard_prod::module_argument(app, config, active.module, arg) {
+                Some(v) => v,
+                None => continue,
+            },
+            None => 0,
+        };
         let Ok(asap) = u16::try_from(i64::from(base.number) + offset) else {
             continue;
         };
@@ -876,37 +1234,43 @@ pub(super) fn sys7_object_defaults(
             Sys7ObjectDefault {
                 flags: base.flags.merge(cref.flags).to_flags(),
                 type_code: size.and_then(sys7_type_code),
+                priority: cref.priority.or(base.priority),
             },
         );
     }
     out
 }
 
-/// The System 7 TYPE octet for an `ObjectSize` (the KNX size code: `1 Bit` is
-/// 0, `1 Byte` 7, `2 Bytes` 8), `None` for a size the table does not know.
-pub(super) fn sys7_type_code(object_size: &str) -> Option<u8> {
-    let code = crate::compute::size_code_from_object_size(Some(object_size));
-    let one_bit = object_size.trim().eq_ignore_ascii_case("1 bit");
-    (code != 0 || one_bit).then_some(code)
-}
-
-/// The System 7 CONFIG octet for a linked object: the project's flags in bits
-/// 7 (U), 6 (T), 4 (W), 3 (R) and 2 (C), the template's bits 5, 1 and 0 kept.
-pub(super) fn sys7_config_from_flags(template: u8, flags: bussard_model::Flags) -> u8 {
-    use bussard_model::Flags;
-    let mut c = template & 0b0010_0011;
-    for (bit, flag) in [
-        (7, Flags::UPDATE),
-        (6, Flags::TRANSMIT),
-        (4, Flags::WRITE),
-        (3, Flags::READ),
-        (2, Flags::COMMUNICATION),
-    ] {
-        if flags.contains(flag) {
-            c |= 1 << bit;
+/// Whether the program's Dynamic section or any module body holds a
+/// `<ComObjectRefRef>` on any branch.
+fn dynamic_declares_com_objects(app: &ApplicationProgram) -> bool {
+    use bussard_model::dynamic::DynamicNode;
+    let mut stack: Vec<&[DynamicNode]> = vec![app.dynamic.as_slice()];
+    stack.extend(app.module_dynamics.values().map(Vec::as_slice));
+    while let Some(nodes) = stack.pop() {
+        for node in nodes {
+            match node {
+                DynamicNode::ComObjectRefRef(_) => return true,
+                DynamicNode::Channel { children, .. }
+                | DynamicNode::ParameterBlock { children, .. }
+                | DynamicNode::Repeat { children, .. } => stack.push(children),
+                DynamicNode::Choose { whens, .. } => {
+                    stack.extend(whens.iter().map(|w| w.children.as_slice()));
+                }
+                DynamicNode::ParameterRefRef(_)
+                | DynamicNode::Module { .. }
+                | DynamicNode::Assign { .. } => {}
+            }
         }
     }
-    c
+    false
+}
+
+/// The System 7 TYPE octet for an `ObjectSize` (the KNX size code: `1 Bit` is
+/// 0, `1 Byte` 7, `2 Bytes` 8), `None` for a size the table does not know; the
+/// descriptor then keeps the product's template octet.
+pub(super) fn sys7_type_code(object_size: &str) -> Option<u8> {
+    crate::compute::object_size_code(object_size)
 }
 
 /// The ASAPs a System 7 association-table image (`[CNT][TSAP ASAP]…`) links.
@@ -935,7 +1299,9 @@ pub(super) fn sys7_linked_asaps(assoc_image: &[u8]) -> BTreeSet<u16> {
 ///   cleared.
 ///
 /// An ASAP whose default carries a TYPE octet (the visible ref's object size)
-/// takes that too.
+/// takes that too, and one whose visible ref (else base object) declares a
+/// `Priority` takes it into bits 1-0 (Resources 3/5/1 §4.18.3.1.2.1, issue
+/// #541); without a declaration the template's priority stays.
 ///
 /// `last_object` is the highest com-object `Number` the application declares:
 /// ETS rewrites the descriptors up to it (numbering gaps included) and leaves
@@ -994,17 +1360,23 @@ pub(super) fn apply_sys7_group_object_links(
                 .copied()
                 .or_else(|| default.map(|o| o.flags | Flags::COMMUNICATION))
             {
-                Some(flags) => d[2] = sys7_config_from_flags(d[2], flags),
+                Some(flags) => d[2] = crate::compute_sys7::sys7_config_byte(d[2], flags),
                 None => d[2] |= 0x04,
             }
         } else {
             match default {
-                Some(o) => d[2] = sys7_config_from_flags(d[2], o.flags - Flags::COMMUNICATION),
+                Some(o) => {
+                    d[2] =
+                        crate::compute_sys7::sys7_config_byte(d[2], o.flags - Flags::COMMUNICATION)
+                }
                 None => d[2] &= !0x04,
             }
         }
         if let Some(t) = default.and_then(|o| o.type_code) {
             d[3] = t;
+        }
+        if let Some(p) = default.and_then(|o| o.priority) {
+            d[2] = (d[2] & !0b11) | (p.code() as u8 & 0b11);
         }
     }
 }
@@ -1360,8 +1732,9 @@ pub fn sys7_task_identity(
 }
 
 /// Maps an `LdCtrlAbsSegment` `SegFlags` attribute to the allocation record's
-/// checksum-control octet: `128` → `0x80` (checksum-controlled), `0` → `0x00`
-/// (runtime-writable). Any other value is passed through when it fits an octet.
+/// memory-attributes octet (bit 7 checksum control): `128` → `0x80`
+/// (checksum-controlled), `0` → `0x00` (runtime-writable). Any other value is
+/// passed through when it fits an octet.
 pub(super) fn seg_flags_octet(seg_flags: Option<u32>) -> Option<u8> {
     seg_flags.and_then(|f| u8::try_from(f).ok())
 }
@@ -1433,6 +1806,7 @@ pub(super) fn sys7_op_label(op: &LoadOp) -> String {
         }
         LoadOp::WriteProp { .. } => "LdCtrlWriteProp (not in the System 7 corpus)".to_string(),
         LoadOp::MasterReset { .. } => "LdCtrlMasterReset (not in the System 7 corpus)".to_string(),
+        LoadOp::MapError { .. } => "LdCtrlMapError (not in the System 7 corpus)".to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -1699,8 +2073,9 @@ mod tests {
             address: 0x43FE,
             size: 123,
             mem_type: 3,
-            seg_flags: 0x80,
-            checksum_ctrl: 0x00,
+            access: 0x80,
+            seg_flags: 0x00,
+            seg_type: 0,
             image: Some(ImageRef {
                 segment_id: seg_id.clone(),
                 kind: ImageKind::Code,
@@ -1719,6 +2094,7 @@ mod tests {
                 Sys7ObjectDefault {
                     flags: Flags::WRITE | Flags::COMMUNICATION,
                     type_code: None,
+                    priority: None,
                 },
             ),
             (
@@ -1726,10 +2102,12 @@ mod tests {
                 Sys7ObjectDefault {
                     flags: Flags::TRANSMIT | Flags::WRITE | Flags::COMMUNICATION,
                     type_code: None,
+                    priority: None,
                 },
             ),
         ]);
-        let run = |declared: Option<&TableLocation>| {
+        let run_with = |declared: Option<&TableLocation>,
+                        defaults: &BTreeMap<u16, Sys7ObjectDefault>| {
             let mut images = BTreeMap::from([(seg_id.clone(), template.clone())]);
             apply_sys7_group_object_links(
                 &steps,
@@ -1737,11 +2115,12 @@ mod tests {
                 declared,
                 &BTreeSet::new(),
                 &BTreeMap::new(),
-                &defaults,
+                defaults,
                 None,
             );
             images.remove(&seg_id).unwrap_or_default()
         };
+        let run = |declared: Option<&TableLocation>| run_with(declared, &defaults);
         // The shape finder alone does not see it: no RAM segment in the plan.
         assert_eq!(sys7_group_object_table(&steps, &BTreeMap::new()), None);
         assert_eq!(run(None), template);
@@ -1753,6 +2132,33 @@ mod tests {
             run(Some(&declared)),
             vec![
                 0x03, 0x60, 0x04, 0x7E, 0x04, 0x13, 0x00, 0x7F, 0x04, 0x53, 0x00, 0x83, 0x04, 0xDB,
+                0x00
+            ]
+        );
+        // A declared priority replaces the template's in bits 1-0 (issue
+        // #541): `High` is the standard's normal (`01`), `Alert` urgent
+        // (`10`); a declared `Low` keeps `11`.
+        let mut prioritised = defaults.clone();
+        for (asap, priority) in [
+            (0, bussard_model::Priority::Low),
+            (1, bussard_model::Priority::High),
+        ] {
+            if let Some(d) = prioritised.get_mut(&asap) {
+                d.priority = Some(priority);
+            }
+        }
+        prioritised.insert(
+            2,
+            Sys7ObjectDefault {
+                flags: Flags::TRANSMIT,
+                type_code: None,
+                priority: Some(bussard_model::Priority::Alarm),
+            },
+        );
+        assert_eq!(
+            run_with(Some(&declared), &prioritised),
+            vec![
+                0x03, 0x60, 0x04, 0x7E, 0x04, 0x13, 0x00, 0x7F, 0x04, 0x51, 0x00, 0x83, 0x04, 0x42,
                 0x00
             ]
         );
@@ -1776,8 +2182,9 @@ mod tests {
                 address: 0x0700,
                 size: 450,
                 mem_type: 2,
-                seg_flags: 0xF2,
-                checksum_ctrl: 0x00,
+                access: 0xF2,
+                seg_flags: 0x00,
+                seg_type: 0,
                 image: None,
             },
             FlashStep::Sys7AbsSegment {
@@ -1785,8 +2192,9 @@ mod tests {
                 address: 0x43FF,
                 size: 811,
                 mem_type: 3,
-                seg_flags: 0xF2,
-                checksum_ctrl: 0x80,
+                access: 0xF2,
+                seg_flags: 0x80,
+                seg_type: 0,
                 image: Some(ImageRef {
                     segment_id: seg_id.clone(),
                     kind: ImageKind::Code,
@@ -1897,14 +2305,15 @@ mod tests {
     /// configuration).
     #[test]
     fn test_sys7_code_segments_never_picks_a_table_or_parameter_segment() {
-        let seg = |lsm: u32, address: u32, mem_type: u8, checksum_ctrl: u8, id: &str, kind| {
+        let seg = |lsm: u32, address: u32, mem_type: u8, seg_flags: u8, id: &str, kind| {
             FlashStep::Sys7AbsSegment {
                 lsm,
                 address,
                 size: 16,
                 mem_type,
-                seg_flags: 0xF2,
-                checksum_ctrl,
+                access: 0xF2,
+                seg_flags,
+                seg_type: 0,
                 image: Some(ImageRef {
                     segment_id: id.to_string(),
                     kind,
@@ -1961,8 +2370,9 @@ mod tests {
                 address: 0x0700,
                 size: 450,
                 mem_type: 2,
-                seg_flags: 0xF2,
-                checksum_ctrl: 0x00,
+                access: 0xF2,
+                seg_flags: 0x00,
+                seg_type: 0,
                 image: None,
             },
             FlashStep::Sys7AbsSegment {
@@ -1970,8 +2380,9 @@ mod tests {
                 address: 0x43FE,
                 size: 883,
                 mem_type: 3,
-                seg_flags: 0xF2,
-                checksum_ctrl: 0x80,
+                access: 0xF2,
+                seg_flags: 0x80,
+                seg_type: 0,
                 image: Some(ImageRef {
                     segment_id: seg_id.clone(),
                     kind: ImageKind::Code,
@@ -2057,8 +2468,9 @@ mod tests {
                 address: 0x0700,
                 size: 16,
                 mem_type: 2,
-                seg_flags: 0xF2,
-                checksum_ctrl: 0x00,
+                access: 0xF2,
+                seg_flags: 0x00,
+                seg_type: 0,
                 image: None,
             },
             FlashStep::Sys7AbsSegment {
@@ -2066,8 +2478,9 @@ mod tests {
                 address: 0x43FF,
                 size: 15,
                 mem_type: 3,
-                seg_flags: 0xF2,
-                checksum_ctrl: 0x80,
+                access: 0xF2,
+                seg_flags: 0x80,
+                seg_type: 0,
                 image: Some(ImageRef {
                     segment_id: seg_id.clone(),
                     kind: ImageKind::Code,
@@ -2123,6 +2536,124 @@ mod tests {
         );
         Ok(())
     }
+    /// A System 7 (0701) app whose LSM 3 segment `AS-43FF` carries a three-slot
+    /// descriptor table (template C set, `df`) that `<ComObjectTable>` names;
+    /// `objects` goes into `<Static>` and `dynamic` is the Dynamic section.
+    fn sys7_descriptor_app(
+        objects: &str,
+        dynamic: &str,
+    ) -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
+        let xml = format!(
+            r#"<KNX xmlns="http://knx.org/xml/project/23">
+         <ApplicationProgram PeiType="0" Id="A" ApplicationNumber="1" ApplicationVersion="16"
+            MaskVersion="MV-0701" Name="Descriptors" LoadProcedureStyle="ProductProcedure">
+          <Static>
+           <Code>
+            <AbsoluteSegment Id="A_AS-43FF" Size="15" Address="17407"><Data>AwcPBwDfAAcB3wcHAt8A</Data></AbsoluteSegment>
+           </Code>
+           <ParameterTypes><ParameterType Id="A_PT-1" Name="t"><TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="1" /></ParameterType></ParameterTypes>
+           <Parameters><Parameter Id="A_P-1" Name="enable" ParameterType="A_PT-1" Value="0" /></Parameters>
+           <ParameterRefs><ParameterRef Id="A_P-1_R-1" RefId="A_P-1" /></ParameterRefs>
+           {objects}
+           <ComObjectTable CodeSegment="A_AS-43FF" Offset="0" />
+           <LoadProcedures>
+            <LoadProcedure>
+             <LdCtrlConnect />
+             <LdCtrlLoad LsmIdx="3" />
+             <LdCtrlAbsSegment LsmIdx="3" Address="17407" Size="15" />
+             <LdCtrlLoadCompleted LsmIdx="3" />
+             <LdCtrlDisconnect />
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+          {dynamic}
+         </ApplicationProgram></KNX>"#
+        );
+        Ok(parse_application_program("A", xml.as_bytes())?)
+    }
+
+    fn plan_descriptor_table(
+        app: &ApplicationProgram,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let plan = plan_flash(
+            app,
+            "1.1.99",
+            0x0701,
+            &no_overrides(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        Ok(plan
+            .image_bytes("A_AS-43FF")
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default())
+    }
+
+    /// Issue #475 (COMIP2 `M-00E1_A-A00D-10-12FB-O00C5`): an application that
+    /// declares no com-object, no module object and no link writes the
+    /// descriptor table as the template has it, C kept on every slot.
+    #[test]
+    fn test_plan_flash_sys7_template_only_table_keeps_the_template()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let app = sys7_descriptor_app("", "")?;
+        assert_eq!(
+            plan_descriptor_table(&app)?,
+            vec![
+                0x03, 0x07, 0x0F, 0x07, 0x00, 0xDF, 0x00, 0x07, 0x01, 0xDF, 0x07, 0x07, 0x02, 0xDF,
+                0x00
+            ]
+        );
+        Ok(())
+    }
+
+    /// Issue #562 (ABB `A-A04C-13-0D6B`): the Dynamic section declares the
+    /// objects, but at the defaults the walk reaches none. ETS writes every
+    /// descriptor as the template with C cleared, not the refs' flags.
+    #[test]
+    fn test_plan_flash_sys7_unreached_objects_keep_the_template_without_c()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let objects = r#"<ComObjects>
+            <ComObject Id="A_O-0" Number="0" ObjectSize="1 Bit" TransmitFlag="Enabled" ReadFlag="Enabled" CommunicationFlag="Enabled" />
+            <ComObject Id="A_O-1" Number="1" ObjectSize="1 Bit" WriteFlag="Enabled" CommunicationFlag="Enabled" />
+           </ComObjects>
+           <ComObjectRefs>
+            <ComObjectRef Id="A_O-0_R-1" RefId="A_O-0" />
+            <ComObjectRef Id="A_O-1_R-2" RefId="A_O-1" />
+           </ComObjectRefs>"#;
+        let dynamic = r#"<Dynamic>
+           <ChannelIndependentBlock>
+            <ParameterBlock Id="A_PB-1" Name="main">
+             <ParameterRefRef RefId="A_P-1_R-1" />
+             <choose ParamRefId="A_P-1_R-1">
+              <when test="1"><ComObjectRefRef RefId="A_O-0_R-1" /><ComObjectRefRef RefId="A_O-1_R-2" /></when>
+             </choose>
+            </ParameterBlock>
+           </ChannelIndependentBlock>
+          </Dynamic>"#;
+        let app = sys7_descriptor_app(objects, dynamic)?;
+        // Objects 0 and 1 are declared: `df & !C` = `db`; slot 2 lies past
+        // the last declared object and keeps the template.
+        assert_eq!(
+            plan_descriptor_table(&app)?,
+            vec![
+                0x03, 0x07, 0x0F, 0x07, 0x00, 0xDB, 0x00, 0x07, 0x01, 0xDB, 0x07, 0x07, 0x02, 0xDF,
+                0x00
+            ]
+        );
+        // Without a Dynamic section the flat defaults still apply: the refs'
+        // flags (T R, W) with C cleared.
+        let flat = sys7_descriptor_app(objects, "")?;
+        assert_eq!(
+            plan_descriptor_table(&flat)?,
+            vec![
+                0x03, 0x07, 0x0F, 0x07, 0x00, 0x4B, 0x00, 0x07, 0x01, 0x13, 0x07, 0x07, 0x02, 0xDF,
+                0x00
+            ]
+        );
+        Ok(())
+    }
+
     /// A fabricated System 7 (mask 0705) app in the MDT canonical LSM 1/2/3 shape
     /// (`[system7-spec §3]`): obj0/PID78 preflight, three LSMs, an AbsSegment with
     /// a per-byte `<Mask>` on LSM 1, an allocate-only RAM segment on LSM 3, a
@@ -2187,6 +2718,83 @@ mod tests {
          </ApplicationProgram></KNX>"#
         );
         parse_application_program("M-0083_A-F", xml.as_bytes()).expect("the fixture app parses")
+    }
+
+    /// A minimal System 7 app with a data segment and a stack segment on LSM 3,
+    /// the second carrying `SegType="{seg_type}"` (issue #487).
+    fn sys7_app_with_seg_type(
+        seg_type: &str,
+    ) -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
+        let xml = format!(
+            r#"<KNX xmlns="http://knx.org/xml/project/23">
+         <ApplicationProgram PeiType="0" Id="M-0083_A-G" ApplicationNumber="14" ApplicationVersion="35"
+            MaskVersion="MV-0705" Name="FabS7Stack" LoadProcedureStyle="ProductProcedure">
+          <Static>
+           <Code />
+           <LoadProcedures>
+            <LoadProcedure>
+             <LdCtrlConnect />
+             <LdCtrlLoad LsmIdx="3" />
+             <LdCtrlAbsSegment LsmIdx="3" Address="1792" Size="8" MemType="2" />
+             <LdCtrlAbsSegment LsmIdx="3" Address="2038" Size="1" Access="0" MemType="2" SegFlags="0" SegType="{seg_type}" />
+             <LdCtrlLoadCompleted LsmIdx="3" />
+             <LdCtrlDisconnect />
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+         </ApplicationProgram></KNX>"#
+        );
+        Ok(parse_application_program("M-0083_A-G", xml.as_bytes())?)
+    }
+
+    #[test]
+    fn test_plan_flash_sys7_stack_segment_keeps_seg_type() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let plan = plan_flash(
+            &sys7_app_with_seg_type("1")?,
+            "1.1.99",
+            0x0705,
+            &no_overrides(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        let seg_types: Vec<(u32, u8)> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                FlashStep::Sys7AbsSegment {
+                    address, seg_type, ..
+                } => Some((*address, *seg_type)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            seg_types,
+            vec![
+                (0x0700, bussard_mgmt::sys7::S7_SUB_ALLOC_DATA),
+                (0x07F6, bussard_mgmt::sys7::S7_SUB_ALLOC_STACK)
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_flash_sys7_unknown_seg_type_refuses() -> Result<(), Box<dyn std::error::Error>> {
+        let err = plan_flash(
+            &sys7_app_with_seg_type("2")?,
+            "1.1.99",
+            0x0705,
+            &no_overrides(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        );
+        assert!(
+            matches!(&err, Err(PlanError::UnresolvableImage { reason, .. }) if reason.contains("SegType 2")),
+            "{err:?}"
+        );
+        Ok(())
     }
 
     fn plan_sys7_range(
@@ -2368,6 +2976,7 @@ mod tests {
                     prop_id: 78,
                     expected: Some(vec![0]),
                     mask: None,
+                    start_element: 1,
                 },
                 FlashStep::Sys7Unload { lsm: 1 },
                 FlashStep::Sys7StartLoading { lsm: 1 },
@@ -2411,6 +3020,104 @@ mod tests {
             &bussard_mgmt::Sys7Profile::corpus_default_for_mask(0x0705),
         );
         assert_eq!(steps, vec![FlashStep::Restart]);
+    }
+
+    /// Issue #488: the pre-download pass follows the device's resident state.
+    /// Every LSM `Unloaded` (a factory-fresh device, the ETS sweep and
+    /// `captures/synthetic/syn-s7-0705/defaults`): no pass. An LSM `Loaded` or
+    /// `Loading`, a resident application id, or a probe that read nothing:
+    /// the pass stays, unloads and all.
+    #[test]
+    fn test_fit_sys7_prelude_follows_the_resident_state() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::preflight::{ResidentObject, ResidentState};
+        use bussard_mgmt::load::LoadState;
+        let xml = r#"<KNX xmlns="http://knx.org/xml/project/11">
+         <ApplicationProgram PeiType="0" Id="M-0083_A-E" ApplicationNumber="14" ApplicationVersion="35"
+            MaskVersion="MV-0705" Name="FabS7" LoadProcedureStyle="ProductProcedure">
+          <Static>
+           <Code>
+            <AbsoluteSegment Id="M-0083_A-E_AS-3" Size="2" Address="17408"><Data>BAU=</Data></AbsoluteSegment>
+           </Code>
+           <LoadProcedures>
+            <LoadProcedure>
+             <LdCtrlUnload LsmIdx="3" />
+             <LdCtrlLoad LsmIdx="3" />
+             <LdCtrlAbsSegment LsmIdx="3" Address="17408" Size="2" />
+             <LdCtrlLoadCompleted LsmIdx="3" />
+             <LdCtrlRestart />
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+         </ApplicationProgram></KNX>"#;
+        let app = parse_application_program("M-0083_A-E", xml.as_bytes())?;
+        let planned = plan_flash(
+            &app,
+            "1.1.99",
+            0x0705,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        let prelude = |plan: &FlashPlan| {
+            plan.steps.iter().find_map(|s| match s {
+                FlashStep::Sys7PreDownloadRestart { unload } => Some(unload.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(prelude(&planned), Some(vec![1, 2, 3, 4]));
+        let lsms = |states: [LoadState; 4]| ResidentState {
+            objects: (1u8..)
+                .zip(states)
+                .map(|(index, state)| ResidentObject {
+                    index,
+                    object_type: None,
+                    state,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let fresh = lsms([LoadState::Unloaded; 4]);
+        let loaded = lsms([
+            LoadState::Loaded,
+            LoadState::Loaded,
+            LoadState::Loaded,
+            LoadState::Unloaded,
+        ]);
+        let loading = lsms([
+            LoadState::Unloaded,
+            LoadState::Unloaded,
+            LoadState::Loading,
+            LoadState::Unloaded,
+        ]);
+        let with_id = ResidentState {
+            app_id: Some(vec![0x00, 0x83, 0x00, 0x0E, 0x23]),
+            ..lsms([LoadState::Unloaded; 4])
+        };
+        let unreadable = ResidentState {
+            unreadable: Some("no load-state machine answered".to_string()),
+            ..Default::default()
+        };
+        for (name, resident, kept) in [
+            ("fresh", &fresh, false),
+            ("loaded", &loaded, true),
+            ("loading", &loading, true),
+            ("resident id", &with_id, true),
+            ("unreadable", &unreadable, true),
+            ("nothing read", &ResidentState::default(), true),
+        ] {
+            let mut plan = planned.clone();
+            plan.fit_sys7_prelude(resident);
+            let expected = kept.then(|| vec![1, 2, 3, 4]);
+            assert_eq!(prelude(&plan), expected, "{name}");
+            // The procedure's own unload of LSM 3 stays either way.
+            assert!(
+                plan.steps.contains(&FlashStep::Sys7Unload { lsm: 3 }),
+                "{name}"
+            );
+        }
+        Ok(())
     }
 
     /// The System 7 parameter segment streams its `<Data>` with the
@@ -2530,6 +3237,123 @@ mod tests {
             s,
             FlashStep::Sys7TaskSegment { lsm: 5, .. } | FlashStep::Sys7StartLoading { lsm: 5 }
         )));
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_flash_sys7_lowers_task_ptr_and_task_ctrl2()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The Task Pointer Record and Task Control Record 2 (KNX 3/5/2
+        // §3.31.2), with the attribute values of the knx_master MV-0021
+        // procedure (issue #527).
+        let xml = r#"<KNX xmlns="http://knx.org/xml/project/23">
+         <ApplicationProgram PeiType="0" Id="M-0048_A-4947" ApplicationNumber="18759" ApplicationVersion="16"
+            MaskVersion="MV-0701" Name="FIX2" LoadProcedureStyle="ProductProcedure">
+          <Static>
+           <Code>
+            <AbsoluteSegment Id="M-0048_A-4947_AS-1" Size="4" Address="16384"><Data>AAECAw==</Data></AbsoluteSegment>
+           </Code>
+           <LoadProcedures>
+            <LoadProcedure>
+             <LdCtrlConnect />
+             <LdCtrlUnload LsmIdx="3" />
+             <LdCtrlLoad LsmIdx="3" />
+             <LdCtrlAbsSegment LsmIdx="3" Address="16384" Size="4" />
+             <LdCtrlTaskSegment LsmIdx="3" Address="16384" />
+             <LdCtrlTaskPtr LsmIdx="3" InitPtr="284" SavePtr="285" SerialPtr="0" />
+             <LdCtrlTaskCtrl2 LsmIdx="3" Callback="20609" Address="282" Seg0="208" Seg1="208" />
+             <LdCtrlLoadCompleted LsmIdx="3" />
+             <LdCtrlRestart />
+             <LdCtrlDisconnect />
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+         </ApplicationProgram></KNX>"#;
+        let app = parse_application_program("M-0048_A-4947", xml.as_bytes())?;
+        let plan = plan_flash(
+            &app,
+            "1.1.99",
+            0x0701,
+            &no_overrides(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        assert!(plan.steps.contains(&FlashStep::Sys7TaskPtr {
+            lsm: 3,
+            init: 284,
+            save: 285,
+            pei_handler: 0,
+        }));
+        assert!(plan.steps.contains(&FlashStep::Sys7TaskCtrl2 {
+            lsm: 3,
+            callback: 20609,
+            com_objects: 282,
+            segment_1: 208,
+            segment_2: 208,
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_sys7_u16_field_out_of_range_is_refused() {
+        assert!(matches!(
+            sys7_u16_field(1, "task pointer init", 0x1_0000),
+            Err(PlanError::Sys7FieldOutOfRange { .. })
+        ));
+        assert!(matches!(
+            sys7_u16_field(1, "task pointer init", 284),
+            Ok(284)
+        ));
+    }
+
+    /// `LdCtrlDelay MilliSeconds="200"` before the restart (16 corpus 0701
+    /// programs, e.g. `M-0076_A-0022-15-D6FE`) lowers to a 200 ms pause right
+    /// before the terminal restart instead of refusing the plan (issue #615).
+    #[test]
+    fn test_plan_flash_sys7_lowers_delay_before_restart() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let xml = r#"<KNX xmlns="http://knx.org/xml/project/23">
+         <ApplicationProgram PeiType="0" Id="M-00FA_A-0615" ApplicationNumber="1" ApplicationVersion="1"
+            MaskVersion="MV-0701" Name="Delay" LoadProcedureStyle="ProductProcedure">
+          <Static>
+           <Code>
+            <AbsoluteSegment Id="M-00FA_A-0615_AS-1" Size="2" Address="16384"><Data>AAE=</Data></AbsoluteSegment>
+           </Code>
+           <LoadProcedures>
+            <LoadProcedure>
+             <LdCtrlConnect />
+             <LdCtrlUnload LsmIdx="1" />
+             <LdCtrlLoad LsmIdx="1" />
+             <LdCtrlAbsSegment LsmIdx="1" Address="16384" Size="2" />
+             <LdCtrlLoadCompleted LsmIdx="1" />
+             <LdCtrlDelay MilliSeconds="200" />
+             <LdCtrlRestart />
+             <LdCtrlDisconnect />
+            </LoadProcedure>
+           </LoadProcedures>
+          </Static>
+         </ApplicationProgram></KNX>"#;
+        let app = parse_application_program("M-00FA_A-0615", xml.as_bytes())?;
+        let plan = plan_flash(
+            &app,
+            "1.1.99",
+            0x0701,
+            &no_overrides(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        let n = plan.steps.len();
+        assert!(n >= 2);
+        assert_eq!(
+            plan.steps[n - 2..],
+            [FlashStep::Delay { milliseconds: 200 }, FlashStep::Restart]
+        );
+        assert_eq!(
+            plan.step_label(&plan.steps[n - 2]),
+            "wait 200 ms (LdCtrlDelay), nothing sent"
+        );
         Ok(())
     }
 
@@ -3114,9 +3938,29 @@ mod tests {
     /// 13) in the second gap, shown only when `P-1` is 0 (and, as on the MDT
     /// programs, a hidden parameter is not downloaded); `gap_param` adds a
     /// `P-5` at offset 14 that is always shown.
+    ///
+    /// With `unconditional`, the procedure allocates the two parts outside
+    /// any `<choose>` (the Jung `A-5015` shape, no capture).
     fn split_segment_app(
         gap_param: bool,
+        unconditional: bool,
     ) -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
+        let parts = r#"<LdCtrlAbsSegment LsmIdx="3" SegType="0" Address="18432" Size="6" Access="255" MemType="3" SegFlags="128" />
+               <LdCtrlAbsSegment LsmIdx="3" SegType="0" Address="18440" Size="4" Access="255" MemType="3" SegFlags="128" />"#;
+        let allocation = if unconditional {
+            parts.to_string()
+        } else {
+            format!(
+                r#"<choose ParamRefId="M-0083_A-S_P-1_R-1">
+              <when test="0">
+               <LdCtrlAbsSegment LsmIdx="3" SegType="0" Address="18432" Size="16" Access="255" MemType="3" SegFlags="128" />
+              </when>
+              <when test="1">
+               {parts}
+              </when>
+             </choose>"#
+            )
+        };
         let (p5, p5_ref, p5_rr) = if gap_param {
             (
                 r#"<Parameter Id="M-0083_A-S_P-5" Name="kept" ParameterType="M-0083_A-S_PT-8" Value="5"><Memory CodeSegment="M-0083_A-S_AS-48" Offset="14" BitOffset="0" /></Parameter>"#,
@@ -3157,15 +4001,7 @@ mod tests {
              <LdCtrlConnect />
              <LdCtrlUnload LsmIdx="3" />
              <LdCtrlLoad LsmIdx="3" />
-             <choose ParamRefId="M-0083_A-S_P-1_R-1">
-              <when test="0">
-               <LdCtrlAbsSegment LsmIdx="3" SegType="0" Address="18432" Size="16" Access="255" MemType="3" SegFlags="128" />
-              </when>
-              <when test="1">
-               <LdCtrlAbsSegment LsmIdx="3" SegType="0" Address="18432" Size="6" Access="255" MemType="3" SegFlags="128" />
-               <LdCtrlAbsSegment LsmIdx="3" SegType="0" Address="18440" Size="4" Access="255" MemType="3" SegFlags="128" />
-              </when>
-             </choose>
+             {allocation}
              <LdCtrlLoadCompleted LsmIdx="3" />
              <LdCtrlRestart />
              <LdCtrlDisconnect />
@@ -3226,7 +4062,7 @@ mod tests {
     #[test]
     fn test_plan_flash_sys7_streams_each_allocation_its_part()
     -> Result<(), Box<dyn std::error::Error>> {
-        let app = split_segment_app(false)?;
+        let app = split_segment_app(false, false)?;
         // P-1 = 0: one allocation holds the whole image, streamed whole.
         let whole = plan_split(&app, "0")?;
         assert_eq!(split_layout(&whole), vec![(0x4800, 16, 0, 16)]);
@@ -3250,27 +4086,60 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_flash_sys7_refuses_a_parameter_no_allocation_holds()
+    fn test_plan_flash_sys7_keeps_a_parameter_no_allocation_holds()
     -> Result<(), Box<dyn std::error::Error>> {
-        let app = split_segment_app(true)?;
+        let app = split_segment_app(true, false)?;
         // Allocated whole, P-5 is written as before.
+        let whole = plan_split(&app, "0")?;
+        assert_eq!(split_layout(&whole), vec![(0x4800, 16, 0, 16)]);
+        assert!(whole.kept().is_empty());
+        // Allocated in parts, P-5 (offset 14) is in no allocation: as in
+        // ETS's download (issue #411), the parts are written and the gaps
+        // kept on the device, P-5's octet among them.
+        let split = plan_split(&app, "1")?;
         assert_eq!(
-            split_layout(&plan_split(&app, "0")?),
-            vec![(0x4800, 16, 0, 16)]
+            split_layout(&split),
+            vec![(0x4800, 6, 0, 6), (0x4808, 4, 8, 4)]
         );
-        // Allocated in parts, P-5 (offset 14) is in no allocation: the device
-        // would keep its own octet, the model sets 5.
-        match plan_split(&app, "1") {
+        let kept = split.kept();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].object, 3);
+        assert_eq!(kept[0].ranges, vec![(6, 8), (12, 16)]);
+        assert_eq!(
+            kept[0].label(),
+            "LSM 3 segment 0x4800 octets 6..8, 12..16 kept"
+        );
+        let placed = split
+            .placed_octets("M-0083_A-S_AS-48")
+            .ok_or("placed octets")?;
+        assert!(!placed.contains(&14) && placed.contains(&0) && placed.contains(&9));
+        let mask = split.segment_mask("M-0083_A-S_AS-48").ok_or("a mask")?;
+        assert_eq!(mask[14], 0x00);
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_flash_sys7_refuses_a_parameter_in_an_unconditional_gap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Split outside any `<choose>`: no capture says what ETS writes, so a
+        // placed parameter in the gap (P-5 at 14) still refuses.
+        match plan_split(&split_segment_app(true, true)?, "1") {
             Err(PlanError::UnsupportedOp { op }) => {
                 assert!(
-                    op.contains("octets 12..16 of segment M-0083_A-S_AS-48"),
+                    op.contains("outside any <choose>")
+                        && op.contains("octets 12..16 of segment M-0083_A-S_AS-48"),
                     "{op}"
                 );
             }
-            other => {
-                return Err(format!("expected the partial-write refusal, got {other:?}").into());
-            }
+            other => return Err(format!("expected the refusal, got {other:?}").into()),
         }
+        // Without a parameter in the gap it plans as in #413, nothing kept.
+        let plan = plan_split(&split_segment_app(false, true)?, "1")?;
+        assert_eq!(
+            split_layout(&plan),
+            vec![(0x4800, 6, 0, 6), (0x4808, 4, 8, 4)]
+        );
+        assert!(plan.kept().is_empty());
         Ok(())
     }
 
@@ -3310,8 +4179,8 @@ mod tests {
     /// only in part (System B, the #402 refusal), each decided one choose and
     /// one branch at a time. Prints one `SPLIT-SEGMENT` line per such program
     /// and a `SPLIT-SEGMENT-SUMMARY`, and asserts that no System 7 procedure
-    /// splits a segment outside a `<choose>`: the layout of every other
-    /// System 7 plan is the one before #413.
+    /// but the known Jung `A-5015-13` splits a segment outside a `<choose>`:
+    /// the layout of every other System 7 plan is the one before #413.
     #[test]
     fn test_sys7_segment_parts_on_the_corpus() -> Result<(), Box<dyn std::error::Error>> {
         use bussard_prod::application::LoadProcedure;
@@ -3474,6 +4343,14 @@ mod tests {
             "SPLIT-SEGMENT-SUMMARY|System 7 {sys7} of {sys7_choose} with a load <choose>|System B {sys_b} of {sys_b_choose} with a load <choose>|splits outside a choose {}",
             default_splits.len()
         );
+        // The one known split outside a `<choose>`, in the corpus since the
+        // crawled vendor archives were folded in (#613, 2026-10-30): the Jung
+        // `A-5015-13` allocates 4 of the 14 octets of `AS-5DAF` and places
+        // parameters at octets 12 and 13. No capture shows what ETS writes
+        // there, so the planner refuses it (issue #411 keeps only a gap a
+        // `<choose>` makes); a new one is reported here.
+        const KNOWN: &[&str] = &["M-0004_A-5015-13-7E56-O00F4"];
+        default_splits.retain(|id| !KNOWN.contains(&id.as_str()));
         assert!(default_splits.is_empty(), "{default_splits:#?}");
         Ok(())
     }

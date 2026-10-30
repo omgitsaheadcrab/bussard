@@ -24,9 +24,9 @@ use std::time::Duration;
 use bussard_download::backup::backups_root;
 use bussard_download::{
     ChangeMark, ChangeSubject, DecodedParameters, DevicePlan, FlashPlan, FullImage, LiveTables,
-    OctetRange, OctetRole, ParamRegions, ParamValue, PlanChange, PlanReport, PlanWrites,
-    ResidentState, Sys7Identity, object_changes, probe_resident_state, read_parameter_regions,
-    regions_memory, select_application, sort_changes, state_hash,
+    ObjectTableWrite, OctetRange, OctetRole, ParamRegions, ParamValue, PlanChange, PlanReport,
+    PlanWrites, ResidentState, Sys7Identity, object_changes, probe_resident_state,
+    read_parameter_regions, regions_memory, select_application, sort_changes, state_hash_with,
 };
 use bussard_mgmt::{L4Channel, Layer4Connection};
 use bussard_model::schema::{Device, ProductEntry};
@@ -458,6 +458,13 @@ pub struct Readback {
     /// model's image, with both values (issue #285).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub internal: Vec<OctetAttribution>,
+    /// The parameters placed in octets a download leaves as the device holds
+    /// them (issue #411, a load-procedure `<choose>` branch that writes part
+    /// of a segment, as ETS does): what the device holds and what the model
+    /// says, with no verdict. Not written by `flash` or `apply`, so never a
+    /// difference.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<DifferenceJson>,
     /// Why the read-back is partial or absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -497,6 +504,10 @@ pub struct ParamDetail {
     /// write them, so neither does the parameter-only download. Listed, never
     /// written or counted.
     pub unwritten: Vec<OctetRange>,
+    /// The System B group-object table as read next to the image the full
+    /// flash writes (issue #540); `None` when the plan does not write the
+    /// table (System 7, or a procedure whose code image carries it).
+    pub object_table: Option<bussard_download::ObjectTableCheck>,
 }
 
 /// A parameter read-back: the report, and the detail when the memory was
@@ -583,6 +594,10 @@ pub async fn read_state<Ch: L4Channel>(
         return state;
     }
     let regions = read_parameter_regions(l4, &plan).await;
+    // The group-object table the full flash writes, against the device's
+    // (issue #540): a link the last flash did not know left its object's
+    // Communication flag off, and `apply` reloads the table to switch it on.
+    let object_table = bussard_download::check_object_table(l4, &plan).await;
     if regions.is_empty() {
         return ParamState::noted(&app.id, "the parameter memory could not be read".into());
     }
@@ -592,8 +607,12 @@ pub async fn read_state<Ch: L4Channel>(
         bussard_download::decode_parameters_with(app, &overrides, &bases, &current, &memo);
     let change =
         bussard_download::group_object_change_with(app, &decoded.values, &overrides, &memo);
-    let needs_flash =
-        (!change.is_empty()).then(|| bussard_download::describe_group_object_change(&change));
+    // Issue #411: a System 7 load-procedure `<choose>` that allocates the
+    // segments differently under the model's values needs the full download
+    // that sends the new allocation records.
+    let needs_flash = (!change.is_empty())
+        .then(|| bussard_download::describe_group_object_change(&change))
+        .or_else(|| bussard_download::allocation_change(app, &decoded.values, &overrides, &memo));
     let device_managed = decoded
         .device_managed
         .iter()
@@ -628,6 +647,7 @@ pub async fn read_state<Ch: L4Channel>(
         .into_iter()
         .filter(|r| r.parameters.iter().any(|p| p.role == OctetRole::Internal))
         .collect();
+    let kept = kept_rows(&decoded.kept, device);
     ParamState {
         readback: Readback {
             application: app.id.clone(),
@@ -635,6 +655,7 @@ pub async fn read_state<Ch: L4Channel>(
             differences,
             device_managed,
             internal,
+            kept,
             note: None,
         },
         detail: Some(ParamDetail {
@@ -645,6 +666,7 @@ pub async fn read_state<Ch: L4Channel>(
             needs_flash,
             octets,
             unwritten,
+            object_table,
         }),
         sys7_identity,
     }
@@ -662,6 +684,12 @@ pub struct FlashedParameters {
     /// How many parameter values the read-back decoded and compared (issue
     /// #349); 0 when the memory was not compared.
     pub compared: usize,
+    /// The parameters placed in octets the flash left as the device holds
+    /// them (issue #411): not written, so not compared. After a fresh
+    /// allocation those octets hold whatever the allocation left, so the
+    /// model's value there is not verified.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<DifferenceJson>,
     /// Why the memory was not compared; `None` when it was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -727,6 +755,7 @@ pub async fn read_flashed_parameters<Ch: L4Channel>(
     let noted = |note: String| FlashedParameters {
         differences: Vec::new(),
         compared: 0,
+        kept: Vec::new(),
         note: Some(note),
     };
     // The plan and the decode share one evaluation of the model's values
@@ -755,10 +784,12 @@ pub async fn read_flashed_parameters<Ch: L4Channel>(
     let device = model
         .and_then(|m| m.devices.get(&target))
         .map(|d| &d.device);
-    let compared = decoded.values.len();
+    let kept = kept_rows(&decoded.kept, device);
+    let compared = decoded.values.len().saturating_sub(kept.len());
     let (_, differences) = report(decoded);
     FlashedParameters {
         compared,
+        kept,
         differences: differences
             .into_iter()
             .map(|d| DifferenceJson {
@@ -791,6 +822,26 @@ fn reading_json(r: bussard_download::ParamReading) -> ReadingJson {
         default: r.default,
         unit: r.unit,
     }
+}
+
+/// The kept parameters of a decoded memory (issue #411) as report rows:
+/// `device` what the device holds, `model` what the model says.
+pub(crate) fn kept_rows(
+    kept: &[bussard_download::ParamChange],
+    device: Option<&Device>,
+) -> Vec<DifferenceJson> {
+    kept.iter()
+        .map(|c| DifferenceJson {
+            key: file_key(device, &c.key),
+            name: c.name.clone(),
+            device: match &c.old {
+                ParamValue::Known(v) => Some(v.clone()),
+                ParamValue::Unknown => None,
+            },
+            model: c.new.to_string(),
+            unit: c.unit.clone(),
+        })
+        .collect()
 }
 
 /// The JSON report rows of a decoded parameter memory.
@@ -851,6 +902,11 @@ pub struct BuiltPlan {
     /// Every run of parameter octets the plan writes, with the parameters
     /// behind it (issue #279). Empty when no parameter octet is written.
     pub octet_ranges: Vec<OctetAttribution>,
+    /// The System B group-object table image `apply` reloads, because the
+    /// device's differs from the one the full flash writes (issue #540).
+    /// `None` when it matches, was not compared, or a full download is
+    /// needed anyway.
+    pub object_table: Option<Vec<u8>>,
 }
 
 /// A run of parameter octets a plan writes, in the model's words (issue
@@ -1228,6 +1284,19 @@ pub fn group_object_refusal(target: IndividualAddress, why: &str) -> String {
     )
 }
 
+/// The refusal of a parameter write whose values make a System 7 load
+/// procedure allocate the segments differently (`why`, from
+/// [`bussard_download::allocation_change`], issue #411): `apply` sends no
+/// allocation record, so only a full `bussard flash <ia>` allocates the new
+/// layout.
+pub fn allocation_refusal(target: IndividualAddress, why: &str) -> String {
+    format!(
+        "the model's parameter values change the memory the load procedure allocates ({why}); \
+         `apply` rewrites parameters in place and sends no allocation record. Run a full \
+         `bussard flash {target}`."
+    )
+}
+
 /// The plan lines of the values the file of `target` stores for parameter
 /// refs the configuration does not show under its current values (issue
 /// #321): the image holds one slot per shown ref, so neither a parameter
@@ -1292,6 +1361,73 @@ fn sys7_flag_plan(live: &LiveTables, report: &PlanReport, notes: &mut Vec<String
         });
     }
     writes.iter().map(|write| write.object).collect()
+}
+
+/// The System B group-object table half of a plan (issue #540): the reload
+/// `apply` writes when the device's table differs from the image the full
+/// flash writes, its notes, and the octets read for the state hash.
+///
+/// Without a comparison (no product data, a parameter read that stopped, a
+/// refused table read) a link the plan adds is named in a note: its object's
+/// Communication flag was not checked, and a device ignores an object whose
+/// flag is off.
+fn object_table_plan(
+    live: &LiveTables,
+    report: &PlanReport,
+    params: Option<&ParamState>,
+    full_download: bool,
+    notes: &mut Vec<String>,
+) -> (Option<ObjectTableWrite>, Option<Vec<u8>>, Option<Vec<u8>>) {
+    if live.sys7().is_some() || full_download {
+        return (None, None, None);
+    }
+    let detail = params.and_then(|p| p.detail.as_ref());
+    let check = detail.and_then(|d| d.object_table.as_ref());
+    let read = check.and_then(|c| c.live.as_ref().ok()).map(|t| t.image());
+    let unchecked = |why: &str, notes: &mut Vec<String>| {
+        let objects: BTreeSet<u16> = report.additions.iter().map(|a| a.object).collect();
+        if objects.is_empty() {
+            return;
+        }
+        let objects: Vec<String> = objects.iter().map(u16::to_string).collect();
+        notes.push(format!(
+            "newly linked object(s) {}: communication flag not checked, the group-object table \
+             was not compared ({why}); a device ignores an object whose flag is off",
+            objects.join(", ")
+        ));
+    };
+    match check {
+        Some(check) => match (&check.live, check.change()) {
+            (Err(why), _) => {
+                unchecked(why, notes);
+                (None, None, None)
+            }
+            (Ok(_), None) => (None, None, read),
+            (Ok(_), Some(change)) => {
+                notes.extend(
+                    change
+                        .sentences()
+                        .into_iter()
+                        .map(|s| format!("group-object table: {s}")),
+                );
+                let write = ObjectTableWrite {
+                    entries: change.to_count,
+                    objects: change.objects.iter().map(|c| c.object).collect(),
+                };
+                (Some(write), Some(check.model.clone()), read)
+            }
+        },
+        None if detail.is_some() => (None, None, None),
+        None => {
+            let why = if params.is_some() {
+                "the application was not read back"
+            } else {
+                "no product data"
+            };
+            unchecked(why, notes);
+            (None, None, None)
+        }
+    }
 }
 
 /// Builds the plan of writing the model to `target`.
@@ -1407,7 +1543,11 @@ pub fn build_device_plan(
                     });
                 }
                 if let Some(why) = &detail.needs_flash {
-                    refusal = Some(group_object_refusal(target, why));
+                    refusal = Some(if why.starts_with("the load procedure allocates") {
+                        allocation_refusal(target, why)
+                    } else {
+                        group_object_refusal(target, why)
+                    });
                     needs_flash = Some(why.clone());
                 } else {
                     match detail.plan.parameters_only(&detail.regions) {
@@ -1456,6 +1596,8 @@ pub fn build_device_plan(
 
     let tables_change = !report.is_noop();
     let communication_flags = sys7_flag_plan(live, report, &mut notes);
+    let (group_object_table, object_table, object_table_read) =
+        object_table_plan(live, report, params, needs_flash.is_some(), &mut notes);
     let writes = PlanWrites {
         address_table: tables_change.then_some(report.resulting_address_count),
         association_table: tables_change.then_some(report.resulting_association_count),
@@ -1477,6 +1619,7 @@ pub fn build_device_plan(
             && needs_flash.is_none()
             && (tables_change || !communication_flags.is_empty()),
         communication_flags,
+        group_object_table,
     };
     let root = backups_root(dir);
     let backup_dir = if parameter_octets > 0 {
@@ -1509,7 +1652,7 @@ pub fn build_device_plan(
             writes,
             backup_dir,
             notes,
-            state_hash: state_hash(live, regions),
+            state_hash: state_hash_with(live, regions, object_table_read.as_deref()),
         },
         partial,
         parameters,
@@ -1517,6 +1660,7 @@ pub fn build_device_plan(
         needs_flash,
         parameters_skipped,
         octet_ranges,
+        object_table,
     }
 }
 

@@ -72,29 +72,31 @@ pub use broadcast::{
     write_individual_address, write_individual_address_by_serial,
 };
 pub use connection::{
-    AuthorizeOutcome, ConnectionSeed, L4Channel, Layer4Connection, LeaseChannel, MAX_OBJECT_INDEX,
-    MGMT_TIMEOUT_MS_ENV, MaxApduAbsence, PID_OBJECT_TYPE, PROBE_TIMEOUT, PropertyDesc,
-    SECURE_APDU_OVERHEAD, STANDARD_FRAME_APDU, SyncRetry, Timeouts, describe_object_properties,
-    probe_object_type, probe_object_types, read_device_descriptor,
-    read_device_descriptor_unsecured,
+    AuthorizeOutcome, CONNECTION_TIMEOUT, ConnectionSeed, L4Channel, Layer4Connection,
+    LeaseChannel, MAX_OBJECT_INDEX, MAX_SYNC_BACKOFF, MGMT_TIMEOUT_MS_ENV, MaxApduAbsence,
+    PID_OBJECT_TYPE, PROBE_TIMEOUT, PropertyDesc, SECURE_APDU_OVERHEAD, STANDARD_FRAME_APDU,
+    SyncRetry, Timeouts, describe_object_properties, probe_object_type, probe_object_types,
+    read_device_descriptor, read_device_descriptor_unsecured,
 };
 pub use device::DeviceConnection;
-pub use error::{MgmtError, Result, SilenceKind};
+pub use error::{MgmtError, Result, SilenceKind, return_code_name};
 pub use io_list::{ObjectTableSource, PID_IO_LIST, discover_object_table, read_io_list};
 pub use load::{
     LD_CTRL_REL_SEGMENT, LoadControl, LoadState, LoadStateContext, MAX_RESTART_PROCESS_WAIT,
     MCB_ENTRY_LEN, McbEntry, PID_LOAD_STATE_CONTROL, PID_MCB_TABLE, PID_PROGRAM_VERSION,
     SegmentAllocation, WriteError, allocate_segment, compare_property, compare_rel_mem,
-    crc16_ccitt, encode_rel_segment, is_connection_death, master_reset, mcb_entry, read_load_state,
-    read_mcb_table, read_program_version, read_property_elements, read_table_reference,
-    restart_process_wait, write_load_control, write_property,
+    crc16_ccitt, encode_rel_segment, is_connection_death, master_reset, mcb_entry,
+    process_time_wait, read_load_state, read_manufacturer_id, read_mcb_table, read_program_version,
+    read_property_elements, read_table_reference, restart_process_wait, write_load_control,
+    write_load_control_unless_absent, write_property,
 };
 // The memory primitives moved out of `load` into their own module (issue #80);
 // every historical `bussard_mgmt::…` and `bussard_mgmt::load::…` path still
 // resolves, so no caller had to change.
 pub use memory::{
-    read_memory, read_memory_range, select_extended_memory, write_memory, write_memory_chunked,
-    write_memory_verified,
+    MemoryService, memory_chunk_for, memory_service, read_memory, read_memory_range,
+    read_memory_strict, select_extended_memory, write_memory, write_memory_chunked,
+    write_memory_echoed, write_memory_verified,
 };
 pub use probe::{
     ADDRESS_PROBE_MS_ENV, AddressProbe, ProbeMemo, SourceCheckError, checked_source,
@@ -108,7 +110,7 @@ pub use secure::SecureLayer;
 pub use sys7::{
     DEVICE_CONTROL_VERIFY_MODE, LsmAccess, PID_DEVICE_CONTROL, Sys7TaskIdentity, VerifyModeOutcome,
     alloc_attr_octets, enable_verify_mode, encode_alloc_segment, encode_task_ctrl1,
-    encode_task_segment, lsm_access_from_profile,
+    encode_task_ctrl2, encode_task_ptr, encode_task_segment, lsm_access_from_profile,
 };
 pub use tables::{
     DeviceTables, ResolvedLink, TableSource, TablesError, discover_interface_objects, read_tables,

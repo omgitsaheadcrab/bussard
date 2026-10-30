@@ -9,11 +9,30 @@
 //! - transmits our TUNNELING_REQUESTs with an incrementing sequence counter and
 //!   awaits the matching TUNNELING_ACK (retransmitting once on timeout),
 //! - re-establishes the tunnel when the gateway link is lost (see below),
-//! - ACKs inbound TUNNELING_REQUESTs, delivering their cEMI to the caller, and
-//!   drops duplicate sequence numbers (ACKing them but not re-delivering),
-//! - handles a server-initiated DISCONNECT_REQUEST.
+//! - ACKs inbound TUNNELING_REQUESTs, delivering their cEMI to the caller; a
+//!   frame one behind the expected sequence is ACKed and dropped, any other
+//!   unexpected sequence dropped without an ACK (Tunnelling 3/8/4 §2.6.1),
+//! - handles a server-initiated DISCONNECT_REQUEST,
+//! - reads interface features (TUNNELLING_FEATURE_GET / RESPONSE) and counts
+//!   inbound feature frames in the same sequence as tunnelling requests.
 //!
 //! The public [`Tunnel`] handle talks to the task over channels.
+//!
+//! # Tunnelling feature services (issue #514)
+//!
+//! TUNNELLING_FEATURE_GET/RESPONSE/SET/INFO are confirmed exactly like a
+//! TUNNELLING_REQUEST and share its sequence counters (Tunnelling 3/8/4
+//! §3.1, §2.6.1): an inbound feature frame is ACKed over UDP when its
+//! sequence is the expected one or one behind, and silently dropped
+//! otherwise; a FEATURE_INFO is logged, a FEATURE_RESPONSE answers the
+//! pending [`Tunnel::feature_get`]. A server without feature services ignores
+//! a GET, without even a TUNNELLING_ACK (§3.5), which over UDP would look like
+//! a lost link and over TCP would desynchronise the sequence. So the tunnel
+//! reads feature 07 (max APDU length, §3.6.8) after CONNECT, as ETS does, only
+//! when the interface's extended description carried the tunnelling-info DIB
+//! that marks a server with feature services (§3.5 NOTE 3); the answer is
+//! [`Tunnel::max_apdu_length`]. An interface that does not answer within 3 s
+//! leaves it `None`.
 //!
 //! # KNXnet/IP Secure (issue #71 Phase B)
 //!
@@ -21,19 +40,34 @@
 //! state machine runs inside an authenticated KNXnet/IP Secure session: every
 //! frame is wrapped in a SECURE_WRAPPER and a wrapped SESSION_STATUS keepalive
 //! goes out every [`SecureTunnelConfig::keepalive`](crate::SecureTunnelConfig::keepalive)
-//! (30 s by default). Over TCP no TUNNELING_ACK is exchanged (TCP is reliable;
-//! the ETS capture of the Jung interface shows none) and every HPAI is the TCP
-//! route-back HPAI. Over UDP (issue #197, INFERRED, knx-sim-verified) the
-//! TUNNELING_ACK is back in the loop, wrapped, and the HPAIs name the real
-//! local endpoint as on a plain UDP tunnel. TCP is tried first; UDP is used
-//! when [`SecureTransport::Udp`] is configured, or with the default
-//! [`SecureTransport::Auto`] when the TCP connect is refused and the
-//! interface's extended search advertises KNXnet/IP Secure. A lost link
-//! re-establishes a new session on the same carrier before the CONNECT. [`Tunnel::connect`] picks the user: explicitly given, or from a
+//! (30 s by default). The session runs over TCP only (KNX IP Secure 3/8/9
+//! §2.2.3.3; issue #513): no TUNNELING_ACK is exchanged (TCP is reliable; the
+//! ETS capture of the Jung interface shows none) and every HPAI is the TCP
+//! route-back HPAI. A TCP connect refused by an interface that advertises
+//! KNXnet/IP Secure fails with [`TransportError::SecureTcpRefused`]. A lost
+//! link re-establishes a new session before the CONNECT. [`Tunnel::connect`]
+//! picks the user: explicitly given, or from a
 //! keyring by matching the gateway's individual address (read with a
 //! SEARCH_REQUEST_EXTENDED) and preferring a free tunnel slot. A plain CONNECT
 //! refused by a secure-only interface becomes
 //! [`TransportError::SecureRequired`] (issue #182).
+//!
+//! # Control and data endpoints (issue #512)
+//!
+//! The CONNECT_RESPONSE names the data endpoint the server prepared for the
+//! channel (KNXnet/IP Core 3/8/2 §5.2, §7.8.2), and that port may differ
+//! from the control endpoint (Core §8.6.3.1). On a plain UDP tunnel the
+//! TUNNELING_REQUESTs and TUNNELING_ACKs go to that data endpoint, while
+//! CONNECT, CONNECTIONSTATE and DISCONNECT stay on the control endpoint (Core
+//! §8.6.3.3, §8.6.3.4; Tunnelling 3/8/4). A route-back data HPAI (`0.0.0.0:0`)
+//! means the endpoint the response came from. While both are the same
+//! endpoint, as on most interfaces, knx-sim by default and the testkit mocks,
+//! the socket stays connected to it and nothing changes on the wire. A
+//! distinct data endpoint swaps the socket for an unconnected one on the same
+//! local endpoint (a connected socket drops datagrams from any other port),
+//! which accepts datagrams from both gateway endpoints and drops the rest. A
+//! secure session keeps route-back semantics: over TCP every endpoint is the
+//! connection itself (Core §8.4.3).
 //!
 //! # Re-establishing a lost tunnel (issue #177)
 //!
@@ -114,24 +148,16 @@ use tokio::time::{self, Instant};
 
 use crate::cemi::CemiFrame;
 use crate::config::{
-    CONNECT_TIMEOUT, ConnectionConfig, DISCONNECT_TIMEOUT, HEARTBEAT_INTERVAL, HEARTBEAT_RETRIES,
-    HEARTBEAT_TIMEOUT, SECURE_KEEPALIVE_INTERVAL, SECURE_PROBE_TIMEOUT, SecureSource,
-    SecureTransport, SecureUser, TUNNELING_ACK_TIMEOUT, TUNNELING_RETRANSMITS, TunnelReconnect,
+    CONNECT_TIMEOUT, ConnectionConfig, DISCONNECT_TIMEOUT, FEATURE_RESPONSE_TIMEOUT,
+    HEARTBEAT_ATTEMPTS, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, SECURE_KEEPALIVE_INTERVAL,
+    SECURE_PROBE_TIMEOUT, SecureSource, SecureTransport, SecureUser, TUNNELING_ACK_TIMEOUT,
+    TUNNELING_RETRANSMITS, TunnelReconnect,
 };
 use crate::conn::{BusConnection, TimestampedFrame};
 use crate::error::{Result, TransportError};
 use crate::host_lock::{Holder, HostLock};
 use crate::knxnet::{self, ConnectionHeader, GatewayDescription, Hpai, ServiceType};
 use crate::secure::{SecureLink, UserKeys};
-
-/// How many sequence numbers *behind* the expected inbound sequence are still
-/// treated as a retransmitted duplicate (ACK-and-drop) rather than silently
-/// discarded. One frame is not enough: a gateway can retransmit a frame two or a
-/// few behind after several of our ACKs were lost, and silently dropping those
-/// leaves the gateway retransmitting forever with no chance to resync (issue
-/// #58). The window is kept small so a genuinely fresh (ahead) sequence is never
-/// mistaken for a duplicate.
-const DUP_ACK_WINDOW: u8 = 8;
 
 /// Inbound queue depth at which the tunnel starts warning that its consumer is
 /// falling behind.
@@ -142,6 +168,17 @@ const DUP_ACK_WINDOW: u8 = 8;
 /// delivered, in order, but something upstream is wedged. The warning repeats
 /// every further `INBOUND_WARN_DEPTH` frames rather than once per frame.
 const INBOUND_WARN_DEPTH: usize = 512;
+
+/// The context of a [`TransportError::GatewayStatus`] from a TUNNELING_ACK.
+const ACK_CONTEXT: &str = "TUNNELING_ACK";
+
+/// Interface feature 03, the bus connection status (Tunnelling 3/8/4 §3.6.4).
+pub const FEATURE_BUS_CONNECTION_STATUS: u8 = 0x03;
+/// Interface feature 06, the interface individual address (3/8/4 §3.6.7).
+pub const FEATURE_INDIVIDUAL_ADDRESS: u8 = 0x06;
+/// Interface feature 07, the max APDU length for bus access, equal to
+/// PID_MAX_INTERFACE_APDU_LENGTH (3/8/4 §3.6.8).
+pub const FEATURE_MAX_APDU_LENGTH: u8 = 0x07;
 
 /// The state of a tunnel's link to its gateway, as published by
 /// [`Tunnel::link_state`].
@@ -159,23 +196,146 @@ pub enum LinkState {
 }
 
 /// The socket under a tunnel: plain UDP, or a KNXnet/IP Secure session over
-/// TCP or UDP (issue #71 Phase B, #197). The tunnel state machine talks plain
+/// TCP (issue #71 Phase B, #513). The tunnel state machine talks plain
 /// KNXnet/IP frames to either.
 enum Link {
-    /// A connected UDP socket (the classic tunnel).
-    Udp(UdpSocket),
+    /// The classic tunnel: one UDP socket talking to the gateway's control and
+    /// data endpoints.
+    Udp(UdpLink),
     /// An authenticated secure session.
     Secure(Box<SecureLink>),
 }
 
+/// The socket of a plain UDP tunnel and the two gateway endpoints it talks to
+/// (see "Control and data endpoints" in the module docs).
+struct UdpLink {
+    /// Connected to the control endpoint while the data endpoint is the same
+    /// one (the kernel filters inbound datagrams and reports a refused port),
+    /// unconnected once a CONNECT_RESPONSE names a distinct data endpoint,
+    /// since a connected socket would drop every datagram from that port.
+    socket: UdpSocket,
+    /// Whether `socket` is still connected to `control`.
+    connected: bool,
+    /// The gateway's control endpoint: CONNECT, CONNECTIONSTATE, DISCONNECT.
+    control: SocketAddrV4,
+    /// The data endpoint of the latest CONNECT_RESPONSE: TUNNELING_REQUEST
+    /// and TUNNELING_ACK. The control endpoint until a response names one.
+    data: SocketAddrV4,
+}
+
+impl UdpLink {
+    /// A link over `socket`, connected to the gateway's `control` endpoint
+    /// (see [`udp_socket`]), with the data endpoint not yet known.
+    fn new(socket: UdpSocket, control: SocketAddrV4) -> Self {
+        UdpLink {
+            socket,
+            connected: true,
+            control,
+            data: control,
+        }
+    }
+
+    /// Adopts the data endpoint HPAI of a CONNECT_RESPONSE. A route-back HPAI
+    /// (zero address or port, Core §8.6.3) stands for the endpoint the
+    /// response came from, the control endpoint. A distinct data endpoint
+    /// replaces the connected socket with an unconnected one on the same
+    /// local endpoint, the one the CONNECT_REQUEST advertised.
+    async fn adopt_data_endpoint(&mut self, hpai: Option<SocketAddrV4>) -> Result<()> {
+        self.data = resolve_data_endpoint(hpai, self.control);
+        if self.data == self.control || !self.connected {
+            return Ok(());
+        }
+        tracing::debug!(
+            control = %self.control,
+            data = %self.data,
+            "gateway uses a distinct data endpoint for the tunnel"
+        );
+        let local = self.socket.local_addr()?;
+        // A UDP port has no TIME_WAIT, so the old socket can go and the new
+        // one bind the same endpoint right away. A datagram arriving in
+        // between is lost; the gateway repeats an unacknowledged
+        // TUNNELLING_REQUEST (Tunnelling 3/8/4 §2.6.1).
+        let placeholder = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await?;
+        drop(std::mem::replace(&mut self.socket, placeholder));
+        self.socket = UdpSocket::bind(local).await?;
+        self.connected = false;
+        Ok(())
+    }
+
+    /// Whether a datagram from `from` belongs to this tunnel: it comes from
+    /// the gateway's control or data endpoint.
+    fn is_gateway_endpoint(&self, from: std::net::SocketAddr) -> bool {
+        match from {
+            std::net::SocketAddr::V4(v4) => v4 == self.control || v4 == self.data,
+            std::net::SocketAddr::V6(_) => false,
+        }
+    }
+
+    /// Sends `frame` to `to`, one of the gateway's endpoints.
+    async fn send_to(&self, frame: &[u8], to: SocketAddrV4) -> Result<()> {
+        if self.connected {
+            // Connected, so `to` is the control endpoint (and the data one).
+            self.socket.send(frame).await?;
+        } else {
+            self.socket.send_to(frame, to).await?;
+        }
+        Ok(())
+    }
+
+    /// Receives the next datagram from the gateway into `buf`. Unconnected,
+    /// datagrams from any other source are dropped here, as the kernel does
+    /// for a connected socket. Cancel-safe: each `recv`/`recv_from` is.
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if self.connected {
+            return Ok(self.socket.recv(buf).await?);
+        }
+        loop {
+            let (n, from) = self.socket.recv_from(buf).await?;
+            if self.is_gateway_endpoint(from) {
+                return Ok(n);
+            }
+            tracing::debug!(%from, "dropped a datagram from outside the tunnel's gateway endpoints");
+        }
+    }
+}
+
+/// The data endpoint a CONNECT_RESPONSE names, with a route-back zero address
+/// or port (Core §8.6.3) replaced by the control endpoint's; the control
+/// endpoint when the response named none.
+fn resolve_data_endpoint(hpai: Option<SocketAddrV4>, control: SocketAddrV4) -> SocketAddrV4 {
+    match hpai {
+        Some(addr) => {
+            let ip = if addr.ip().is_unspecified() {
+                *control.ip()
+            } else {
+                *addr.ip()
+            };
+            let port = if addr.port() == 0 {
+                control.port()
+            } else {
+                addr.port()
+            };
+            SocketAddrV4::new(ip, port)
+        }
+        None => control,
+    }
+}
+
 impl Link {
-    /// Sends one plain KNXnet/IP frame (wrapped on a secure link).
+    /// Sends one plain KNXnet/IP frame (wrapped on a secure link) to the
+    /// control endpoint.
     async fn send(&mut self, frame: &[u8]) -> Result<()> {
         match self {
-            Link::Udp(socket) => {
-                socket.send(frame).await?;
-                Ok(())
-            }
+            Link::Udp(udp) => udp.send_to(frame, udp.control).await,
+            Link::Secure(link) => link.send(frame).await,
+        }
+    }
+
+    /// Sends a TUNNELING_REQUEST or TUNNELING_ACK: to the data endpoint on a
+    /// plain UDP tunnel, through the session on a secure link.
+    async fn send_data(&mut self, frame: &[u8]) -> Result<()> {
+        match self {
+            Link::Udp(udp) => udp.send_to(frame, udp.data).await,
             Link::Secure(link) => link.send(frame).await,
         }
     }
@@ -183,8 +343,17 @@ impl Link {
     /// Receives the next plain KNXnet/IP frame into `buf`. Cancel-safe.
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
         match self {
-            Link::Udp(socket) => Ok(socket.recv(buf).await?),
+            Link::Udp(udp) => udp.recv(buf).await,
             Link::Secure(link) => link.recv(buf).await,
+        }
+    }
+
+    /// Adopts the data endpoint of a CONNECT_RESPONSE. A secure session keeps
+    /// route-back semantics, so only the plain UDP tunnel uses it.
+    async fn adopt_data_endpoint(&mut self, hpai: Option<SocketAddrV4>) -> Result<()> {
+        match self {
+            Link::Udp(udp) => udp.adopt_data_endpoint(hpai).await,
+            Link::Secure(_) => Ok(()),
         }
     }
 
@@ -194,7 +363,7 @@ impl Link {
     /// A connected UDP socket whose peer port is closed gets an ICMP port
     /// unreachable for a datagram it sent earlier; Linux reports it as
     /// `ECONNREFUSED` on the NEXT `send` or `recv` (Windows as `WSAECONNRESET`
-    /// on `recv`), macOS mostly not at all. The error is consumed by the call
+    /// on `recv`, there also unconnected), macOS mostly not at all. The error is consumed by the call
     /// that returns it and the socket stays usable, so while re-establishing a
     /// tunnel it is one more sign the gateway is away, not a reason to abandon
     /// the attempt (issue #177). Never true on a secure TCP link, where a
@@ -211,17 +380,15 @@ impl Link {
             )
     }
 
-    /// Whether the link runs over UDP (plain, or a secure session on UDP).
+    /// Whether the link runs over UDP (the plain tunnel; a secure session
+    /// is TCP-only).
     fn is_udp(&self) -> bool {
-        match self {
-            Link::Udp(_) => true,
-            Link::Secure(link) => link.is_udp(),
-        }
+        matches!(self, Link::Udp(_))
     }
 
-    /// Whether the tunnelling layer uses TUNNELING_ACK: over UDP, plain or
-    /// secure. Over TCP it does not (CONFIRMED against the ETS capture: no
-    /// ACKs on a TCP tunnel).
+    /// Whether the tunnelling layer uses TUNNELING_ACK: over UDP only. Over
+    /// TCP it does not (CONFIRMED against the ETS capture: no ACKs on a TCP
+    /// tunnel).
     fn acks(&self) -> bool {
         self.is_udp()
     }
@@ -258,7 +425,8 @@ pub(crate) enum Plan {
     Secure {
         /// The candidate users, best first.
         users: Vec<(SecureUser, Option<Holder>)>,
-        /// What the keyring probe learned, reused by the UDP fallback.
+        /// What the keyring probe learned, reused when a TCP refusal is
+        /// classified.
         probed: Option<Box<GatewayDescription>>,
     },
 }
@@ -288,6 +456,13 @@ enum Command {
     },
     /// Cleanly disconnect; reply when done.
     Close { reply: oneshot::Sender<Result<()>> },
+    /// Read one interface feature with up to `attempts` GETs; reply with the
+    /// value, or `None` when the interface did not answer.
+    FeatureGet {
+        feature: u8,
+        attempts: u32,
+        reply: oneshot::Sender<Result<Option<Vec<u8>>>>,
+    },
 }
 
 /// A KNXnet/IP tunneling connection.
@@ -304,6 +479,8 @@ pub struct Tunnel {
     link: watch::Receiver<LinkState>,
     /// The KNXnet/IP Secure user this tunnel authenticated as, if secure.
     secure_user: Option<u8>,
+    /// Interface feature 07 as read after CONNECT, if the interface answered.
+    max_apdu: Option<u16>,
 }
 
 impl Tunnel {
@@ -324,6 +501,13 @@ impl Tunnel {
         })?;
 
         let plan = plan_connection(config, gateway).await?;
+        // Only a server whose extended description carries the
+        // tunnelling-info DIB is known to serve feature services (3/8/4
+        // §3.5 NOTE 3); any other one may ignore a GET without an ACK.
+        let feature_services = match &plan {
+            Plan::Secure { probed, .. } => probed.as_deref().is_some_and(serves_features),
+            Plan::Plain { probed, .. } => probed.as_ref().is_some_and(serves_features),
+        };
         let requested = config
             .secure
             .as_ref()
@@ -338,9 +522,13 @@ impl Tunnel {
                 keyring_note,
             } => {
                 let (socket, local_hpai) = udp_socket(gateway, config.local_interface).await?;
-                let mut link = Link::Udp(socket);
+                let mut link = Link::Udp(UdpLink::new(socket, gateway));
                 match Self::handshake(&mut link, local_hpai).await {
-                    Ok((channel_id, assigned_ia)) => Opened {
+                    Ok(Granted {
+                        channel_id,
+                        assigned_ia,
+                        ..
+                    }) => Opened {
                         link,
                         local_hpai,
                         channel_id,
@@ -363,14 +551,10 @@ impl Tunnel {
             keys: secure_user,
             lock: user_lock,
         } = opened;
-        let secure_transport = match &link {
-            Link::Secure(l) => l.transport(),
-            Link::Udp(_) => SecureTransport::Tcp,
-        };
         let (link_tx, link_rx) = watch::channel(LinkState::Up { assigned_ia });
         if let Some(user) = &secure_user {
             tracing::info!(
-                "KNXnet/IP Secure tunnel to {gateway} established over {secure_transport} \
+                "KNXnet/IP Secure tunnel to {gateway} established over tcp \
                  as user {} (channel {channel_id})",
                 user.user_id
             );
@@ -406,17 +590,17 @@ impl Tunnel {
             gateway,
             local_interface: config.local_interface,
             secure_user,
-            secure_transport,
             keepalive,
             reconnect: config.reconnect,
             link_state: link_tx,
             last_rx: Instant::now(),
+            feature_answer: None,
             _user_lock: user_lock,
         };
         let secure_user = task_state.secure_user.as_ref().map(|u| u.user_id);
         let task = tokio::spawn(task_state.run());
 
-        Ok(Tunnel {
+        let mut tunnel = Tunnel {
             commands: cmd_tx,
             frames: frame_rx,
             queued,
@@ -424,7 +608,65 @@ impl Tunnel {
             assigned_ia,
             link: link_rx,
             secure_user,
-        })
+            max_apdu: None,
+        };
+        if feature_services {
+            // ETS reads the max APDU length right after CONNECT; one GET, no
+            // repeat, so an interface that stays silent costs one 3 s wait.
+            match tunnel.request_feature(FEATURE_MAX_APDU_LENGTH, 1).await {
+                Ok(Some(value)) if value.len() == 2 => {
+                    let apdu = u16::from_be_bytes([value[0], value[1]]);
+                    tracing::debug!(apdu, "interface feature 07: max APDU length");
+                    tunnel.max_apdu = Some(apdu);
+                }
+                Ok(Some(value)) => {
+                    tracing::debug!(?value, "interface feature 07 with an unexpected size");
+                }
+                Ok(None) => tracing::debug!("interface feature 07 not answered"),
+                Err(err) => tracing::debug!(%err, "interface feature 07 not read"),
+            }
+        }
+        Ok(tunnel)
+    }
+
+    /// Reads interface feature `feature` (Tunnelling 3/8/4 §3.2): sends a
+    /// TUNNELLING_FEATURE_GET, waits 3 s for the TUNNELLING_FEATURE_RESPONSE
+    /// and repeats the GET once if none came.
+    ///
+    /// Returns the feature value, or `None` when the interface did not answer
+    /// either GET. Only call it on an interface that serves feature services
+    /// (its extended description lists tunnelling slots): one that does not
+    /// ignores the GET without an ACK, which over UDP fails the request like
+    /// a lost link (§3.5).
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::GatewayStatus`] with the response's return code when
+    /// the interface refused the read (for example `E_ADDRESS_VOID` for an
+    /// unknown feature), and the errors of a send.
+    pub async fn feature_get(&self, feature: u8) -> Result<Option<Vec<u8>>> {
+        self.request_feature(feature, 2).await
+    }
+
+    /// The interface's max APDU length for bus access (feature 07, equal to
+    /// PID_MAX_INTERFACE_APDU_LENGTH), as read after CONNECT. `None` when the
+    /// interface is not known to serve feature services or did not answer.
+    pub fn max_apdu_length(&self) -> Option<u16> {
+        self.max_apdu
+    }
+
+    /// Hands a feature read with `attempts` GETs to the task.
+    async fn request_feature(&self, feature: u8, attempts: u32) -> Result<Option<Vec<u8>>> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(Command::FeatureGet {
+                feature,
+                attempts,
+                reply,
+            })
+            .await
+            .map_err(|_| TransportError::Closed)?;
+        rx.await.map_err(|_| TransportError::Closed)?
     }
 
     /// The KNXnet/IP Secure tunnelling user this tunnel authenticated as, or
@@ -446,8 +688,9 @@ impl Tunnel {
     }
 
     /// Runs the CONNECT / CONNECT_RESPONSE handshake, returning the channel id
-    /// and any assigned individual address.
-    async fn handshake(link: &mut Link, hpai: Hpai) -> Result<(u8, Option<u16>)> {
+    /// and any assigned individual address. A plain UDP link adopts the data
+    /// endpoint the response names.
+    async fn handshake(link: &mut Link, hpai: Hpai) -> Result<Granted> {
         let req = knxnet::connect_request(hpai, hpai);
         link.send(&req)
             .await
@@ -463,7 +706,9 @@ impl Tunnel {
                 .map_err(|e| crate::secure::at_stage(e, "CONNECT_RESPONSE"))?;
             let parsed = knxnet::parse(&buf[..n])?;
             if parsed.service == ServiceType::ConnectResponse {
-                return accept_connect_response(parsed.body);
+                let granted = accept_connect_response(parsed.body)?;
+                link.adopt_data_endpoint(granted.data_endpoint).await?;
+                return Ok(granted);
             }
             if matches!(link, Link::Udp(_)) {
                 return Err(TransportError::InvalidField {
@@ -471,7 +716,7 @@ impl Tunnel {
                     value: 0,
                 });
             }
-            // Over a secure session, TCP or UDP, other frames can precede the
+            // Over a secure session other frames can precede the
             // answer (a TUNNELLING_FEATURE_INFO, say): skip them. The session
             // has already authenticated every one of them, so a stray frame is
             // the interface's, not a spoof.
@@ -479,8 +724,8 @@ impl Tunnel {
     }
 }
 
-/// Binds the UDP socket of a plain tunnel (or a secure session over UDP) and
-/// returns it with the HPAI it advertises.
+/// Binds the UDP socket of a plain tunnel, connected to the gateway's
+/// control endpoint, and returns it with the HPAI it advertises.
 pub(crate) async fn udp_socket(
     gateway: SocketAddrV4,
     local_interface: Ipv4Addr,
@@ -803,7 +1048,11 @@ async fn connect_secure_user(
     let hpai = link.hpai();
     let mut link = Link::Secure(Box::new(link));
     match Tunnel::handshake(&mut link, hpai).await {
-        Ok((channel_id, assigned_ia)) => Ok((link, hpai, channel_id, assigned_ia)),
+        Ok(Granted {
+            channel_id,
+            assigned_ia,
+            ..
+        }) => Ok((link, hpai, channel_id, assigned_ia)),
         Err(err) => {
             link.close().await;
             Err(err)
@@ -811,16 +1060,14 @@ async fn connect_secure_user(
     }
 }
 
-/// Opens the secure session of a tunnel over the carrier `requested` names.
+/// Opens the secure session of a tunnel over TCP.
 ///
-/// `Tcp` and `Udp` are taken literally. `Auto` is TCP, as ETS uses with the
-/// tested interface. When that connect is refused and the interface's
-/// extended search (`probed`, or a fresh probe) advertises KNXnet/IP Secure,
-/// the interface may serve UDP only; `Auto` still does not switch, because the
-/// UDP carrier is verified against knx-sim and the testkit mock only, and
-/// returns [`TransportError::SecureTcpRefused`] so the operator can opt in with
-/// `--secure-transport udp` (issue #197). Any other TCP failure is returned as
-/// it is.
+/// A unicast secure session runs over TCP only (KNX IP Secure 3/8/9
+/// §2.2.3.3, §2.2.3.6.4; issue #513). With `Tcp` a failure is returned as it
+/// is. With `Auto`, a refused connect to an interface whose extended search
+/// (`probed`, or a fresh probe) advertises KNXnet/IP Secure becomes
+/// [`TransportError::SecureTcpRefused`], which names the likely causes. Any
+/// other failure is returned as it is.
 pub(crate) async fn open_secure(
     gateway: SocketAddrV4,
     local: Ipv4Addr,
@@ -830,36 +1077,33 @@ pub(crate) async fn open_secure(
     timeout: std::time::Duration,
 ) -> Result<SecureLink> {
     match requested {
-        SecureTransport::Tcp => SecureLink::open(gateway, local, user, requested, timeout).await,
-        SecureTransport::Udp => {
-            tracing::warn!(
-                "KNXnet/IP Secure over UDP to {gateway}: verified against knx-sim only, \
-                 not against a real interface (issue #197)"
-            );
-            SecureLink::open(gateway, local, user, requested, timeout).await
-        }
-        SecureTransport::Auto => {
-            match SecureLink::open(gateway, local, user, SecureTransport::Tcp, timeout).await {
-                Err(err) if is_tcp_refusal(&err) => {
-                    let secure_capable = match probed {
-                        Some(d) => d.secure_capable(),
-                        None => crate::discovery::describe_gateway_extended(
-                            gateway,
-                            SECURE_PROBE_TIMEOUT,
-                        )
-                        .await
-                        .is_ok_and(|d| d.secure_capable()),
-                    };
-                    if secure_capable {
-                        Err(TransportError::SecureTcpRefused { gateway })
-                    } else {
-                        Err(err)
+        SecureTransport::Tcp => SecureLink::open(gateway, local, user, timeout).await,
+        SecureTransport::Auto => match SecureLink::open(gateway, local, user, timeout).await {
+            Err(err) if is_tcp_refusal(&err) => {
+                let secure_capable = match probed {
+                    Some(d) => d.secure_capable(),
+                    None => {
+                        crate::discovery::describe_gateway_extended(gateway, SECURE_PROBE_TIMEOUT)
+                            .await
+                            .is_ok_and(|d| d.secure_capable())
                     }
+                };
+                if secure_capable {
+                    Err(TransportError::SecureTcpRefused { gateway })
+                } else {
+                    Err(err)
                 }
-                other => other,
             }
-        }
+            other => other,
+        },
     }
+}
+
+/// Whether `description` marks a server with tunnelling feature services:
+/// its extended description carried the tunnelling-info DIB (Tunnelling
+/// 3/8/4 §3.5 NOTE 3).
+fn serves_features(description: &GatewayDescription) -> bool {
+    description.tunnel_slots.is_some()
 }
 
 /// Whether `err` is a refused TCP connect (nothing listens on the port).
@@ -898,9 +1142,20 @@ async fn refusal(
     TransportError::GatewayStatus { status, context }
 }
 
-/// Decodes a CONNECT_RESPONSE body into the granted channel id and assigned
-/// individual address, turning a refusal into its error.
-fn accept_connect_response(body: &[u8]) -> Result<(u8, Option<u16>)> {
+/// What a successful CONNECT_RESPONSE granted.
+struct Granted {
+    /// The channel id.
+    channel_id: u8,
+    /// The individual address the gateway assigned, if it named one.
+    assigned_ia: Option<u16>,
+    /// The data endpoint HPAI the server prepared for the channel (Core
+    /// §5.2), as sent: route-back zeros are resolved by the link.
+    data_endpoint: Option<SocketAddrV4>,
+}
+
+/// Decodes a CONNECT_RESPONSE body into what it granted, turning a refusal
+/// into its error.
+fn accept_connect_response(body: &[u8]) -> Result<Granted> {
     let resp = knxnet::parse_connect_response(body)?;
     // A full interface is a capacity refusal, not a transport fault: give it
     // its own variant so the CLI can name the likely other clients and exit
@@ -914,7 +1169,11 @@ fn accept_connect_response(body: &[u8]) -> Result<(u8, Option<u16>)> {
             context: "CONNECT_RESPONSE",
         });
     }
-    Ok((resp.channel_id, resp.assigned_ia))
+    Ok(Granted {
+        channel_id: resp.channel_id,
+        assigned_ia: resp.assigned_ia,
+        data_endpoint: resp.data_endpoint,
+    })
 }
 
 impl BusConnection for Tunnel {
@@ -1001,9 +1260,6 @@ struct TaskState {
     /// The KNXnet/IP Secure user of this tunnel, if it is secure; a
     /// re-establish opens a fresh secure session with it.
     secure_user: Option<UserKeys>,
-    /// The carrier the secure session was opened on (`Tcp` or `Udp`); a
-    /// re-establish uses the same one. Unused on a plain tunnel.
-    secure_transport: SecureTransport,
     /// The secure session keepalive interval (`ZERO` = none).
     keepalive: std::time::Duration,
     /// How a lost link is re-established (issue #177).
@@ -1013,6 +1269,9 @@ struct TaskState {
     /// When the link last delivered anything, for the TCP read deadline
     /// (issue #192).
     last_rx: Instant,
+    /// The last in-sequence TUNNELLING_FEATURE_RESPONSE: feature, return
+    /// code, value. Taken by [`do_feature_get`](Self::do_feature_get).
+    feature_answer: Option<(u8, u8, Vec<u8>)>,
     /// Marks the secure user as held by this tunnel for other bussard
     /// processes on the host (issue #287); released when the task ends.
     _user_lock: Option<HostLock>,
@@ -1075,6 +1334,10 @@ impl TaskState {
                     match cmd {
                         Some(Command::Send { frame, reply }) => {
                             let r = self.do_send(&frame, &mut buf).await;
+                            let _ = reply.send(r);
+                        }
+                        Some(Command::FeatureGet { feature, attempts, reply }) => {
+                            let r = self.feature_get_command(feature, attempts, &mut buf).await;
                             let _ = reply.send(r);
                         }
                         Some(Command::Close { reply }) => {
@@ -1176,7 +1439,9 @@ impl TaskState {
     }
 
     /// Whether `err` signals a lost gateway link that the task should
-    /// re-establish (issue #177) rather than surface.
+    /// re-establish (issue #177) rather than surface. A TUNNELING_ACK whose
+    /// error status persisted through the repeat counts as one: Tunnelling
+    /// 3/8/4 §2.6.1 disconnects after it as after a missing ACK (issue #516).
     fn should_reestablish(&self, err: &TransportError) -> bool {
         self.reconnect.enabled()
             && matches!(
@@ -1186,6 +1451,10 @@ impl TaskState {
                     | TransportError::Io { .. }
                     | TransportError::SecureSessionEnded(_)
                     | TransportError::BadHeader(..)
+                    | TransportError::GatewayStatus {
+                        context: ACK_CONTEXT,
+                        ..
+                    }
             )
     }
 
@@ -1224,26 +1493,43 @@ impl TaskState {
     }
 
     /// One TUNNELING_REQUEST on the current channel: send, await the ACK, and
-    /// retransmit once on timeout.
+    /// repeat once when the ACK is missing or carries an error status
+    /// (Tunnelling 3/8/4 §2.6.1, issue #516). A second failure is returned;
+    /// [`should_reestablish`](Self::should_reestablish) treats it as a lost
+    /// link.
     async fn send_once(&mut self, frame: &CemiFrame, buf: &mut [u8]) -> Result<()> {
+        self.send_sequenced(|header| knxnet::tunneling_request(header, frame), buf)
+            .await
+    }
+
+    /// Sends one frame of the tunnelling family under the next outgoing
+    /// sequence (`build` makes it from the connection header) and awaits its
+    /// confirmation as [`send_once`](Self::send_once) describes: TUNNELLING
+    /// REQUESTs and feature services share the counter and the rules
+    /// (Tunnelling 3/8/4 §3.1).
+    async fn send_sequenced(
+        &mut self,
+        build: impl Fn(ConnectionHeader) -> Vec<u8>,
+        buf: &mut [u8],
+    ) -> Result<()> {
         let seq = self.outgoing_seq;
         let header = ConnectionHeader {
             channel_id: self.channel_id,
             seq,
         };
-        let datagram = knxnet::tunneling_request(header, frame);
+        let datagram = build(header);
 
         if !self.link.acks() {
             // Over TCP there is no TUNNELING_ACK: the stream is reliable and a
             // broken one surfaces as a socket error (CONFIRMED, ETS capture).
-            self.link.send(&datagram).await?;
+            self.link.send_data(&datagram).await?;
             self.outgoing_seq = self.outgoing_seq.wrapping_add(1);
             return Ok(());
         }
 
         let mut attempt = 0;
         loop {
-            self.link.send(&datagram).await?;
+            self.link.send_data(&datagram).await?;
             match self.await_ack(seq, buf).await {
                 Ok(()) => {
                     self.outgoing_seq = self.outgoing_seq.wrapping_add(1);
@@ -1252,6 +1538,18 @@ impl TaskState {
                 Err(TransportError::Timeout(_)) if attempt < TUNNELING_RETRANSMITS => {
                     attempt += 1;
                     tracing::warn!(seq, attempt, "tunneling ACK timeout; retransmitting");
+                }
+                Err(TransportError::GatewayStatus {
+                    status,
+                    context: ACK_CONTEXT,
+                }) if attempt < TUNNELING_RETRANSMITS => {
+                    attempt += 1;
+                    tracing::warn!(
+                        seq,
+                        attempt,
+                        status,
+                        "tunneling ACK with an error status; repeating the request"
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -1286,7 +1584,7 @@ impl TaskState {
                         if status != 0 {
                             return Err(TransportError::GatewayStatus {
                                 status,
-                                context: "TUNNELING_ACK",
+                                context: ACK_CONTEXT,
                             });
                         }
                         return Ok(());
@@ -1310,8 +1608,13 @@ impl TaskState {
             Err(_) => return true, // ignore malformed
         };
         match parsed.service {
-            ServiceType::TunnelingRequest => {
-                self.handle_tunneling_request(parsed.body).await;
+            ServiceType::TunnelingRequest
+            | ServiceType::TunnelingFeatureGet
+            | ServiceType::TunnelingFeatureResponse
+            | ServiceType::TunnelingFeatureSet
+            | ServiceType::TunnelingFeatureInfo => {
+                self.handle_tunneling_request(parsed.service, parsed.body)
+                    .await;
                 true
             }
             ServiceType::DisconnectRequest => {
@@ -1329,8 +1632,10 @@ impl TaskState {
         }
     }
 
-    /// Handles an inbound TUNNELING_REQUEST per the KNXnet/IP tunnelling ACK rules
-    /// (issue #60).
+    /// Handles an inbound TUNNELING_REQUEST, or a tunnelling feature frame,
+    /// per the KNXnet/IP tunnelling ACK rules (issue #60): the feature services
+    /// are confirmed and sequence-counted exactly like a TUNNELING_REQUEST
+    /// (Tunnelling 3/8/4 §3.1, issue #514).
     ///
     /// The sequence number decides the ACK, and it is read *before* the cEMI is
     /// decoded so an un-decodable-but-in-sequence frame is still ACKed:
@@ -1342,9 +1647,12 @@ impl TaskState {
     ///   simply not delivered.
     /// * **Exact previous seq (seq-1)** — a retransmitted duplicate: ACK it (so
     ///   the gateway stops resending) but drop it without advancing.
-    /// * **Any other out-of-window seq** — SILENTLY DISCARD, no ACK (C2). ACKing
-    ///   a frame we then drop would wrongly tell the gateway we accepted it.
-    async fn handle_tunneling_request(&mut self, body: &[u8]) {
+    /// * **Any other seq** — SILENTLY DISCARD, no ACK (C2; Tunnelling 3/8/4
+    ///   §2.6.1). ACKing a frame we then drop would wrongly tell the gateway we
+    ///   accepted it. A conforming server repeats a frame once, so a frame two
+    ///   or more behind is never its retransmission (issue #516 retired the
+    ///   wider window of #58).
+    async fn handle_tunneling_request(&mut self, service: ServiceType, body: &[u8]) {
         // Read the connection header (sequence) without committing to a cEMI
         // decode, so an unknown-message-code frame can still be ACKed.
         let (header, cemi_bytes) = match knxnet::parse_tunneling_header(body) {
@@ -1360,8 +1668,7 @@ impl TaskState {
         }
 
         // How far `seq` is *behind* the expected sequence, modulo the 8-bit space
-        // (0 means it is the expected frame). A small window of behind values are
-        // treated as retransmitted duplicates.
+        // (0 means it is the expected frame, 1 the repeated previous one).
         let behind = self.incoming_seq.wrapping_sub(seq);
 
         if seq == self.incoming_seq {
@@ -1369,9 +1676,13 @@ impl TaskState {
             // cEMI decodes (C3 — an unknown message code must not stall the tunnel).
             if self.link.acks() {
                 let ack = knxnet::tunneling_ack(self.channel_id, seq, 0);
-                let _ = self.link.send(&ack).await;
+                let _ = self.link.send_data(&ack).await;
             }
             self.incoming_seq = self.incoming_seq.wrapping_add(1);
+            if service != ServiceType::TunnelingRequest {
+                self.handle_feature_frame(service, cemi_bytes);
+                return;
+            }
 
             match CemiFrame::decode(cemi_bytes) {
                 Ok(cemi) => {
@@ -1391,19 +1702,14 @@ impl TaskState {
                     );
                 }
             }
-        } else if (1..=DUP_ACK_WINDOW).contains(&behind) {
-            // A recently-seen sequence, up to `DUP_ACK_WINDOW` frames behind the
-            // one we expect next: a retransmitted duplicate we already accepted.
-            // ACK it with its OWN sequence (so the gateway stops resending) but do
-            // NOT advance and do NOT re-deliver. The window is wider than one frame
-            // because a gateway can retransmit a frame two (or a few) behind after
-            // several of our ACKs were lost; the old one-frame window silently
-            // discarded those, so the gateway retransmitted forever and its next
-            // in-order frame — which we would have accepted — never got a chance to
-            // resync `incoming_seq` (issue #58).
+        } else if behind == 1 {
+            // The previous sequence: the gateway's repeat of a frame we already
+            // accepted (our ACK was lost). ACK it with its OWN sequence (so the
+            // gateway stops resending) but do NOT advance and do NOT re-deliver
+            // (Tunnelling 3/8/4 §2.6.1).
             if self.link.acks() {
                 let ack = knxnet::tunneling_ack(self.channel_id, seq, 0);
-                let _ = self.link.send(&ack).await;
+                let _ = self.link.send_data(&ack).await;
             }
             tracing::debug!(
                 seq,
@@ -1411,9 +1717,9 @@ impl TaskState {
                 "ACK-and-drop duplicate (behind) tunneling request"
             );
         } else {
-            // Ahead of the window, or too far behind to be a plausible retransmit:
-            // silently discard, NO ACK (C2). ACKing a frame we then drop would
-            // wrongly tell the gateway we accepted it.
+            // Any other sequence: silently discard, NO ACK (C2; 3/8/4 §2.6.1).
+            // ACKing a frame we then drop would wrongly tell the gateway we
+            // accepted it.
             tracing::warn!(
                 seq,
                 expected = self.incoming_seq,
@@ -1422,10 +1728,105 @@ impl TaskState {
         }
     }
 
+    /// Takes an in-sequence feature frame (its body after the connection
+    /// header): a FEATURE_RESPONSE answers the pending read, a FEATURE_INFO
+    /// is logged, a GET or SET from the server has no meaning for a client.
+    fn handle_feature_frame(&mut self, service: ServiceType, body: &[u8]) {
+        let (Some(&feature), Some(&code)) = (body.first(), body.get(1)) else {
+            tracing::debug!(?service, "dropping a feature frame without a feature id");
+            return;
+        };
+        let value = body.get(2..).unwrap_or_default().to_vec();
+        match service {
+            ServiceType::TunnelingFeatureResponse => {
+                self.feature_answer = Some((feature, code, value));
+            }
+            ServiceType::TunnelingFeatureInfo => {
+                tracing::debug!(
+                    feature = format!("0x{feature:02x}"),
+                    ?value,
+                    "TUNNELLING_FEATURE_INFO from the interface"
+                );
+            }
+            other => tracing::debug!(?other, "ignoring a feature request from the interface"),
+        }
+    }
+
+    /// Runs a [`Command::FeatureGet`]: [`do_feature_get`](Self::do_feature_get),
+    /// re-establishing the tunnel when the GET found the link lost (the read
+    /// itself is then reported as unanswered).
+    async fn feature_get_command(
+        &mut self,
+        feature: u8,
+        attempts: u32,
+        buf: &mut [u8],
+    ) -> Result<Option<Vec<u8>>> {
+        match self.do_feature_get(feature, attempts, buf).await {
+            Err(err) if self.should_reestablish(&err) => {
+                self.reestablish(err, Instant::now(), buf).await?;
+                Ok(None)
+            }
+            other => other,
+        }
+    }
+
+    /// Sends up to `attempts` TUNNELLING_FEATURE_GETs for `feature`, each
+    /// confirmed like a TUNNELING_REQUEST and followed by a wait of
+    /// [`FEATURE_RESPONSE_TIMEOUT`] for the response (3/8/4 §3.2), serving
+    /// other inbound traffic meanwhile.
+    async fn do_feature_get(
+        &mut self,
+        feature: u8,
+        attempts: u32,
+        buf: &mut [u8],
+    ) -> Result<Option<Vec<u8>>> {
+        for attempt in 0..attempts {
+            self.feature_answer = None;
+            self.send_sequenced(|header| knxnet::tunneling_feature_get(header, feature), buf)
+                .await?;
+            let deadline = Instant::now() + FEATURE_RESPONSE_TIMEOUT;
+            loop {
+                if let Some((answered, code, value)) = self.feature_answer.take() {
+                    if answered != feature {
+                        tracing::debug!(answered, feature, "a response for another feature");
+                        continue;
+                    }
+                    if code != 0 {
+                        return Err(TransportError::GatewayStatus {
+                            status: code,
+                            context: "TUNNELLING_FEATURE_RESPONSE",
+                        });
+                    }
+                    return Ok(Some(value));
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let n = match time::timeout(remaining, self.link.recv(buf)).await {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => break,
+                };
+                self.last_rx = Instant::now();
+                let datagram = buf[..n].to_vec();
+                if !self.handle_inbound(&datagram).await {
+                    return Err(TransportError::Disconnected(self.channel_id));
+                }
+            }
+            tracing::debug!(
+                feature,
+                attempt = attempt + 1,
+                "no TUNNELLING_FEATURE_RESPONSE within 3 s"
+            );
+        }
+        Ok(None)
+    }
+
     /// Sends a heartbeat and awaits its response, retrying per the spec.
     async fn do_heartbeat(&mut self, buf: &mut [u8]) -> Result<()> {
         let r = self
-            .heartbeat_with(HEARTBEAT_RETRIES, HEARTBEAT_TIMEOUT, buf)
+            .heartbeat_with(HEARTBEAT_ATTEMPTS, HEARTBEAT_TIMEOUT, buf)
             .await;
         if r.is_ok() {
             self.last_rx = Instant::now();
@@ -1527,7 +1928,11 @@ impl TaskState {
                 .connect_attempt(wait, old_channel, &mut old_open, buf)
                 .await
             {
-                Ok((channel, assigned_ia)) => {
+                Ok(Granted {
+                    channel_id: channel,
+                    assigned_ia,
+                    ..
+                }) => {
                     self.channel_id = channel;
                     self.outgoing_seq = 0;
                     self.incoming_seq = 0;
@@ -1572,10 +1977,10 @@ impl TaskState {
         old_channel: u8,
         old_open: &mut bool,
         buf: &mut [u8],
-    ) -> Result<(u8, Option<u16>)> {
+    ) -> Result<Granted> {
         let deadline = Instant::now() + wait;
         if let Some(user) = &self.secure_user {
-            // A secure tunnel needs a fresh session on the same carrier: the
+            // A secure tunnel needs a fresh TCP session: the
             // old session died with the link. End the old one FIRST (wrapped
             // STATUS_CLOSE, then the socket): an interface that holds one
             // session per user would otherwise refuse the new session as long
@@ -1585,15 +1990,7 @@ impl TaskState {
             // DISCONNECT is owed.
             self.link.close().await;
             *old_open = false;
-            let link = SecureLink::open(
-                self.gateway,
-                self.local_interface,
-                user,
-                self.secure_transport,
-                wait,
-            )
-            .await?;
-            // A UDP session has a new socket, so a new endpoint to advertise.
+            let link = SecureLink::open(self.gateway, self.local_interface, user, wait).await?;
             self.local_hpai = link.hpai();
             self.link = Link::Secure(Box::new(link));
         }
@@ -1625,7 +2022,11 @@ impl TaskState {
                 continue;
             };
             match parsed.service {
-                ServiceType::ConnectResponse => return accept_connect_response(parsed.body),
+                ServiceType::ConnectResponse => {
+                    let granted = accept_connect_response(parsed.body)?;
+                    self.link.adopt_data_endpoint(granted.data_endpoint).await?;
+                    return Ok(granted);
+                }
                 ServiceType::DisconnectResponse => {
                     if parsed.body.first() == Some(&old_channel) {
                         *old_open = false;
@@ -1694,11 +2095,52 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_deferred_refusal_only_icmp_kinds_on_udp() -> Result<()> {
-        let link = Link::Udp(UdpSocket::bind("127.0.0.1:0").await?);
+        let link = Link::Udp(UdpLink::new(UdpSocket::bind("127.0.0.1:0").await?, CONTROL));
         assert!(link.is_deferred_refusal(&io(std::io::ErrorKind::ConnectionRefused)));
         assert!(link.is_deferred_refusal(&io(std::io::ErrorKind::ConnectionReset)));
         assert!(!link.is_deferred_refusal(&io(std::io::ErrorKind::PermissionDenied)));
         assert!(!link.is_deferred_refusal(&TransportError::HeartbeatLost));
+        Ok(())
+    }
+
+    /// A gateway control endpoint for the endpoint tests.
+    const CONTROL: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 10), 3671);
+
+    #[test]
+    fn test_resolve_data_endpoint_takes_the_hpai_and_resolves_route_back() {
+        let distinct = SocketAddrV4::new(*CONTROL.ip(), 50_100);
+        assert_eq!(resolve_data_endpoint(Some(distinct), CONTROL), distinct);
+        // Route-back (Core §8.6.3): the endpoint the response came from.
+        let route_back = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+        assert_eq!(resolve_data_endpoint(Some(route_back), CONTROL), CONTROL);
+        let port_only = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 50_100);
+        assert_eq!(resolve_data_endpoint(Some(port_only), CONTROL), distinct);
+        assert_eq!(resolve_data_endpoint(None, CONTROL), CONTROL);
+    }
+
+    #[tokio::test]
+    async fn test_adopt_data_endpoint_unconnects_only_for_a_distinct_endpoint() -> Result<()> {
+        let control = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3671);
+        let (socket, hpai) = udp_socket(control, Ipv4Addr::LOCALHOST).await?;
+        let mut link = UdpLink::new(socket, control);
+
+        // The same endpoint: the connected socket stays.
+        link.adopt_data_endpoint(Some(control)).await?;
+        assert!(link.connected);
+        assert_eq!(link.data, control);
+
+        // A distinct one: unconnected, on the advertised local endpoint.
+        let distinct = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3672);
+        link.adopt_data_endpoint(Some(distinct)).await?;
+        assert!(!link.connected);
+        assert_eq!(link.data, distinct);
+        assert_eq!(
+            link.socket.local_addr()?,
+            std::net::SocketAddr::V4(hpai.addr)
+        );
+        assert!(link.is_gateway_endpoint(control.into()));
+        assert!(link.is_gateway_endpoint(distinct.into()));
+        assert!(!link.is_gateway_endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3673).into()));
         Ok(())
     }
 

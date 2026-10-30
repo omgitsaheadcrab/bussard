@@ -65,7 +65,8 @@ pub enum ServiceType {
     /// SEARCH_RESPONSE_EXTENDED — the answer, carrying the requested DIBs
     /// (including the KNXnet/IP Secure ones).
     SearchResponseExtended = 0x020C,
-    /// TUNNELLING_FEATURE_GET (Tunnelling v2; ETS sends it, bussard ignores it).
+    /// TUNNELLING_FEATURE_GET (Tunnelling v2): reads an interface feature;
+    /// bussard reads feature 07 after CONNECT, as ETS does (issue #514).
     TunnelingFeatureGet = 0x0422,
     /// TUNNELLING_FEATURE_RESPONSE.
     TunnelingFeatureResponse = 0x0423,
@@ -439,6 +440,16 @@ pub fn tunneling_request(header: ConnectionHeader, cemi: &CemiFrame) -> Vec<u8> 
     frame(ServiceType::TunnelingRequest, &body)
 }
 
+/// Builds a TUNNELLING_FEATURE_GET for interface feature `feature` (KNXnet/IP
+/// Tunnelling 3/8/4 §5.4.8): the connection header, the feature id and one
+/// reserved octet.
+pub fn tunneling_feature_get(header: ConnectionHeader, feature: u8) -> Vec<u8> {
+    let mut body = Vec::with_capacity(6);
+    header.encode(&mut body);
+    body.extend_from_slice(&[feature, 0x00]);
+    frame(ServiceType::TunnelingFeatureGet, &body)
+}
+
 /// Builds a TUNNELING_ACK: connection header only, with a status byte in place
 /// of the reserved byte.
 pub fn tunneling_ack(channel_id: u8, seq: u8, status: u8) -> Vec<u8> {
@@ -610,24 +621,34 @@ pub const DIB_TUNNELING_INFO: u8 = 0x07;
 /// one while connected, which is why a connect can fail with
 /// `E_NO_MORE_CONNECTIONS` on a perfectly healthy gateway.
 ///
-/// The status word's low three bits are, from bit 0 up: free, authorized,
-/// usable (KNXnet/IP Core v2, tunnelling-info DIB).
+/// The status word's low three bits are, from bit 0 up: free, authorised,
+/// usable (KNXnet/IP Core 3/8/2 §7.5.4.8). Bit 1 depends on where it is read:
+/// inside a KNXnet/IP Secure session it says whether this client would be
+/// authorised for the slot; outside one it says whether the slot needs
+/// authorisation at all (0 = needs it, 1 = open to anyone). bussard reads the
+/// DIB with a plain SEARCH_REQUEST_EXTENDED, always outside a session, so the
+/// bit is decoded as [`authorisation_required`](Self::authorisation_required)
+/// (issue #518).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TunnelSlot {
     /// The individual address bound to this slot.
     pub individual_address: u16,
     /// The slot is currently unoccupied.
     pub free: bool,
-    /// The requesting client is authorized to use this slot.
-    pub authorized: bool,
+    /// The slot needs tunnelling credentials (a KNXnet/IP Secure user): bit 1
+    /// read outside a secure session is clear. On a secure-only interface
+    /// every slot needs them; it says nothing about whether the keyring holds
+    /// them.
+    pub authorisation_required: bool,
     /// The slot is usable (the interface is in normal operation).
     pub usable: bool,
 }
 
 /// Bit 0 of a tunnelling slot status: the slot is free.
 const SLOT_FREE: u16 = 0x0001;
-/// Bit 1 of a tunnelling slot status: the client is authorized for the slot.
-const SLOT_AUTHORIZED: u16 = 0x0002;
+/// Bit 1 of a tunnelling slot status, read outside a secure session: the
+/// slot needs no authorisation (Core 3/8/2 §7.5.4.8).
+const SLOT_NO_AUTHORISATION: u16 = 0x0002;
 /// Bit 2 of a tunnelling slot status: the slot is usable.
 const SLOT_USABLE: u16 = 0x0004;
 
@@ -816,7 +837,7 @@ fn parse_dibs(cur: &mut Cursor<'_>) -> GatewayDescription {
                         TunnelSlot {
                             individual_address: u16::from_be_bytes([c[0], c[1]]),
                             free: status & SLOT_FREE != 0,
-                            authorized: status & SLOT_AUTHORIZED != 0,
+                            authorisation_required: status & SLOT_NO_AUTHORISATION == 0,
                             usable: status & SLOT_USABLE != 0,
                         }
                     })

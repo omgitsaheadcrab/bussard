@@ -260,6 +260,8 @@ pub fn run(
             &inputs,
             model.as_ref(),
             dry.dump_images.as_deref(),
+            dry.resident.as_deref(),
+            full,
             no_factory_reset,
             parameters_only,
             &secure_material,
@@ -366,6 +368,8 @@ pub fn run(
         let probe_options = L4Options {
             source: SourcePolicy::Known(source),
             tool_key: tool_key.clone(),
+            // A device reset to default is named, not flashed (issue #532).
+            factory_key: secure_material.fdsk.clone(),
             high_water: secure_seq.clone(),
             authorize: Authorize::Skip,
             ..L4Options::default()
@@ -452,6 +456,7 @@ pub fn run(
                         };
                         if let Some(state) = &resident {
                             facts.object_table = state.object_table.clone();
+                            facts.association_pdt = state.association_pdt;
                         }
                         // The plan needs only the mask, so it is built here, and the
                         // parameter read-back (issue #109) rides this same
@@ -590,6 +595,9 @@ pub fn run(
 
     let (connected, device_mask, resident, facts, current, preread, (sys7, live_flags), kept) =
         probe;
+    // A flash rewrites the security object: the next plan reads PID 61 again
+    // instead of a cache (issue #336).
+    bussard_service::security_change::forget_flags(dir, target);
     if let Some(l4) = kept {
         handover.keep(l4);
     }
@@ -680,6 +688,7 @@ pub fn run(
     let written_senders = match inputs.finish(
         &mut plan,
         Some(&freshness),
+        resident.as_ref(),
         no_factory_reset,
         model.as_ref(),
         target,
@@ -694,7 +703,8 @@ pub fn run(
     };
     // A group address that leaves or joins Data Secure (issue #331): the
     // security program against the PID 61 the pre-flight read.
-    if let Some(line) = live_flags.as_deref().and_then(|flags| {
+    // `--json` carries the same line as `security_object` (issue #336).
+    let security_change = live_flags.as_deref().and_then(|flags| {
         let links = model
             .as_ref()
             .and_then(|m| m.links.links.get(&target))
@@ -702,8 +712,8 @@ pub fn run(
             .unwrap_or(&[]);
         bussard_service::security_change::from_flash_plan(target, &plan, links, flags)
             .and_then(|change| change.change(model.as_ref()))
-    }) && !output.json
-    {
+    });
+    if let (Some(line), false) = (&security_change, output.json) {
         println!("{}", line.line());
     }
 
@@ -737,7 +747,13 @@ pub fn run(
     let preflight_elapsed = preflight_started.elapsed();
 
     if output.json {
-        print_plan_json(target, device_mask, &plan, &params)?;
+        print_plan_json(
+            target,
+            device_mask,
+            &plan,
+            &params,
+            security_change.as_ref(),
+        )?;
     } else {
         print_plan(
             target,
@@ -874,6 +890,14 @@ pub fn run(
             ),
             readiness_summary(&plan.identity.id, readiness)
         );
+        // Issue #524: the verify-mode echoes the System 7 stream compared.
+        if let Some(echoes) = outcome.as_ref().ok().and_then(|o| o.verify_echoes) {
+            eprintln!(
+                "verify mode: {} of {} memory-write echoes compared, set again on {} \
+                 reconnect(s)",
+                echoes.echoes_compared, echoes.chunks_written, echoes.re_enabled
+            );
+        }
     }
 
     match outcome {
@@ -996,6 +1020,8 @@ fn dry_run(
     inputs: &FlashInputs<'_>,
     model: Option<&bussard_model::Model>,
     dump_images: Option<&Path>,
+    resident: Option<&Path>,
+    full: bool,
     no_factory_reset: bool,
     parameters_only: bool,
     secure_material: &crate::secure_key::SecureMaterial,
@@ -1022,9 +1048,35 @@ fn dry_run(
     };
     // Offline there is no device to judge freshness on, so only the planner's
     // own factory reset (a sparse, filled-segment download) shows, unless the
-    // operator waived it.
+    // operator waived it. A recorded device state (`--resident`, issue #490)
+    // stands in for the pre-flight probe: the verdict shapes the plan as it
+    // does live.
+    // The recorded objects are System B interface objects, or on a System 7
+    // plan the load-state machines (issue #488: an all-Unloaded record drops
+    // the pre-download pass, as on a factory-fresh device). A property-only
+    // plan keeps the offline shape.
+    let recorded = match resident {
+        Some(path) if !parameters_only && !plan.is_property_only() => {
+            let recorded = crate::flash_resident::Recorded::read(path)?;
+            let recorded = if plan.is_sys7() {
+                recorded.into_sys7()
+            } else {
+                recorded
+            };
+            Some(recorded).filter(|r| r.has_states())
+        }
+        _ => None,
+    };
+    let freshness = recorded
+        .as_ref()
+        .map(|r| assess_freshness(&r.state, &plan.identity));
     let mut plan = plan;
-    bussard_service::flash::apply_freshness(&mut plan, None, no_factory_reset);
+    bussard_service::flash::apply_freshness(
+        &mut plan,
+        freshness.as_ref(),
+        recorded.as_ref().map(|r| &r.state),
+        no_factory_reset,
+    );
     if parameters_only {
         return crate::flash_params::dry_run(target, &plan, output.json);
     }
@@ -1033,6 +1085,35 @@ fn dry_run(
     {
         eprintln!("cannot flash: {err}");
         return Ok(ExitCode::FAILURE);
+    }
+    if let (Some(recorded), Some(freshness)) = (&recorded, &freshness) {
+        let verdict = match freshness {
+            Freshness::Fresh => "no loaded application".to_string(),
+            Freshness::SameApplication { resident } => {
+                format!("holds this application ({resident})")
+            }
+            Freshness::Resident { resident, .. } => format!(
+                "holds another application ({})",
+                resident.as_deref().unwrap_or("unidentified")
+            ),
+            Freshness::Mismatch { reason } | Freshness::Unknown { reason } => reason.clone(),
+        };
+        eprintln!(
+            "dry run: the recorded device {verdict}; load procedure {}",
+            if plan.is_par_procedure() {
+                "par"
+            } else {
+                "full"
+            }
+        );
+        if !plan.is_sys7() && bussard_service::flash::skip_unchanged(full, &plan, freshness) {
+            let skipped = recorded.skip_matching(&mut plan);
+            if !skipped.is_empty() {
+                eprintln!(
+                    "dry run: object(s) {skipped:?} skipped: the recorded MCB matches the image"
+                );
+            }
+        }
     }
     let params = if plan.is_sys7() {
         ParamPlan {
@@ -1044,7 +1125,7 @@ fn dry_run(
         param_plan(app, overrides_map, base_offsets, &CurrentMemory::new())
     };
     if output.json {
-        print_plan_json(target, device_mask, &plan, &params)?;
+        print_plan_json(target, device_mask, &plan, &params, None)?;
     } else {
         print_plan(
             target,
@@ -1299,6 +1380,9 @@ pub struct DryRun {
     /// `--dump-images <dir>`: write `plan.json` and one `.bin` per streamed
     /// image (plus the table images) into this directory.
     pub dump_images: Option<std::path::PathBuf>,
+    /// `--resident <file>`: plan against this recorded device state
+    /// ([`crate::flash_resident`]) instead of no device.
+    pub resident: Option<std::path::PathBuf>,
 }
 
 /// The note the parameter plan carries when `--force` skipped the read-back.
@@ -1377,6 +1461,7 @@ fn print_param_plan(params: &ParamPlan) {
     if let Some(note) = &params.note {
         println!("  note        : {note}");
     }
+    print_kept_params(params);
     if params.changes.is_empty() {
         println!("  parameters  : no parameter change");
         return;
@@ -1395,13 +1480,90 @@ fn print_param_plan(params: &ParamPlan) {
     }
 }
 
-/// Emits the pre-flight as JSON, including the `parameters` array (issue #109).
+/// The parameters the download leaves as the device holds them (issue #411):
+/// neither written nor ignored, and not verifiable after a fresh allocation.
+fn print_kept_params(params: &ParamPlan) {
+    if params.kept.is_empty() {
+        return;
+    }
+    println!(
+        "  kept        : {} parameter(s) kept on the device: the load procedure's branch does \
+         not write their octets (as ETS's download), so the device keeps what it holds; after a \
+         fresh allocation that is whatever the allocation left, so the model's value is not \
+         verified:",
+        params.kept.len()
+    );
+    for kept in &params.kept {
+        println!("      {}", kept.kept_line());
+    }
+}
+
+/// The `kept_memory` array of the JSON plan (issue #411).
+fn kept_memory_json(plan: &FlashPlan) -> Vec<serde_json::Value> {
+    plan.kept()
+        .iter()
+        .map(|k| {
+            serde_json::json!({
+                "object": k.object,
+                "segment": k.segment,
+                "allocated": k.allocated,
+                "address": k.address,
+                "ranges": k.ranges.iter().map(|(s, e)| [s, e]).collect::<Vec<_>>(),
+                "label": k.label(),
+            })
+        })
+        .collect()
+}
+
+/// The octet runs the download leaves as the device holds them (issue
+/// #411), one line each: `object 4 octets 128..256 kept`.
+fn kept_memory_lines(plan: &FlashPlan) -> Vec<String> {
+    plan.kept()
+        .iter()
+        .map(|k| match k.address {
+            // System 7: the taken branch allocates the segment in parts and
+            // the gap in no allocation (issue #411).
+            Some(_) => format!(
+                "{} (segment {} of {} octets: not allocated, not written, not compared)",
+                k.label(),
+                k.segment,
+                k.allocated
+            ),
+            None => format!(
+                "{} (segment {} of {} octets: not written, not read back, no MCB CRC compared)",
+                k.label(),
+                k.segment,
+                k.allocated
+            ),
+        })
+        .collect()
+}
+
+/// Emits the pre-flight as JSON, including the `parameters` array (issue #109)
+/// and, when the pre-flight read PID 61 and a group address leaves or joins
+/// Data Secure, the `security_object` change the text output prints (issue
+/// #336): `line` as printed (`- security object: Data Secure off for …`),
+/// with its `mark`, `subject` and `sentence`.
 fn print_plan_json(
     target: IndividualAddress,
     device_mask: u16,
     plan: &FlashPlan,
     params: &ParamPlan,
+    security_change: Option<&bussard_download::PlanChange>,
 ) -> anyhow::Result<()> {
+    let value = plan_json(target, device_mask, plan, params, security_change);
+    crate::output::print(crate::output::schema::FLASH, &value)?;
+    Ok(())
+}
+
+/// The document [`print_plan_json`] prints.
+fn plan_json(
+    target: IndividualAddress,
+    device_mask: u16,
+    plan: &FlashPlan,
+    params: &ParamPlan,
+    security_change: Option<&bussard_download::PlanChange>,
+) -> serde_json::Value {
     let parameters: Vec<serde_json::Value> = params
         .changes
         .iter()
@@ -1421,7 +1583,7 @@ fn print_plan_json(
             })
         })
         .collect();
-    let value = serde_json::json!({
+    serde_json::json!({
         "device": target.to_string(),
         "device_mask": format!("{device_mask:04X}"),
         "application": {
@@ -1433,6 +1595,26 @@ fn print_plan_json(
         },
         "parameters": parameters,
         "parameter_note": params.note,
+        // Issue #411: the parameters and octets the download keeps on the
+        // device (not written, not verified).
+        "kept_parameters": params.kept.iter().map(|c| serde_json::json!({
+            "key": c.key,
+            "name": c.name,
+            "device": match &c.old {
+                ParamValue::Known(v) => serde_json::Value::String(v.clone()),
+                ParamValue::Unknown => serde_json::Value::Null,
+            },
+            "model": c.new.to_string(),
+            "unit": c.unit,
+            "written": false,
+            "verified": false,
+        })).collect::<Vec<_>>(),
+        "kept_memory": kept_memory_json(plan),
+        "security_object": security_change.map(|change| {
+            let mut value = serde_json::json!(change);
+            value["line"] = serde_json::Value::String(change.line());
+            value
+        }),
         "memory": {
             "write_bytes": plan.total_write_bytes(),
             "steps": plan.steps.len(),
@@ -1440,9 +1622,7 @@ fn print_plan_json(
             "estimated_seconds": plan.estimated_duration().as_secs_f64(),
         },
         "procedure": trace(plan),
-    });
-    crate::output::print(crate::output::schema::FLASH, &value)?;
-    Ok(())
+    })
 }
 
 fn print_plan(
@@ -1512,6 +1692,9 @@ fn print_plan(
              group key(s), {secured} secured group object(s)"
         );
     }
+    for line in kept_memory_lines(plan) {
+        println!("  kept memory : {line}");
+    }
     if verbose > 0 {
         println!("  procedure   :");
         for line in trace(plan) {
@@ -1551,6 +1734,9 @@ struct FreshnessDecision {
 ///   `SameApplication` through [`bussard_download::flash_gate`]). Refused unless `force`, because the flash would destroy it with no
 ///   backup; the message names the resident application and the two ways
 ///   forward.
+/// - [`Freshness::Mismatch`] — the device is not one this download fits (an
+///   association table in a format bussard does not write). Refused unless
+///   `force`, before anything is unloaded.
 /// - [`Freshness::Unknown`] — the state could not be read. Refused unless
 ///   `force`: "unreadable" is not evidence of an empty device, and a flash with
 ///   no backup must not be what finds out.
@@ -1637,6 +1823,28 @@ fn decide_freshness(
                     \n\
                      Re-flashing the SAME application needs no --force; this device does not \
                      report it."
+                ),
+                proceed: false,
+                prompt_note: None,
+            }
+        }
+        Freshness::Mismatch { reason } => {
+            if force {
+                return FreshnessDecision {
+                    message: format!(
+                        "\nWARNING: --force — {target} via {gateway} does not match this \
+                         download: {reason}. Flashing anyway."
+                    ),
+                    proceed: true,
+                    prompt_note: Some(format!("{target} does not match this download ({reason}).")),
+                };
+            }
+            FreshnessDecision {
+                message: format!(
+                    "\nREFUSING to flash {target}: {reason}.\n\
+                     Nothing was unloaded or written. Check that the address names the \
+                     device the model means,\n\
+                     or re-run with --force to flash anyway."
                 ),
                 proceed: false,
                 prompt_note: None,
@@ -2277,5 +2485,45 @@ mod tests {
             decision.message
         );
         assert!(decision.prompt_note.is_some());
+    }
+
+    #[test]
+    fn test_plan_json_carries_the_security_object_line() -> Result<(), Box<dyn std::error::Error>> {
+        // Issue #336: `flash --json` carries the "Data Secure off for <GA>"
+        // line the text output prints from the pre-flight PID 61 read.
+        let plan = bussard_download::plan_flash(
+            &app("M-0083_A-0001-01-0001"),
+            "1.1.10",
+            0x07B0,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        let change = bussard_download::PlanChange {
+            mark: bussard_download::ChangeMark::Removed,
+            subject: bussard_download::ChangeSubject::Security,
+            channel: None,
+            key: "security object".to_string(),
+            object: None,
+            sentence: "security object: Data Secure off for 1/2/3 (Level): its group key leaves \
+                       the group key table (PID 53) and object 22 loses its security flag (PID \
+                       61 0x03 to 0x00)"
+                .to_string(),
+        };
+        let target: IndividualAddress = "1.1.10".parse()?;
+        let params = ParamPlan::default();
+        let with = plan_json(target, 0x07B0, &plan, &params, Some(&change));
+        assert_eq!(with["security_object"]["line"], change.line());
+        assert!(
+            with["security_object"]["line"]
+                .as_str()
+                .is_some_and(|l| l.starts_with("- security object: Data Secure off for 1/2/3")),
+            "{with}"
+        );
+        assert_eq!(with["security_object"]["subject"], "security");
+        let without = plan_json(target, 0x07B0, &plan, &params, None);
+        assert!(without["security_object"].is_null(), "{without}");
+        Ok(())
     }
 }

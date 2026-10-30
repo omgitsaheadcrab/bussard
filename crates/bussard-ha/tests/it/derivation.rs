@@ -251,6 +251,53 @@ fn test_sensor_type_for_two_byte_power_and_temperature_difference()
 }
 
 #[test]
+fn test_sensor_type_for_scaled_subtypes() -> Result<(), Box<dyn std::error::Error>> {
+    // 7.003 / 7.004 count 10 ms / 100 ms and 13.002 counts 0.0001 m³/h (KNX
+    // 03_07_02 §3.8.2, §3.14.1): a raw-count type would show 10 for 1.0 s.
+    let model = ModelBuilder::new("1.1.205", "Lueftung", None)
+        .group("4/5/0", "Nachlaufzeit", "7.004")
+        .group("4/5/1", "Verzoegerung", "7.003")
+        .group("4/5/2", "Volumenstrom", "13.002")
+        .object(0, "7.004", "CRT", None, Some("4/5/0"), &[])
+        .object(1, "7.003", "CRT", None, Some("4/5/1"), &[])
+        .object(2, "13.002", "CRT", None, Some("4/5/2"), &[])
+        .build();
+
+    let yaml = generate(&model, &Overrides::default())?;
+    assert!(yaml.contains("type: time_period_100msec"), "{yaml}");
+    assert!(yaml.contains("type: time_period_10msec"), "{yaml}");
+    assert!(yaml.contains("type: flow_rate_m3h"), "{yaml}");
+    assert!(!yaml.contains("type: pulse_2byte"), "{yaml}");
+    assert!(!yaml.contains("type: 4byte_signed"), "{yaml}");
+    Ok(())
+}
+
+#[test]
+fn test_sensor_type_for_time_and_colour_temperature() -> Result<(), Box<dyn std::error::Error>> {
+    // 7.600 colour temperature in K, 7.005 seconds, 13.100 seconds (KNX
+    // 03_07_02 §3.8, §3.14.3): HA has a type per sub-type for each.
+    let model = ModelBuilder::new("1.1.206", "DALI Gateway", None)
+        .group("4/6/0", "Farbtemperatur Status", "7.600")
+        .group("4/6/1", "Nachlaufzeit", "7.005")
+        .group("4/6/2", "Betriebsstunden", "13.100")
+        .group("4/6/3", "Zaehler", "12.001")
+        .object(0, "7.600", "CRT", None, Some("4/6/0"), &[])
+        .object(1, "7.005", "CRT", None, Some("4/6/1"), &[])
+        .object(2, "13.100", "CRT", None, Some("4/6/2"), &[])
+        .object(3, "12.001", "CRT", None, Some("4/6/3"), &[])
+        .build();
+
+    let yaml = generate(&model, &Overrides::default())?;
+    assert!(yaml.contains("type: color_temperature"), "{yaml}");
+    assert!(yaml.contains("type: time_period_sec"), "{yaml}");
+    assert!(yaml.contains("type: long_delta_timesec"), "{yaml}");
+    assert!(yaml.contains("type: pulse_4_ucount"), "{yaml}");
+    assert!(!yaml.contains("type: pulse_2byte"), "{yaml}");
+    assert!(!yaml.contains("type: 4byte_signed"), "{yaml}");
+    Ok(())
+}
+
+#[test]
 fn test_try_sensor_skips_write_only_command_objects() -> Result<(), Box<dyn std::error::Error>> {
     // A write-only input (CW) receives a setpoint; it never publishes one. A
     // `sensor` on it would sit permanently unknown in Home Assistant.
@@ -284,6 +331,39 @@ fn binary_sensor_device_class_from_dpt_and_name() -> Result<(), Box<dyn std::err
     // 1.005 alarm -> problem; 1.019 -> window.
     assert!(yaml.contains("device_class: problem"), "{yaml}");
     assert!(yaml.contains("device_class: window"), "{yaml}");
+    Ok(())
+}
+
+#[test]
+fn test_binary_sensor_invert_for_open_close_contact() -> Result<(), Box<dyn std::error::Error>> {
+    // 1.009 is 0 = open, 1 = close; 1.019 is 0 = closed, 1 = open (03_07_02
+    // §3.1). HA reads "on" as open for a window, so only 1.009 is inverted.
+    let model = ModelBuilder::new("1.1.31", "Binary Input", None)
+        .group("4/2/1", "Fenster Bad", "1.009")
+        .group("4/2/2", "Fenster Küche", "1.019")
+        .group("4/2/3", "Taster Status", "1.009")
+        .object(1, "1.009", "CRT", None, Some("4/2/1"), &[])
+        .object(2, "1.019", "CRT", None, Some("4/2/2"), &[])
+        .object(3, "1.009", "CRT", None, Some("4/2/3"), &[])
+        .build();
+
+    let yaml = generate(&model, &Overrides::default())?;
+    let entry = |name: &str| -> Result<String, Box<dyn std::error::Error>> {
+        let start = yaml
+            .find(&format!("name: {name}"))
+            .ok_or_else(|| format!("{name} missing:\n{yaml}"))?;
+        let rest = &yaml[start..];
+        let end = rest[1..].find("- name:").map_or(rest.len(), |i| i + 1);
+        Ok(rest[..end].to_string())
+    };
+    let bad = entry("Fenster Bad")?;
+    assert!(bad.contains("device_class: window"), "{bad}");
+    assert!(bad.contains("invert: true"), "{bad}");
+    let kitchen = entry("Fenster Küche")?;
+    assert!(!kitchen.contains("invert"), "{kitchen}");
+    // No opening class, no inversion: "on" is just the bit.
+    let button = entry("Taster Status")?;
+    assert!(!button.contains("invert"), "{button}");
     Ok(())
 }
 

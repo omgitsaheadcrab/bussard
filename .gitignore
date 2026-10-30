@@ -12,16 +12,22 @@ bussard-initial.md
 # cache dir so nothing downloaded or generated under it is ever committed.
 tests-support/product-corpus/cache*/
 
-# Second, separate corpus of vendor product files found by crawling (see
-# tests-support/product-corpus-extra/README.md). Same rule: the whole cache
-# dir is git-ignored, only the pointer index is committed.
+# The former crawled corpus, folded into the main one (data/product-index.json)
+# on 2026-10-30. A local copy of its cache may remain; never commit it.
 tests-support/product-corpus-extra/cache*/
 
 # Local KNX installation data (the user's personal model at the repo root).
 # Anchored to the root so it does not swallow committed example models such as
 # knx-sim/examples/small-installation/knx/.
 /knx/
-captures/
+# Captures are the owner's installation, except the synthetic products' ETS
+# captures (epic #596): ours, committed, replayed in CI. No .knxprod and no
+# knx_master.xml goes in there (*.knxprod above; the rows name the xml/).
+**/captures/
+!/captures/
+/captures/*
+!/captures/synthetic/
+/captures/synthetic/**/.bussard/
 *.db
 
 # Rust
@@ -54,3 +60,5 @@ tools/ets-sweep/.unpacked/
 
 # external specification
 dev/knx-standard-3.0.0/
+# Synthetic products built and signed by tools/ets-sweep/synthetic (#596)
+tools/ets-sweep/synthetic/out/

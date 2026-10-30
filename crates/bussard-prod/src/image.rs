@@ -31,7 +31,9 @@
 //! `01 F4`, 2000 as `07 D0`, 10 as `00 0A`), unless the program declares
 //! `<Options ParameterByteOrder="LittleEndian">`: then a byte-aligned integer
 //! field of two or more octets is stored least significant octet first (the
-//! ABB 6119/20's debounce 5633 as `01 16`, issue #386).
+//! ABB 6119/20's debounce 5633 as `01 16`, issue #386), and so is a float
+//! (DPT 9 21.5 as `33 0C`, IEEE-754 Single 21.5 as `00 00 AC 41` in the ETS
+//! download of the synthetic `syn-le-order`, issue #403).
 //!
 //! # Base image
 //!
@@ -137,7 +139,8 @@ fn apply_erased_fill(
 ///    non-unique (module repetition and multi-ref parameters).
 ///
 /// The resolved value is encoded MSB-first big-endian (little-endian for a
-/// multi-octet integer of a `ParameterByteOrder="LittleEndian"` program) into
+/// multi-octet integer or a float of a `ParameterByteOrder="LittleEndian"`
+/// program) into
 /// the byte image keyed by the memory's `CodeSegment`. Returns a map from segment id to its image.
 ///
 /// # Module-instance offsets
@@ -287,10 +290,12 @@ pub fn compute_parameter_image_placed_with(
         // ref-id overrides (step 4) are applied in a second pass so a module
         // parameter's default lands at its declared offset while each overridden
         // instance lands at its own instance offset.
-        let value: Option<String> = ref_value
-            .get(param.id.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| param.default.clone());
+        let value: Option<String> = param.initial_value.clone().or_else(|| {
+            ref_value
+                .get(param.id.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| param.default.clone())
+        });
 
         let ptype = param
             .parameter_type
@@ -332,7 +337,19 @@ pub fn compute_parameter_image_placed_with(
                     .unwrap_or(base_arg);
                 let mut offsets = Vec::new();
                 for instance in &app.module_instances {
-                    let base = instance.arg_values.get(rel_arg).copied().unwrap_or(0);
+                    // An argument without a value (an allocator's) refuses
+                    // rather than placing the parameter at base 0 (issue #449).
+                    let Some(base) = instance.arg_values.get(rel_arg).copied() else {
+                        return Err(param_err(
+                            app,
+                            pname,
+                            &format!(
+                                "module instance {} has no value for the BaseOffset \
+                                 argument {rel_arg}",
+                                instance.id
+                            ),
+                        ));
+                    };
                     let effective = i64::from(offset).checked_add(base).and_then(|v| {
                         if v >= 0 {
                             usize::try_from(v).ok()
@@ -409,10 +426,12 @@ pub fn compute_parameter_image_placed_with(
         let pname = param.name.as_deref().unwrap_or(&param.id);
 
         // The member's default value (a ref override may also target it).
-        let value: Option<String> = ref_value
-            .get(param.id.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| param.default.clone());
+        let value: Option<String> = param.initial_value.clone().or_else(|| {
+            ref_value
+                .get(param.id.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| param.default.clone())
+        });
         let ptype = param
             .parameter_type
             .as_deref()
@@ -759,7 +778,10 @@ fn dynamic_image(
                     ValueSource::VendorDefault
                 },
             ),
-            None => (slot.parameter.default.clone(), ValueSource::VendorDefault),
+            None => (
+                slot.parameter.starting_value().map(str::to_string),
+                ValueSource::VendorDefault,
+            ),
         };
         let range =
             write_slot(app, &mut images, &slot, value.as_deref(), source).map_err(|err| {
@@ -898,9 +920,14 @@ fn dynamic_parameter_slots_with<'a>(
     config: &bussard_ets::dynamic::DynamicConfig,
     union_of: &UnionIndex<'_>,
 ) -> Result<Vec<ParameterSlot<'a>>> {
+    check_object_bases(app, config)?;
     let mut slots = Vec::new();
     if app.downloads_invisible_parameters() {
-        invisible_parameter_slots(app, config, union_of, &mut slots)?;
+        invisible_parameter_slots(app, config, union_of, &mut slots, |_| true)?;
+    } else {
+        // ETS writes a hidden `LegacyPatchAlways` parameter at its default
+        // regardless (issue #450).
+        invisible_parameter_slots(app, config, union_of, &mut slots, |p| p.legacy_patch_always)?;
     }
     for active in &config.parameters {
         let full_ref = format!("{}_{}", app.id, active.param_ref_id);
@@ -926,8 +953,52 @@ fn dynamic_parameter_slots_with<'a>(
     Ok(slots)
 }
 
+/// The value of the module argument `arg` (a full or app-relative id) in the
+/// module instance `module` of `config`, `None` when the instance has none
+/// (or there is no instance).
+pub fn module_argument(
+    app: &ApplicationProgram,
+    config: &bussard_ets::dynamic::DynamicConfig,
+    module: Option<usize>,
+    arg: &str,
+) -> Option<i64> {
+    let rel = arg.strip_prefix(&format!("{}_", app.id)).unwrap_or(arg);
+    config.module_args(module)?.get(rel).copied()
+}
+
+/// Refuses a configuration that reaches a module com-object whose
+/// `BaseNumber` argument has no value in its instance (issue #449): an
+/// allocator-fed argument past its allocator, or one ETS computes in a way
+/// bussard does not model. Placing the object at base 0 would give it
+/// another object's number.
+fn check_object_bases(
+    app: &ApplicationProgram,
+    config: &bussard_ets::dynamic::DynamicConfig,
+) -> Result<()> {
+    for active in &config.com_objects {
+        let Some((base, _)) = app.resolve(&active.com_object_ref_id) else {
+            continue;
+        };
+        if let Some(arg) = base.base_number_ref.as_deref()
+            && module_argument(app, config, active.module, arg).is_none()
+        {
+            return Err(ProdError::ParameterImage {
+                parameter: format!("com-object {}", active.com_object_ref_id),
+                reason: format!(
+                    "its module instance has no value for the BaseNumber argument {}; \
+                     refusing rather than numbering the object from 0",
+                    arg.strip_prefix(&format!("{}_", app.id)).unwrap_or(arg)
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Resolves `at` to a slot, the byte offset shifted by the module instance's
-/// `BaseOffset` argument.
+/// `BaseOffset` argument. A `BaseOffset` the instance has no value for
+/// refuses (issue #449): resolving it to 0 laid an MDT logic module over the
+/// application's own parameters.
 fn slot_at<'a>(
     app: &'a ApplicationProgram,
     config: &bussard_ets::dynamic::DynamicConfig,
@@ -937,11 +1008,20 @@ fn slot_at<'a>(
     param_ref_id: Option<String>,
 ) -> Result<ParameterSlot<'a>> {
     let pname = param.name.as_deref().unwrap_or(&param.id);
-    let base = at
-        .base
-        .map(|b| b.strip_prefix(&format!("{}_", app.id)).unwrap_or(b))
-        .and_then(|rel| config.module_args(module)?.get(rel).copied())
-        .unwrap_or(0);
+    let base = match at.base {
+        Some(arg) => module_argument(app, config, module, arg).ok_or_else(|| {
+            param_err(
+                app,
+                pname,
+                &format!(
+                    "its module instance has no value for the BaseOffset argument {}; \
+                     refusing rather than placing the parameter at base 0",
+                    arg.strip_prefix(&format!("{}_", app.id)).unwrap_or(arg)
+                ),
+            )
+        })?,
+        None => 0,
+    };
     let offset = usize::try_from(at.offset + base).map_err(|_| {
         param_err(
             app,
@@ -1000,7 +1080,10 @@ fn parameter_type_of<'a>(
 
 /// The slots of the parameters the configuration does not show, for an
 /// application whose download carries them
-/// ([`ApplicationProgram::downloads_invisible_parameters`]).
+/// ([`ApplicationProgram::downloads_invisible_parameters`]), or of those of
+/// them `include` picks (the `LegacyPatchAlways` ones ETS writes in any
+/// case, issue #450: the Zennio DALI-BOX v2's 128 hidden group limits, the
+/// ABB Data Logging's hidden thresholds).
 ///
 /// Every application-level parameter with a location that the walk did not
 /// reach gets its default, the parameter's own `Value`: ETS does not write a
@@ -1016,6 +1099,7 @@ fn invisible_parameter_slots<'a>(
     config: &bussard_ets::dynamic::DynamicConfig,
     union_of: &UnionIndex<'_>,
     slots: &mut Vec<ParameterSlot<'a>>,
+    include: impl Fn(&bussard_ets::application::Parameter) -> bool,
 ) -> Result<()> {
     let prefix = format!("{}_", app.id);
     // The application-level parameters the walk reached, and the unions they
@@ -1036,6 +1120,7 @@ fn invisible_parameter_slots<'a>(
     let mut params: Vec<_> = app
         .parameters
         .values()
+        .filter(|p| include(p))
         .filter(|p| !reached.contains(p.id.as_str()))
         .filter(|p| {
             !p.id
@@ -1234,8 +1319,9 @@ fn base_image(app: &ApplicationProgram, seg_id: &str) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// Where a resolved parameter value came from, for the enum-membership leniency
-/// rule in [`encode_value`].
+/// Where a resolved parameter value came from, for the enum-membership and
+/// integer-range leniency rules in [`encode_value`] (the range rule is in
+/// `encode_int`, issue #405).
 ///
 /// An enum parameter whose value is not one of its declared members is a
 /// data-quality trap. The rule depends on who chose the value:
@@ -1252,17 +1338,23 @@ fn base_image(app: &ApplicationProgram, seg_id: &str) -> Vec<u8> {
 ///   genuine mistake worth refusing, so the strict membership check stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValueSource {
-    /// The vendor's own default (chain steps 1-3): lenient on a non-member enum.
+    /// The vendor's own default (chain steps 1-3): lenient on a non-member enum
+    /// and on an integer outside its type's range.
     VendorDefault,
-    /// A caller-supplied override (chain step 4): strict on a non-member enum.
+    /// A caller-supplied override (chain step 4): strict on both.
     UserOverride,
 }
 
 /// An encoded parameter value ready to place.
 enum Placement {
     /// One or more whole bytes, laid down starting at the byte offset. Used for
-    /// byte-aligned payloads (text, float, byte-multiple ints at bit offset 0).
+    /// byte-aligned payloads (text, raw data, byte-multiple ints at bit offset 0).
     Bytes(Vec<u8>),
+    /// The big-endian octets of a float (DPT 9, IEEE-754 Single or Double),
+    /// laid down like [`Placement::Bytes`] but reversed when the program
+    /// declares `ParameterByteOrder="LittleEndian"` (see
+    /// [`little_endian_field`], issue #403).
+    Float(Vec<u8>),
     /// A bit field up to 64 bits wide, holding the unsigned `value`, placed
     /// MSB-first from `bit_offset` and allowed to span byte boundaries.
     Field { bits: u32, value: u64 },
@@ -1313,7 +1405,7 @@ fn encode_value(
             signed,
             min,
             max,
-        }) => encode_int(app, pname, *size_bits, *signed, *min, *max, value),
+        }) => encode_int(app, pname, *size_bits, *signed, *min, *max, value, source),
         Some(ParameterType::Enum { size_bits, values }) => {
             // Enum default is the raw numeric value; validate it is a declared
             // member when it parses, but always encode the number. A device
@@ -1379,7 +1471,8 @@ fn encode_value(
             encode_int_bits(app, pname, size_bits.unwrap_or(8), false, n)
         }
         Some(ParameterType::Text { size_bits }) => {
-            // The program's `TextParameterEncoding`, NUL-padded, refused when
+            // The program's `TextParameterEncoding` (ISO 8859-1 when it
+            // declares none, as ETS writes it, #416), NUL-padded, refused when
             // it does not fit (issue #401).
             let len = (size_bits.unwrap_or(0) / 8) as usize;
             TextCodec::from_declaration(app.text_parameter_encoding.as_deref())
@@ -1391,8 +1484,19 @@ fn encode_value(
             encode_float(app, pname, encoding.as_deref(), *max, value)
         }
         Some(ParameterType::None) | None => Ok(Placement::Empty),
+        Some(ParameterType::Color { space }) => {
+            // `#RRGGBB` (or `#HHSSVV`, `#RRGGBBWW`) as one octet per
+            // component in the written order (issue #616).
+            space
+                .encode(value.unwrap_or(""))
+                .map(Placement::Bytes)
+                .map_err(|reason| param_err(app, pname, &reason))
+        }
         Some(ParameterType::Other { kind, .. }) if kind == "TypeRawData" => {
             encode_raw_data(app, pname, value)
+        }
+        Some(ParameterType::Other { kind, .. }) if kind == "TypeIPAddress" => {
+            encode_ip_address(app, pname, value)
         }
         Some(ParameterType::Other {
             kind,
@@ -1405,8 +1509,9 @@ fn encode_value(
             size_bits, kind, ..
         }) => {
             // Unknown shape: if it declares a byte-multiple width and the value
-            // is a plain integer, place it big-endian; else refuse rather than
-            // guess.
+            // is a plain integer, place it big-endian; a value with no width
+            // refuses rather than leave the template in place unannounced (the
+            // `TypeIPAddress` DNS servers of issue #457 did).
             match (size_bits, value) {
                 (Some(bits), Some(v)) if bits % 8 == 0 => {
                     let n: i64 = v.trim().parse().map_err(|_| {
@@ -1414,6 +1519,14 @@ fn encode_value(
                     })?;
                     encode_int_bits(app, pname, *bits, false, n)
                 }
+                (None, Some(v)) if !v.trim().is_empty() => Err(param_err(
+                    app,
+                    pname,
+                    &format!(
+                        "{kind} declares no SizeInBit, so value `{}` has no width to be written with",
+                        v.trim()
+                    ),
+                )),
                 _ => Ok(Placement::Empty),
             }
         }
@@ -1490,6 +1603,10 @@ fn encode_raw_data(
 ///   big-endian `f32`;
 /// * `"IEEE-754 Double"` — an 8-byte big-endian `f64`.
 ///
+/// The octets are returned big-endian as a [`Placement::Float`];
+/// [`little_endian_field`] reverses them for a `ParameterByteOrder="LittleEndian"`
+/// program (issue #403).
+///
 /// Before this existed every float was written as 2 bytes of DPT 9, so an
 /// IEEE-754 parameter went into the device image at the wrong width *and* with
 /// the wrong bytes. An `Encoding` this function does not know is refused rather
@@ -1516,7 +1633,7 @@ fn encode_float(
                     &format!("float value `{raw}` is not finite"),
                 ));
             }
-            Ok(Placement::Bytes(f.to_be_bytes().to_vec()))
+            Ok(Placement::Float(f.to_be_bytes().to_vec()))
         }
         Some("ieee-754 double") | Some("ieee 754 double") => {
             let f: f64 = raw.trim().parse().map_err(|_| {
@@ -1529,7 +1646,7 @@ fn encode_float(
                     &format!("float value `{raw}` is not finite"),
                 ));
             }
-            Ok(Placement::Bytes(f.to_be_bytes().to_vec()))
+            Ok(Placement::Float(f.to_be_bytes().to_vec()))
         }
         other => {
             if let Some(unknown) = other {
@@ -1560,7 +1677,7 @@ fn encode_float(
                     &format!("float value `{f}` is out of DPT-9 range"),
                 )
             })?;
-            Ok(Placement::Bytes(enc.to_vec()))
+            Ok(Placement::Float(enc.to_vec()))
         }
     }
 }
@@ -1571,9 +1688,10 @@ fn encode_float(
 ///
 /// Issue #89: the Busch-Wächter PRO 280 (`M-0007_A-6179-82`) has a brightness
 /// threshold defaulting to 1000 lux; `100000 / 64 = 1562.5` and ETS writes
-/// `36 1A` (mantissa 1562), where the group-value encoder's halving with
+/// `36 1A` (mantissa 1562), where the old group-value encoder's halving with
 /// rounding away from zero wrote `36 1B`. Its 65535 default is `66 40`
-/// (`6553500 / 4096 = 1599.98`, rounded to 1600).
+/// (`6553500 / 4096 = 1599.98`, rounded to 1600). Both now share
+/// [`bussard_model::encode_float16_raw`] (issue #493).
 ///
 /// `7F FF` (mantissa 2047, exponent 15, `670760.96`) is the "invalid data"
 /// marker of a DPT 9 group value, but a parameter is memory, not a group
@@ -1582,20 +1700,8 @@ fn encode_float(
 /// `None` when the value is not finite, out of range, or encodes to `7F FF`
 /// without `admits_top`.
 fn encode_dpt9_parameter(value: f64, admits_top: bool) -> Option<[u8; 2]> {
-    if !value.is_finite() {
-        return None;
-    }
-    let scaled = value * 100.0;
-    let (exponent, mantissa) = (0u16..=15).find_map(|e| {
-        let m = (scaled / f64::from(1u32 << e)).round_ties_even();
-        (-2048.0..=2047.0).contains(&m).then_some((e, m as i32))
-    })?;
-    let (sign, bits) = if mantissa < 0 {
-        (0x8000u16, (mantissa + 2048) as u16)
-    } else {
-        (0, mantissa as u16)
-    };
-    let raw = sign | (exponent << 11) | (bits & 0x07ff);
+    // The rounding rule is shared with the group-value encoder (issue #493).
+    let raw = bussard_model::encode_float16_raw(value)?;
     (raw != 0x7FFF || admits_top).then_some(raw.to_be_bytes())
 }
 
@@ -1620,6 +1726,24 @@ fn admits_dpt9_top(max: Option<f64>) -> bool {
 }
 
 /// Encodes a `<TypeNumber>` value, honouring declared min/max and signedness.
+///
+/// The declared range is checked against a [`ValueSource::UserOverride`]: a
+/// value the user set in the model (`bussard set`, MCP `knx_set_parameter`,
+/// a device file) outside its type is a mistake and is refused. A
+/// [`ValueSource::VendorDefault`] outside the range is encoded as declared,
+/// with a warning naming the parameter, because that is what ETS writes
+/// (issue #405): the synthetic product `syn-union-default-range` has a hidden
+/// (`Access="None"`) union member with default `1` and type 129..129, and
+/// ETS 6.4.1 wrote `01` (capture
+/// `captures/synthetic/syn-union-default-range/defaults/`, 2026-10-30). The
+/// real case is the ABB/Busch-Jaeger `A-A074`/`A-A075` "Vent Dummy Prio Ende".
+///
+/// The image builder knows which is which at this point: the vendor-default
+/// pass and the Dynamic slots without an override pass `VendorDefault`, the
+/// override pass and a slot whose ref the caller set pass `UserOverride`
+/// ([`bussard_ets::dynamic::DynamicConfig::is_override`]). The field width is
+/// checked for both: a default that does not fit its field cannot be written.
+#[allow(clippy::too_many_arguments)] // the type's four facets, the value and its source
 fn encode_int(
     app: &ApplicationProgram,
     pname: &str,
@@ -1628,6 +1752,7 @@ fn encode_int(
     min: Option<i64>,
     max: Option<i64>,
     value: Option<&str>,
+    source: ValueSource,
 ) -> Result<Placement> {
     let raw = value.unwrap_or("0");
     let n: i64 = raw.trim().parse().map_err(|_| {
@@ -1637,23 +1762,21 @@ fn encode_int(
             &format!("integer value `{raw}` is not an integer"),
         )
     })?;
-    if let Some(lo) = min
-        && n < lo
-    {
-        return Err(param_err(
-            app,
-            pname,
-            &format!("value {n} is below the declared minimum {lo}"),
-        ));
-    }
-    if let Some(hi) = max
-        && n > hi
-    {
-        return Err(param_err(
-            app,
-            pname,
-            &format!("value {n} is above the declared maximum {hi}"),
-        ));
+    let out_of_range = match (min, max) {
+        (Some(lo), _) if n < lo => Some(format!("value {n} is below the declared minimum {lo}")),
+        (_, Some(hi)) if n > hi => Some(format!("value {n} is above the declared maximum {hi}")),
+        _ => None,
+    };
+    if let Some(why) = out_of_range {
+        match source {
+            ValueSource::UserOverride => return Err(param_err(app, pname, &why)),
+            ValueSource::VendorDefault => tracing::warn!(
+                parameter = pname,
+                value = n,
+                "vendor default lies outside its type's range ({why}); writing it as \
+                 declared, as ETS does (issue #405)"
+            ),
+        }
     }
     encode_int_bits(app, pname, size_bits.unwrap_or(8), signed, n)
 }
@@ -1777,7 +1900,9 @@ fn place_checked(
     // The exclusive byte end this placement writes up to (bit fields round up).
     let end: u64 = match placement {
         Placement::Empty => offset as u64,
-        Placement::Bytes(bytes) => (offset as u64).saturating_add(bytes.len() as u64),
+        Placement::Bytes(bytes) | Placement::Float(bytes) => {
+            (offset as u64).saturating_add(bytes.len() as u64)
+        }
         Placement::Field { bits, .. } => {
             let start_bit = (offset as u64)
                 .saturating_mul(8)
@@ -1814,17 +1939,22 @@ fn place_checked(
     Ok(first..usize::try_from(end).unwrap_or(first).max(first))
 }
 
-/// A byte-aligned integer field of a program that declares
+/// A byte-aligned integer field or a float of a program that declares
 /// `ParameterByteOrder="LittleEndian"`, as the octets it stores: least
 /// significant first. `None` when the placement keeps the default MSB-first
-/// order: a big-endian program, a field of one octet or less, one that is not
-/// a whole number of octets or does not start on an octet boundary, and any
-/// [`Placement::Bytes`] payload (text, raw data, floats, `BinaryValue`
-/// members, packed times and integers wider than 64 bits).
+/// order: a big-endian program, an integer field of one octet or less, one
+/// that is not a whole number of octets or does not start on an octet
+/// boundary, and any [`Placement::Bytes`] payload (text, raw data,
+/// `BinaryValue` members, packed times and integers wider than 64 bits).
 ///
 /// Issue #386: the ABB 6119/20 (`M-0007_A-A002-13`, little-endian) holds its
 /// 16-bit debounce enumeration value 5633 (`0x1601`) as `01 16` at `0x6D01`
 /// in the ETS download of 1.1.44.
+///
+/// Issue #403: ETS reverses floats too. The ETS 6.4.1 download of the
+/// synthetic `syn-le-order` (`captures/synthetic/syn-le-order/defaults/`)
+/// holds DPT 9 21.5 (`0x0C33`) as `33 0C` and IEEE-754 Single 21.5
+/// (`0x41AC0000`) as `00 00 AC 41`.
 fn little_endian_field(
     app: &ApplicationProgram,
     bit_offset: u8,
@@ -1839,6 +1969,9 @@ fn little_endian_field(
         {
             let len = (*bits / 8) as usize;
             Some(Placement::Bytes(value.to_le_bytes()[..len].to_vec()))
+        }
+        Placement::Float(bytes) if app.parameters_little_endian => {
+            Some(Placement::Bytes(bytes.iter().rev().copied().collect()))
         }
         _ => None,
     }
@@ -1870,7 +2003,7 @@ fn read_int_field(
 fn place(image: &mut Vec<u8>, offset: usize, bit_offset: u8, placement: &Placement) {
     match placement {
         Placement::Empty => {}
-        Placement::Bytes(bytes) => {
+        Placement::Bytes(bytes) | Placement::Float(bytes) => {
             let end = offset + bytes.len();
             if image.len() < end {
                 image.resize(end, 0);
@@ -2057,21 +2190,42 @@ fn decode_value(
                 | Some("ieee 754 single")
                 | Some("dpt 14")
                 | Some("dpt14") => {
-                    let b = bytes(4)?;
-                    Some(f32::from_be_bytes([b[0], b[1], b[2], b[3]]).to_string())
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(bytes(4)?);
+                    Some(
+                        if little_endian {
+                            f32::from_le_bytes(arr)
+                        } else {
+                            f32::from_be_bytes(arr)
+                        }
+                        .to_string(),
+                    )
                 }
                 Some("ieee-754 double") | Some("ieee 754 double") => {
                     let mut arr = [0u8; 8];
                     arr.copy_from_slice(bytes(8)?);
-                    Some(f64::from_be_bytes(arr).to_string())
+                    Some(
+                        if little_endian {
+                            f64::from_le_bytes(arr)
+                        } else {
+                            f64::from_be_bytes(arr)
+                        }
+                        .to_string(),
+                    )
                 }
                 _ => {
                     let b = bytes(2)?;
-                    Some(decode_dpt9_parameter([b[0], b[1]]).to_string())
+                    let be = if little_endian {
+                        [b[1], b[0]]
+                    } else {
+                        [b[0], b[1]]
+                    };
+                    Some(decode_dpt9_parameter(be).to_string())
                 }
             }
         }
         ParameterType::None => None,
+        ParameterType::Color { space } => space.decode(bytes(space.octets())?),
         ParameterType::Other { kind, .. } if kind == "TypeRawData" => {
             use base64::Engine as _;
             let len = bytes(4)?;
@@ -2079,6 +2233,10 @@ fn decode_value(
             let data =
                 image.get(offset.checked_add(4)?..offset.checked_add(4)?.checked_add(len)?)?;
             Some(base64::engine::general_purpose::STANDARD.encode(data))
+        }
+        ParameterType::Other { kind, .. } if kind == "TypeIPAddress" => {
+            let b = bytes(4)?;
+            Some(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string())
         }
         ParameterType::Other {
             kind,
@@ -2147,7 +2305,7 @@ fn read_field(image: &[u8], offset: usize, bit_offset: u8, bits: u32) -> Option<
 fn field_matches(image: &[u8], offset: usize, bit_offset: u8, placement: &Placement) -> bool {
     match placement {
         Placement::Empty => true,
-        Placement::Bytes(bytes) => offset
+        Placement::Bytes(bytes) | Placement::Float(bytes) => offset
             .checked_add(bytes.len())
             .and_then(|end| image.get(offset..end))
             .is_some_and(|held| held == bytes.as_slice()),
@@ -2279,12 +2437,13 @@ pub fn compute_property_values(
                 ValueSource::VendorDefault,
             ),
         };
-        let placement = match parameter_type_of(app, param) {
-            Some(ParameterType::Other { kind, .. }) if kind == "TypeIPAddress" => {
-                encode_ip_address(app, pname, value.as_deref())?
-            }
-            ptype => encode_value(app, pname, ptype, value.as_deref(), source)?,
-        };
+        let placement = encode_value(
+            app,
+            pname,
+            parameter_type_of(app, param),
+            value.as_deref(),
+            source,
+        )?;
         let image = out.entry((object, loc.property_id)).or_default();
         place_checked(
             app,
@@ -2301,9 +2460,10 @@ pub fn compute_property_values(
 
 /// Encodes a `<TypeIPAddress>` property value: an IPv4 address as its four
 /// octets, most significant first. ETS writes the dotted quad
-/// (`192.168.255.255`, the IPS 300 SREG) or the address as one number (`0`).
-/// Only the property path encodes it: a memory parameter of this type keeps
-/// the template octets as before issue #390.
+/// (`192.168.255.255`, the IPS 300 SREG) or the address as one number (`0`),
+/// into a property (issue #390) and into memory alike: the Zennio ALLinBOX DNS
+/// servers `192.168.1.1` / `192.168.1.2` as `c0 a8 01 01 c0 a8 01 02`
+/// (issue #457).
 fn encode_ip_address(
     app: &ApplicationProgram,
     pname: &str,
@@ -2382,6 +2542,94 @@ mod tests {
     ) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error>> {
         let m = compute_parameter_image(app, &no_overrides(), &no_bases())?;
         Ok(m.get("M-1_A-1_RS-1").cloned().unwrap_or_default())
+    }
+
+    /// Issue #457 (Zennio ALLinBOX `dns.ipServer[0]`/`[1]`): a memory
+    /// parameter of `<TypeIPAddress>` is written as the dotted quad's four
+    /// octets, big-endian, and reads back as the dotted quad.
+    #[test]
+    fn test_compute_parameter_image_ip_address_in_memory()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let ty = r#"<TypeIPAddress AddressType="HostAddress" />"#;
+        let app = app_with(&[
+            ("dns1", ty, Some("192.168.1.1"), 8, 0),
+            ("dns2", ty, Some("192.168.1.2"), 12, 0),
+        ])?;
+        let image = image_of(&app)?;
+        assert_eq!(
+            image.get(8..16),
+            Some(&[0xc0, 0xa8, 0x01, 0x01, 0xc0, 0xa8, 0x01, 0x02][..])
+        );
+        let param = app.parameters.get("M-1_A-1_P-1").ok_or("no dns2")?;
+        assert_eq!(
+            decode_parameter_value(&app, param, &image, 12, 0).as_deref(),
+            Some("192.168.1.2")
+        );
+        assert_eq!(
+            canonical_parameter_value(&app, param, Some("3232235778")).as_deref(),
+            Some("192.168.1.2")
+        );
+        Ok(())
+    }
+
+    /// An unknown parameter type with a value but no `SizeInBit` refuses
+    /// instead of leaving the template in place (issue #457).
+    #[test]
+    fn test_compute_parameter_image_widthless_value_refuses()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let app = app_with(&[("odd", r#"<TypeMystery />"#, Some("5"), 0, 0)])?;
+        let err = compute_parameter_image(&app, &no_overrides(), &no_bases());
+        assert!(
+            matches!(&err, Err(ProdError::ParameterImage { reason, .. }) if reason.contains("no SizeInBit")),
+            "{err:?}"
+        );
+        // No value: nothing to write, as before.
+        let empty = app_with(&[("odd", r#"<TypeMystery />"#, None, 0, 0)])?;
+        assert!(compute_parameter_image(&empty, &no_overrides(), &no_bases()).is_ok());
+        Ok(())
+    }
+
+    /// Issue #616: a `<TypeColor>` value (`#FF0000`, also for `HSV`) is
+    /// placed as one octet per component in the written order, decodes back to
+    /// the same string, and a value that is not a hex colour refuses.
+    ///
+    /// The written order is bussard's reading; the ETS capture of the
+    /// synthetic `syn-color-param` (RGB) and `syn-color-param-hsv` products
+    /// must confirm it.
+    #[test]
+    fn test_compute_parameter_image_type_color()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let app = app_with(&[
+            ("on", r#"<TypeColor Space="RGB" />"#, Some("#FF8001"), 4, 0),
+            ("hsv", r#"<TypeColor Space="HSV" />"#, Some("#2A80C0"), 8, 0),
+            (
+                "w",
+                r#"<TypeColor Space="RGBW" />"#,
+                Some("#11223344"),
+                12,
+                0,
+            ),
+        ])?;
+        let image = image_of(&app)?;
+        assert_eq!(image.get(4..7), Some(&[0xFF, 0x80, 0x01][..]));
+        assert_eq!(image.get(8..11), Some(&[0x2A, 0x80, 0xC0][..]));
+        assert_eq!(image.get(12..16), Some(&[0x11, 0x22, 0x33, 0x44][..]));
+        let on = app.parameters.get("M-1_A-1_P-0").ok_or("no on")?;
+        assert_eq!(
+            decode_parameter_value(&app, on, &image, 4, 0).as_deref(),
+            Some("#FF8001")
+        );
+        assert_eq!(
+            canonical_parameter_value(&app, on, Some("#ff8001")).as_deref(),
+            Some("#FF8001")
+        );
+        let bad = app_with(&[("on", r#"<TypeColor Space="RGB" />"#, Some("red"), 0, 0)])?;
+        let err = compute_parameter_image(&bad, &no_overrides(), &no_bases());
+        assert!(
+            matches!(&err, Err(ProdError::ParameterImage { reason, .. }) if reason.contains("RGB colour")),
+            "{err:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -2702,7 +2950,8 @@ mod tests {
 
     /// A text parameter takes the program's `TextParameterEncoding` (issue
     /// #401): MDT's eight-octet `Scènario` in ISO 8859-15, refused in UTF-8
-    /// and when the program declares no encoding; it reads back the same.
+    /// and in a code page bussard does not know, ISO 8859-1 when the program
+    /// declares none (#416); it reads back the same.
     #[test]
     fn test_compute_parameter_image_text_uses_the_declared_encoding()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -2713,6 +2962,8 @@ mod tests {
             0,
             0,
         )])?;
+        assert_eq!(&image_of(&app)?[0..8], b"Sc\xE8nario");
+        app.text_parameter_encoding = Some("shift_jis".to_string());
         assert!(compute_parameter_image(&app, &no_overrides(), &no_bases()).is_err());
         app.text_parameter_encoding = Some("utf-8".to_string());
         let err = compute_parameter_image(&app, &no_overrides(), &no_bases())
@@ -2853,8 +3104,11 @@ mod tests {
         Ok(())
     }
 
+    /// A vendor default outside its type's range is written as declared; the
+    /// same value as a user override is refused (issue #405).
     #[test]
-    fn min_max_enforced() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn test_encode_int_default_out_of_range_written_override_refused()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let app = app_with(&[(
             "t",
             r#"<TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="10" maxInclusive="20" />"#,
@@ -2862,10 +3116,79 @@ mod tests {
             0,
             0,
         )])?;
-        let err = compute_parameter_image(&app, &no_overrides(), &no_bases())
+        assert_eq!(image_of(&app)?.first(), Some(&0x05));
+        let mut overrides = BTreeMap::new();
+        overrides.insert("P-0_R-1".to_string(), "5".to_string());
+        let err = compute_parameter_image(&app, &overrides, &no_bases())
             .err()
-            .ok_or("expected an error")?;
+            .ok_or("an override below the minimum is refused")?;
         assert!(err.to_string().contains("minimum"), "{err}");
+        overrides.insert("P-0_R-1".to_string(), "21".to_string());
+        let err = compute_parameter_image(&app, &overrides, &no_bases())
+            .err()
+            .ok_or("an override above the maximum is refused")?;
+        assert!(err.to_string().contains("maximum"), "{err}");
+        overrides.insert("P-0_R-1".to_string(), "15".to_string());
+        let image = compute_parameter_image(&app, &overrides, &no_bases())?;
+        assert_eq!(image["M-1_A-1_RS-1"].first(), Some(&15));
+        Ok(())
+    }
+
+    /// The `syn-union-default-range` shape (issue #405, ABB/BJE `A-A074`/
+    /// `A-A075` "Vent Dummy Prio Ende"): a hidden union member, reached in the
+    /// parameter block, whose default 1 lies outside its type 129..129.
+    const UNION_RANGE_XML: &str = r#"<KNX xmlns="http://knx.org/xml/project/20">
+     <ApplicationProgram Id="A" MaskVersion="MV-07B0" Name="stray">
+      <Static>
+       <Code><RelativeSegment Id="A_RS-1" Size="4" LoadStateMachine="4" Offset="0"><Data>/////w==</Data></RelativeSegment></Code>
+       <ParameterTypes>
+        <ParameterType Id="A_PT-1" Name="marker"><TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="129" maxInclusive="129" /></ParameterType>
+        <ParameterType Id="A_PT-2" Name="mode"><TypeRestriction Base="Value" SizeInBit="8"><Enumeration Text="off" Value="0" Id="A_PT-2_EN-0" /><Enumeration Text="on" Value="1" Id="A_PT-2_EN-1" /></TypeRestriction></ParameterType>
+       </ParameterTypes>
+       <Parameters>
+        <Union SizeInBit="8">
+         <Memory CodeSegment="A_RS-1" Offset="3" BitOffset="0" />
+         <Parameter Id="A_UP-1" Name="stray_marker" ParameterType="A_PT-1" Value="1" Access="None" Offset="0" BitOffset="0" DefaultUnionParameter="true" />
+         <Parameter Id="A_UP-2" Name="stray_mode" ParameterType="A_PT-2" Value="0" Offset="0" BitOffset="0" />
+        </Union>
+       </Parameters>
+       <ParameterRefs>
+        <ParameterRef Id="A_UP-1_R-1" RefId="A_UP-1" />
+        <ParameterRef Id="A_UP-2_R-2" RefId="A_UP-2" />
+       </ParameterRefs>
+      </Static>
+      <Dynamic>
+       <ChannelIndependentBlock><ParameterBlock Id="A_PB-1">
+        <ParameterRefRef RefId="A_UP-1_R-1" />
+       </ParameterBlock></ChannelIndependentBlock>
+      </Dynamic>
+     </ApplicationProgram></KNX>"#;
+
+    #[test]
+    fn test_compute_parameter_image_union_default_outside_range_written_as_declared() -> Result<()>
+    {
+        let app = parse_application_program("A", UNION_RANGE_XML.as_bytes())?;
+        assert!(uses_dynamic_image(&app));
+        // ETS writes the declared default `01` (capture of
+        // syn-union-default-range, 2026-10-30), not the type's only value `81`.
+        let images = compute_parameter_image(&app, &no_overrides(), &BTreeMap::new())?;
+        assert_eq!(images["A_RS-1"].get(3), Some(&0x01));
+        // A user value 1 for the same member is refused; 129 is written.
+        let mut overrides = BTreeMap::new();
+        overrides.insert("UP-1_R-1".to_string(), "1".to_string());
+        let err = compute_parameter_image(&app, &overrides, &BTreeMap::new())
+            .err()
+            .ok_or(ProdError::ParameterImage {
+                parameter: "stray_marker".into(),
+                reason: "a user value 1 was accepted".into(),
+            })?;
+        assert!(
+            err.to_string().contains("below the declared minimum 129"),
+            "{err}"
+        );
+        overrides.insert("UP-1_R-1".to_string(), "129".to_string());
+        let images = compute_parameter_image(&app, &overrides, &BTreeMap::new())?;
+        assert_eq!(images["A_RS-1"].get(3), Some(&0x81));
         Ok(())
     }
 
@@ -3697,6 +4020,99 @@ mod tests {
         Ok(())
     }
 
+    /// The `syn-le-order` floats (issue #403): `ParameterByteOrder` set by
+    /// `{order}`, a DPT 9 at offset 0, an IEEE-754 Single at 2 and an
+    /// IEEE-754 Double at 6, each with default 21.5.
+    fn float_order_xml(order: &str) -> String {
+        format!(
+            r#"<KNX xmlns="http://knx.org/xml/project/20">
+     <ApplicationProgram Id="A" MaskVersion="MV-07B0" Name="le">
+      <Static>
+       <Code><AbsoluteSegment Id="A_AS-4000" Size="14" Address="16384"><Data>AAAAAAAAAAAAAAAAAAA=</Data></AbsoluteSegment></Code>
+       <ParameterTypes>
+        <ParameterType Id="A_PT-1" Name="d9"><TypeFloat Encoding="DPT 9" minInclusive="-273" maxInclusive="670760" /></ParameterType>
+        <ParameterType Id="A_PT-2" Name="f32"><TypeFloat Encoding="IEEE-754 Single" minInclusive="-100" maxInclusive="100" /></ParameterType>
+        <ParameterType Id="A_PT-3" Name="f64"><TypeFloat Encoding="IEEE-754 Double" minInclusive="-100" maxInclusive="100" /></ParameterType>
+       </ParameterTypes>
+       <Parameters>
+        <Parameter Id="A_P-1" Name="nest" ParameterType="A_PT-1" Value="21.5"><Memory CodeSegment="A_AS-4000" Offset="0" BitOffset="0" /></Parameter>
+        <Parameter Id="A_P-2" Name="egg" ParameterType="A_PT-2" Value="21.5"><Memory CodeSegment="A_AS-4000" Offset="2" BitOffset="0" /></Parameter>
+        <Parameter Id="A_P-3" Name="air" ParameterType="A_PT-3" Value="21.5"><Memory CodeSegment="A_AS-4000" Offset="6" BitOffset="0" /></Parameter>
+       </Parameters>
+       <ParameterRefs>
+        <ParameterRef Id="A_P-1_R-1" RefId="A_P-1" />
+        <ParameterRef Id="A_P-2_R-2" RefId="A_P-2" />
+        <ParameterRef Id="A_P-3_R-3" RefId="A_P-3" />
+       </ParameterRefs>
+       <Options {order} />
+      </Static>
+      <Dynamic><ChannelIndependentBlock><ParameterBlock Id="A_PB-1">
+       <ParameterRefRef RefId="A_P-1_R-1" />
+       <ParameterRefRef RefId="A_P-2_R-2" />
+       <ParameterRefRef RefId="A_P-3_R-3" />
+      </ParameterBlock></ChannelIndependentBlock></Dynamic>
+     </ApplicationProgram></KNX>"#
+        )
+    }
+
+    /// Issue #403: a little-endian program stores its floats least
+    /// significant octet first, as ETS 6.4.1 wrote `syn-le-order`
+    /// (`captures/synthetic/syn-le-order/defaults/`: DPT 9 21.5 as `33 0C`,
+    /// IEEE-754 Single 21.5 as `00 00 AC 41`); the Double follows the same
+    /// rule (no capture yet). The decoder reads each back in the program's
+    /// order, and a big-endian or undeclared order stays MSB-first.
+    #[test]
+    fn test_compute_parameter_image_little_endian_floats()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let le_double = 21.5f64.to_le_bytes();
+        let be_double = 21.5f64.to_be_bytes();
+        let cases: [(&str, [u8; 6], [u8; 8]); 3] = [
+            (
+                r#"ParameterByteOrder="LittleEndian""#,
+                [0x33, 0x0C, 0x00, 0x00, 0xAC, 0x41],
+                le_double,
+            ),
+            (
+                r#"ParameterByteOrder="BigEndian""#,
+                [0x0C, 0x33, 0x41, 0xAC, 0x00, 0x00],
+                be_double,
+            ),
+            ("", [0x0C, 0x33, 0x41, 0xAC, 0x00, 0x00], be_double),
+        ];
+        for (order, head, double) in cases {
+            let app = parse_application_program("A", float_order_xml(order).as_bytes())?;
+            let images = compute_parameter_image(&app, &no_overrides(), &BTreeMap::new())?;
+            let image = &images["A_AS-4000"];
+            assert_eq!(image[..6], head, "{order}");
+            assert_eq!(image[6..14], double, "{order}");
+
+            // An override takes the same order, and every float decodes back.
+            let mut overrides = BTreeMap::new();
+            overrides.insert("P-1_R-1".to_string(), "-3".to_string());
+            overrides.insert("P-2_R-2".to_string(), "-3.25".to_string());
+            overrides.insert("P-3_R-3".to_string(), "0.1".to_string());
+            let image = &compute_parameter_image(&app, &overrides, &BTreeMap::new())?["A_AS-4000"];
+            let decode = |id: &str, offset: usize| {
+                app.parameters
+                    .get(id)
+                    .and_then(|p| decode_parameter_value(&app, p, image, offset, 0))
+            };
+            assert_eq!(decode("A_P-1", 0).as_deref(), Some("-3"), "{order}");
+            assert_eq!(decode("A_P-2", 2).as_deref(), Some("-3.25"), "{order}");
+            assert_eq!(decode("A_P-3", 6).as_deref(), Some("0.1"), "{order}");
+            // The canonical form does not depend on the order.
+            for (id, value) in [("A_P-1", "-3"), ("A_P-2", "-3.25"), ("A_P-3", "0.1")] {
+                let param = app.parameters.get(id).ok_or("missing parameter")?;
+                assert_eq!(
+                    canonical_parameter_value(&app, param, Some(value)).as_deref(),
+                    Some(value),
+                    "{order} {id}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_compute_parameter_image_dynamic_writes_only_shown_parameters() -> Result<()> {
         let app = parse_application_program("A", DYN_XML.as_bytes())?;
@@ -4068,7 +4484,6 @@ mod tests {
         for replacement in [
             r#"<Options DownloadInvisibleParameters="None" />"#,
             r#"<Options DownloadInvisibleParameters="Background" />"#,
-            r#"<Options PreferPartialDownloadIfApplicationLoaded="true" />"#,
         ] {
             let xml = HIDDEN_XML.replace(options, replacement);
             let app = parse_application_program("A", xml.as_bytes())?;
@@ -4076,6 +4491,93 @@ mod tests {
             let images = compute_parameter_image(&app, &no_overrides(), &BTreeMap::new())?;
             assert_eq!(images["A_RS-1"], [0, 0, 0, 1], "{replacement}");
         }
+        Ok(())
+    }
+
+    /// Issue #450: a hidden `LegacyPatchAlways` parameter is written at its
+    /// default even when the application keeps hidden parameters at the
+    /// template (`Background`, `None`, or System 7); a hidden parameter
+    /// without the flag keeps the template. The read-back decoder walks the
+    /// same slots.
+    #[test]
+    fn test_compute_parameter_image_dynamic_writes_hidden_legacy_patch_always() -> Result<()> {
+        let options = r#"<Options TextParameterEncoding="utf-8" Comparable="false" Reconstructable="false" />"#;
+        let cycle = r#"Name="cycle" ParameterType="A_PT-2" Value="600""#;
+        for (mask, replacement) in [
+            (
+                "MV-07B0",
+                r#"<Options DownloadInvisibleParameters="Background" />"#,
+            ),
+            (
+                "MV-07B0",
+                r#"<Options DownloadInvisibleParameters="None" />"#,
+            ),
+            ("MV-0705", options),
+        ] {
+            let xml = HIDDEN_XML
+                .replace(options, replacement)
+                .replace("MV-07B0", mask)
+                .replace(cycle, &format!("{cycle} LegacyPatchAlways=\"true\""));
+            let app = parse_application_program("A", xml.as_bytes())?;
+            assert!(
+                !app.downloads_invisible_parameters(),
+                "{mask} {replacement}"
+            );
+            let images = compute_parameter_image(&app, &no_overrides(), &BTreeMap::new())?;
+            // The hidden cycle carries its default 600; the hidden union
+            // keeps the template.
+            assert_eq!(images["A_RS-1"], [0x02, 0x58, 0, 1], "{mask} {replacement}");
+            let config = bussard_ets::dynamic::evaluate_dynamic(&app, &no_overrides());
+            let slots = dynamic_parameter_slots(&app, &config)?;
+            assert!(
+                slots
+                    .iter()
+                    .any(|s| s.param_ref_id.is_none()
+                        && s.parameter.name.as_deref() == Some("cycle")),
+                "{mask} {replacement}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Issue #448: a System 7 program without `DownloadInvisibleParameters`
+    /// keeps the template for hidden parameters up to project/20 (Steinel
+    /// HPD 2, Busch-Jaeger `A-FF11-15`), where the same System B program
+    /// writes their defaults; from project/21 on it writes them too
+    /// (`syn-s7-hidden-default`). A System B one that prefers a partial
+    /// download keeps the template (Zennio DALI-BOX `A-3311`).
+    #[test]
+    fn test_compute_parameter_image_dynamic_hidden_defaults_follow_the_system() -> Result<()> {
+        let options = r#"<Options TextParameterEncoding="utf-8" Comparable="false" Reconstructable="false" />"#;
+        let partial = HIDDEN_XML.replace(
+            options,
+            r#"<Options PreferPartialDownloadIfApplicationLoaded="true" />"#,
+        );
+        let app = parse_application_program("A", partial.as_bytes())?;
+        assert!(!app.downloads_invisible_parameters());
+        let images = compute_parameter_image(&app, &no_overrides(), &BTreeMap::new())?;
+        assert_eq!(images["A_RS-1"], [0, 0, 0, 1]);
+        for mask in ["MV-0705", "MV-0701"] {
+            let system7 = HIDDEN_XML.replace("MV-07B0", mask);
+            let app = parse_application_program("A", system7.as_bytes())?;
+            assert!(!app.downloads_invisible_parameters(), "{mask}");
+            let images = compute_parameter_image(&app, &no_overrides(), &BTreeMap::new())?;
+            assert_eq!(images["A_RS-1"], [0, 0, 0, 1], "{mask}");
+            for schema in ["21", "23"] {
+                let newer = system7.replace(
+                    "http://knx.org/xml/project/20",
+                    &format!("http://knx.org/xml/project/{schema}"),
+                );
+                let app = parse_application_program("A", newer.as_bytes())?;
+                assert!(app.downloads_invisible_parameters(), "{mask} {schema}");
+                let images = compute_parameter_image(&app, &no_overrides(), &BTreeMap::new())?;
+                assert_eq!(images["A_RS-1"], [0x02, 0x58, 5, 1], "{mask} {schema}");
+            }
+        }
+        // System B writes them in an older schema too.
+        let older = HIDDEN_XML.replace("project/20", "project/11");
+        let app = parse_application_program("A", older.as_bytes())?;
+        assert!(app.downloads_invisible_parameters());
         Ok(())
     }
 

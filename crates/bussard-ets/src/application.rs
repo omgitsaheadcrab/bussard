@@ -27,10 +27,11 @@ use crate::error::{EtsError, Result};
 use crate::flags::FlagSet;
 use crate::translation::TranslationCollector;
 use bussard_model::Dpt;
+pub use bussard_model::color_codec::ColorSpace;
 pub use bussard_model::dynamic::{
-    BlockRef, CalculationParameter, ChannelRef, CompareOp, DynamicNode, DynamicWhen, EnumValue,
-    LabelMatch, Memory, ParameterCalculation, Union, UnionMember, WhenTest, enum_member_by_label,
-    flatten_containers,
+    Allocator, BlockRef, CalculationParameter, ChannelRef, CompareOp, ComputedArg, DynamicNode,
+    DynamicWhen, EnumValue, LabelMatch, Memory, ParameterCalculation, Union, UnionMember, WhenTest,
+    enum_member_by_label, flatten_containers,
 };
 
 /// A base `<ComObject>` from the application program.
@@ -52,6 +53,9 @@ pub struct ComObject {
     pub dpt: Option<Dpt>,
     /// Flags declared on the base object.
     pub flags: FlagSet,
+    /// The declared `Priority`, if any (absent means Low).
+    #[serde(default)]
+    pub priority: Option<bussard_model::Priority>,
     /// For a module com-object: the argument id (its `BaseNumber` attribute)
     /// whose value is added to `number` to compute the instance's effective
     /// object number.
@@ -77,6 +81,9 @@ pub struct ComObjectRef {
     pub dpt: Option<Dpt>,
     /// Flags declared on the ref (override the base's).
     pub flags: FlagSet,
+    /// Optional `Priority` override.
+    #[serde(default)]
+    pub priority: Option<bussard_model::Priority>,
     /// The `TextParameterRefId`, app-relative (e.g. `MD-1_P-1_R-1`): the
     /// parameter ref whose value replaces the `{{0}}`/`{{0:…}}` placeholder in
     /// [`Self::text`] (see [`crate::label::substitute_label`]).
@@ -251,6 +258,17 @@ impl ResolvedComObject<'_> {
     pub fn flags(&self) -> bussard_model::Flags {
         self.base.flags.merge(self.cref.flags).to_flags()
     }
+
+    /// The declared priority (ref overrides base), `None` when neither
+    /// declares one.
+    pub fn declared_priority(&self) -> Option<bussard_model::Priority> {
+        self.cref.priority.or(self.base.priority)
+    }
+
+    /// The effective priority: the declared one, else Low.
+    pub fn priority(&self) -> bussard_model::Priority {
+        self.declared_priority().unwrap_or_default()
+    }
 }
 
 /// A parameter type: the shape (int/enum/text/float/none) plus its size.
@@ -292,6 +310,13 @@ pub enum ParameterType {
     },
     /// `<TypeNone>`: a marker type carrying no memory value.
     None,
+    /// `<TypeColor Space="…">`: a colour, written in the model as `#` and two
+    /// hex digits per component (`#FF0000`) and placed in memory as one
+    /// octet per component (issue #616).
+    Color {
+        /// The declared colour space: how many components and what they mean.
+        space: ColorSpace,
+    },
     /// Any other type element (e.g. `TypeColor`, `TypeTime`, `TypePicture`),
     /// preserved by name so nothing is silently dropped.
     Other {
@@ -351,6 +376,28 @@ pub struct Parameter {
     /// writes the value these parameters compose (issue #390).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub property: Option<PropertyLocation>,
+    /// Whether the parameter declares `LegacyPatchAlways="true"`: ETS writes
+    /// it at its default even while the configuration hides it, whatever
+    /// the application's `DownloadInvisibleParameters` says (issue #450).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_patch_always: bool,
+    /// For a `TypeText` parameter, the `InitialValue` ETS starts a new device
+    /// with, in the language the program was parsed in (its
+    /// `<Translation AttributeName="InitialValue">`, else the untranslated
+    /// attribute). It wins over the parameter's and its refs' `Value` as the
+    /// default (issue #473: the Busch-Wächter PRO 2800's device name is
+    /// "Busch-Wächter Pro" in a German project). `None` for any other type
+    /// and for a text parameter without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_value: Option<String>,
+}
+
+impl Parameter {
+    /// The value ETS gives the parameter on a new device: its
+    /// [`Self::initial_value`], else its `Value`.
+    pub fn starting_value(&self) -> Option<&str> {
+        self.initial_value.as_deref().or(self.default.as_deref())
+    }
 }
 
 /// Where a property-located parameter sits: the interface object (by index or
@@ -427,11 +474,53 @@ pub enum SegmentKind {
     Absolute,
 }
 
+/// The `Mode` and `Fill` octets of a relative allocation (`LdCtrlRelSegment`),
+/// octets 6 and 7 of the Data Relative Allocation record (KNX 3/5/3 §3.5.1.2).
+///
+/// ETS copies the product's `@Mode` and `@Fill` into the record verbatim, also
+/// when `Mode` is `0` and the fill octet has no effect on the device: the
+/// synthetic product `syn-relseg-fill` (`Mode="0" Fill="255"`) is allocated
+/// with `00 ff` (issue #480).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SegmentFill {
+    /// The `Mode` octet; bit 0 asks the device to fill the segment.
+    pub mode: u8,
+    /// The `Fill` octet: the fill byte when bit 0 of `mode` is set, sent
+    /// as given otherwise.
+    pub fill: u8,
+}
+
+impl SegmentFill {
+    /// `Mode` 0 and `Fill` 0: no pre-fill (the DA.tp shape and every table
+    /// object allocation ETS sends).
+    pub const NONE: SegmentFill = SegmentFill { mode: 0, fill: 0 };
+
+    /// `Mode` 1 with fill byte `byte`: the device pre-fills the segment.
+    #[must_use]
+    pub const fn filled(byte: u8) -> SegmentFill {
+        SegmentFill {
+            mode: 1,
+            fill: byte,
+        }
+    }
+
+    /// The byte the device pre-fills the segment with: `Some(fill)` when bit 0
+    /// of `mode` is set, `None` when the segment keeps its contents.
+    #[must_use]
+    pub const fn prefill(self) -> Option<u8> {
+        if self.mode & 0x01 != 0 {
+            Some(self.fill)
+        } else {
+            None
+        }
+    }
+}
+
 /// One step of a load procedure, a faithful (uninterpreted) representation of an
 /// `LdCtrl*` element. Known control ops get a typed variant carrying the
 /// attributes phase-3 (`bussard-download`) will need; unrecognized ops are kept
 /// verbatim as [`LoadOp::Raw`] so nothing is lost.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LoadOp {
     /// `<LdCtrlConnect>`.
     Connect,
@@ -439,6 +528,15 @@ pub enum LoadOp {
     Disconnect,
     /// `<LdCtrlRestart>`.
     Restart,
+    /// `<LdCtrlDelay MilliSeconds=…>`: a pause of the given length between two
+    /// steps of the procedure, with nothing sent on the wire. 35 corpus
+    /// applications put `MilliSeconds="200"` right before `LdCtrlRestart`
+    /// (issue #615).
+    Delay {
+        /// The pause in milliseconds (`MilliSeconds`); `None` when the attribute
+        /// is absent or not a number.
+        milliseconds: Option<u32>,
+    },
     /// `<LdCtrlMerge MergeId=…>`: a splice marker in a **master-template**
     /// `Load` procedure (`knx_master.xml`). It is not an on-wire operation: when
     /// a merged application is assembled against the master template, each
@@ -499,6 +597,34 @@ pub enum LoadOp {
         /// Repeat count.
         count: Option<u32>,
     },
+    /// `<LdCtrlTaskPtr LsmIdx=… InitPtr=… SavePtr=… SerialPtr=…>`: the Task
+    /// Pointer Record (Additional Load Controls segment type 03h, KNX 3/5/2
+    /// §3.31.2).
+    TaskPtr {
+        /// Load-state-machine index.
+        lsm_idx: Option<u32>,
+        /// `InitPtr`: the init address.
+        init_ptr: Option<u32>,
+        /// `SavePtr`: the save address.
+        save_ptr: Option<u32>,
+        /// `SerialPtr`: the PEI handler address.
+        serial_ptr: Option<u32>,
+    },
+    /// `<LdCtrlTaskCtrl2 LsmIdx=… Callback=… Address=… Seg0=… Seg1=…>`: Task
+    /// Control Record 2 (Additional Load Controls segment type 05h, KNX 3/5/2
+    /// §3.31.2).
+    TaskCtrl2 {
+        /// Load-state-machine index.
+        lsm_idx: Option<u32>,
+        /// `Callback`: the callback address.
+        callback: Option<u32>,
+        /// `Address`: the group-object table pointer.
+        address: Option<u32>,
+        /// `Seg0`: the first group-object segment pointer.
+        seg0: Option<u32>,
+        /// `Seg1`: the second group-object segment pointer.
+        seg1: Option<u32>,
+    },
     /// `<LdCtrlRelSegment …>`: a relative-segment control op.
     RelSegment {
         /// Load-state-machine index.
@@ -507,16 +633,14 @@ pub enum LoadOp {
         size: Option<u32>,
         /// `AppliesTo` filter (e.g. `"full"`, `"par"`, `"full,par"`).
         applies_to: Option<String>,
-        /// The device-side pre-fill the allocation requests, decoded from the
-        /// op's `Mode` (fill flag) / `Fill` (fill byte) attributes, or the older
-        /// `Fill` / `FillByte` spelling. `Some(b)` means the ETS procedure asks
-        /// for the fill (`Mode="1"`) — the device pre-fills the freshly
-        /// allocated segment with `b` before the writes land (the app-code
-        /// segment on some products, e.g. Jung LED A-3030 obj4 alloc
-        /// `030b000028c1 01 00 0000`). `None` means no fill was asked for
-        /// (`Mode="0"`, or no fill attribute at all): the DA.tp behaviour
-        /// bussard has always emitted.
-        fill: Option<u8>,
+        /// The op's `Mode` and `Fill` octets (or the older `Fill` / `FillByte`
+        /// spelling), as the allocation record carries them. With the mode's
+        /// fill bit set the device pre-fills the freshly allocated segment
+        /// (the app-code segment on some products, e.g. Jung LED A-3030 obj4
+        /// alloc `030b000028c1 01 00 0000`); with it clear the `Fill` octet is
+        /// still sent as given (ETS does, issue #480). No attribute at all is
+        /// [`SegmentFill::NONE`], the DA.tp shape.
+        fill: SegmentFill,
     },
     /// `<LdCtrlAbsSegment …>`: an absolute-segment control op.
     AbsSegment {
@@ -535,6 +659,10 @@ pub enum LoadOp {
         /// `SegFlags` attribute: `128` marks a checksum-controlled segment,
         /// `0` a segment the application rewrites at runtime.
         seg_flags: Option<u32>,
+        /// `SegType` attribute: the Additional Load Controls segment type the
+        /// allocation goes out as, `0` = AllocAbsDataSeg (absent), `1` =
+        /// AllocAbsStackSeg (KNX 3/5/2 §3.31.2, §3.31.3.4; issue #487).
+        seg_type: Option<u32>,
     },
     /// `<LdCtrlWriteRelMem …>`: write into relative (parameter) memory.
     WriteRelMem {
@@ -616,6 +744,11 @@ pub enum LoadOp {
         /// `Occurrence`: which object of `ObjType` the op addresses when it
         /// names the object by type (absent = the first, 0).
         occurrence: Option<u32>,
+        /// `StartElement`: the 1-based array element the compare reads (absent
+        /// = 1). The Siemens 07B0 applications compare elements 1, 2, 3, 5 and 6
+        /// of object 4's PID 246 one by one (issue #614).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_element: Option<u32>,
     },
     /// `<LdCtrlCompareRelMem …>`: read relative (segment-relative) memory and
     /// compare it against expected data — the memory twin of
@@ -674,6 +807,20 @@ pub enum LoadOp {
         /// How many MCB array elements to read (`Count`), defaulting to 1.
         count: Option<u32>,
     },
+    /// `<LdCtrlMapError OriginalError=… MappedError=…>`: an ETS tool-side rule,
+    /// not a device operation (the KNX Standard has no such load control). From
+    /// this op on, the tool reports the error `OriginalError` of a following
+    /// step as `MappedError` (0 = success); a later `LdCtrlMapError` for the same
+    /// code replaces the rule, and one that maps the code to itself ends it.
+    /// The 27 Siemens 07B0 applications of the corpus (issue #614) map
+    /// `0xC0042B08` to 0 for the `LdCtrlUnload LsmIdx="5"` that follows, then
+    /// back to itself.
+    MapError {
+        /// The ETS error code the rule rewrites (`OriginalError`).
+        original_error: Option<u32>,
+        /// The code it is reported as (`MappedError`); 0 means success.
+        mapped_error: Option<u32>,
+    },
     /// Any other `LdCtrl*` element, preserved by name and attribute list.
     Raw {
         /// The element's local name (e.g. `"LdCtrlLoadImageProp"`).
@@ -702,6 +849,11 @@ pub struct LoadProcedure {
     /// through [`LoadProcedure::guards_of`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guards: Vec<Vec<LoadGuard>>,
+    /// Per op, at the same index as [`Self::ops`], its `AppliesTo` attribute
+    /// verbatim (`"full"`, `"par"`, `"grp"`, `"full,par"`, ...), `None` when
+    /// the op carries none. Read it through [`LoadProcedure::applies_to_of`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applies_to: Vec<Option<String>>,
 }
 
 impl LoadProcedure {
@@ -709,6 +861,48 @@ impl LoadProcedure {
     pub fn guards_of(&self, index: usize) -> &[LoadGuard] {
         self.guards.get(index).map(Vec::as_slice).unwrap_or(&[])
     }
+
+    /// The `AppliesTo` attribute of op `index`, `None` when it has none.
+    pub fn applies_to_of(&self, index: usize) -> Option<&str> {
+        self.applies_to.get(index).and_then(Option::as_deref)
+    }
+
+    /// Whether op `index` belongs only to a partial download: its `AppliesTo`
+    /// names the parameter (`par`) or group-address (`grp`) download and
+    /// neither the complete download (`full`) nor every download (`all`,
+    /// `auto`).
+    pub fn is_partial_only(&self, index: usize) -> bool {
+        self.applies_to_of(index)
+            .is_some_and(applies_to_partial_only)
+    }
+
+    /// Whether the procedure lists the group-address download (an op with
+    /// `AppliesTo="grp"` only) next to the complete one. The Siemens 07B0
+    /// product procedures (issue #614) list the complete, parameter and
+    /// group-address downloads one after the other in one `<LoadProcedure>`;
+    /// a complete download runs none of the [`Self::is_partial_only`] ops of
+    /// such a procedure.
+    pub fn lists_partial_downloads(&self) -> bool {
+        self.applies_to.iter().flatten().any(|scope| {
+            let mut tokens = scope.split(',').map(str::trim).filter(|t| !t.is_empty());
+            tokens.clone().next().is_some() && tokens.all(|t| t.eq_ignore_ascii_case("grp"))
+        })
+    }
+}
+
+/// Whether an `AppliesTo` value names only partial downloads (`par`, `grp`)
+/// and not the complete one (`full`, `all`, `auto`). An empty value applies to
+/// every download.
+pub fn applies_to_partial_only(applies_to: &str) -> bool {
+    let tokens: Vec<&str> = applies_to
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    !tokens.is_empty()
+        && tokens
+            .iter()
+            .all(|t| t.eq_ignore_ascii_case("par") || t.eq_ignore_ascii_case("grp"))
 }
 
 /// A `<choose ParamRefId>` inside a `<LoadProcedure>`.
@@ -737,6 +931,30 @@ pub struct TableLocation {
     pub code_segment: String,
     /// The table's byte offset inside that segment.
     pub offset: u32,
+}
+
+/// The Data Secure table capacities an application declares (issue #537):
+/// how many entries the device's group key table (PID 53), security
+/// individual address table (PID 54) and point-to-point key table hold. ETS
+/// sizes the download with them; KNX 3/5/1 §6.3.7 and §6.3.8 leave the
+/// capacity to the device.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SecurityCapacity {
+    /// `MaxSecurityGroupKeyTableEntries`.
+    pub group_key_table_entries: Option<u32>,
+    /// `MaxSecurityIndividualAddressEntries`.
+    pub individual_address_entries: Option<u32>,
+    /// `MaxSecurityP2PKeyTableEntries`.
+    pub p2p_key_table_entries: Option<u32>,
+}
+
+impl SecurityCapacity {
+    /// Whether the application declares none of the figures.
+    pub fn is_empty(&self) -> bool {
+        self.group_key_table_entries.is_none()
+            && self.individual_address_entries.is_none()
+            && self.p2p_key_table_entries.is_none()
+    }
 }
 
 /// One parsed ApplicationProgram.
@@ -768,6 +986,18 @@ pub struct ApplicationProgram {
     /// manufacturer in the application id.
     #[serde(default)]
     pub legacy_patch_manufacturer_in_task_segment: bool,
+    /// Whether the program declares an ETS download plugin
+    /// (`<Extension EtsDownloadPlugin=...>`, even an empty one). ETS then
+    /// writes the System B group-object table with the communication flag
+    /// on every declared object (issue #565, the Busch-Jaeger DALI gateways).
+    #[serde(default)]
+    pub ets_download_plugin: bool,
+    /// Whether `<Options>` declares `SupportsExtendedMemoryServices="true"`.
+    /// ETS reads and writes memory above `0xFFFF` with
+    /// `A_MemoryExtended_*` when it does and with `A_UserMemory_*` when it
+    /// does not (issue #472, the sweep over Zennio, ABB and Busch-Jaeger).
+    #[serde(default)]
+    pub supports_extended_memory_services: bool,
     /// Application-program display name (translation applied).
     pub name: Option<String>,
     /// The declared `DefaultLanguage`: the language of the untranslated
@@ -787,6 +1017,18 @@ pub struct ApplicationProgram {
     /// Whether the application declares `IsSecureEnabled="true"`: it is KNX
     /// Data-Secure-capable (issue #71, spec §11). Capability, not activation.
     pub is_secure_enabled: bool,
+    /// The application's Data Secure table capacities (issue #537): the
+    /// `MaxSecurity*` attributes of `<ApplicationProgram>`. All `None` when
+    /// the application declares none.
+    #[serde(default)]
+    pub security_capacity: SecurityCapacity,
+    /// `AdditionalAddressesCount`: how many tunnelling addresses the device's
+    /// KNXnet/IP parameter object holds (`PID_ADDITIONAL_INDIVIDUAL_ADDRESSES`)
+    /// on hardware with a KNX IP interface built in (the Zennio ALLinBOX 1612
+    /// declares 5). ETS writes exactly that many after the download (issue
+    /// #455). `None` when the application declares none.
+    #[serde(default)]
+    pub additional_addresses_count: Option<u16>,
     /// The XML schema version this file declared, e.g. `"20"`, `"21"`, `"23"`.
     pub schema_version: Option<String>,
     /// The `<Options DownloadInvisibleParameters>` value (`None`, `Background`),
@@ -851,6 +1093,15 @@ pub struct ApplicationProgram {
     /// `ArgBeschriftung` → `MD-1_A-3`), used to resolve `{{Arg…}}` placeholders
     /// in channel and com-object texts against a module instance's values.
     pub argument_ids: HashMap<String, String>,
+    /// The `Allocates` of every module `<Argument>` that declares one, keyed
+    /// by app-relative argument id (issue #449): how far an allocator-fed
+    /// value of the argument advances its allocator.
+    #[serde(default)]
+    pub argument_allocates: HashMap<String, i64>,
+    /// The `<Allocator>`s of the application's and the module definitions'
+    /// `<Static>`, keyed by app-relative id (`L-2`, `MD-1_L-1`) (issue #449).
+    #[serde(default)]
+    pub allocators: HashMap<String, Allocator>,
     /// Dynamic-section `<Module>` instantiations, in document order. Each is one
     /// channel's set of argument values; empty for a non-module application.
     pub module_instances: Vec<ModuleInstance>,
@@ -872,21 +1123,79 @@ impl ApplicationProgram {
     /// Whether a download writes the parameters the configuration does not
     /// show, with their defaults.
     ///
-    /// ETS does when `<Options>` declares neither `DownloadInvisibleParameters`
-    /// nor `PreferPartialDownloadIfApplicationLoaded="true"` (issue #89),
-    /// established from full-download captures:
+    /// Never when `<Options>` declares `DownloadInvisibleParameters` (`None`
+    /// or `Background`) or `PreferPartialDownloadIfApplicationLoaded="true"`:
+    /// the segment template stays for them on both systems. Without either
+    /// attribute ETS 6 writes them on a System B program (mask `xxB0`) at
+    /// every schema version, and on a System 7 one (mask `0700`, `0701`,
+    /// `0705`) from schema version [`Self::FIRST_SYSTEM7_SCHEMA_WITH_HIDDEN_DEFAULTS`]
+    /// on (issues #89 and #448). Established from full-download captures,
+    /// each one a hidden parameter whose default differs from its template:
     ///
-    /// * Busch-Jaeger Busch-Wächter PRO 280 (`M-0007_A-6179-82`) and Steinel
-    ///   ControlPro (`M-008E_A-7188-31`), neither attribute: hidden parameters
-    ///   carry their defaults (the Busch-Jaeger's sending cycle 600 behind
-    ///   "Enable group object In operation = No").
-    /// * Jung 230021SU, 390041SR, F50 (`None`) and ABB BE/S16 (`Background`),
-    ///   all with partial download preferred: hidden parameters keep the
-    ///   segment template (the ABB hides the same sending cycle and gets 0).
-    /// * Jung System 7 2116REG, 3181, 3361 (no `DownloadInvisibleParameters`,
-    ///   partial download preferred): the template too.
+    /// * System B, neither attribute, defaults written: Busch-Wächter PRO
+    ///   280 / 2800 (`M-0007_A-6179-82`, project/20, `MinEtsVersion` 5.0)
+    ///   and the synthetic `syn-hidden-default` (project/23).
+    /// * System 7, neither attribute, defaults written: the synthetic
+    ///   `syn-s7-hidden-default` (0705, project/23).
+    /// * System 7, neither attribute, template kept: its twin
+    ///   `syn-s7-hidden-default-p11` (project/11, the same product otherwise),
+    ///   the sweep's Steinel HPD 2 and TruePresence, ekinex, B.E.G. DIM,
+    ///   Zennio Sensato, MDT rain sensor and Elsner rows (project/11), and
+    ///   Busch-Jaeger `A-FF11-15` (0705, project/20, `MinEtsVersion` 3.0d,
+    ///   14 octets differ when its hidden defaults are written).
+    /// * System B, partial download preferred, template kept: Busch-Jaeger
+    ///   DALI gateways `A-A0AC`, `A-A0AD`, Zennio DALI-BOX `A-3131`,
+    ///   `A-3311`, `A-3331`, Jung 230021SU, 390041SR, F50, ABB BE/S16.
+    /// * Declared `None` or `Background`, template kept on both systems.
+    ///
+    /// The schema version alone does not decide: in project/20 the System B
+    /// PRO 280 writes and the System 7 `A-FF11-15` keeps. Not settled: the
+    /// System 7 boundary between 21 and 23 (the corpus has no System 7
+    /// program in project/21 or /22, so the choice of 21 changes no vendor
+    /// product), System B below project/20 (no capture separates it; the
+    /// Steinel ControlPro, project/11, has its hidden defaults equal to the
+    /// template), and whether ETS keys on `MinEtsVersion` instead (every
+    /// capture above that writes has 5.0 or later, every one that keeps has
+    /// 4.0 or earlier or none). `syn-s7-hidden-default` rendered in
+    /// project/23 with `MinEtsVersion="4.0"` would tell the two apart.
     pub fn downloads_invisible_parameters(&self) -> bool {
-        self.download_invisible_parameters.is_none() && !self.prefer_partial_download
+        self.download_invisible_parameters.is_none()
+            && !self.prefer_partial_download
+            && (self.is_system_b()
+                || (self.is_system_7()
+                    && self
+                        .schema_number()
+                        .is_some_and(|n| n >= Self::FIRST_SYSTEM7_SCHEMA_WITH_HIDDEN_DEFAULTS)))
+    }
+
+    /// The first `http://knx.org/xml/project/<N>` schema version from which
+    /// a System 7 program without `DownloadInvisibleParameters` gets the
+    /// parameters the configuration does not show written at their defaults
+    /// (issue #448; see [`Self::downloads_invisible_parameters`]).
+    pub const FIRST_SYSTEM7_SCHEMA_WITH_HIDDEN_DEFAULTS: u32 = 21;
+
+    /// The schema version of [`Self::schema_version`] as a number (`23` for
+    /// `http://knx.org/xml/project/23`), `None` when the file declared none
+    /// or a non-numeric one.
+    pub fn schema_number(&self) -> Option<u32> {
+        self.schema_version.as_deref()?.trim().parse().ok()
+    }
+
+    /// Whether the program is a System 7 one: its `MaskVersion` is `0700`,
+    /// `0701` or `0705`.
+    pub fn is_system_7(&self) -> bool {
+        self.mask_version
+            .as_deref()
+            .and_then(|m| u16::from_str_radix(m.trim(), 16).ok())
+            .is_some_and(|m| matches!(m, 0x0700 | 0x0701 | 0x0705))
+    }
+
+    /// Whether the program is a System B one: its `MaskVersion` is `xxB0`
+    /// (`07B0` on TP, `27B0`/`57B0` on other media).
+    pub fn is_system_b(&self) -> bool {
+        self.mask_version
+            .as_deref()
+            .is_some_and(bussard_model::param_model::is_system_b_mask)
     }
 
     /// Whether this is a `PeiProgram` (a second loadable program, not an
@@ -1248,6 +1557,18 @@ pub fn parse_application_program_in(
     }
 
     apply_translations(&mut app, &translations);
+    // `InitialValue` is the starting value of a text parameter only.
+    let types = &app.parameter_types;
+    for param in app.parameters.values_mut() {
+        let text = param
+            .parameter_type
+            .as_deref()
+            .and_then(|t| types.get(t))
+            .is_some_and(|d| matches!(d.kind, ParameterType::Text { .. }));
+        if !text {
+            param.initial_value = None;
+        }
+    }
     Ok(app)
 }
 
@@ -1355,6 +1676,15 @@ fn handle_start(
             app.is_secure_enabled = get(m, b"IsSecureEnabled")
                 .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
                 .unwrap_or(false);
+            // The Data Secure table capacities (issue #537).
+            let count = |name: &[u8]| get(m, name).and_then(|v| v.trim().parse::<u32>().ok());
+            app.security_capacity = SecurityCapacity {
+                group_key_table_entries: count(b"MaxSecurityGroupKeyTableEntries"),
+                individual_address_entries: count(b"MaxSecurityIndividualAddressEntries"),
+                p2p_key_table_entries: count(b"MaxSecurityP2PKeyTableEntries"),
+            };
+            app.additional_addresses_count =
+                get(m, b"AdditionalAddressesCount").and_then(|v| v.trim().parse::<u16>().ok());
             app.dynamic_table_management = get(m, b"DynamicTableManagement")
                 .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
         }
@@ -1372,6 +1702,7 @@ fn handle_start(
         b"LRTransformation" if state.calc.is_some() => state.calc_script = Some(String::new()),
         b"ParameterRefRef" if state.calc_outputs.is_some() => calc_parameter(state, m, &app.id),
         b"Options" => insert_options(app, m),
+        b"Extension" => insert_extension(app, m),
         b"ComObjectTable" => insert_com_object_table(app, m),
         b"Language" => translations.enter_language(get(m, b"Identifier")),
         b"TranslationElement" => translations.enter_element(get(m, b"RefId")),
@@ -1379,6 +1710,7 @@ fn handle_start(
         b"ComObjectRef" => insert_com_object_ref(app, m),
         b"Channel" => insert_channel(app, m),
         b"Argument" => insert_argument(app, m),
+        b"Allocator" => insert_allocator(app, m),
         b"ParameterType" => {
             state.pt_id = get(m, b"Id").map(str::to_string);
             state.pt_name = get(m, b"Name").map(str::to_string);
@@ -1511,6 +1843,15 @@ fn insert_options(app: &mut ApplicationProgram, m: &Attrs) {
         get(m, b"ParameterByteOrder").is_some_and(|v| v.eq_ignore_ascii_case("LittleEndian"));
     app.text_parameter_encoding = get(m, b"TextParameterEncoding").map(str::to_string);
     app.legacy_patch_manufacturer_in_task_segment = flag(b"LegacyPatchManufacturerIdInTaskSegment");
+    app.supports_extended_memory_services = flag(b"SupportsExtendedMemoryServices");
+}
+
+/// Reads a `<Extension>` element: whether it names an ETS download plugin
+/// (the attribute's presence counts, the products leave it empty).
+fn insert_extension(app: &mut ApplicationProgram, m: &Attrs) {
+    if get(m, b"EtsDownloadPlugin").is_some() {
+        app.ets_download_plugin = true;
+    }
 }
 
 /// Handles an `Empty` (self-closing) event.
@@ -1531,7 +1872,9 @@ fn handle_empty(
         b"ComObjectRef" => insert_com_object_ref(app, m),
         b"Channel" => insert_channel(app, m),
         b"Argument" => insert_argument(app, m),
+        b"Allocator" => insert_allocator(app, m),
         b"Options" => insert_options(app, m),
+        b"Extension" => insert_extension(app, m),
         b"ComObjectTable" => insert_com_object_table(app, m),
         b"NumericArg" => {
             // A `<NumericArg RefId=arg-id Value=n>` of the current `<Module>`.
@@ -1659,6 +2002,14 @@ fn handle_empty(
         b"RelativeSegment" => insert_segment(app, m, SegmentKind::Relative),
         b"AbsoluteSegment" => insert_segment(app, m, SegmentKind::Absolute),
         name if name.starts_with(b"Type") => {
+            // A colour of a space the schema names has its own shape (issue
+            // #616); any other space stays an `Other`.
+            if name == b"TypeColor"
+                && let Some(space) = get(m, b"Space").and_then(ColorSpace::from_attr)
+            {
+                state.pt_kind = Some(ParameterType::Color { space });
+                return Ok(());
+            }
             // Other type shapes (TypeColor, TypeTime, TypePicture, TypeIPAddress…).
             let kind = String::from_utf8_lossy(name).into_owned();
             state.pt_kind = Some(ParameterType::Other {
@@ -1677,7 +2028,7 @@ fn handle_empty(
 }
 
 /// The attributes a translation may replace.
-const TRANSLATED: &[&str] = &["Name", "Text", "FunctionText"];
+const TRANSLATED: &[&str] = &["Name", "Text", "FunctionText", "InitialValue"];
 
 /// Applies the collected translations to names, texts, function texts and
 /// enumeration texts.
@@ -1721,6 +2072,9 @@ fn apply_translations(app: &mut ApplicationProgram, translations: &TranslationCo
         if let Some(t) = translations.get(id, "Text") {
             param.text = Some(t.to_string());
         }
+        if let Some(t) = translations.get(id, "InitialValue") {
+            param.initial_value = Some(t.to_string());
+        }
     }
     for (id, pref) in app.parameter_refs.iter_mut() {
         if let Some(t) = translations.get(id, "Text") {
@@ -1756,6 +2110,9 @@ fn apply_translations(app: &mut ApplicationProgram, translations: &TranslationCo
                     for w in whens {
                         translate_tree(&mut w.children, full, translations);
                     }
+                }
+                DynamicNode::Repeat { children, .. } => {
+                    translate_tree(children, full, translations);
                 }
                 DynamicNode::ParameterRefRef(_)
                 | DynamicNode::ComObjectRefRef(_)
@@ -1796,6 +2153,7 @@ fn insert_com_object(app: &mut ApplicationProgram, m: &Attrs) {
             object_size: get(m, b"ObjectSize").map(str::to_string),
             dpt: get(m, b"DatapointType").and_then(parse_ets_dpt),
             flags: flagset_from(m),
+            priority: get(m, b"Priority").and_then(bussard_model::Priority::from_ets),
             base_number_ref: get(m, b"BaseNumber").map(str::to_string),
         },
     );
@@ -1817,6 +2175,7 @@ fn insert_com_object_ref(app: &mut ApplicationProgram, m: &Attrs) {
             object_size: get(m, b"ObjectSize").map(str::to_string),
             dpt: get(m, b"DatapointType").and_then(parse_ets_dpt),
             flags: flagset_from(m),
+            priority: get(m, b"Priority").and_then(bussard_model::Priority::from_ets),
             text_parameter_ref: relative_attr(m, b"TextParameterRefId", &app.id),
         },
     );
@@ -1884,16 +2243,38 @@ fn insert_channel(app: &mut ApplicationProgram, m: &Attrs) {
     );
 }
 
-/// Records a module `<Argument>`'s name → app-relative id (first wins).
+/// Records a module `<Argument>`'s name → app-relative id (first wins) and
+/// its `Allocates`.
 fn insert_argument(app: &mut ApplicationProgram, m: &Attrs) {
-    let (Some(id), Some(name)) = (get(m, b"Id"), get(m, b"Name")) else {
+    let Some(rel) = get(m, b"Id").and_then(|id| app_relative_id(id, &app.id)) else {
         return;
     };
-    if let Some(rel) = app_relative_id(id, &app.id) {
+    if let Some(allocates) = get(m, b"Allocates").and_then(|v| v.trim().parse::<i64>().ok()) {
+        app.argument_allocates.insert(rel.to_string(), allocates);
+    }
+    if let Some(name) = get(m, b"Name") {
         app.argument_ids
             .entry(name.to_string())
             .or_insert_with(|| rel.to_string());
     }
+}
+
+/// Records an `<Allocator Id Start maxInclusive>` (issue #449).
+fn insert_allocator(app: &mut ApplicationProgram, m: &Attrs) {
+    let (Some(rel), Some(start)) = (
+        get(m, b"Id").and_then(|id| app_relative_id(id, &app.id)),
+        get(m, b"Start").and_then(|v| v.trim().parse::<i64>().ok()),
+    ) else {
+        return;
+    };
+    let max_inclusive = get(m, b"maxInclusive").and_then(|v| v.trim().parse::<i64>().ok());
+    app.allocators.insert(
+        rel.to_string(),
+        Allocator {
+            start,
+            max_inclusive,
+        },
+    );
 }
 
 /// Inserts a parameter, returning its id so the caller can attach a later
@@ -1913,6 +2294,8 @@ fn insert_parameter_start(app: &mut ApplicationProgram, m: &Attrs) -> Option<Str
             memory: None,
             base_value: get(m, b"BaseValue").map(str::to_string),
             property: None,
+            legacy_patch_always: get(m, b"LegacyPatchAlways").is_some_and(parse_xml_bool),
+            initial_value: get(m, b"InitialValue").map(str::to_string),
         },
     );
     Some(id)
@@ -2056,8 +2439,10 @@ struct ParseState {
 /// each `<ModuleDef>`'s Dynamic section from streaming events.
 #[derive(Debug, Default)]
 struct DynTreeBuilder {
-    /// The app-relative id of the `<ModuleDef>` currently open, if any.
-    module_def: Option<String>,
+    /// The app-relative ids of the open `<ModuleDef>`s, outermost first: a
+    /// `<SubModuleDefs>` nests one module definition in another (issue
+    /// #449), and the outer definition's `<Dynamic>` follows the inner ones.
+    module_defs: Vec<String>,
     /// The open frames, outermost first; non-empty exactly while inside a
     /// `<Dynamic>` element.
     frames: Vec<DynFrame>,
@@ -2080,6 +2465,14 @@ enum DynFrame {
         id: String,
         module_def: String,
         args: HashMap<String, i64>,
+        computed_args: Vec<ComputedArg>,
+    },
+    /// An open `<Repeat>` and its children so far.
+    Repeat {
+        id: String,
+        param_ref_id: Option<String>,
+        count: Option<u32>,
+        children: Vec<DynamicNode>,
     },
     /// An open `<Channel>` and its children so far.
     Channel(ChannelRef, Vec<DynamicNode>),
@@ -2094,7 +2487,8 @@ impl DynTreeBuilder {
             Some(DynFrame::Root(children))
             | Some(DynFrame::When(DynamicWhen { children, .. }))
             | Some(DynFrame::Channel(_, children))
-            | Some(DynFrame::Block(_, children)) => {
+            | Some(DynFrame::Block(_, children))
+            | Some(DynFrame::Repeat { children, .. }) => {
                 children.push(node);
             }
             // A node directly under `<choose>` or `<Module>` is not valid
@@ -2134,7 +2528,7 @@ impl DynTreeBuilder {
         };
         if self.frames.is_empty() {
             match name {
-                b"ModuleDef" => self.module_def = Some(rel(b"Id")),
+                b"ModuleDef" => self.module_defs.push(rel(b"Id")),
                 b"Dynamic" => self.frames.push(DynFrame::Root(Vec::new())),
                 _ => {}
             }
@@ -2153,6 +2547,13 @@ impl DynTreeBuilder {
                 id: rel(b"Id"),
                 module_def: rel(b"RefId"),
                 args: HashMap::new(),
+                computed_args: Vec::new(),
+            }),
+            b"Repeat" => self.frames.push(DynFrame::Repeat {
+                id: rel(b"Id"),
+                param_ref_id: relative_attr(m, b"ParameterRefId", app_id),
+                count: get(m, b"Count").and_then(|v| v.trim().parse().ok()),
+                children: Vec::new(),
             }),
             b"Channel" => self.frames.push(DynFrame::Channel(
                 ChannelRef {
@@ -2187,16 +2588,37 @@ impl DynTreeBuilder {
         }
         match name {
             b"NumericArg" => {
-                if let Some(DynFrame::Module { args, .. }) = self.frames.last_mut()
-                    && let (Some(arg), Some(value)) = (
-                        get(m, b"RefId").map(|id| app_relative_id(id, app_id).unwrap_or(id)),
-                        get(m, b"Value").and_then(|v| v.trim().parse::<i64>().ok()),
-                    )
+                let rel = |key: &[u8]| {
+                    get(m, key).map(|id| app_relative_id(id, app_id).unwrap_or(id).to_string())
+                };
+                if let Some(DynFrame::Module {
+                    args,
+                    computed_args,
+                    ..
+                }) = self.frames.last_mut()
+                    && let Some(arg) = rel(b"RefId")
                 {
-                    args.insert(arg.to_string(), value);
+                    let value = get(m, b"Value").and_then(|v| v.trim().parse::<i64>().ok());
+                    let allocator = rel(b"AllocatorRefId");
+                    let base = rel(b"BaseValue");
+                    match (value, &allocator, &base) {
+                        (Some(value), None, None) => {
+                            args.insert(arg, value);
+                        }
+                        // An allocator or a base makes the value the
+                        // instance's to compute (issue #449); a bare
+                        // argument without a value stays absent.
+                        (_, Some(_), _) | (_, _, Some(_)) => computed_args.push(ComputedArg {
+                            arg,
+                            allocator,
+                            value,
+                            base,
+                        }),
+                        (None, None, None) => {}
+                    }
                 }
             }
-            b"when" | b"choose" | b"Module" | b"Channel" | b"ParameterBlock" => {
+            b"when" | b"choose" | b"Module" | b"Channel" | b"ParameterBlock" | b"Repeat" => {
                 // An empty branch, choose, argument-less module or empty
                 // container: open and close it at once.
                 self.start(name, m, app_id);
@@ -2211,7 +2633,9 @@ impl DynTreeBuilder {
     /// An end event. `app` receives a finished `<Dynamic>` tree.
     fn end(&mut self, name: &[u8], app: Option<&mut ApplicationProgram>) {
         match name {
-            b"ModuleDef" if self.frames.is_empty() => self.module_def = None,
+            b"ModuleDef" if self.frames.is_empty() => {
+                self.module_defs.pop();
+            }
             b"when" => {
                 if let Some(DynFrame::When(_)) = self.frames.last()
                     && let Some(DynFrame::When(branch)) = self.frames.pop()
@@ -2239,12 +2663,32 @@ impl DynTreeBuilder {
                         id,
                         module_def,
                         args,
+                        computed_args,
                     }) = self.frames.pop()
                 {
                     self.push_node(DynamicNode::Module {
                         id,
                         module_def,
                         args,
+                        computed_args,
+                    });
+                }
+            }
+            b"Repeat" => {
+                if let Some(DynFrame::Repeat { .. }) = self.frames.last()
+                    && let Some(DynFrame::Repeat {
+                        id,
+                        param_ref_id,
+                        count,
+                        children,
+                    }) = self.frames.pop()
+                    && !children.is_empty()
+                {
+                    self.push_node(DynamicNode::Repeat {
+                        id,
+                        param_ref_id,
+                        count,
+                        children,
                     });
                 }
             }
@@ -2284,7 +2728,7 @@ impl DynTreeBuilder {
                     self.frames.pop();
                 }
                 if let (Some(DynFrame::Root(children)), Some(app)) = (self.frames.pop(), app) {
-                    match &self.module_def {
+                    match self.module_defs.last() {
                         Some(md) => {
                             app.module_dynamics.insert(md.clone(), children);
                         }
@@ -2402,22 +2846,20 @@ fn decode_hex_bytes(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Decodes a `LdCtrlRelSegment`'s fill attributes into the pre-fill value to
-/// request.
+/// Decodes a `LdCtrlRelSegment`'s fill attributes into the record's `Mode` and
+/// `Fill` octets.
 ///
-/// The KNX schema spells the allocation's fill as `Mode` (the fill flag: `1`
-/// pre-fills the freshly allocated segment, `0` does not) plus `Fill` (the fill
-/// byte). A real Jung F50 procedure reads
-/// `<LdCtrlRelSegment AppliesTo="full" LsmIdx="4" Size="6152" Mode="1" Fill="0"/>`
-/// and ETS sends `03 0b 00 00 18 08 01 00 00 00` for it: flag set, byte `00`
-/// (issue #123). So when `Mode` is present it decides: non-zero → `Some(Fill)`
-/// (`Fill` defaulting to `0`), zero → `None`.
+/// The KNX schema spells the allocation's fill as `Mode` (bit 0 pre-fills the
+/// freshly allocated segment) plus `Fill` (the fill byte). Both are copied as
+/// given: a Jung F50 procedure reads `Mode="1" Fill="0"` and ETS sends
+/// `03 0b 00 00 18 08 01 00 00 00` (issue #123); `syn-relseg-fill` reads
+/// `Mode="0" Fill="255"` and ETS sends `03 0b 00 00 01 00 00 ff 00 00`
+/// (issue #480). A value that does not parse as an octet is `0`.
 ///
 /// Without a `Mode` attribute the older reading applies: `Fill="1"`/`"true"` is
-/// the flag and `FillByte` the byte (decimal or `0x` hex, default `0`). Any
-/// other value, or no attribute at all, means no pre-fill (the DA.tp shape,
-/// byte-identical to the historical no-fill allocation).
-fn parse_fill(m: &Attrs) -> Option<u8> {
+/// the flag and `FillByte` the byte (decimal or `0x` hex, default `0`). No
+/// attribute at all is [`SegmentFill::NONE`] (the DA.tp shape).
+fn parse_fill(m: &Attrs) -> SegmentFill {
     let byte = |raw: Option<&str>| {
         raw.and_then(|s| {
             let s = s.trim();
@@ -2430,15 +2872,19 @@ fn parse_fill(m: &Attrs) -> Option<u8> {
         .unwrap_or(0)
     };
     if let Some(mode) = get(m, b"Mode") {
-        let on = mode.trim().parse::<u8>().map(|v| v != 0).unwrap_or(false);
-        return on.then(|| byte(get(m, b"Fill")));
+        return SegmentFill {
+            mode: byte(Some(mode)),
+            fill: byte(get(m, b"Fill")),
+        };
     }
-    let raw = get(m, b"Fill")?;
+    let Some(raw) = get(m, b"Fill") else {
+        return SegmentFill::NONE;
+    };
     let on = matches!(raw.trim(), "1" | "true" | "True" | "TRUE");
-    if !on {
-        return None;
+    SegmentFill {
+        mode: u8::from(on),
+        fill: byte(get(m, b"FillByte")),
     }
-    Some(byte(get(m, b"FillByte")))
 }
 
 /// Records the branches the op just appended to the open procedure sits in,
@@ -2478,6 +2924,9 @@ pub(crate) fn push_load_op(cur_lp: &mut Option<LoadProcedure>, e: &BytesStart, m
         b"LdCtrlConnect" => LoadOp::Connect,
         b"LdCtrlDisconnect" => LoadOp::Disconnect,
         b"LdCtrlRestart" => LoadOp::Restart,
+        b"LdCtrlDelay" => LoadOp::Delay {
+            milliseconds: u(b"MilliSeconds"),
+        },
         b"LdCtrlMerge" => LoadOp::Merge {
             merge_id: s(b"MergeId"),
         },
@@ -2503,6 +2952,19 @@ pub(crate) fn push_load_op(cur_lp: &mut Option<LoadProcedure>, e: &BytesStart, m
             address: u(b"Address"),
             count: u(b"Count"),
         },
+        b"LdCtrlTaskPtr" => LoadOp::TaskPtr {
+            lsm_idx: u(b"LsmIdx"),
+            init_ptr: u(b"InitPtr"),
+            save_ptr: u(b"SavePtr"),
+            serial_ptr: u(b"SerialPtr"),
+        },
+        b"LdCtrlTaskCtrl2" => LoadOp::TaskCtrl2 {
+            lsm_idx: u(b"LsmIdx"),
+            callback: u(b"Callback"),
+            address: u(b"Address"),
+            seg0: u(b"Seg0"),
+            seg1: u(b"Seg1"),
+        },
         b"LdCtrlRelSegment" => LoadOp::RelSegment {
             lsm_idx: u(b"LsmIdx"),
             size: u(b"Size"),
@@ -2516,6 +2978,7 @@ pub(crate) fn push_load_op(cur_lp: &mut Option<LoadProcedure>, e: &BytesStart, m
             access: u(b"Access"),
             mem_type: u(b"MemType"),
             seg_flags: u(b"SegFlags"),
+            seg_type: u(b"SegType"),
         },
         b"LdCtrlWriteRelMem" => LoadOp::WriteRelMem {
             obj_idx: u(b"ObjIdx"),
@@ -2545,6 +3008,7 @@ pub(crate) fn push_load_op(cur_lp: &mut Option<LoadProcedure>, e: &BytesStart, m
             mask: get(m, b"Mask").and_then(decode_hex_bytes),
             range: s(b"Range"),
             occurrence: u(b"Occurrence"),
+            start_element: u(b"StartElement"),
         },
         b"LdCtrlCompareRelMem" => LoadOp::CompareRelMem {
             obj_idx: u(b"ObjIdx"),
@@ -2566,12 +3030,29 @@ pub(crate) fn push_load_op(cur_lp: &mut Option<LoadProcedure>, e: &BytesStart, m
             prop_id: u(b"PropId"),
             count: u(b"Count"),
         },
+        b"LdCtrlMapError" => LoadOp::MapError {
+            original_error: get(m, b"OriginalError").and_then(parse_error_code),
+            mapped_error: get(m, b"MappedError").and_then(parse_error_code),
+        },
         other => LoadOp::Raw {
             name: String::from_utf8_lossy(other).into_owned(),
             attrs: ordered_attrs(m),
         },
     };
+    // Keep the scopes parallel to the ops, whatever pushed ops before.
+    lp.applies_to.resize(lp.ops.len(), None);
+    lp.applies_to.push(s(b"AppliesTo"));
     lp.ops.push(op);
+}
+
+/// An ETS error code attribute: decimal as the corpus writes it
+/// (`OriginalError="3221498632"`), or hexadecimal with a `0x` prefix.
+fn parse_error_code(v: &str) -> Option<u32> {
+    let v = v.trim();
+    match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => v.parse::<u32>().ok(),
+    }
 }
 
 /// An XML schema boolean (`true`/`1` are true, everything else false).
@@ -2663,6 +3144,51 @@ mod tests {
         Ok(parse_application_program_str("M-00FA_A-1", SAMPLE)?)
     }
 
+    /// Three com-objects: base `High` overridden to `Low` by its ref, base
+    /// `Alert` kept by a ref that declares none, and one declaring nothing.
+    const PRIORITY_SAMPLE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<KNX xmlns="http://knx.org/xml/project/23">
+ <ManufacturerData><Manufacturer RefId="M-00FA"><ApplicationPrograms>
+  <ApplicationProgram Id="M-00FA_A-2" ApplicationNumber="8" ApplicationVersion="16" MaskVersion="MV-07B0" Name="Prio">
+   <Static>
+    <ComObjectTable>
+     <ComObject Id="M-00FA_A-2_O-0" Number="0" Text="a" ObjectSize="1 Bit" Priority="High" CommunicationFlag="Enabled" />
+     <ComObject Id="M-00FA_A-2_O-1" Number="1" Text="b" ObjectSize="1 Bit" Priority="Alert" CommunicationFlag="Enabled" />
+     <ComObject Id="M-00FA_A-2_O-2" Number="2" Text="c" ObjectSize="1 Bit" CommunicationFlag="Enabled" />
+    </ComObjectTable>
+    <ComObjectRefs>
+     <ComObjectRef Id="M-00FA_A-2_O-0_R-1" RefId="M-00FA_A-2_O-0" Priority="Low" />
+     <ComObjectRef Id="M-00FA_A-2_O-1_R-1" RefId="M-00FA_A-2_O-1" />
+     <ComObjectRef Id="M-00FA_A-2_O-2_R-1" RefId="M-00FA_A-2_O-2" />
+    </ComObjectRefs>
+   </Static>
+  </ApplicationProgram>
+ </ApplicationPrograms></Manufacturer></ManufacturerData>
+</KNX>"#;
+
+    #[test]
+    fn test_insert_com_object_ref_priority_overrides_base()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use bussard_model::Priority;
+        let app = parse_application_program_str("M-00FA_A-2", PRIORITY_SAMPLE)?;
+        let base = app.com_objects.get("M-00FA_A-2_O-0").ok_or("missing O-0")?;
+        assert_eq!(base.priority, Some(Priority::High));
+        let resolved: Vec<(u16, Option<Priority>, Priority)> = app
+            .resolved_com_objects()
+            .iter()
+            .map(|c| (c.number(), c.declared_priority(), c.priority()))
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![
+                (0, Some(Priority::Low), Priority::Low),
+                (1, Some(Priority::Alarm), Priority::Alarm),
+                (2, None, Priority::Low),
+            ]
+        );
+        Ok(())
+    }
+
     #[test]
     fn parses_identity_and_schema() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let app = sample()?;
@@ -2702,7 +3228,7 @@ mod tests {
     fn test_parse_application_program_download_invisible_parameters() -> Result<()> {
         let xml = |options: &str| {
             format!(
-                r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t"><Static>{options}</Static></ApplicationProgram></KNX>"#
+                r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t" MaskVersion="MV-07B0"><Static>{options}</Static></ApplicationProgram></KNX>"#
             )
         };
         for (options, declared, partial, writes) in [
@@ -2786,6 +3312,92 @@ mod tests {
         Ok(())
     }
 
+    /// Issue #448: without the attributes, a System B program writes hidden
+    /// defaults at every schema, a System 7 one from project/21 on; another
+    /// mask never does.
+    #[test]
+    fn test_downloads_invisible_parameters_by_system_and_schema() -> Result<()> {
+        for (mask, schema, writes) in [
+            ("07B0", "11", true),
+            ("07B0", "20", true),
+            ("07B0", "23", true),
+            ("0705", "11", false),
+            ("0705", "20", false),
+            ("0705", "21", true),
+            ("0705", "23", true),
+            ("0701", "20", false),
+            ("0701", "23", true),
+            ("0700", "23", true),
+            ("0021", "23", false),
+            ("0912", "23", false),
+        ] {
+            let xml = format!(
+                r#"<KNX xmlns="http://knx.org/xml/project/{schema}"><ApplicationProgram Id="M-1_A-1" Name="t" MaskVersion="MV-{mask}"><Static><Options Comparable="true" /></Static></ApplicationProgram></KNX>"#
+            );
+            let app = parse_application_program_str("M-1_A-1", &xml)?;
+            assert_eq!(app.schema_number(), schema.parse().ok(), "{mask} {schema}");
+            assert_eq!(
+                app.downloads_invisible_parameters(),
+                writes,
+                "{mask} {schema}"
+            );
+            let background = xml.replace(
+                r#"Comparable="true""#,
+                r#"DownloadInvisibleParameters="Background""#,
+            );
+            let app = parse_application_program_str("M-1_A-1", &background)?;
+            assert!(!app.downloads_invisible_parameters(), "{mask} {schema}");
+        }
+        // No namespace: no schema version, so System 7 keeps the template.
+        let xml = r#"<KNX><ApplicationProgram Id="M-1_A-1" Name="t" MaskVersion="MV-0705"><Static /></ApplicationProgram></KNX>"#;
+        let app = parse_application_program_str("M-1_A-1", xml)?;
+        assert_eq!(app.schema_number(), None);
+        assert!(!app.downloads_invisible_parameters());
+        Ok(())
+    }
+
+    /// `SupportsExtendedMemoryServices` decides the memory service above
+    /// `0xFFFF` (issue #472); absent means no.
+    #[test]
+    fn test_parse_application_program_supports_extended_memory_services() -> Result<()> {
+        for (options, expected) in [
+            (r#"<Options SupportsExtendedMemoryServices="true" />"#, true),
+            (
+                r#"<Options SupportsExtendedMemoryServices="false" />"#,
+                false,
+            ),
+            (r#"<Options Comparable="true" />"#, false),
+        ] {
+            let xml = format!(
+                r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t"><Static>{options}</Static></ApplicationProgram></KNX>"#
+            );
+            let app = parse_application_program_str("M-1_A-1", &xml)?;
+            assert_eq!(app.supports_extended_memory_services, expected, "{options}");
+        }
+        Ok(())
+    }
+
+    /// `<Extension EtsDownloadPlugin="">` marks the program (issue #565);
+    /// an `<Extension>` without the attribute does not.
+    #[test]
+    fn test_parse_application_program_ets_download_plugin() -> Result<()> {
+        for (extension, expected) in [
+            (
+                r#"<Extension EtsDownloadPlugin="" EtsUiPlugin="" EtsDataHandler="" />"#,
+                true,
+            ),
+            (r#"<Extension EtsUiPlugin="" />"#, false),
+            ("", false),
+        ] {
+            let xml = format!(
+                r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t"><Static>{extension}<Options /></Static></ApplicationProgram></KNX>"#
+            );
+            let app = parse_application_program_str("M-1_A-1", &xml)?;
+            assert_eq!(app.ets_download_plugin, expected, "{extension}");
+        }
+        Ok(())
+    }
+
     /// `DynamicTableManagement` comes in both spellings: `1` on the Jung
     /// `A-2088`, `true` on the Theben Meteodata `A-140C` (issue #383).
     #[test]
@@ -2803,6 +3415,45 @@ mod tests {
             let app = parse_application_program_str("M-1_A-1", &xml)?;
             assert_eq!(app.dynamic_table_management, expected, "{attr}");
         }
+        Ok(())
+    }
+
+    /// Issue #537: the Data Secure table capacities, absent when undeclared.
+    #[test]
+    fn test_parse_application_program_security_capacity() -> Result<()> {
+        let xml = r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t" IsSecureEnabled="true" MaxSecurityGroupKeyTableEntries="1500" MaxSecurityIndividualAddressEntries="5000" MaxSecurityP2PKeyTableEntries="100"><Static /></ApplicationProgram></KNX>"#;
+        let app = parse_application_program_str("M-1_A-1", xml)?;
+        assert_eq!(
+            app.security_capacity,
+            SecurityCapacity {
+                group_key_table_entries: Some(1500),
+                individual_address_entries: Some(5000),
+                p2p_key_table_entries: Some(100),
+            }
+        );
+        let plain = r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t"><Static /></ApplicationProgram></KNX>"#;
+        assert!(
+            parse_application_program_str("M-1_A-1", plain)?
+                .security_capacity
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    /// Issue #455: `AdditionalAddressesCount` (5 on the Zennio ALLinBOX 1612
+    /// `M-0071_A-4A11-13-48E1`), absent when undeclared.
+    #[test]
+    fn test_parse_application_program_additional_addresses_count() -> Result<()> {
+        let xml = |attr: &str| {
+            format!(
+                r#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-1_A-1" Name="t"{attr}><Static /></ApplicationProgram></KNX>"#
+            )
+        };
+        let app =
+            parse_application_program_str("M-1_A-1", &xml(r#" AdditionalAddressesCount="5""#))?;
+        assert_eq!(app.additional_addresses_count, Some(5));
+        let app = parse_application_program_str("M-1_A-1", &xml(""))?;
+        assert_eq!(app.additional_addresses_count, None);
         Ok(())
     }
 
@@ -2914,10 +3565,12 @@ mod tests {
             }
         ));
         assert!(matches!(kind("M-00FA_A-1_PT-none")?, ParameterType::None));
-        match kind("M-00FA_A-1_PT-col")? {
-            ParameterType::Other { kind, .. } => assert_eq!(kind, "TypeColor"),
-            other => panic!("expected other, got {other:?}"),
-        }
+        assert!(matches!(
+            kind("M-00FA_A-1_PT-col")?,
+            ParameterType::Color {
+                space: ColorSpace::Rgb
+            }
+        ));
         Ok(())
     }
 
@@ -3055,6 +3708,24 @@ mod tests {
     }
 
     #[test]
+    fn test_push_load_op_delay_is_typed() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // `LdCtrlDelay MilliSeconds` parses as a typed pause, not a Raw op the
+        // planner refuses (issue #615); the DeclarePropDesc beside it stays Raw.
+        let xml = include_bytes!("../tests/fixtures/ldctrl_declare_prop_desc_and_delay.app.xml");
+        let app = parse_application_program("M-00FA_A-0004-11-ABCD-O000A", xml)?;
+        let ops = &app.load_procedures[0].ops;
+        assert!(ops.contains(&LoadOp::Delay {
+            milliseconds: Some(1000)
+        }));
+        assert!(
+            ops.iter().any(
+                |op| matches!(op, LoadOp::Raw { name, .. } if name == "LdCtrlDeclarePropDesc")
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
     fn parses_load_image_prop_variants() -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Both the ObjIdx form (MDT A-0007, Jung 23024) and the ObjType +
         // Occurrence system-object form, plus a Count attribute.
@@ -3130,7 +3801,7 @@ mod tests {
         // The Jung LED A-3030 shape: the code segment (obj4) sets Fill="1" so the
         // device pre-fills the allocation (obj4 alloc `030b000028c1 01 00 0000`),
         // while the table objects keep Fill="0". A procedure with no `Fill`
-        // attribute (the DA.tp shape) parses to `None` so the historical no-fill
+        // attribute (the DA.tp shape) parses to `SegmentFill::NONE` so the no-fill
         // allocation is byte-identical.
         let xml = r#"<KNX xmlns="http://knx.org/xml/project/23">
          <ApplicationProgram Id="M-1_A-1" Name="x">
@@ -3147,20 +3818,35 @@ mod tests {
         assert!(matches!(
             ops[0],
             LoadOp::RelSegment {
-                fill: Some(0),
+                fill: SegmentFill { mode: 1, fill: 0 },
                 lsm_idx: Some(4),
                 ..
             }
         ));
-        // Fill="0" → None (no pre-fill).
-        assert!(matches!(ops[1], LoadOp::RelSegment { fill: None, .. }));
-        // Fill absent → None (the DA.tp default).
-        assert!(matches!(ops[2], LoadOp::RelSegment { fill: None, .. }));
+        // Fill="0" → mode 0 (no pre-fill).
+        assert!(matches!(
+            ops[1],
+            LoadOp::RelSegment {
+                fill: SegmentFill::NONE,
+                ..
+            }
+        ));
+        // Fill absent → NONE (the DA.tp default).
+        assert!(matches!(
+            ops[2],
+            LoadOp::RelSegment {
+                fill: SegmentFill::NONE,
+                ..
+            }
+        ));
         // Fill="1" with an explicit hex FillByte.
         assert!(matches!(
             ops[3],
             LoadOp::RelSegment {
-                fill: Some(0xAB),
+                fill: SegmentFill {
+                    mode: 1,
+                    fill: 0xAB
+                },
                 ..
             }
         ));
@@ -3179,19 +3865,35 @@ mod tests {
            <LdCtrlRelSegment AppliesTo="full" LsmIdx="4" Size="6152" Mode="1" Fill="0" />
            <LdCtrlRelSegment AppliesTo="par" LsmIdx="4" Size="6152" Mode="0" Fill="0" />
            <LdCtrlRelSegment LsmIdx="4" Size="2" Mode="1" Fill="255" />
+           <LdCtrlRelSegment LsmIdx="4" Size="256" Mode="0" Fill="255" />
           </LoadProcedure></LoadProcedures>
          </ApplicationProgram></KNX>"#;
         let app = parse_application_program_str("M-1_A-1", xml)?;
         let ops = &app.load_procedures[0].ops;
-        assert!(matches!(ops[0], LoadOp::RelSegment { fill: Some(0), .. }));
-        assert!(matches!(ops[1], LoadOp::RelSegment { fill: None, .. }));
-        assert!(matches!(
-            ops[2],
-            LoadOp::RelSegment {
-                fill: Some(0xFF),
-                ..
-            }
-        ));
+        let fills: Vec<SegmentFill> = ops
+            .iter()
+            .filter_map(|op| match op {
+                LoadOp::RelSegment { fill, .. } => Some(*fill),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fills,
+            vec![
+                SegmentFill::filled(0),
+                SegmentFill::NONE,
+                SegmentFill::filled(0xFF),
+                SegmentFill {
+                    mode: 0,
+                    fill: 0xFF
+                },
+            ]
+        );
+        assert_eq!(fills[0].prefill(), Some(0));
+        assert_eq!(fills[1].prefill(), None);
+        // Mode 0 with a Fill octet: no pre-fill, but the octet is kept for
+        // the record (ETS sends `00 ff` for `syn-relseg-fill`, issue #480).
+        assert_eq!(fills[3].prefill(), None);
         Ok(())
     }
 
@@ -3246,6 +3948,7 @@ mod tests {
             id,
             module_def,
             args,
+            ..
         } = &inner[0].children[0]
         else {
             panic!("expected a module");
@@ -3937,6 +4640,37 @@ mod tests {
                 verify: Some(false),
                 count: None,
                 ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_task_ptr_and_task_ctrl2() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let xml = br#"<KNX xmlns="http://knx.org/xml/project/20"><ApplicationProgram Id="M-00FA_A-0003" MaskVersion="MV-0701">
+          <Static><LoadProcedures><LoadProcedure>
+            <LdCtrlTaskPtr LsmIdx="3" InitPtr="284" SavePtr="285" SerialPtr="0" />
+            <LdCtrlTaskCtrl2 LsmIdx="3" Callback="20609" Address="282" Seg0="208" Seg1="200" />
+          </LoadProcedure></LoadProcedures></Static></ApplicationProgram></KNX>"#;
+        let app = parse_application_program("M-00FA_A-0003", &xml[..])?;
+        let ops = &app.load_procedures.first().ok_or("a procedure")?.ops;
+        assert!(matches!(
+            ops[0],
+            LoadOp::TaskPtr {
+                lsm_idx: Some(3),
+                init_ptr: Some(284),
+                save_ptr: Some(285),
+                serial_ptr: Some(0),
+            }
+        ));
+        assert!(matches!(
+            ops[1],
+            LoadOp::TaskCtrl2 {
+                lsm_idx: Some(3),
+                callback: Some(20609),
+                address: Some(282),
+                seg0: Some(208),
+                seg1: Some(200),
             }
         ));
         Ok(())

@@ -23,6 +23,7 @@ mod flash_cmd;
 mod flash_dump;
 mod flash_handover;
 mod flash_params;
+mod flash_resident;
 mod groups_cmd;
 mod ha_config_cmd;
 mod history_cmd;
@@ -52,6 +53,7 @@ mod restart_cmd;
 mod restore_cmd;
 
 mod scan_cmd;
+mod secure_diag_cmd;
 mod secure_key;
 mod status_cmd;
 mod test_cmd;
@@ -154,11 +156,11 @@ struct Global {
     /// `--secure-user` password (never the password itself).
     #[arg(long, global = true, value_name = "VAR")]
     secure_password_env: Option<String>,
-    /// KNXnet/IP Secure: the carrier of the secure session. Default `auto`:
-    /// TCP, the only carrier tested against a real interface; an interface
-    /// that refuses TCP but advertises Secure is reported, never switched to
-    /// UDP on its own. `udp` is an explicit opt-in, verified against knx-sim
-    /// only (issue #197).
+    /// KNXnet/IP Secure: how the secure session's TCP connect is handled.
+    /// A unicast secure session runs over TCP only (KNX IP Secure 3/8/9
+    /// §2.2.3.3, issue #513). Default `auto`: an interface that refuses TCP
+    /// but advertises Secure is reported with the likely causes; `tcp`
+    /// reports the refusal as it is.
     #[arg(long, global = true, value_enum, value_name = "TRANSPORT")]
     secure_transport: Option<SecureTransportArg>,
 }
@@ -166,12 +168,10 @@ struct Global {
 /// The `--secure-transport` values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum SecureTransportArg {
-    /// TCP; names `udp` when TCP is refused and the interface advertises Secure.
+    /// TCP; explains a refused connect when the interface advertises Secure.
     Auto,
-    /// TCP only.
+    /// TCP, a refused connect reported as it is.
     Tcp,
-    /// UDP only (verified against knx-sim only).
-    Udp,
 }
 
 impl From<SecureTransportArg> for bussard_transport::SecureTransport {
@@ -179,7 +179,6 @@ impl From<SecureTransportArg> for bussard_transport::SecureTransport {
         match arg {
             SecureTransportArg::Auto => bussard_transport::SecureTransport::Auto,
             SecureTransportArg::Tcp => bussard_transport::SecureTransport::Tcp,
-            SecureTransportArg::Udp => bussard_transport::SecureTransport::Udp,
         }
     }
 }
@@ -218,6 +217,7 @@ impl Command {
             | Command::Plan { .. }
             | Command::Apply { .. }
             | Command::Interface { .. }
+            | Command::Secure { .. }
             | Command::Commission { .. }
             | Command::Backup { .. }
             | Command::Restore { .. }
@@ -254,6 +254,9 @@ impl Command {
             | Command::Restore { tool_key, .. }
             | Command::Restart { tool_key, .. }
             | Command::Replace { tool_key, .. } => tool_key.is_some(),
+            Command::Secure {
+                command: SecureCommand::Diag { tool_key, .. },
+            } => tool_key.is_some(),
             _ => false,
         }
     }
@@ -312,6 +315,7 @@ impl Command {
                 | Command::Validate { .. }
                 | Command::Groups { .. }
                 | Command::Interface { .. }
+                | Command::Secure { .. }
                 | Command::Doc { .. }
                 | Command::Monitor { .. }
                 | Command::Test { .. }
@@ -645,6 +649,36 @@ enum KeysCommand {
     Show,
 }
 
+/// The `bussard secure` subcommands (issue #533).
+#[derive(Debug, Subcommand)]
+enum SecureCommand {
+    /// Read a Data Secure device's security failures log (PID 55: the
+    /// sequence, cryptographic and access error counters and the latest
+    /// failure), its security report (PID 57) and whether it broadcasts the
+    /// report (PID 58), with its tool key.
+    ///
+    /// After a secured write that did nothing, the counts tell the causes
+    /// apart: no new count means the sender is not in the device's security
+    /// individual address table, a cryptographic count a wrong or stale group
+    /// key, an access count a group-object security flag mismatch.
+    Diag {
+        /// The device, e.g. `1.1.5`.
+        #[arg(value_name = "ADDRESS")]
+        address: String,
+        /// Clear the log and reset the report after a confirmation, then read
+        /// both back.
+        #[arg(long)]
+        clear: bool,
+        /// Skip the confirmation prompt of --clear.
+        #[arg(long)]
+        yes: bool,
+        /// The raw 32-hex-character KNX Data Secure tool key, for a test
+        /// device. Prefer `--keyring`.
+        #[arg(long, value_name = "HEX", conflicts_with = "keyring")]
+        tool_key: Option<String>,
+    },
+}
+
 /// The `bussard interface` subcommands (issue #398).
 #[derive(Debug, Subcommand)]
 enum InterfaceCommand {
@@ -812,6 +846,10 @@ enum Command {
         /// bench device: process arguments are visible to other users.
         #[arg(long, value_name = "HEX")]
         tool_key: Option<String>,
+        /// Write the address although another device already answers at it
+        /// (the check is step 1 of the standard's address write, issue #530).
+        #[arg(long)]
+        force: bool,
     },
     /// Read a device's tables back over the bus and diff them against the model,
     /// or (with `--line`) sweep a whole line and synthesize a fresh model.
@@ -936,6 +974,10 @@ enum Command {
         /// it without (identity and links by number) and say where to get it.
         #[arg(long)]
         no_download: bool,
+        /// Write the address although another device already answers at it
+        /// (the check is step 1 of the standard's address write, issue #530).
+        #[arg(long)]
+        force: bool,
     },
     /// Download the full application program into a device (a fresh device, or
     /// one whose application changes). Everyday changes go through `apply`.
@@ -984,9 +1026,11 @@ enum Command {
         #[arg(long)]
         no_factory_reset: bool,
         /// Rewrite only the parameter memory of a device that already runs this
-        /// application (issue #119): no unload, no segment allocation, no table
-        /// write. Only the octets that differ from what the device holds are
-        /// written, then the load completes and the device restarts. Refused when
+        /// application (issue #119): no table write. On System B it runs the
+        /// standard's partial download (unload, load, Mode 0 re-allocation that
+        /// keeps the memory, issue #543). Only the octets that differ from what
+        /// the device holds are written, then the load completes and the device
+        /// restarts. Refused when
         /// the device runs another application or is not Loaded, and when a
         /// changed parameter shows or hides a com-object (that needs a full flash).
         /// The parameter memory is backed up first. With `--dry-run`, prints the
@@ -1022,6 +1066,15 @@ enum Command {
         /// flash would stream (one `.bin` each, plus the table images) into DIR.
         #[arg(long, value_name = "DIR", requires = "dry_run")]
         dump_images: Option<PathBuf>,
+        /// With `--dry-run`, plan against the device state recorded in FILE
+        /// (JSON: the application objects' load states, the application id
+        /// and the MCB entries, as `knxtrace image` writes it from an ETS
+        /// capture) instead of no device: the freshness verdict, the
+        /// product's `par` procedure for a device holding this application,
+        /// and the skip of objects whose image already matches take the shape
+        /// a live flash takes on that device (issue #490).
+        #[arg(long, value_name = "FILE", requires = "dry_run")]
+        resident: Option<PathBuf>,
     },
     /// Show what `apply` would write to a device (links and, with product
     /// data, parameters) without writing; or (with `--line`) plan every model
@@ -1314,6 +1367,11 @@ enum Command {
     Interface {
         #[command(subcommand)]
         command: InterfaceCommand,
+    },
+    /// KNX Data Secure device diagnostics: `secure diag <address>`.
+    Secure {
+        #[command(subcommand)]
+        command: SecureCommand,
     },
     /// Export the group-address plan in a format ETS can import.
     ExportGroups {
@@ -1670,12 +1728,16 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
             address,
             yes,
             tool_key,
+            force,
         } => assign_cmd::run(
             address.as_deref(),
             dir,
-            yes,
-            g.allow_remote_gateway,
-            json,
+            assign_cmd::AssignFlags {
+                yes,
+                allow_remote_gateway: g.allow_remote_gateway,
+                json,
+                force,
+            },
             // `--tool-key` overrides the keyring's device entries; the keyring
             // still opens a KNXnet/IP Secure tunnel (issue #203).
             secure_key::ToolKeySource {
@@ -1758,11 +1820,13 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
             yes,
             yes_download,
             no_download,
+            force,
         } => adopt_cmd::run(
             adopt_cmd::AdoptOptions {
                 address: address.as_deref(),
                 product: product.as_deref(),
                 yes,
+                force,
                 consent: product_fetch::Consent {
                     yes_download,
                     no_download,
@@ -1788,6 +1852,7 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
             secure_sender,
             dry_run,
             dump_images,
+            resident,
         } => flash_cmd::run(
             &address,
             product.as_deref(),
@@ -1807,7 +1872,10 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
             flash_cmd::FlashOutput {
                 json,
                 verbose: g.verbose,
-                dry_run: dry_run.then_some(flash_cmd::DryRun { dump_images }),
+                dry_run: dry_run.then_some(flash_cmd::DryRun {
+                    dump_images,
+                    resident,
+                }),
             },
         ),
         Command::Plan {
@@ -2053,6 +2121,23 @@ fn run(command: Command, g: &Resolved) -> anyhow::Result<ExitCode> {
                     json,
                 },
                 &g.mgmt(),
+            ),
+        },
+        Command::Secure { command } => match command {
+            SecureCommand::Diag {
+                address,
+                clear,
+                yes,
+                tool_key,
+            } => secure_diag_cmd::run(
+                &address,
+                dir,
+                json,
+                clear,
+                yes,
+                g.allow_remote_gateway,
+                g.tool_keys(tool_key.as_deref()),
+                g.mgmt(),
             ),
         },
         Command::ExportGroups { format, out } => export_groups_cmd::run(dir, format, &out),

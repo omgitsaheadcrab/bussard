@@ -88,8 +88,8 @@ download` path.
 Phase A delivers:
 
 1. **Importer stops dropping secure material** (`bussard-ets` / `bussard-prod`):
-   preserve `IsSecureEnabled` and `MaxSecurity*` sizing attrs (currently
-   dropped, zero references in any crate `[corpus §1]`); surface FDSK-certificate
+   preserve `IsSecureEnabled` and `MaxSecurity*` sizing attrs (both kept
+   now; the sizing since #537, see §11); surface FDSK-certificate
    presence and `<Security>` seqnum state from the knxproj import. **Flags and
    structure only in the committed model files** - key values must NEVER touch `knx/` (a
    reviewable, committed tree). See §2 and §11.
@@ -492,8 +492,10 @@ tunnel management path, secure-1-1-12 capture, 2026-09-23]`. The inner APDU
 starts with `000000b` in the six bits above the APCI; after a positive MAC
 check the receiver also verifies those six bits are zero and drops the frame
 otherwise, without a failure count and with the sequence still accepted
-(§5.2.1.4, `[TSS J §3.1.12]`). bussard's decoder masks the bits instead of
-checking them (`asdu.rs` `parse_inner_apdu`); harmless for a tool, a sim gap (#535).
+(§5.2.1.4, `[TSS J §3.1.12]`). bussard's decoder and knx-sim's check them
+(`AsduError::ReservedBits`, `SecureError::ReservedBits`, #535): the frame is
+refused, its sequence still moves the freshness table, the sim logs the drop
+without a failure count.
 The Sync services reuse this frame with a different body, see §6.3.
 
 ### 5.4 CCM nonce (block_0) for TP frames `[XKNX data_secure_asdu.py, CONFIRMED]`
@@ -649,7 +651,14 @@ device stores it as PID 59 `[KNX 3/5/1 §6.3.13]`, the tool-access counter it
 accepts from ETS/bussard separately and outside any property (§6.2, readable
 only through the Sync). The millisecond clock is what ETS writes into PID 59
 at activation and into PID 54 entries, and what bussard uses for its own
-counter (§5.9); any strictly increasing value would do.
+counter (§5.9); any strictly increasing value would do. bussard never lowers
+the counter: it writes `max(clock, the device's next sequence)`, the latter
+from the Sync_Res and every frame the device sent since (#535; the tool syncs
+first and then sets, `[KNX 3/3/7 §5.3.1]`). The device protects the
+confirmation of that write already with the value written `[KNX 3/5/1
+§6.3.13.3 NOTE 110]`, so bussard moves its freshness floor for the device to
+it before the request goes out (`bussard_mgmt::ip_secure::write_sequence_number`,
+the one PID 59 write path; the end-device activation of #201 reuses it).
 
 ### 5.9 Sequence seeding (no persistence)
 
@@ -799,7 +808,16 @@ fails under one key ETS retries it under the other (tool key ↔ FDSK, `[KNX
 3/5/2 §4.1 NOTE 18]`): that is how a device somebody reset to default is
 found again. bussard's retry policy (three attempts, 1 s then 2 s backoff,
 issue #166) is a deliberate deviation for devices that T_ACK before their
-security layer is up; it never falls back to the FDSK (#532).
+security layer is up. After those attempts, when the key store holds the
+device's FDSK, bussard sends one more Sync_Req (a fresh challenge, same
+connection) under the FDSK (#532). A Sync_Res that verifies there means the
+device was reset to default (erase code 02h or the local reset drop the tool
+key and make the FDSK active again, `[KNX 3/5/1 §6.1.4, §6.3.10.4 NOTE 108;
+AN194 §2.3.2.12]`): the session ends with `MgmtError::FactoryKeyActive`,
+which names the state and the next step, and nothing is read or written
+under the FDSK outside an explicit activation. The converse, a device the
+model does not mark activated that refuses plain access, is tried under the
+FDSK too (`describe`), before the "export a keyring" advice.
 
 bussard: `DataSecureSession::sync_request` builds the request with a fresh
 challenge; `unwrap` applies a verified Sync_Res (send sequence =
@@ -886,7 +904,7 @@ pcap and keyring from the environment) re-checks every CONFIRMED row.
 | ETS sends DISCONNECT and closes TCP without a SESSION_STATUS close | CONFIRMED (bussard also sends `STATUS_CLOSE`, as XKNX does) | last frames of session 3 |
 | SESSION_AUTHENTICATE MAC (§7.5) and SecureWrapper `additional_data` (§8.2) | INFERRED (XKNX, which works against real interfaces; three independent implementations agree on vectors: bussard, knx-sim, a Python script) | not checkable without the session key |
 | Session idle timeout 60 s; keepalive every 30 s (wrapped `STATUS_KEEPALIVE`) is adequate | CONFIRMED (live, read-only, 2026-09-25, #197): `bussard test --secure-idle` against 1.1.200 found the TCP session alive after 45 s idle and dropped with a wrapped `STATUS_TIMEOUT` at 59.97 s, 3 of 3 runs (`SECURE_SESSION_TIMEOUT`). Configurable (`SecureTunnelConfig::keepalive`, `BUSSARD_SECURE_KEEPALIVE_SECS`, `0` = none); an interval of 60 s or more is warned about at connect | the capture's sessions last seconds; the timeout was measured with the idle probe (§8.3) |
-| Secure session over **UDP** (#197): SESSION_REQUEST with the client's UDP HPAI, the tunnel's control/data HPAIs as on a plain UDP tunnel, TUNNELING_ACK inside SECURE_WRAPPERs in both directions, TIMER_NOTIFY ignored on unicast | **NOT ALLOWED by the standard** (3/8/9 KNX IP Secure §2.2.3.3: unicast sessions use TCP, not UDP; §2.2.3.6.4: a SESSION_REQUEST received over UDP, or with any HPAI but the TCP route-back one, is discarded; TSSK test 2.2.25). Only knx-sim and the testkit mock answer it; a conforming interface never will (#513) | no UDP-only interface exists by specification; the Jung interface serves TCP. The opt-in `--secure-transport udp` and the `SecureTcpRefused` hint are to be retired (#513) |
+| Secure session over **UDP** (#197): SESSION_REQUEST with the client's UDP HPAI, the tunnel's control/data HPAIs as on a plain UDP tunnel, TUNNELING_ACK inside SECURE_WRAPPERs in both directions, TIMER_NOTIFY ignored on unicast | **NOT ALLOWED by the standard** (3/8/9 KNX IP Secure §2.2.3.3: unicast sessions use TCP, not UDP; §2.2.3.6.4: a SESSION_REQUEST received over UDP, or with any HPAI but the TCP route-back one, is discarded; TSSK test 2.2.25). A conforming interface never answers it (#513) | no UDP-only interface exists by specification; the Jung interface serves TCP. Retired in #513: the opt-in `--secure-transport udp`, the `SecureTcpRefused` hint naming it, and the UDP sessions of knx-sim and the testkit mock (which now discard a SESSION_REQUEST over UDP, as TSSK 2.2.25 expects) |
 
 What ETS did in session 3 was a **device management** connection to the
 interface (CRI `02 03`: 24-octet CONNECT_REQUEST, 18-octet response; 3/8/3
@@ -904,7 +922,7 @@ The client (`crates/bussard-transport/src/secure.rs`, `tunnel.rs`):
    selects the secure tunnel; the user whose tunnel address is a free slot is
    preferred. With `--secure-user`/`--secure-password-env`, go secure directly.
 2. TCP connect (the only carrier the standard allows, 3/8/9 §2.2.3.3; the
-   UDP socket of #197 is a sim-only artefact, #513); SESSION_REQUEST with a
+   UDP carrier of #197 was removed in #513); SESSION_REQUEST with a
    fresh X25519 key. Each of SESSION_RESPONSE and the authentication
    SESSION_STATUS is waited for at most 10 s (3/8/9 §2.2.3.6.1, §2.2.3.8.1);
    a failed authentication needs a new session with a new key pair, never a
@@ -950,7 +968,11 @@ The status table in 3/8/1 Overview §5.5 lists CLOSE as 04h and KEEPALIVE as
 interface (which keeps a session alive on 04h for well over 60 s) agree on
 the values above, so the Overview table is taken to be the misprint.
 SESSION_STATUS is only ever sent wrapped (§2.2.3.9.2); a plain one is not a
-valid session event (#522).
+valid session event. bussard logs and drops a plain SESSION_STATUS in the
+handshake and in an established session; neither an authentication verdict
+nor a session end is taken from one (#522). SESSION_RESPONSE must be exactly
+56 octets and SESSION_AUTHENTICATE exactly 24 (§2.2.3.7.5, §2.2.3.8.5); a
+malformed SESSION_RESPONSE is discarded, not fatal.
 
 ### 7.2 ECDH session-key derivation `[XKNX ip_secure.py, CONFIRMED]`
 
@@ -1028,7 +1050,8 @@ message_authentication_code 16 bytes
 `MESSAGE_AUTHENTICATION_CODE_LENGTH = 16`; fixed overhead beyond the wrapped
 payload = 32 octets, so the smallest valid wrapper is 44 octets (6 header +
 16 security information + a 6-octet inner header + 16 MAC); anything shorter
-is discarded (3/8/9 §2.2.1.3.3). bussard's `MIN_WRAPPER_LEN` is 38 (#522).
+is discarded (3/8/9 §2.2.1.3.3). bussard's `MIN_WRAPPER_LEN` is 44
+and a shorter wrapper is discarded before the MAC check (#522).
 
 ### 8.2 Crypto blocks
 
@@ -1055,26 +1078,18 @@ the wrapped SESSION_AUTHENTICATE, so the session never authenticates.
   SESSION_RESPONSE. `message_tag` = 0 for tunnelling `[CONFIRMED]`. Replay
   protection = never accept a sequence below the next expected one. bussard
   runs unicast over TCP first, as ETS does with this interface.
-- **Unicast (UDP)** `[NOT ALLOWED: 3/8/9 §2.2.3.3 and §2.2.3.6.4; sim-only, #513]`:
+- **Unicast (UDP)** `[NOT ALLOWED: 3/8/9 §2.2.3.3 and §2.2.3.6.4; removed, #513]`:
   the standard reserves unicast secure sessions to TCP, because the
   strictly-increasing sequence rule loses reordered datagrams; a conforming
-  server discards a SESSION_REQUEST that arrives over UDP. What follows
-  describes the knx-sim/mock behaviour bussard's opt-in was written against,
-  kept for the record until #513 removes it: the same session on
-  one UDP socket connected to the control endpoint. SESSION_REQUEST carries the
-  socket's real HPAI (`08 01 <ip> <port>`), CONNECT names it as control and
-  data endpoint, and the tunnelling layer keeps its TUNNELING_ACKs (wrapped).
-  A reordered datagram fails the strictly-increasing replay check and is
-  dropped; the ACK/retransmit layer recovers it. Every frame goes to the
-  control endpoint; the CONNECT_RESPONSE data endpoint is not used (as on the
-  plain UDP tunnel). Frames that precede the CONNECT_RESPONSE inside the
-  session (a TUNNELLING_FEATURE_INFO, say) are skipped, as over TCP.
-  Selection: `--secure-transport auto` (default) is TCP only; when the TCP
-  connect is refused and the extended search advertises the security family,
-  it fails with `SecureTcpRefused`, which names `--secure-transport udp`, and
-  never switches to UDP on its own. `--secure-transport udp` is the explicit
-  opt-in. No real interface can be tested over UDP: the specification
-  excludes the carrier, so there is nothing left to capture.
+  server discards a SESSION_REQUEST that arrives over UDP (TSSK 2.2.25).
+  bussard's opt-in UDP carrier (#197) and the UDP sessions of knx-sim and
+  the testkit mock were removed in #513; both now discard a SESSION_REQUEST
+  over UDP. `--secure-transport` keeps `auto` (default) and `tcp`, both TCP:
+  with `auto` a TCP connect refused by an interface whose extended search
+  advertises the security family fails with `SecureTcpRefused`, which says
+  the session is TCP-only and names the likely causes (secure tunnelling
+  disabled, the interface's TCP connections taken, Core §8.4.3.1, or a
+  different device at that address).
 - The wrapper sits at the `frame()`/`do_send` seam in
   `crates/bussard-transport/src/tunnel.rs:279` - the plain tunnelling frame is
   built as today, then wrapped in a SecureWrapper before the socket write, and
@@ -1184,9 +1199,16 @@ together (a bigger change). `[research §6.2, CONFIRMED crate licenses/versions]
 Cheap, independent of the crypto, do first `[corpus §5]`:
 
 - `bussard-prod`/`bussard-ets`: preserve `ApplicationProgram/@IsSecureEnabled`
-  and the `MaxSecurity{IndividualAddress,GroupKeyTable,P2PKey}Entries` sizing
-  attrs (currently dropped). Surface them as a `secure` flag + sizing on the
-  model.
+  and the `MaxSecurity{GroupKeyTable,IndividualAddress,P2PKeyTable}Entries`
+  sizing attrs. Done (#537): `ApplicationProgram::security_capacity`, the
+  product model's `data_secure:` (format 9) and `describe`'s `tables`. A
+  download checks the group key table (PID 53) and the security individual
+  address table (PID 54) against them before anything is opened; when the
+  product gives no figure, it reads the property description's
+  `max_nr_of_elem` over the tool-key connection (`[AN193 §2.2.4.4]`; the
+  capacity is the device's, `[KNX 3/5/1 §6.3.7, §6.3.8]`) and checks that.
+  `apply`, `flash` and the MCP plan refuse with the product figures before
+  they connect.
 - knxproj import: surface `<DeviceCertificate>` **presence** (a boolean "has
   FDSK") and the `<Security SequenceNumber SequenceNumberTimestamp>` state per
   device.
@@ -1245,7 +1267,7 @@ telegram and confirms every secured group transmission negatively, while the
 tool key and the security mode stay valid `[KNX 3/5/1 §6.3.4 NOTE 97, §6.3.7.4,
 §6.3.8.4, §6.3.10.4; KNX 3/3/7 §5.5.2 items 2 and 3]`; so between bussard's
 `Unload` and `LoadCompleted`, and after an apply that failed in between, the
-device is deaf and mute on its secured group addresses (the read-back does not yet check that state, #534). Master reset
+device is deaf and mute on its secured group addresses. The read-back after every apply and flash therefore reads the state (`A_FunctionPropertyExt_State_Read` PID 5, falling back to `A_PropertyExtValue_Read` element 1, `[KNX 3/5/1 §4.23.2.3.1]`) and is not verified unless it answers Loaded; a write that fails after the `Unload` names that consequence (#534). Master reset
 `[AN194 §2.3.2.13]`: erase codes 02h, 07h and the local reset clear PID 52, 53,
 54, 60, 61 and the load state and reset PID 55, 57, 58; 02h and the local
 reset also drop the tool key (FDSK active again), switch the security mode
@@ -1340,6 +1362,18 @@ The key tables (PID 53, PID 56) are never read: knx-sim refuses those reads
 with count 0, as a real device is expected to. Whether a real device serves
 multi-element reads of PID 61 and PID 54 has not been observed yet; the halving
 falls back to single elements if it does not.
+
+**Diagnostics (PID 55, 57, 58)** `[KNX 3/5/1 §6.3.9, §6.3.11, §6.3.12; bussard + knx-sim, no capture yet; issue #533]`.
+`bussard secure diag <ia>`, `status <ia>` and `knx_describe_device` read
+the security failures log with `A_FunctionPropertyExt_State_Read` PID 55
+(`00 00 00`: the counters; `00 01 00`: the latest failure), the report
+(PID 57) and the report control (PID 58) with `A_PropertyExtValue_Read`;
+`--clear` sends `A_FunctionPropertyExt_Command` PID 55 `00 00 00` and writes
+PID 57 := 0, then reads both back. What counts is in KNX 3/3/7 §5.4 and KNX
+3/5/1 §6.3.15.3 Table 108: an unlisted sender is dropped without a count
+(KNX 3/3/7 §5.2.1.1), a MAC failure counts cryptographic, a stale sequence
+SeqNr, a flag mismatch access. knx-sim models those counts; the layout of a
+real device's answer is not captured yet.
 
 ### 11.2 Switching one group address's security off or on `[issue #331; the write shape follows §11.1, the removal is VERIFIED against the 2026-10-24 capture `1-1-5-no-secure-ga.pcapng`, see SAFETY.md]`
 
@@ -1520,13 +1554,15 @@ greppable.
 5. ~~**KNXnet/IP Secure over UDP** (§8.3, #197)~~ **Settled by the standard**
    (spec review 2026-10-28, #513): 3/8/9 §2.2.3.3 and §2.2.3.6.4 exclude UDP
    for unicast secure sessions, so no capture can exist; the opt-in carrier
-   and its sim/mock servers are to be retired.
+   and its sim/mock servers were retired in #513.
 6. ~~**The interface's session idle timeout** (§8.3, #197)~~ **Settled**
    2026-09-25: 60 s on the Jung interface (idle probe, alive at 45 s,
    `STATUS_TIMEOUT` at 59.97 s, 3 of 3); the 30 s keepalive is CONFIRMED
    adequate.
-7. **`A_PropertyExtDescription_Response` layout**: not in any capture; bussard
-   follows KNX 3/3/7 (`crates/bussard-mgmt/src/property_ext.rs`), INFERRED.
+7. ~~**`A_PropertyExtDescription_Response` layout**~~ **Settled by the
+   standard** (#197): `[KNX 3/3/7 §3.4.3.2 Figures 44, 45]` give the layout
+   bussard encodes and decodes (`crates/bussard-mgmt/src/property_ext.rs`),
+   with `max_nr_of_elem` as two full octets. No capture holds one yet.
 8. **FDSK QR/label string encoding** - only if commissioning from a scanned label
    (a non-goal, §1.4). `[research §2.6, UNKNOWN]`; the standard does not define
    it either (`[KNX 3/5/1 §6.1.3]`: no standardised access to the FDSK).

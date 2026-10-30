@@ -42,6 +42,10 @@ pub struct ProductModel {
     /// The application program id (`M-0002_A-A0ED-10-9B4E`), the prefix the
     /// app-relative ids drop.
     pub program_id: String,
+    /// The Data Secure table capacities of a Data-Secure-capable application
+    /// (`data_secure:`, format 9, issue #537); `None` for an application that
+    /// does not declare `IsSecureEnabled`.
+    pub data_secure: Option<DataSecureCapacity>,
     /// The application's own Dynamic section (`dynamic:`, format 5, issue
     /// #345), app-relative ids throughout: what [`crate::dynamic::evaluate_dynamic`]
     /// walks through this model's [`crate::dynamic::DynamicSource`] impl.
@@ -60,10 +64,59 @@ pub struct ProductModel {
     /// its parameter, its `Value` where it matters and whether it is internal
     /// (the `refs:` of each parameter, format 5).
     pub parameter_refs: BTreeMap<String, RefDef>,
+    /// The application's and the module definitions' `<Allocator>`s, keyed
+    /// by app-relative id (`L-2`, `MD-1_L-1`) (`allocators:`, format 10,
+    /// issue #449).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub allocators: BTreeMap<String, crate::dynamic::Allocator>,
+    /// The `Allocates` of every module `<Argument>` that declares one, keyed
+    /// by app-relative argument id (`argument_allocates:`, format 10).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub argument_allocates: BTreeMap<String, i64>,
+    /// Whether the application is a System B one: its
+    /// `identity.mask_version` is `xxB0` (issue #474).
+    #[serde(default)]
+    pub system_b: bool,
     /// The ETS parameter pages and channels, derived from [`Self::dynamic`]
     /// on first use ([`Self::blocks`]).
     #[serde(skip)]
     pages: std::sync::OnceLock<Vec<crate::blocks::BlockDef>>,
+    /// [`Self::blocks`] followed by the channels of the module instances
+    /// ([`Self::blocks_with_module_channels`]).
+    #[serde(skip)]
+    pages_with_modules: std::sync::OnceLock<Vec<crate::blocks::BlockDef>>,
+    /// The conditions in front of every ref ([`Self::ref_index`]).
+    #[serde(skip)]
+    ref_index: std::sync::OnceLock<crate::dynamic::RefIndex>,
+}
+
+/// The Data Secure table capacities a product declares (the application's
+/// `MaxSecurity*` attributes, issue #537): how many entries the group key
+/// table (PID 53), the security individual address table (PID 54) and the
+/// point-to-point key table hold. `None` where the product gives no figure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct DataSecureCapacity {
+    /// `MaxSecurityGroupKeyTableEntries`.
+    #[serde(
+        default,
+        rename = "max_group_key_table_entries",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub group_key_table_entries: Option<u32>,
+    /// `MaxSecurityIndividualAddressEntries`.
+    #[serde(
+        default,
+        rename = "max_individual_address_entries",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub individual_address_entries: Option<u32>,
+    /// `MaxSecurityP2PKeyTableEntries`.
+    #[serde(
+        default,
+        rename = "max_p2p_key_table_entries",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub p2p_key_table_entries: Option<u32>,
 }
 
 /// One `ParameterRef` of a product model (an entry of a parameter's `refs:`).
@@ -93,6 +146,9 @@ pub struct ObjectDef {
     pub dpt: Option<String>,
     /// The communication flags, as written.
     pub flags: Option<String>,
+    /// The transmission priority the product declares, where it is not Low
+    /// (format 8, issue #541).
+    pub priority: Option<crate::flags::Priority>,
 }
 
 /// The product-model format this build writes: `model_format:` at the top of
@@ -104,8 +160,15 @@ pub struct ObjectDef {
 /// and integer width, issue #345; format 6 drops `blocks:`,
 /// `parameter_when:` and `ref_values:`, which the tree gives, and writes a
 /// parameter's own default, issue #345; format 7 a text type's
-/// `encoding:`, issue #401).
-pub const MODEL_FORMAT: u32 = 7;
+/// `encoding:`, issue #401; format 8 a com-object's `priority:` where it is
+/// not Low, issue #541; format 9 a Data-Secure-capable application's table
+/// capacities, `data_secure:`, issue #537; format 10 `<Repeat>` nodes, a
+/// module's computed arguments, `allocators:` and `argument_allocates:`,
+/// issue #449, and a text
+/// parameter's `initial_value:`, issue #473; format 11 a colour type,
+/// `color: { space: RGB }`, issue #616; format 12 a virtual parameter's
+/// `virtual: true`, issue #474).
+pub const MODEL_FORMAT: u32 = 12;
 
 /// Whether the model file at `path` is of the current [`MODEL_FORMAT`]. Reads
 /// only the head of the file, where the emitter puts the key.
@@ -154,6 +217,16 @@ pub struct ParamDef {
     /// For an enumeration, its members (code and label): what an override
     /// written as a label is matched against. Empty for other kinds.
     pub enum_values: Vec<crate::dynamic::EnumValue>,
+    /// A text parameter's `InitialValue` in the model's language
+    /// (`initial_value:`, format 10, issue #473): the value a new device
+    /// starts with, which wins over the `Value`s as the default.
+    #[serde(default)]
+    pub initial_value: Option<String>,
+    /// Whether the parameter is virtual: no memory, no property and no
+    /// union place, so it only ever has its value (`virtual: true`, format
+    /// 12, issue #474).
+    #[serde(default)]
+    pub is_virtual: bool,
 }
 
 /// A parameter's type, mirroring the `type:` tag in the model YAML.
@@ -186,6 +259,12 @@ pub enum ParamKind {
     Float,
     /// A marker with no memory (`none`).
     None,
+    /// A colour (`color`) of the declared space, written `#RRGGBB` (issue
+    /// #616).
+    Color {
+        /// The `<TypeColor>` `Space`.
+        space: crate::color_codec::ColorSpace,
+    },
     /// Any other shape (`other`), not range-checked.
     Other,
 }
@@ -210,6 +289,20 @@ struct RawModel {
     module_dynamics: BTreeMap<String, Vec<crate::dynamic::DynamicNode>>,
     #[serde(default, with = "crate::dynamic_compact::unions")]
     unions: Vec<crate::dynamic::Union>,
+    #[serde(default)]
+    data_secure: Option<DataSecureCapacity>,
+    #[serde(default)]
+    allocators: BTreeMap<String, crate::dynamic::Allocator>,
+    #[serde(default)]
+    argument_allocates: BTreeMap<String, i64>,
+    #[serde(default)]
+    identity: Option<RawIdentity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawIdentity {
+    #[serde(default)]
+    mask_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +315,8 @@ struct RawComObject {
     dpt: Option<String>,
     #[serde(default)]
     flags: Option<String>,
+    #[serde(default)]
+    priority: Option<crate::flags::Priority>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +338,10 @@ struct RawParam {
     bits: Option<u32>,
     #[serde(default)]
     signed: bool,
+    #[serde(default)]
+    initial_value: Option<String>,
+    #[serde(default, rename = "virtual")]
+    is_virtual: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -290,6 +389,9 @@ enum RawType {
         max: Option<f64>,
     },
     None,
+    Color {
+        space: crate::color_codec::ColorSpace,
+    },
     Other {
         #[serde(default)]
         kind: Option<String>,
@@ -376,6 +478,8 @@ impl ProductModel {
                     base_value: p.base_value,
                     integer_width: p.bits.map(|bits| (bits, p.signed)),
                     enum_values,
+                    initial_value: p.initial_value,
+                    is_virtual: p.is_virtual,
                 },
             );
         }
@@ -384,6 +488,7 @@ impl ProductModel {
             function: o.function_text,
             dpt: o.dpt,
             flags: o.flags,
+            priority: o.priority,
         };
         let com_objects = raw
             .com_objects
@@ -401,11 +506,20 @@ impl ProductModel {
             com_objects,
             com_object_refs,
             program_id: app_ref.to_string(),
+            data_secure: raw.data_secure,
             dynamic: raw.dynamic,
             module_dynamics: raw.module_dynamics,
             unions: raw.unions,
             parameter_refs,
+            allocators: raw.allocators,
+            argument_allocates: raw.argument_allocates,
+            system_b: raw
+                .identity
+                .and_then(|i| i.mask_version)
+                .is_some_and(|m| is_system_b_mask(&m)),
             pages: std::sync::OnceLock::new(),
+            pages_with_modules: std::sync::OnceLock::new(),
+            ref_index: std::sync::OnceLock::new(),
         })
     }
 
@@ -416,20 +530,44 @@ impl ProductModel {
         self.pages.get_or_init(|| crate::blocks::pages_of(self))
     }
 
-    /// The vendor default of app-relative parameter ref `reference`: the
-    /// ref's own `Value` when the model records one, else the parameter's
-    /// default. This is the value ETS shows, and a download writes, when
-    /// nothing is stored (issue #326).
+    /// The value-free index of the conditions in front of every parameter
+    /// and com-object ref ([`crate::dynamic::RefIndex`]), built once: every
+    /// device view of the application reads it (issue #302).
+    pub fn ref_index(&self) -> &crate::dynamic::RefIndex {
+        self.ref_index
+            .get_or_init(|| crate::dynamic::RefIndex::new(self))
+    }
+
+    /// [`Self::blocks`] followed by the `<Channel>`s of the module instances
+    /// the Dynamic section places ([`crate::blocks::module_channels_of`],
+    /// issue #302), derived once. The first `blocks().len()` entries are
+    /// [`Self::blocks`], so an index into either means the same block.
+    pub fn blocks_with_module_channels(&self) -> &[crate::blocks::BlockDef] {
+        self.pages_with_modules.get_or_init(|| {
+            let mut all = self.blocks().to_vec();
+            all.extend(crate::blocks::module_channels_of(self));
+            all
+        })
+    }
+
+    /// The vendor default of app-relative parameter ref `reference`: a text
+    /// parameter's `InitialValue` (issue #473), else the ref's own `Value`
+    /// when the model records one, else the parameter's default. This is the
+    /// value ETS shows, and a download writes, when nothing is stored (issue
+    /// #326).
     pub fn ref_default(&self, reference: &str) -> Option<&str> {
         match self.parameter_refs.get(reference) {
-            Some(r) => r
-                .value
-                .as_deref()
-                .or_else(|| self.parameters.get(&r.parameter)?.default.as_deref()),
+            Some(r) => {
+                let def = self.parameters.get(&r.parameter);
+                // A text parameter's `InitialValue` comes first (issue #473).
+                def.and_then(|d| d.initial_value.as_deref())
+                    .or(r.value.as_deref())
+                    .or_else(|| def?.default.as_deref())
+            }
             None => self
                 .parameters
                 .get(crate::blocks::ref_param_id(reference))
-                .and_then(|d| d.default.as_deref()),
+                .and_then(|d| d.initial_value.as_deref().or(d.default.as_deref())),
         }
     }
 
@@ -536,6 +674,33 @@ impl crate::dynamic::DynamicSource for ProductModel {
     fn unions(&self) -> &[crate::dynamic::Union] {
         &self.unions
     }
+
+    fn allocator(&self, allocator_id: &str) -> Option<crate::dynamic::Allocator> {
+        self.allocators.get(allocator_id).copied()
+    }
+
+    fn argument_allocates(&self, arg_id: &str) -> Option<i64> {
+        self.argument_allocates.get(arg_id).copied()
+    }
+
+    fn initial_value(&self, param_id: &str) -> Option<&str> {
+        self.parameters.get(param_id)?.initial_value.as_deref()
+    }
+
+    fn is_virtual(&self, param_id: &str) -> bool {
+        self.parameters.get(param_id).is_some_and(|p| p.is_virtual)
+    }
+
+    fn is_system_b(&self) -> bool {
+        self.system_b
+    }
+}
+
+/// Whether a `MaskVersion` (`07B0`, `MV-07B0`) is a System B one (`xxB0`).
+pub fn is_system_b_mask(mask: &str) -> bool {
+    let mask = mask.trim();
+    let digits = mask.strip_prefix("MV-").unwrap_or(mask);
+    u16::from_str_radix(digits, 16).is_ok_and(|m| m & 0x0FFF == 0x07B0)
 }
 
 impl RawType {
@@ -553,6 +718,7 @@ impl RawType {
             },
             RawType::Float { .. } => ParamKind::Float,
             RawType::None => ParamKind::None,
+            RawType::Color { space } => ParamKind::Color { space },
             RawType::Other { .. } => ParamKind::Other,
         }
     }
@@ -1072,6 +1238,30 @@ parameters:
         assert_eq!(model.resolve_key(None, "zwei-refs"), None);
         assert_eq!(model.resolve_key(None, "ohnerefs"), None);
         assert_eq!(model.resolve_key(None, "unbekannt"), None);
+        Ok(())
+    }
+
+    /// Issue #616: format 11 writes a `<TypeColor>` as `!color {space}`.
+    #[test]
+    fn test_from_yaml_color_type() -> Result<(), Box<dyn std::error::Error>> {
+        let yaml = "\
+identity:
+  id: M-00FA_A-1
+parameters:
+  - id: M-00FA_A-1_P-1
+    type: !color
+      space: HSV
+    default: '#FF0000'
+";
+        let m = ProductModel::from_yaml(yaml, "M-00FA_A-1")?;
+        let p = m.parameters.get("P-1").ok_or("no P-1")?;
+        assert!(matches!(
+            p.kind,
+            ParamKind::Color {
+                space: crate::color_codec::ColorSpace::Hsv
+            }
+        ));
+        assert_eq!(p.default.as_deref(), Some("#FF0000"));
         Ok(())
     }
 

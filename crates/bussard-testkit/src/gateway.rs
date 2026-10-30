@@ -118,6 +118,10 @@ pub struct GatewayStats {
     pub requests: usize,
     /// TUNNELLING_ACKs received from the client.
     pub client_acks: usize,
+    /// The interface features the client read with TUNNELLING_FEATURE_GET
+    /// (issue #514). Feature 07 is answered with a max APDU length of 248,
+    /// any other with `E_ADDRESS_VOID`.
+    pub feature_gets: Vec<u8>,
     /// Every KNXnet/IP service received, in order (including the datagrams an
     /// [`Outage`] swallowed).
     pub services: Vec<ServiceType>,
@@ -127,6 +131,10 @@ pub struct GatewayStats {
     pub intercepted: usize,
     /// The channel ids granted by successful CONNECTs, in order.
     pub channels: Vec<u8>,
+    /// With [`GatewayBuilder::data_port`]: datagrams that arrived on the wrong
+    /// endpoint (TUNNELLING_REQUEST/ACK on the control port, any other service
+    /// on the data port). They are dropped unanswered.
+    pub misrouted: usize,
     /// Whether the gateway task has ended.
     pub finished: bool,
 }
@@ -148,6 +156,7 @@ pub struct GatewayBuilder {
     interceptors: Vec<Interceptor>,
     confirm: Option<(Duration, ConfirmHook)>,
     tunnel_ia: u16,
+    data_port: bool,
 }
 
 impl Default for GatewayBuilder {
@@ -168,11 +177,23 @@ impl Default for GatewayBuilder {
             interceptors: Vec::new(),
             confirm: None,
             tunnel_ia: crate::consts::TUNNEL_IA_RAW,
+            data_port: false,
         }
     }
 }
 
 impl GatewayBuilder {
+    /// Serves the tunnel's data connection on a second port (issue #512), as
+    /// KNXnet/IP Core 3/8/2 §8.6.3.1 allows: the CONNECT_RESPONSE names it as
+    /// the data endpoint, TUNNELLING_REQUESTs and ACKs travel through it in
+    /// both directions, and CONNECT, CONNECTIONSTATE and DISCONNECT stay on
+    /// [`MockGateway::addr`]. A datagram on the wrong port is dropped and
+    /// counted in [`GatewayStats::misrouted`].
+    pub fn data_port(mut self) -> Self {
+        self.data_port = true;
+        self
+    }
+
     /// The channel id CONNECT_RESPONSE grants (default `0x21`).
     pub fn channel(mut self, channel: u8) -> Self {
         self.channel = channel;
@@ -331,13 +352,20 @@ impl GatewayBuilder {
     /// Fails when the loopback socket cannot be bound.
     pub async fn start(self) -> Result<MockGateway, MockError> {
         let (addr, sock) = wire::bind().await?;
+        let (data_port, data_sock) = if self.data_port {
+            let (data_addr, data_sock) = wire::bind().await?;
+            (data_addr.port(), Some(data_sock))
+        } else {
+            (addr.port(), None)
+        };
         let sent = Arc::new(Mutex::new(Vec::new()));
         let line = Arc::new(Mutex::new(self.devices));
         let (stats_tx, stats_rx) = watch::channel(GatewayStats::default());
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let server = Server {
             sock,
-            port: addr.port(),
+            data_sock,
+            data_port,
             channel: self.channel,
             tunnel_ia: self.tunnel_ia,
             ack: self.ack,
@@ -368,6 +396,7 @@ impl GatewayBuilder {
         let task = tokio::spawn(server.run(cmd_rx));
         Ok(MockGateway {
             addr,
+            data_port,
             sent,
             line,
             stats: stats_rx,
@@ -385,6 +414,7 @@ enum Command {
 /// A running mock gateway. Dropping it stops the task.
 pub struct MockGateway {
     addr: SocketAddrV4,
+    data_port: u16,
     sent: Arc<Mutex<Vec<CemiFrame>>>,
     line: Arc<Mutex<Vec<MockDevice>>>,
     stats: watch::Receiver<GatewayStats>,
@@ -415,6 +445,12 @@ impl MockGateway {
     /// The bound port.
     pub fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    /// The data endpoint's port: the distinct port of
+    /// [`GatewayBuilder::data_port`], otherwise [`MockGateway::port`].
+    pub fn data_port(&self) -> u16 {
+        self.data_port
     }
 
     /// Every cEMI frame the client has sent in a TUNNELLING_REQUEST, in order.
@@ -529,7 +565,10 @@ impl Drop for MockGateway {
 /// The task side of a [`MockGateway`].
 struct Server {
     sock: UdpSocket,
-    port: u16,
+    /// The distinct data socket of [`GatewayBuilder::data_port`].
+    data_sock: Option<UdpSocket>,
+    /// The port the CONNECT_RESPONSE names as the data endpoint.
+    data_port: u16,
     channel: u8,
     tunnel_ia: u16,
     ack: AckPolicy,
@@ -576,12 +615,16 @@ enum Flow {
 
 impl Server {
     async fn run(mut self, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
-        let mut buf = [0u8; 1024];
         loop {
             let flow = tokio::select! {
-                received = tokio::time::timeout(self.idle_timeout, self.sock.recv_from(&mut buf)) => {
+                received = tokio::time::timeout(
+                    self.idle_timeout,
+                    recv_either(&self.sock, self.data_sock.as_ref()),
+                ) => {
                     match received {
-                        Ok(Ok((n, from))) => self.on_datagram(&buf[..n], from).await,
+                        Ok(Ok((bytes, from, on_data))) => {
+                            self.on_datagram(&bytes, from, on_data).await
+                        }
                         _ => Flow::Stop,
                     }
                 }
@@ -609,6 +652,15 @@ impl Server {
         }
     }
 
+    /// Sends a TUNNELLING_REQUEST or ACK from the data endpoint.
+    async fn send_data(&self, bytes: &[u8], to: SocketAddr) -> Flow {
+        let sock = self.data_sock.as_ref().unwrap_or(&self.sock);
+        match sock.send_to(bytes, to).await {
+            Ok(_) => Flow::Continue,
+            Err(_) => Flow::Stop,
+        }
+    }
+
     /// Pushes one indication and advances the gateway's sequence number.
     async fn push(&mut self, peer: SocketAddr, frame: &CemiFrame) -> Flow {
         let header = ConnectionHeader {
@@ -616,7 +668,7 @@ impl Server {
             seq: self.gw_seq,
         };
         self.gw_seq = self.gw_seq.wrapping_add(1);
-        self.send(&knxnet::tunneling_request(header, frame), peer)
+        self.send_data(&knxnet::tunneling_request(header, frame), peer)
             .await
     }
 
@@ -693,13 +745,28 @@ impl Server {
             .any(|hook| hook(&inbound) == Verdict::Swallow)
     }
 
-    async fn on_datagram(&mut self, bytes: &[u8], from: SocketAddr) -> Flow {
+    async fn on_datagram(&mut self, bytes: &[u8], from: SocketAddr, on_data: bool) -> Flow {
         let Ok(parsed) = knxnet::parse(bytes) else {
             return Flow::Continue;
         };
         let service = parsed.service;
         let body = parsed.body.to_vec();
         self.stats.send_modify(|s| s.services.push(service));
+        if self.data_sock.is_some() {
+            let data_service = matches!(
+                service,
+                ServiceType::TunnelingRequest
+                    | ServiceType::TunnelingAck
+                    | ServiceType::TunnelingFeatureGet
+                    | ServiceType::TunnelingFeatureResponse
+                    | ServiceType::TunnelingFeatureSet
+                    | ServiceType::TunnelingFeatureInfo
+            );
+            if data_service != on_data {
+                self.stats.send_modify(|s| s.misrouted += 1);
+                return Flow::Continue;
+            }
+        }
         if self.intercepted(service, &body) {
             self.stats.send_modify(|s| s.intercepted += 1);
             return Flow::Continue;
@@ -759,8 +826,33 @@ impl Server {
                 Flow::Continue
             }
             ServiceType::TunnelingRequest => self.on_tunneling_request(&body, from).await,
+            ServiceType::TunnelingFeatureGet => self.on_feature_get(&body, from).await,
             _ => Flow::Continue,
         }
+    }
+
+    /// Answers a TUNNELLING_FEATURE_GET as a Tunnelling v2 server does
+    /// (Tunnelling 3/8/4 §3.2): the ACK under the client's sequence, then a
+    /// TUNNELLING_FEATURE_RESPONSE under the gateway's own.
+    async fn on_feature_get(&mut self, body: &[u8], from: SocketAddr) -> Flow {
+        let (Ok((header, _)), Some(&feature)) = (knxnet::parse_tunneling_header(body), body.get(4))
+        else {
+            return Flow::Continue;
+        };
+        self.stats.send_modify(|s| s.feature_gets.push(feature));
+        let ack = knxnet::tunneling_ack(header.channel_id, header.seq, 0);
+        if matches!(self.send_data(&ack, from).await, Flow::Stop) {
+            return Flow::Stop;
+        }
+        let mut response = vec![0x04, self.channel, self.gw_seq, 0x00, feature];
+        if feature == 0x07 {
+            response.extend_from_slice(&[0x00, 0x00, 0xF8]);
+        } else {
+            response.push(0x22);
+        }
+        self.gw_seq = self.gw_seq.wrapping_add(1);
+        let frame = wire::frame(ServiceType::TunnelingFeatureResponse, &response);
+        self.send_data(&frame, from).await
     }
 
     async fn on_connect(&mut self, from: SocketAddr) -> Flow {
@@ -769,7 +861,7 @@ impl Server {
             let reply = wire::frame(ServiceType::ConnectResponse, &connect_refusal_body(status));
             return self.send(&reply, from).await;
         }
-        let mut body = connect_response_body(self.channel, self.port);
+        let mut body = connect_response_body(self.channel, self.data_port);
         // The CRD's last two octets are the assigned tunnel address.
         let n = body.len();
         body[n - 2..].copy_from_slice(&self.tunnel_ia.to_be_bytes());
@@ -850,7 +942,7 @@ impl Server {
         };
         if let Some(status) = ack_status {
             let ack = knxnet::tunneling_ack(tr.header.channel_id, tr.header.seq, status);
-            if matches!(self.send(&ack, from).await, Flow::Stop) {
+            if matches!(self.send_data(&ack, from).await, Flow::Stop) {
                 return Flow::Stop;
             }
         }
@@ -963,6 +1055,23 @@ pub(crate) fn line_output(line: &mut [MockDevice], cemi: &CemiFrame) -> Vec<Out>
             };
             dev.tool = tool;
             let kind = tpci::classify(cemi.tpci_octet());
+            // The connection timeout (03_03_04 §5, E16, A6): the device closed
+            // the idle connection, so a numbered data telegram without a new
+            // T_Connect meets CLOSED and draws a T_Disconnect (A10).
+            if dev.connection_timed_out() && dev.send_seq.is_some() {
+                dev.send_seq = None;
+                if let TpciKind::NumberedData(_) = kind {
+                    dev.timed_out_requests += 1;
+                    emit(
+                        dev,
+                        tool,
+                        None,
+                        vec![Step::Control(tpci::T_DISCONNECT)],
+                        &mut out,
+                    );
+                    return out;
+                }
+            }
             match kind {
                 TpciKind::Connect => {
                     dev.send_seq = Some(0);
@@ -1058,6 +1167,30 @@ fn emit(
 
 /// Marks a device-originated frame as an `L_Data.ind`, as a real interface
 /// delivers it.
+/// Receives one datagram on the control socket or, when there is one, the data
+/// socket, and says which (`true` for the data socket).
+async fn recv_either(
+    control: &UdpSocket,
+    data: Option<&UdpSocket>,
+) -> std::io::Result<(Vec<u8>, SocketAddr, bool)> {
+    let mut buf = [0u8; 1024];
+    let Some(data) = data else {
+        let (n, from) = control.recv_from(&mut buf).await?;
+        return Ok((buf[..n].to_vec(), from, false));
+    };
+    let mut data_buf = [0u8; 1024];
+    tokio::select! {
+        r = control.recv_from(&mut buf) => {
+            let (n, from) = r?;
+            Ok((buf[..n].to_vec(), from, false))
+        }
+        r = data.recv_from(&mut data_buf) => {
+            let (n, from) = r?;
+            Ok((data_buf[..n].to_vec(), from, true))
+        }
+    }
+}
+
 fn indication(mut frame: CemiFrame) -> CemiFrame {
     frame.message_code = MessageCode::LDataInd;
     frame

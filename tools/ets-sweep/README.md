@@ -7,6 +7,13 @@ on the Mac starts a simulated device per product, has ETS download into it, and
 keeps the capture. Nothing here links into the bussard crates: this directory
 is Python run with `uv`, and knx-sim is a separate process.
 
+In the triangle of ETS, bussard and knx-sim (`dev/testing.md`, "ETS, bussard
+and knx-sim: the triangle"), the sweep is how ETS gets into the tests: ETS is a
+capture tool, and the captures it takes here feed the offline oracle rows and
+knx-sim's calibration replays. The synthetic product catalogue planned in #596
+will run this sweep over fabricated `M-00FA` products whose captures can be
+committed and replayed in CI.
+
 ## Pieces
 
 - `driver/ets_driver.py` runs **inside the VM** in the interactive desktop
@@ -172,10 +179,24 @@ the knx-sim device config); the learned values are kept per application.
 `oracle.py` builds a scratch model per captured application (one device
 1.1.1 at its defaults, no links; `oracle_model.py`) and runs the offline
 oracle row against the capture into `results/oracle.json`, the load-control
-verdict and its differences under `loadctl` (#419). From a worktree, read the
+verdict and its differences under `loadctl` (#419). Each product file is
+imported once, into `.oracle-products/<sha>/`, and every row's model links
+that import and pins its own device: a row of the 152 MB ABB catalogue takes
+seconds and 228 KB instead of 3.5 minutes and 1.6 GB. From a worktree, read the
 main checkout's captures and write nothing under them:
 `--captures <main>/captures/ets-sweep --work <scratch> --seed-models` (the last
-copies the model the sweep already imported instead of importing again).
+takes the model the sweep already imported as the product import, once per
+file). `BUSSARD_PRODUCT_CORPUS` points a worktree at the main checkout's
+corpus (`<main>/tests-support/product-corpus`).
+
+**Wrong catalog row.** The driver takes the sole local catalog row of an order
+number without checking its version cell (OCR truncates it). When the version
+the row shows is readable and is not the job's, `defaults.py` records the job
+as `skipped-catalog-version` instead of `captured` (Busch-Jaeger
+`A-6109-50-71A0` ran against the row of version 1.1, 2026-10-29). ETS prints
+the version octet's nibbles in decimal (0x1C is `1.12`, 0xB1 is `11.1`).
+`defaults.py --relabel` applies the rule to the results already recorded,
+without the VM.
 
 What ETS needed from the sim in this part: connectionless
 `A_DeviceDescriptor_Read` / `A_PropertyValue_Read` (ETS probes KNX Secure
@@ -183,3 +204,376 @@ capable devices before connecting), and the device identity above. A KNX
 Secure capable product makes ETS ask for a project password a few seconds
 after it is added and again at download; the plain pass answers Abbrechen,
 which leaves the device's secure commissioning off.
+
+## Manifest and parity summary
+
+    uv run tools/ets-sweep/summary.py [--results DIR] [--no-history]
+
+writes, next to the results: `manifest.json` (per application its labels only:
+product file, mask, manufacturer, sweep outcome, oracle and load-control
+verdict, coverage, and the ETS version of the run), `summary.md` (outcome
+counts, identical / benign / differs per mask family and per manufacturer,
+the verdict changes since the previous manifest) and `changes.json`; each
+manifest is also kept as `history/manifest-<stamp>.json`. `benign.json`
+(application id to reason, kept by hand) turns an explained `differs` into
+`benign`. An application whose capture is newer than its oracle row is
+`pending`.
+
+Offline tests of the Mac-side pieces: `uv run tools/ets-sweep/test_ets_sweep.py`.
+
+## Partial-download rows (#469)
+
+A partial download (`bussard apply`, ETS's "Partiell") writes into a device
+that already holds a full download, so its oracle row needs that device:
+
+    uv run tools/ets-sweep/apply_rows.py captures/ets-sweep/<app> --product <file.knxprod> \
+        --app <application id> [--work DIR] --run
+
+reads a series directory (one run directory per step in name order, the first
+a full download with links, each later one an ETS partial download after a
+link change, each with `ets.pcapng`, `sim.yaml` and the `objects.json` the
+driver read after the change), builds the bussard model of every partial step
+(links from `objects.json`: an object with the transmit flag sends on its
+first address and listens to the others) and writes one `run=apply` row per
+step. `95-offline-oracle.sh` then starts knx-sim on loopback with the
+captures of every earlier step replayed (`replay:` in the sim config, knx-sim
+`src/replay.rs`), runs `bussard apply` against it, and `knxtrace statediff`
+compares the device memory after it and the load-control records with ETS's
+step. ETS rewrites a whole table in 12-octet chunks where bussard writes one
+octet, so the comparison is on the final state of every octet either side
+wrote, not on frames.
+
+The captures stay where the sweep recorded them, under `captures/` (gitignored,
+like every sweep capture); the rows file and the step models are generated
+next to them or under `--work` with absolute paths and are not committed.
+`apply_rows.py` is the tracked part. knx-sim must be built
+(`cargo build` in `knx-sim/`, or `KNX_SIM_BIN`).
+
+First run, EK-E72 series of 2026-10-28 (`M-00B6_A-4537-03-DE59`, steps B, C, D):
+association table, group-object table and C flags identical in all three;
+two differences in every step, both in `apply` only (the full download of step
+A is identical under `flash`): `apply` writes the address table's first entry
+(the device's own address, 2 octets) that ETS never writes, and its
+`AbsSegment` records allocate the written table length with access `f2`
+where ETS allocates the whole segment (`0x00ED`, `0x00EB`) with `ff`. In step
+D ETS also restarts LSM 3 and rewrites the unchanged group-object table, which
+`apply` skips.
+`apply_rows.py --line-step b` adds a `run=apply-line` row for step B (`apply
+--line 1.1`, the line mode's own path to the tables); on the EK-E72 it gives
+the same verdict as the device row.
+
+## Part 7: links variant and partial-download series (#478)
+
+**Links variant, every product.** `defaults.py --variant links` runs the
+applications the defaults sweep captured once more, with a few links made
+before the download (`series.links_hook`: three objects linked to 1/0/1..,
+transmitting objects first, and a second address on one of them), into
+`captures/ets-sweep/<app>/links/` with the object table ETS showed after
+linking (`objects.json`); outcomes in `results/links.json`.
+`oracle.py --variant links` builds each row's model with those links
+(`apply_rows.links_from_objects`) and writes `results/oracle-links.json`;
+`summary.py` adds the links variant's parity per mask family.
+
+**Partial-download series, representative products.**
+
+    uv run tools/ets-sweep/series.py partial [--only M-00B6] [--steps abcd] [--oracle]
+
+runs steps A to D (`a-full-links`, `b-partial-add-<n>`, `c-partial-remove-<n>`,
+`d-partial-second-ga`) in one sim process per product, each step's slice of
+the sim's pcap kept in its own run directory with `objects.json` and
+`objects.png`. The objects come from what ETS shows at defaults
+(`series.plan_links`; `series.py plan <objects.json>` prints the plan
+offline). `results/series.json` records per product why it was chosen and each
+step's outcome, and `summary.py` lists it. `--oracle` writes and runs the
+`run=apply` rows plus the `line apply` row of step B on the Mac
+(`--no-ets --oracle` for series already recorded). The representatives
+(`series.REPRESENTATIVES`): Jung 3361-1M (0705, load control through
+properties), MDT AKK (0705, through memory), Ekinex EK-E72 (0705,
+group-object table in its own segment), Zennio ACTinBOX MAX6 (0701; the
+Theben 4940275 the issue names failed the defaults sweep), KNX Virtual DA.tp
+(07B0).
+
+## Part 6: nightly run, manifests and the repair loop (#425)
+
+**What runs.** `uv run tools/ets-sweep/nightly.py` (`--dry-run` prints the
+commands): preflight (the driver answers and ETS is among its windows, else
+the run stops), `cargo build` of bussard and knx-sim, every shard of
+`defaults.py --redo-failed` one after the other and the links variant, the
+oracle over every row again (`--redo`, so a bussard change shows as a verdict
+change), `summary.py`, and `followups.py`. Log: `results/nightly/<stamp>.log`;
+`results/run.json` holds the run id, the ETS version (the file version of
+`ETS6N.exe`) and every command's exit code and seconds. A lock directory
+(`results/nightly/lock`) keeps a second run out. Nothing is committed.
+
+**Install (launchd, the default).** The agent is
+`dev.bussard.ets-sweep.nightly`, 01:30 local time:
+
+    sed -e "s|__REPO__|$PWD|g" -e "s|__HOME__|$HOME|g" \
+        tools/ets-sweep/schedule/dev.bussard.ets-sweep.nightly.plist \
+        > ~/Library/LaunchAgents/dev.bussard.ets-sweep.nightly.plist
+    mkdir -p tools/ets-sweep/results/nightly
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.bussard.ets-sweep.nightly.plist
+    launchctl kickstart gui/$(id -u)/dev.bussard.ets-sweep.nightly   # one run now, to check
+
+Remove it with `launchctl bootout gui/$(id -u)/dev.bussard.ets-sweep.nightly`.
+`schedule/crontab.txt` is the cron alternative (cron skips a night the Mac
+slept through). The checkout the agent points at must not be a worktree that
+gets removed, and nothing else may drive ETS during the run.
+
+**Follow-up issues.** `followups.py` drafts an issue for every application
+whose verdict went from identical to differs (application id, mask, product
+file, capture path, the oracle summary and the first 30 lines of its diff)
+and prints it; `--create` (`nightly.py --create-issues`) opens them with the
+labels `bug`, `ets-sweep`, `oracle`, skipping an application an open issue
+already names; `results/followups.json` remembers what was opened.
+
+**Repair loop.** When a run of `sweep.run_one` fails, it keeps
+`<run dir>/repair/`: `screen.png` (the desktop at half size), `popups.txt`
+and `tree.txt` (UI Automation trees of ETS's popups and main window; the main
+window has none, see above), `error.txt` (the error and the failing flow's
+trace from the driver) and `repair.json` (the ETS version, which of these
+worked). After an ETS update the fix is a diff against `driver/ets_driver.py`
+made from those; the sweep is pinned to 6.4.1 build 6.4.8718.
+
+**Manifest format** (`results/manifest.json`, labels only):
+
+    {"generated": "<UTC iso>", "ets_version": "6.4.8718.0", "run": "<stamp>",
+     "apps": {"<application id>": {"file": "<product file>", "mask": "07B0",
+              "manufacturer": "M-0083", "outcome": "captured",
+              "verdict": "identical|benign|differs|differs-props|not-comparable|oracle-error|pending|<outcome>",
+              "loadctl": "identical", "coverage": "100.0%", "benign": "<reason>"}},
+     "links": {...same per application, the links variant...},
+     "series": {"<application id>": {"why": "...", "steps": {...}}}}
+
+**One application by hand**: `uv run tools/ets-sweep/defaults.py --filter <application id> --redo`
+then `uv run tools/ets-sweep/oracle.py --filter <application id> --redo`.
+
+**Ports and names**: the driver on `127.0.0.1:8765` in the VM (reached over
+ssh), the sim on `127.0.0.1:3672` in the VM, ETS's connection `knx-sim` and
+project `ets-sweep`; on the Mac the `run=apply` rows bind a free loopback UDP
+port per row.
+
+## Part 4: KNX Data Secure (#423), not yet run
+
+    export ETS_SWEEP_PROJECT_PASSWORD=<8-64 letters and digits>
+    uv run tools/ets-sweep/secure.py jobs                    # the secure-capable captured applications
+    uv run tools/ets-sweep/secure.py run --filter <app> --limit 1
+
+`secure.py` runs every application the defaults sweep captured whose program
+declares `IsSecureEnabled="true"` once more, in a project of its own
+(`ets-sweep-secure`: set up once by hand as a copy of `ets-sweep` with the
+`knx-sim` connection bound to it, because a project password would also lock
+the plain sweep's project). The sim device starts in factory state with a
+synthetic FDSK as its tool key and a synthetic serial number (PID 11), both
+derived from the application id. The driver sets the project password when
+ETS asks (`set_project_password`), types the device certificate when ETS asks
+for one at the download (`enter_certificate`), and after the download exports
+the keyring (`export_keyring`: the project tab's context menu, the save
+dialog, the export password). The keyring lands next to the capture as
+`project.knxkeys` (gitignored with the capture) and `knxtrace devices
+--keyring` decides `decoded` / `partial` / `undecoded`; outcomes in
+`results/secure.json`.
+
+The driver's secure flows were written without ETS at hand (2026-10-30):
+they anchor on dialog text and fail with what they saw, and the repair loop
+keeps a screenshot. The certificate's 4-bit check is not confirmed either:
+`secure.py cert --check "<label>"` on a real device's FDSK label prints its
+serial and which check (`crc4-itu`, `crc4-plain`, `none`) it carries, never
+the key; `run --check-variant` picks the one ETS takes.
+
+## Part 5: generated parameter sets (#424), not yet run
+
+    uv run tools/ets-sweep/params.py plan --app <application id> [--seed 1] [--n 3]   # offline
+    uv run tools/ets-sweep/params.py run --filter <application id> --limit 1
+    uv run tools/ets-sweep/params.py oracle --filter <application id>
+
+`plan` draws N configurations per application, seeded: half of each
+configuration's changes switch a page on (the parameter and value bussard's
+`device --json` names for an inactive page, so only parameters ETS shows at
+defaults), the rest are other enumeration and integer parameters of the
+product model, each off its default. `run` adds the device as the defaults
+sweep does, sets the changes through the driver (`param_pages`, `set_param`:
+the device's parameter view, the page list and each parameter's row read by
+OCR), downloads, and exports the project (`export_project`) next to the
+capture in `captures/ets-sweep/<app>/params-<seed>-<n>/`; `params.json` there
+says per change whether it was set, unreachable (not on any page the editor
+found) or failed. `oracle` imports each export with `bussard import` and runs
+the oracle row with the export as the product data, so the model holds
+exactly what ETS downloaded; verdicts in `results/oracle-params.json`.
+
+The parameter editor was written without ETS at hand (2026-10-30): the
+regions of the page list and the parameter area (`PARAM_PAGES`, `PARAM_AREA`
+in the driver) are first guesses to correct from a screenshot.
+
+## Synthetic products: signing (#596)
+
+    uv run tools/ets-sweep/synthetic/clone_datp.py              # DA.tp clone -> synthetic/out/ (gitignored)
+    uv run tools/ets-sweep/synthetic/sign.py synthetic/out/KNX_Synthetic_DA_M-00FA.knxprod
+    uv run tools/ets-sweep/synthetic/sign.py --dir-only <in.knxprod> [<out>]   # step 4 only, no hashes
+    uv run tools/ets-sweep/synthetic/sign.py --verify <file.knxprod>   # the library's verdict per hash
+
+A fabricated product under `M-00FA` carries the same integrity data as one
+ETS exports: a `Hash` on the `ApplicationProgram`, on each `Product` and
+`Hardware2Program`, `RegistrationSignature`s on their `RegistrationInfo`, and
+an application id whose last four hex digits are a fingerprint of the
+program's hash. bussard and knx-sim ignore all of it; ETS checks it.
+
+`sign.py` uploads `synthetic/signer.cs` to `C:\Users\macremote\ets-sweep\signer\`,
+compiles it with the .NET Framework `csc.exe` once per source change
+(`signer.sha` holds the source digest), runs it on the product and downloads
+the result (`<in>-signed.knxprod`). The signer is our own C#; it loads ETS's
+`Knx.Ets.XmlSigning.dll` from the ETS 6 folder and calls its internal classes
+by reflection (the DLL is obfuscated, the classes below keep readable names).
+No ETS library is compiled against, copied or committed. Per manufacturer
+folder it runs:
+
+1. `Signer.ApplicationProgramHasher(file, {}, patchIds: true, null).HashFile()`
+   per `*_A-*.xml`: computes the program's `Hash`, derives the fingerprint and
+   rewrites the program under its new id (`A-2600-10-0001` becomes
+   `A-2600-10-731A`), file renamed to match. The hasher deletes its input, so
+   the signer hands it a renamed copy.
+2. `Signer.HardwareSigner(Hardware.xml, oldToNewAppIds, appHashes, patchIds: true).SignFile()`:
+   new `Hash` on `Product` and `Hardware2Program`, new
+   `RegistrationSignature`s, `Hardware2Program` ids and `ApplicationProgramRef`s
+   patched to the new application id.
+3. `Signer.CatalogIdPatcher(Catalog.xml, oldToNewHardware2ProgramIds, null).Patch()`:
+   `CatalogItem` ids and `Hardware2ProgramRefId`s follow.
+4. `XmlSigning.SignDirectory(folder, false, null)`: writes `M-00FA.signature`
+   next to the folder. The folder path must be **absolute**: with a relative
+   path the library signs something else (the first signer ran on `work\M-00FA`
+   and ETS refused its output), and its own check calls that signature
+   invalid; with the absolute path the check says valid.
+
+A product in another schema (`[application] schema = 11` of the generator,
+#448) is signed in that schema: `sign.py` reads the namespace of the
+application and passes `signer.exe --schema 11`, which hands the library's
+hasher, hardware signer and catalog patcher that `targetSchemaVersion` (by
+default they rewrite each file in project/23 and fail on a project/11 root:
+"Das Präfix '' kann nicht von '.../project/23' in '.../project/11' ... neu
+definiert werden", 2026-10-30), and the stub master becomes
+`C:\ProgramData\KNX\XML\project-11\knx_master.xml`. ETS 6.4.1 imported the
+signed project/11 product without complaint.
+
+`knx_master.xml` is left as it is, except that a stub (no `<MasterData>`, the
+`<KNX/>` of `tests-support/synthetic-products`) is replaced with ETS's own
+`C:\ProgramData\KNX\XML\project-23\knx_master.xml` (`signer.exe --master`,
+`sign.py --keep-master` to skip it): ETS 6.4 refuses the stub on import with
+"Die Eingabezeichenfolge hat das falsche Format" (ETS6.log: a FormatException
+in `MasterDataVersion.Update`, 2026-10-30). Check of the library: the KNX Virtual file
+signed unchanged comes out byte-identical in every entry (plus the
+`.signature`), and `--verify` reports every hash, registration signature and
+the directory signature of the signed clone valid, the hashes of the unsigned
+clone invalid. (`--verify`'s master data check calls every `knx_master.xml`
+invalid, vendor files included; it is not what ETS checks.)
+
+**What ETS 6.4.1 needs (2026-10-30)**: a valid `<manufacturer>.signature`.
+Every refusal read "Import fehlgeschlagen! ... Projektdatei hat keine gültige
+Signatur"; ETS6.log records nothing for it.
+
+| file imported through `/ets/catalog_import` | ETS |
+| --- | --- |
+| unsigned clone (stale hashes, no `.signature`) | refused, "Projektdatei hat keine gültige Signatur" |
+| signed, directory signed from a relative path | refused, same message |
+| the same without `M-00FA.signature` | refused, same message |
+| the same with the master data of an imported MDT ETS6 product | refused, same message |
+| `knx-sim/tests/fixtures/KNX_Virtual_M-00FA.knxprod` itself, and a plain re-zip of it | refused, same message (the fixture has no `.signature`; it is not an importable product file) |
+| signed with the absolute path (`sign.py` now) | **imported**, "Import erfolgreich ... Produkt: Synthetic Dimming Actuator"; `/ets/catalog_search SYN.da` finds "KNX Association, Synthetic Dimming Actuator, SYN.da, Dimmen, 1.0" |
+| `--dir-only` (stale hashes, ids `A-2700-10-0001`, order number `SYN.db`) | **imported**, so ETS's import checks the directory signature and not the hashes |
+| `--dir-only` of the `SYN.da` clone after the signed one | refused, "The product has a different hash than the existing product." |
+
+`RegistrationInfo` stays `Registered` with the signatures the library writes;
+`NotRegistered` was not needed. The catalogue shows the manufacturer as "KNX
+Association" (M-00FA). Use the full signer for synthetic products: a download
+or a project may look at the hashes the import does not.
+
+**First download of the clone** (`sweep.py --knxprod <signed> --app
+M-00FA_A-2600-10-731A --search SYN.da`): ETS added the device and downloaded,
+51 operations, the same as the original DA.tp run of the same day except the
+`PID_PROGRAM_VERSION` value (application number 0x2600). Both failed the same
+way ("Programmieren(Appl.): fehlgeschlagen, Ein interner Gerätefehler ist
+aufgetreten"): the sim's master reset with erase code 4 dropped the segment ETS
+allocated before it (#600, fixed by #602).
+
+## Synthetic products: calibration (#596 step 2)
+
+    uv run tools/ets-sweep/synthetic/calibrate.py \
+        --knxprod tools/ets-sweep/synthetic/out/KNX_Synthetic_DA_M-00FA-signed.knxprod \
+        --app M-00FA_A-2600-10-731A --search SYN.da \
+        --reference-knxprod knx-sim/tests/fixtures/KNX_Virtual_M-00FA.knxprod \
+        --reference-app M-00FA_A-2500-10-51CB --reference-search DA.tp [--no-ets]
+
+A synthetic product is only useful if ETS treats it like the product it
+stands for. `calibrate.py` runs each product through the sweep
+(`captures/ets-sweep/<app>/plain-defaults/`), writes `requests.txt` next to
+the capture (`synthetic/distil.py`: the tool's `L_Data.req`s, retransmissions
+once, the format of `knx-sim/tests/fixtures/*_requests.txt`), runs the defaults
+oracle row of each (`oracle.run_row`), and compares: the `ops.txt` sequences
+apart from `PID_PROGRAM_VERSION`, the request streams apart from the
+application number, the oracle verdict, coverage and load-control verdict, and
+knx-sim's replay of both fixtures (`ets_calibration.rs`,
+`test_replay_spec_synthetic_matches_reference`, gated on
+`KNX_SIM_CALIBRATE` and `KNX_SIM_CALIBRATE_REFERENCE`): each must reach Loaded
+with no rejection and both must leave the same memory image. Without a
+reference it runs the download, the fixture and the oracle row of one product.
+Nothing it writes is committed: the clone is KNX Association data renamed.
+
+Result for the signed DA.tp clone (2026-10-30, VM sim with #602): ETS
+"Abgeschlossen" for both, 50 operations each, identical apart from the
+`PID_PROGRAM_VERSION` value; 95 requests each, identical apart from the
+application number octet in that property write (`00fa25..` vs `00fa26..`);
+oracle `identical`, coverage 100.0%, load control `identical` for both; the
+replay reaches Loaded on objects 1 to 4 with the same segments and images
+(0xA000 2, 0xC000 2, 0x8000 148, 0x6000 256 octets) for both.
+
+## Synthetic products: the generator (#596 step 3)
+
+    uv run tests-support/synthetic-products/generate.py --zip syn-minimal
+    uv run tools/ets-sweep/synthetic/sign.py tests-support/synthetic-products/syn-minimal/build/syn-minimal.knxprod
+    uv run tests-support/synthetic-products/generate.py syn-minimal \
+        --signed-id tests-support/synthetic-products/syn-minimal/build/syn-minimal-signed.knxprod
+    uv run tools/ets-sweep/synthetic/calibrate.py \
+        --knxprod tests-support/synthetic-products/syn-minimal/build/syn-minimal-signed.knxprod \
+        --app M-00FA_A-2700-10-D80E --search SYN.min
+
+The products are TOML specs under `tests-support/synthetic-products/` (its
+README has the schema, the id rule and the flow). Result for `syn-minimal`
+(2026-10-30, ETS 6.4.1, VM sim with #602): signed id `M-00FA_A-2700-10-D80E`;
+the import with the stub master was refused (see the signing section), with
+ETS's master put in by the signer it imported ("Import erfolgreich ...
+Produkt: Synthetic minimal", catalogue row "KNX Association, Synthetic
+minimal, SYN.min, Synthetisch minimal, 1.0"); the download ended
+"Programmieren(Appl.): Abgeschlossen" with objects 1 to 4 Loaded, 43
+operations, 83 tool requests; the oracle row is `identical`, coverage
+100.0%, load control `identical` (17 records), `par=ok(256) gobj=ok(4)
+assoc=ok(2) addr=ok(2) props=ok(1)`.
+
+## Synthetic products: committed captures (#596 step 5)
+
+    uv run tools/ets-sweep/synthetic/capture.py syn-minimal
+
+`capture.py` runs render, zip, sign, `--signed-id`, the catalogue import and
+search, the `defaults` download (`calibrate.py`) and the oracle row of the
+committed files, and writes `captures/synthetic/<product>/defaults/`,
+`captures/synthetic/rows.txt` and `captures/synthetic/manifest.json` (the
+flow and layout: `tests-support/synthetic-products/README.md`, "Captures").
+`winbuild-knx-sim.sh` writes the commit it built from next to `knx-sim.exe`
+(`knx-sim.exe.git`) for the manifest.
+
+Result for `syn-minimal` ("Nest-side light switch", `NEST-LIGHT`,
+2026-10-30, ETS 6.4.1 build 6.4.8718, VM sim built from 06a27ec0): the first
+import of the renamed product broke ETS's catalogue ("Der angegebene
+Schlüssel war nicht im Wörterbuch angegeben", a KeyNotFoundException in the
+catalogue refresh, on every later catalogue action and after a restart):
+`generate.py` left the `-` of `NEST-LIGHT` unescaped in the product and
+catalogue item ids, where ETS escapes it (`.2D`, as in Enertex
+`M-00A6_H-00000030-0_P-1176.2D08`). With the id fixed, the `M-00FA` product
+store moved aside (`C:\ProgramData\KNX\ETS6\ProductStore-aside-M-00FA-20261030-145024`)
+and `SYN.da` and `SYN.db` imported again, the product imported and
+`catalog_search NEST-LIGHT` finds it. The download ended "Programmieren(Appl.):
+Abgeschlossen", objects 1 to 4 Loaded, 43 operations, 83 tool requests; the
+signed id is unchanged (`M-00FA_A-2700-10-D80E`: the application's hash does
+not cover the product texts). `PID_PROGRAM_VERSION` on the wire is
+`00fa 2700 10` (manufacturer, application number, version), so the rows name
+the rendered id. The row of the committed files (the `xml/` zipped with the
+stub master): `identical`, coverage 100.0%, load control `identical` (17
+records), `par=ok(256) gobj=ok(4) assoc=ok(2) addr=ok(2) props=ok(1)`.

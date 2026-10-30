@@ -281,6 +281,66 @@ def ets_failed_since(c, since: str) -> bool:
     return False
 
 
+def product_properties(knxprod: Path, app: str) -> list[dict]:
+    """The device properties the application binds parameters to, with the
+    values those parameters hold: `<Parameter ...><Property ObjectIndex
+    PropertyId/>`. ETS compares them before a download (Configuration
+    Procedures 3/5/3 §3.5.2: the hardware type, PID 78, against a parameter
+    of the application program), so a factory device of that hardware holds
+    them. The value is the selected Enumeration member's BinaryValue of a
+    TypeRestriction, or the number or text encoded to the property's size.
+    (Found by the coordinator session, 2026-10-28: 72 of 73 learned PID 78
+    values sit in the product's own XML.)"""
+    import base64
+    import zipfile
+
+    try:
+        z = zipfile.ZipFile(knxprod)
+        name = next((n for n in z.namelist() if n.endswith(f"{app}.xml")), None)
+        if not name:
+            return []
+        xml = z.read(name).decode("utf-8", "replace")
+    except (OSError, zipfile.BadZipFile):
+        return []
+
+    def attr(tag: str, key: str) -> str | None:
+        m = re.search(rf'\b{key}="([^"]*)"', tag)
+        return m.group(1) if m else None
+
+    out: list[dict] = []
+    for m in re.finditer(r"(<Parameter\s[^>]*>)\s*(<Property\s[^>]*/>)", xml):
+        param, prop = m.group(1), m.group(2)
+        obj, pid = attr(prop, "ObjectIndex"), attr(prop, "PropertyId")
+        pid_ = attr(param, "Id")
+        ptype, value = attr(param, "ParameterType"), attr(param, "Value") or "0"
+        if obj is None or pid is None or not ptype:
+            continue
+        ref = re.search(rf'<ParameterRef\s[^>]*RefId="{re.escape(pid_ or "")}"[^>]*>', xml)
+        if ref and attr(ref.group(0), "Value") is not None:
+            value = attr(ref.group(0), "Value") or value
+        t = xml.find(f'<ParameterType Id="{ptype}"')
+        block = xml[t: xml.find("</ParameterType>", t)] if t >= 0 else ""
+        size_m = re.search(r'SizeInBit="(\d+)"', block)
+        size = (int(size_m.group(1)) + 7) // 8 if size_m else 0
+        data: bytes | None = None
+        if "<TypeRestriction" in block:
+            for e in re.finditer(r"<Enumeration\s[^>]*>", block):
+                if attr(e.group(0), "Value") == value:
+                    b64 = attr(e.group(0), "BinaryValue")
+                    data = base64.b64decode(b64) if b64 else int(value).to_bytes(max(size, 1), "big")
+                    break
+        elif "<TypeNumber" in block and size:
+            try:
+                data = int(float(value)).to_bytes(size, "big", signed=int(float(value)) < 0)
+            except (ValueError, OverflowError):
+                data = None
+        elif "<TypeText" in block and size:
+            data = value.encode("latin-1", "replace")[:size].ljust(size, b"\0")
+        if data is not None:
+            out.append({"object": int(obj), "pid": int(pid), "value": data.hex()})
+    return out
+
+
 def secure_enabled(knxprod: Path, app: str) -> bool:
     """Whether the application declares IsSecureEnabled (ETS then asks for a
     project password a few seconds after the device is added)."""
@@ -297,13 +357,69 @@ def secure_enabled(knxprod: Path, app: str) -> bool:
     return True  # unknown: keep the wait
 
 
+ETS_EXE = r"C:\Program Files (x86)\ETS6\ETS6N.exe"
+_ETS_VERSION: dict = {}
+
+
+def ets_version(c) -> str | None:
+    """ETS's file version in the VM (`6.4.8718...`), read once per session:
+    the sweep is pinned to one ETS version, and a driver failure after an
+    ETS update is a driver repair (#419, #425)."""
+    if "v" not in _ETS_VERSION:
+        try:
+            out = vm.run(c, "powershell -NoProfile -Command \"(Get-Item '" + ETS_EXE + "').VersionInfo.FileVersion\"", 60)[1]
+            _ETS_VERSION["v"] = out.strip().splitlines()[-1].strip() if out.strip() else None
+        except Exception:  # noqa: BLE001 - a version we cannot read is recorded as unknown
+            _ETS_VERSION["v"] = None
+    return _ETS_VERSION["v"]
+
+
+def save_repair(c, out: Path, error: str, failed: dict | None = None) -> dict:
+    """The repair loop (#425): when a run fails, keep what the driver saw next
+    to the outcome, so the fix is a diff against the driver: a screenshot of
+    the desktop, the UI Automation trees of ETS's popups and main window,
+    the failing flow's trace, and the ETS version. Read-only driver calls;
+    each one that fails is noted, none raises."""
+    repair = out / "repair"
+    repair.mkdir(parents=True, exist_ok=True)
+    trace = (failed or {}).get("trace") or ""
+    (repair / "error.txt").write_text(error + ("\n\n" + trace if trace else "") + "\n")
+    saved: dict = {"dir": str(repair), "ets_version": ets_version(c)}
+    for name, path, body in (("screen.png", "/screenshot", {"window": "desktop", "scale": 0.5}),
+                             ("popups.txt", "/popups", {"depth": 8}),
+                             ("tree.txt", "/tree", {"depth": 3})):
+        try:
+            r = vm.driver(c, "POST", path, body, timeout=120)
+            if name.endswith(".png") and r.get("png_base64"):
+                import base64
+
+                (repair / name).write_bytes(base64.b64decode(r["png_base64"]))
+            else:
+                (repair / name).write_text(r.get("tree") or json.dumps(r)[:20000])
+            saved[name] = "ok"
+        except Exception as exc:  # noqa: BLE001 - evidence, not a step
+            saved[name] = f"failed: {exc}"[:200]
+    (repair / "repair.json").write_text(json.dumps(saved, indent=1))
+    return saved
+
+
 def run_one(c, knxprod: Path, app: str, search: str, *, version: str | None = None, ia: str = "1.1.1",
             variant: str = "plain-defaults", mode: str = "application", project: str = "ets-sweep",
             connection: str = "knx-sim", sim_port: int = 3672, timeout: int = 900, quiet: int = 45,
             first_traffic: int = 120, mask: str = "", properties: list[dict] | None = None,
-            fallback_search: str = "") -> dict:
+            fallback_search: str = "", before_download=None, after_download=None,
+            secure: dict | None = None, repair: bool = True, flow_extra: dict | None = None) -> dict:
     """One ETS download of `app` into a sim inside the VM; returns the result
-    and leaves capture, sim log, driver.json and ops.txt in the run directory."""
+    and leaves capture, sim log, driver.json and ops.txt in the run directory.
+
+    `before_download(flow, out)` runs after the device is added and the
+    connection selected (the links variant links objects there, #478);
+    `after_download(flow, out)` once the download ended (the secure variant
+    exports the keyring, #423). Each returns a dict kept in the result under
+    `before` / `after`. `secure` is the sim device's `security:` config.
+    `flow_extra` goes into every driver call's body (the secure pass sends the
+    project password and the device certificate, #423). A failed run keeps
+    the repair artefacts (`save_repair`) unless `repair` is off."""
     out = CAPTURES / app / variant
     out.mkdir(parents=True, exist_ok=True)
     version = app_version(app) if version is None else version
@@ -312,16 +428,16 @@ def run_one(c, knxprod: Path, app: str, search: str, *, version: str | None = No
     t0 = time.time()
     since = vm_now(c)
     try:
-        sim = RemoteSim(c, knxprod.resolve(), app, ia, sim_port, None, out / "sim.log", mask=mask, properties=properties)
+        sim = RemoteSim(c, knxprod.resolve(), app, ia, sim_port, secure, out / "sim.log", mask=mask, properties=properties)
     except RuntimeError as exc:
         result.update({"outcome": "sim-refused", "error": str(exc)[-600:], "seconds": round(time.time() - t0)})
         (out / "driver.json").write_text(json.dumps(result, indent=1, ensure_ascii=False))
         return result
+    steps: dict = {}
     try:
-        steps: dict = {}
 
         def flow(flow_name: str, /, **body) -> dict:
-            r = vm.driver(c, "POST", f"/ets/{flow_name}", {"project": project, **body}, timeout=600)
+            r = vm.driver(c, "POST", f"/ets/{flow_name}", {"project": project, **(flow_extra or {}), **body}, timeout=600)
             steps[flow_name if flow_name not in steps else f"{flow_name}#{len(steps)}"] = r
             if not r.get("ok", True):
                 raise RuntimeError(f"{flow_name}: {r.get('error')}")
@@ -338,6 +454,8 @@ def run_one(c, knxprod: Path, app: str, search: str, *, version: str | None = No
             raise RuntimeError(f"catalog add added nothing: {add.get('row')}")
         result["catalog_row"] = add.get("row")
         flow("select_connection", name=connection)
+        if before_download is not None:
+            result["before"] = before_download(flow, out)
         flow("download", ia=ia, mode=mode)
         # Wait for the end of the download, whichever signal comes first:
         # - success: the device restarted (not a master reset) after its load
@@ -372,13 +490,18 @@ def run_one(c, knxprod: Path, app: str, search: str, *, version: str | None = No
         # again.
         settle = time.time()
         while True:
-            result["history"] = vm.driver(c, "POST", "/ets/history", {}, timeout=120).get("lines")
+            result["history"] = vm.driver(c, "POST", "/ets/history", dict(flow_extra or {}), timeout=120).get("lines")
             result["ets"] = ets_status(result["history"])
             if result["ets"] != "unknown" or time.time() - settle > 120:
                 break
             time.sleep(5)
+        if after_download is not None:
+            result["after"] = after_download(flow, out)
     except Exception as exc:  # noqa: BLE001 - recorded per application, the batch goes on
         result["error"] = str(exc)[:600]
+        if repair:
+            failed = next((r for r in reversed(list(steps.values())) if not r.get("ok", True)), None)
+            result["repair"] = save_repair(c, out, str(exc), failed)
     finally:
         sim.stop()
         try:
@@ -394,7 +517,11 @@ def run_one(c, knxprod: Path, app: str, search: str, *, version: str | None = No
         result["ops"] = sum(1 for l in ops.stdout.splitlines() if re.match(r"\s+\d+\s", l))
     err = result.get("error") or ""
     result["outcome"] = (
-        "skipped-compat-mode" if "compatibility mode" in err
+        # A prompt met before this product was even added belongs to the
+        # previous one (it kept coming back for a device left in the project,
+        # 2026-10-29): retry, do not skip.
+        "driver-error" if "compatibility mode before project_tab" in err
+        else "skipped-compat-mode" if "compatibility mode" in err
         else "skipped-ets-invalid-product" if "ETS product data invalid" in err
         else "skipped-catalog-version" if "catalog version mismatch" in err
         else "skipped-not-in-catalog" if "not found in catalog search" in err

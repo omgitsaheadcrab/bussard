@@ -65,8 +65,17 @@ pub mod pid {
     pub const GRP_KEY_TABLE: u16 = 53;
     /// `PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE`: 8-octet rows `[IA:16][seq:48]`.
     pub const SECURITY_IA_TABLE: u16 = 54;
+    /// `PID_SECURITY_FAILURES_LOG`: a function property, the failure counters
+    /// and the latest failure (KNX 3/5/1 §6.3.9, bussard issue #533).
+    pub const SECURITY_FAILURES_LOG: u16 = 55;
     /// `PID_TOOL_KEY`: the 16-octet tool key (write-only).
     pub const TOOL_KEY: u16 = 56;
+    /// `PID_SECURITY_REPORT`: DPT_Security_Report, b0 = a failure since the
+    /// tool last reset it (KNX 3/5/1 §6.3.11).
+    pub const SECURITY_REPORT: u16 = 57;
+    /// `PID_SECURITY_REPORT_CONTROL`: DPT_Enable, broadcast the report on
+    /// every failure (KNX 3/5/1 §6.3.12).
+    pub const SECURITY_REPORT_CONTROL: u16 = 58;
     /// `PID_SEQUENCE_NUMBER_SENDING`: the device's 6-octet sending sequence.
     pub const SEQUENCE_NUMBER_SENDING: u16 = 59;
     /// `PID_GO_SECURITY_FLAGS`: one octet per group object (element n = GO n).
@@ -77,6 +86,9 @@ pub mod pid {
 pub mod rc {
     /// The request was carried out.
     pub const SUCCESS: u8 = 0x00;
+    /// A field of the request other than the service id has an invalid value
+    /// (`E_DATA_VOID`, KNX 3/5/1 §6.3.9.3.3).
+    pub const DATA_VOID: u8 = 0xF8;
     /// The request is malformed for this property: wrong data length, a count
     /// of zero, an unknown load event, or a value write to a function property.
     pub const INVALID_COMMAND: u8 = 0xF2;
@@ -102,12 +114,14 @@ pub mod rc {
 /// 12-bit `max_elements` field can describe.
 pub const FALLBACK_MAX_GROUP_OBJECTS: u16 = 4095;
 
-/// Capacity of the group key table (rows). A plausible device limit; the real
-/// Jung device's capacity is not captured.
+/// Capacity of the group key table (rows) when the product declares none
+/// (`MaxSecurityGroupKeyTableEntries`, bussard issue #537). A plausible
+/// device limit.
 pub const MAX_GROUP_KEY_ROWS: u16 = 1024;
 
-/// Capacity of the security individual address table (rows). A plausible device
-/// limit; the real device's capacity is not captured.
+/// Capacity of the security individual address table (rows) when the product
+/// declares none (`MaxSecurityIndividualAddressEntries`). A plausible device
+/// limit.
 pub const MAX_IA_TABLE_ROWS: u16 = 64;
 
 /// Size of one group key table row: address-table index (2) + key (16).
@@ -120,10 +134,11 @@ const GO_FLAG: usize = 1;
 const TOOL_KEY_LEN: usize = 16;
 /// Size of the sending sequence number.
 const SEQ_LEN: usize = 6;
-/// The highest valid group-object security flag: bit 0 and bit 1 are the
-/// authentication and confidentiality flags; ETS writes 0x03 for a secured
+/// The used bits of a group-object security flag octet: bit 0 and bit 1 are
+/// the authentication and confidentiality flags, b7..b2 are reserved and
+/// ignored (KNX 3/5/1 §6.3.15.2 Figure 81). ETS writes 0x03 for a secured
 /// group object and 0x00 for a plain one.
-const MAX_GO_FLAG: u8 = 0x03;
+const GO_FLAG_MASK: u8 = 0x03;
 
 /// PDT codes for the property descriptions.
 const PDT_CONTROL: u8 = 0x00;
@@ -134,6 +149,43 @@ const PDT_GENERIC_08: u8 = 0x18;
 const PDT_GENERIC_16: u8 = 0x20;
 const PDT_GENERIC_18: u8 = 0x22;
 const PDT_FUNCTION: u8 = 0x3E;
+
+/// The kind of a security failure the device logs (KNX 3/5/1 §6.3.9.3.2
+/// error types).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// 02h: a sequence number below the one expected.
+    SeqNr,
+    /// 03h: a MAC that does not verify.
+    Cryptographic,
+    /// 04h: a verified telegram the group object's security flags refuse.
+    Access,
+}
+
+impl FailureKind {
+    /// The error-type octet.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            FailureKind::SeqNr => 0x02,
+            FailureKind::Cryptographic => 0x03,
+            FailureKind::Access => 0x04,
+        }
+    }
+}
+
+/// The security failures log (PID 55): saturating counters and the latest
+/// failing message (only n = 0 is stored, the minimum the standard asks).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FailuresLog {
+    /// SeqNr errors.
+    pub seq: u16,
+    /// Cryptographic errors.
+    pub crypto: u16,
+    /// Access or roles errors.
+    pub access: u16,
+    /// The latest failure: sender IA (raw), sender sequence, kind.
+    pub latest: Option<(u16, [u8; 6], FailureKind)>,
+}
 
 /// The security object's load state (the byte PID 5 reports).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +344,16 @@ pub struct SecurityObject {
     pending_tool_key: Option<[u8; TOOL_KEY_LEN]>,
     /// A send sequence written and not yet taken by the session.
     pending_seq: Option<u64>,
+    /// The security failures log (PID 55, bussard issue #533).
+    failures: FailuresLog,
+    /// The security report (PID 57): b0 Security Failure.
+    report: u8,
+    /// The security report control (PID 58): 1 = broadcast on a failure.
+    report_control: u8,
+    /// Rows the group key table (PID 53) holds.
+    group_key_capacity: u16,
+    /// Rows the security individual address table (PID 54) holds.
+    ia_capacity: u16,
 }
 
 impl std::fmt::Debug for SecurityObject {
@@ -328,7 +390,26 @@ impl SecurityObject {
             seq_sending: [0; SEQ_LEN],
             pending_tool_key: None,
             pending_seq: None,
+            failures: FailuresLog::default(),
+            report: 0,
+            report_control: 0,
+            group_key_capacity: MAX_GROUP_KEY_ROWS,
+            ia_capacity: MAX_IA_TABLE_ROWS,
         }
+    }
+
+    /// Takes the table capacities from the product data (bussard issue #537):
+    /// a declared figure replaces [`MAX_GROUP_KEY_ROWS`] or
+    /// [`MAX_IA_TABLE_ROWS`]. The writes refuse rows beyond them and the
+    /// property descriptions report them.
+    pub fn with_capacity(mut self, capacity: crate::prod::SecurityCapacity) -> Self {
+        if let Some(rows) = capacity.group_key_rows {
+            self.group_key_capacity = rows;
+        }
+        if let Some(rows) = capacity.ia_rows {
+            self.ia_capacity = rows;
+        }
+        self
     }
 
     /// A security object in factory state for a device that takes Data Secure
@@ -339,6 +420,32 @@ impl SecurityObject {
             security_mode: 0,
             ..Self::new_activated()
         }
+    }
+
+    /// Records one security failure (KNX 3/3/7 §5.4, KNX 3/5/1 §6.3.9 and
+    /// §6.3.15.3): the counter of its kind saturates at 65 535, the message
+    /// becomes the latest failure and the report's Security Failure bit is
+    /// set. Returns whether the report control asks for a broadcast.
+    pub fn record_failure(&mut self, kind: FailureKind, sender: u16, seq: [u8; 6]) -> bool {
+        let counter = match kind {
+            FailureKind::SeqNr => &mut self.failures.seq,
+            FailureKind::Cryptographic => &mut self.failures.crypto,
+            FailureKind::Access => &mut self.failures.access,
+        };
+        *counter = counter.saturating_add(1);
+        self.failures.latest = Some((sender, seq, kind));
+        self.report |= 0x01;
+        self.report_control & 0x01 != 0
+    }
+
+    /// The security failures log.
+    pub fn failures(&self) -> FailuresLog {
+        self.failures
+    }
+
+    /// The security report octet (PID 57).
+    pub fn security_report(&self) -> u8 {
+        self.report
     }
 
     /// Takes the tool key written since the last call, if any.
@@ -366,10 +473,11 @@ impl SecurityObject {
         self.go_flags.count()
     }
 
-    /// The security flags of group object `n` (1-based), if written.
+    /// The security flags of group object `n` (1-based), if written: the
+    /// authentication and confidentiality bits, the reserved bits cleared.
     pub fn go_flag(&self, n: u16) -> Option<u8> {
         let off = usize::from(n).checked_sub(1)?;
-        self.go_flags.bytes.get(off).copied()
+        self.go_flags.bytes.get(off).map(|f| f & GO_FLAG_MASK)
     }
 
     /// How many times the tool key was written.

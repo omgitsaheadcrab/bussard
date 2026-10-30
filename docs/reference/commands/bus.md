@@ -22,6 +22,7 @@ Behaviour:
 - With a keyring, a secured group telegram is verified and decrypted with the group key of its destination GA, decoded like a plain one and marked `[secured]`.
 - A MAC failure shows `[secured (MAC failed) seq=… raw=…]`, and a GA without a key shows `[secured (no group key) …]`.
 - A sequence number that does not increase per sender adds a warning. Nothing is dropped.
+- A payload a conforming receiver ignores still decodes, with a note saying why (KNX 03_07_01 §2.4): a reserved bit set (`45` on `18.001`), a field out of range (hour 24 on `10.001`, month 0 on `11.001`, `24:30` on `19.001`), tariff 255 on `5.006`, or a reserved enumeration code (`05` on `20.102`). This is the answer to "the bus says X but nothing happened".
 
 ??? note "Details"
     A secured group telegram is `A_SecureData` with the tool-access bit clear.
@@ -70,9 +71,11 @@ A KNX Data Secure device accepts a secured telegram only from an address in its 
 |---|---|
 | The device's recorded table (`secure_senders` in `bussard.lock`, from `bussard adopt` or a verified secured `apply`, `apply --line`, `flash` or `knx_apply_device`) | Admits exactly the addresses it lists. |
 | No recorded table, but an ETS assignment of the GA to that tunnelling address in the keyring or key store | Admitted. |
-| Neither | Unknown. |
+| Neither | Unknown: bussard reads the device's table (PID 54) with its tool key from `--keyring` before sending, records it in `bussard.lock` and judges with it. |
 
-When every linked device has a recorded table that lacks the tunnel address, the command is refused before sending:
+The read in the last row happens once per device: after it, the lock holds the table. A device without a tool key, or one that does not answer the read, stays unknown, and the note says why.
+
+When every linked device has a table that lacks the tunnel address, the command is refused before sending:
 
 ```console
 1.1.5 does not list the tunnel address 1.1.25 as a secure sender of 1/0/4; the actuator would discard the telegram. Admit the tunnel addresses (see below) or send plain only if the GA is not secured on the device.
@@ -81,8 +84,10 @@ When every linked device has a recorded table that lacks the tunnel address, the
 The refusal is followed by how to admit them. With no evidence either way, the telegram is sent and stderr says:
 
 ```console
-note: sent secured from 1.1.25; delivery to 1.1.5 is not confirmed by KNX; if nothing happens, 1.1.5 probably does not admit 1.1.25
+note: sent secured from 1.1.25; delivery to 1.1.5 is not confirmed by KNX; if nothing happens, 1.1.5 probably does not admit 1.1.25; if nothing happens, `bussard secure diag 1.1.5` ...
 ```
+
+`bussard secure diag` reads the device's security failures log, which tells the causes of a dropped telegram apart (see [KNX Secure](../../how-to/knx-secure.md#when-a-secured-write-does-nothing)).
 
 To admit the tunnel addresses, set `admit_tunnel_senders = true` under `[connection]` and `apply` the device. The other ways are on [KNX Secure](../../how-to/knx-secure.md).
 
@@ -98,8 +103,44 @@ $ bussard write 3/0/4 on
 ```
 
 The value is human-typed: `on`/`off`, `up`/`down`, a number, or a percentage like `75%`.
-A scene number is the raw field, 0 to 63. ETS and Home Assistant show scenes counted from
-1 (KNX 03_07_02 Datapoint Types §3.19 NOTE 9), so ETS scene 4 is `scene 3` here (#495).
+A `1.xxx` value also takes the word pair of its sub-type (KNX 03_07_02 §3.1, and `1.100`):
+`occupied` on `1.018`, `night` on `1.024`, `heating` on `1.100`, `closed`/`open` on `1.019`
+(0 = closed) and `open`/`close` on `1.009` (0 = open); `read` and `monitor` print the same words.
+A forced-operation value (`2.001`-`2.012`, KNX 03_07_02 §3.2) is `control` plus the word of the
+matching `1.xxx` sub-type, `control on` or `control down` on `2.008`, or `release` to drop the
+control bit; `read` and `monitor` show `Control: On` or `No control`.
+A relative dimming or blind step (`3.007`, `3.008`) is a direction and a step size:
+`increase 25%`, `down 50%`, `up`, `break`. The step code divides the full range into
+2^(code-1) intervals (KNX 03_07_02 §3.3), so the step sizes are 100, 50, 25, 12.5, 6.25,
+3.125 and 1.5625 %; `increase 3` names the code directly, and a direction alone is 100 %.
+`read` and `monitor` print the step size: `0B` on a `3.007` address is `Increase 25 %`.
+A scene number (`17.001`, `18.001`, and scenes A/B of `1.022`) counts from 1, as ETS and Home
+Assistant show it (KNX 03_07_02 Datapoint Types §3.19 NOTE 9, §3.1 footnote 2): `scene 3` sends
+the field 2, so ETS scene 3 is `scene 3` here. `raw 2` sends the field itself. `read` and
+`monitor` show both: `activate scene 3 (raw 2)`.
+Text, time and date have their own forms: `"Hello"` on a `16.000` address (ASCII, up to 14
+characters, padded with `00`; `16.001` takes Latin-1) and any UTF-8 text on `28.001`;
+`12:30` or `Mon 07:30:00` on `10.001`; `2026-10-29` on `11.001` (1990-2089, KNX 03_07_02
+§3.12); `2026-10-29 12:30:00` on `19.001`, with an optional weekday and the flags `summer`,
+`fault`, `working-day`, `bank-day`, `sync` and `reliable`. A `19.001` value without a weekday
+sends the date's own one.
+A colour is `#FF8000` or `rgb(255, 128, 0)` on `232.600`, and `#FF800010`, `#FF8000` or
+`rgbw(255, 128, 0, -)` on `251.600`, where a channel left out (or `-`) is sent marked invalid
+(KNX 03_07_02 §6.18). `read` and `monitor` decode `242.600` to x, y and brightness, and
+`249.600`, `250.600`, `252.600` and `254.600` to their named fields.
+An enumeration (`20.xxx`, KNX 03_07_02 §3.21, §4.3, §6.3) takes its label or code: `cool` or `3`
+on `20.105`; `read` and `monitor` print the label, and `Unknown(18)` for a reserved code. A bit
+set (`21.xxx`, `22.xxx`) reads as the names of its set bits, `0A` on `21.001` is
+`Fault, InAlarm`, and takes the same list or `none`. A `6.020` status shows its five status
+fields (0 = set, §3.7) and the active mode.
+A scaled sub-type takes the scaled value, never the raw count: `50 %` on an `8.010` address
+sends `13 88`, `1.5 s` (or `1500 ms`) on `7.004` sends `00 0F`, `1.5 m3/h` on `13.002` sends
+`00 00 3A 98` (KNX 03_07_02 §3.8.2, §3.9.1, §3.9.2, §3.14.1). A value outside the range or finer
+than the resolution is refused; `read` and `monitor` show these values with their unit.
+Every integer and float sub-type with a unit in KNX 03_07_02 §3.5-§3.15 shows it and takes it
+as a suffix: `6500 K` on `7.600`, `3600 s` on `13.100` or `7.005`, `2 K` on `9.002`, `50 %` on
+`5.004`; ASCII spellings work too (`1 m3/h`). A `5.003` angle keeps one decimal, so `80` reads
+`180.7 °` and `22.5` is a valid input.
 
 | Flag / arg | Default | Meaning |
 |---|---|---|
@@ -193,7 +234,7 @@ Behaviour:
 | `DROPPED after <t> s (<reason>)` | The interface ended the session or closed the connection. |
 | `SILENT` | No answer. |
 
-- The credentials come from `connection.keyring`, or from `--secure-user`/`--secure-password-env`. `--secure-transport` picks the carrier.
+- The credentials come from `connection.keyring`, or from `--secure-user`/`--secure-password-env`. The session runs over TCP only (KNX IP Secure 3/8/9 §2.2.3.3).
 - `--json` prints the same as an object: `outcome`, `after_ms`, `reason`, `answered_ms`, `transport`, `user_id`.
 - It uses no tunnel slot and nothing reaches the bus, so it needs neither `--yes` nor `--allow-remote-gateway`.
 - Run it with growing `SECS` (say 45, 65, 90, 125) to bracket the interface's timeout.

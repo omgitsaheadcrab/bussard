@@ -12,6 +12,10 @@ use std::time::Duration;
 /// The default KNXnet/IP UDP port (unicast and multicast).
 pub const DEFAULT_PORT: u16 = 3671;
 
+/// The default multicast TTL of routing datagrams: PID_TTL's default
+/// (KNXnet/IP Device Management 3/8/3 §2.5.18, issue #519).
+pub const DEFAULT_MULTICAST_TTL: u32 = 16;
+
 /// The KNX routing multicast group (`224.0.23.12`).
 pub const DEFAULT_MULTICAST: Ipv4Addr = Ipv4Addr::new(224, 0, 23, 12);
 
@@ -24,8 +28,15 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// Per-attempt timeout waiting for a CONNECTIONSTATE_RESPONSE (spec: 10 s).
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Number of heartbeat attempts before the connection is declared dead (spec: 3).
+/// How often an unanswered or failed CONNECTIONSTATE_REQUEST is repeated
+/// before the connection is declared dead: three times, after the first
+/// request (KNXnet/IP Core 3/8/2 §5.4, issue #516).
 pub const HEARTBEAT_RETRIES: u32 = 3;
+
+/// CONNECTIONSTATE_REQUESTs sent in total before the connection is declared
+/// dead: the first one plus [`HEARTBEAT_RETRIES`] repeats, 40 s at
+/// [`HEARTBEAT_TIMEOUT`] each, inside the server's 120 s heartbeat timeout.
+pub const HEARTBEAT_ATTEMPTS: u32 = HEARTBEAT_RETRIES + 1;
 
 /// Timeout waiting for a TUNNELING_ACK to one of our requests (spec: 1 s).
 pub const TUNNELING_ACK_TIMEOUT: Duration = Duration::from_secs(1);
@@ -33,6 +44,11 @@ pub const TUNNELING_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 /// Number of times a tunneling request is retransmitted on ACK timeout before
 /// erroring. The spec allows one retransmit, i.e. two sends total.
 pub const TUNNELING_RETRANSMITS: u32 = 1;
+
+/// How long a TUNNELLING_FEATURE_GET waits for its TUNNELLING_FEATURE_RESPONSE
+/// after the GET was confirmed: the server answers within 3 s (KNXnet/IP
+/// Tunnelling 3/8/4 §3.2, issue #514).
+pub const FEATURE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Timeout waiting for a CONNECT_RESPONSE during the handshake.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -242,27 +258,23 @@ pub enum SecureSource {
     Explicit,
 }
 
-/// Which carrier a KNXnet/IP Secure session runs over (issue #197).
+/// How the tunnel reaches the interface for a KNXnet/IP Secure session.
+///
+/// A unicast secure session runs over TCP only (KNX IP Secure 3/8/9
+/// §2.2.3.3, §2.2.3.6.4; issue #513), so both values open TCP; they differ
+/// only in how a refused TCP connect is reported.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SecureTransport {
-    /// TCP, the carrier ETS uses with the tested interface and the only one
-    /// verified against a real interface. When the TCP connect is refused and
-    /// the interface's extended search advertises KNXnet/IP Secure, the
-    /// connect fails with [`TransportError::SecureTcpRefused`] naming
-    /// `--secure-transport udp`; it never switches to UDP on its own
-    /// (issue #197).
+    /// TCP, the default. When the TCP connect is refused and the interface's
+    /// extended search advertises KNXnet/IP Secure, the connect fails with
+    /// [`TransportError::SecureTcpRefused`], which names the likely causes.
     ///
     /// [`TransportError::SecureTcpRefused`]: crate::TransportError::SecureTcpRefused
     #[default]
     Auto,
-    /// TCP only: no TUNNELING_ACK, route-back HPAIs (CONFIRMED against the
-    /// Jung interface).
+    /// TCP, with a refused connect reported as it is: no TUNNELING_ACK,
+    /// route-back HPAIs (CONFIRMED against the Jung interface).
     Tcp,
-    /// UDP only, an explicit opt-in: the session and the tunnel on one UDP
-    /// socket, TUNNELING_ACK inside SECURE_WRAPPERs, the real local endpoint
-    /// in every HPAI. INFERRED from the KNX specification, verified against
-    /// knx-sim and the testkit mock only; no real interface has been tested.
-    Udp,
 }
 
 impl std::fmt::Display for SecureTransport {
@@ -270,7 +282,6 @@ impl std::fmt::Display for SecureTransport {
         f.write_str(match self {
             SecureTransport::Auto => "auto",
             SecureTransport::Tcp => "tcp",
-            SecureTransport::Udp => "udp",
         })
     }
 }
@@ -284,7 +295,8 @@ pub struct SecureTunnelConfig {
     pub users: Vec<SecureUser>,
     /// Where the users came from.
     pub source: SecureSource,
-    /// TCP (the default, `Auto`), or UDP when explicitly asked for.
+    /// How a refused TCP connect is reported (`Auto` by default); the
+    /// session always runs over TCP.
     pub transport: SecureTransport,
     /// How often the tunnel sends a wrapped `STATUS_KEEPALIVE`
     /// ([`SECURE_KEEPALIVE_INTERVAL`] by default). [`Duration::ZERO`] sends
@@ -369,6 +381,9 @@ pub struct ConnectionConfig {
     pub gateway: Option<SocketAddrV4>,
     /// For routing: the multicast group and port. Defaults to `224.0.23.12:3671`.
     pub multicast: SocketAddrV4,
+    /// For routing: the IP TTL of the multicast datagrams,
+    /// [`DEFAULT_MULTICAST_TTL`] unless configured.
+    pub multicast_ttl: u32,
     /// The local IPv4 interface to bind / join the group on. `0.0.0.0` lets the
     /// OS choose.
     pub local_interface: Ipv4Addr,
@@ -388,6 +403,7 @@ impl ConnectionConfig {
             transport: TransportKind::Tunnel,
             gateway: Some(gateway),
             multicast: SocketAddrV4::new(DEFAULT_MULTICAST, DEFAULT_PORT),
+            multicast_ttl: DEFAULT_MULTICAST_TTL,
             local_interface: Ipv4Addr::UNSPECIFIED,
             reconnect: TunnelReconnect::default(),
             secure: None,
@@ -401,6 +417,7 @@ impl ConnectionConfig {
             transport: TransportKind::Routing,
             gateway: None,
             multicast: SocketAddrV4::new(DEFAULT_MULTICAST, DEFAULT_PORT),
+            multicast_ttl: DEFAULT_MULTICAST_TTL,
             local_interface: Ipv4Addr::UNSPECIFIED,
             reconnect: TunnelReconnect::default(),
             secure: None,
@@ -410,6 +427,12 @@ impl ConnectionConfig {
     /// This configuration with KNXnet/IP Secure tunnelling credentials.
     pub fn with_secure(mut self, secure: Option<SecureTunnelConfig>) -> Self {
         self.secure = secure;
+        self
+    }
+
+    /// This configuration with a different multicast TTL for routing.
+    pub fn with_multicast_ttl(mut self, ttl: u32) -> Self {
+        self.multicast_ttl = ttl;
         self
     }
 
@@ -463,10 +486,10 @@ mod tests {
         assert_eq!(config.transport, SecureTransport::Auto);
         assert_eq!(config.keepalive, SECURE_KEEPALIVE_INTERVAL);
         let config = config
-            .with_transport(SecureTransport::Udp)
+            .with_transport(SecureTransport::Tcp)
             .with_keepalive(Duration::from_secs(10));
-        assert_eq!(config.transport, SecureTransport::Udp);
+        assert_eq!(config.transport, SecureTransport::Tcp);
         assert_eq!(config.keepalive, Duration::from_secs(10));
-        assert_eq!(SecureTransport::Udp.to_string(), "udp");
+        assert_eq!(SecureTransport::Tcp.to_string(), "tcp");
     }
 }

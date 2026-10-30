@@ -176,6 +176,9 @@ struct DeviceState {
     device_control: u8,
     /// Every value written to `obj0/PID_DEVICE_CONTROL`, in order.
     device_control_writes: Vec<u8>,
+    /// `obj3/PID_PROGRAM_VERSION`, the resident application's id (issue
+    /// #481); `None` answers count 0, as a device without it.
+    program_version: Option<Vec<u8>>,
     /// The segment-write count at each restart, so a test can place the
     /// restarts relative to the download (issue #116).
     restart_at_writes: Vec<usize>,
@@ -219,6 +222,15 @@ struct DeviceState {
     /// Addresses whose memory writes the device acknowledges but does not
     /// store (issue #320): the octet keeps its old value.
     frozen: Vec<u16>,
+    /// Echo every verify-mode write with its first octet flipped (issue #524):
+    /// the device stored the right octets, the echo says otherwise.
+    corrupt_echo: bool,
+    /// Drop the L4 connection once (silent until a fresh `T_Connect`) right
+    /// after this many verify echoes were sent (issue #524).
+    drop_after_echoes: Option<usize>,
+    /// For each segment content write, whether verify mode was on when it
+    /// arrived (issue #524).
+    writes_in_verify_mode: Vec<bool>,
 }
 
 impl DeviceState {
@@ -264,6 +276,7 @@ fn fresh_device(mode: LsmMode, fault: Fault) -> Shared {
         absent_objects: Vec::new(),
         device_control: 0,
         device_control_writes: Vec::new(),
+        program_version: None,
         restart_at_writes: Vec::new(),
         verify_echoes_sent: 0,
         lsm_state_reads: 0,
@@ -279,6 +292,9 @@ fn fresh_device(mode: LsmMode, fault: Fault) -> Shared {
         l4_connects: 0,
         tunnel_connects: 0,
         frozen: Vec::new(),
+        corrupt_echo: false,
+        drop_after_echoes: None,
+        writes_in_verify_mode: Vec::new(),
     }))
 }
 
@@ -527,6 +543,8 @@ fn handle_request(state: &Shared, req_apci: u16, payload: &[u8]) -> Reaction {
         // the fault). The read-back verify then sees exactly what we stored.
         s.memory_writes_seen += 1;
         s.segment_writes.push((addr, data.len()));
+        let verify_on = s.device_control & DEVICE_CONTROL_VERIFY_MODE != 0;
+        s.writes_in_verify_mode.push(verify_on);
         for (i, &b) in data.iter().enumerate() {
             let a = addr.wrapping_add(i as u16);
             if s.frozen.contains(&a) {
@@ -548,6 +566,18 @@ fn handle_request(state: &Shared, req_apci: u16, payload: &[u8]) -> Reaction {
                 let a = addr.wrapping_add(i as u16);
                 echo.push(s.memory.get(&a).copied().unwrap_or(0));
             }
+            if s.corrupt_echo
+                && let Some(first) = echo.get_mut(2)
+            {
+                *first ^= 0xFF;
+            }
+            if s.drop_after_echoes == Some(s.verify_echoes_sent) {
+                // The link drops before the echo goes out; the device keeps
+                // the write and answers nothing more on this connection.
+                s.drop_after_echoes = None;
+                s.l4_dead_after_outage = true;
+                return Reaction::Silent;
+            }
             return Reaction::Answer(A_MEMORY_RESPONSE | count as u16, echo);
         }
         return Reaction::Ack;
@@ -567,6 +597,17 @@ fn handle_request(state: &Shared, req_apci: u16, payload: &[u8]) -> Reaction {
                 s.lsm5_property_accesses += 1;
             }
             return Reaction::Nak;
+        }
+        // The application object's PID_PROGRAM_VERSION (issue #481).
+        if obj == 3 && pid == 13 {
+            let held = s.program_version.clone();
+            return Reaction::Answer(
+                A_PROPERTY_VALUE_RESPONSE,
+                match held {
+                    Some(id) => prop_response(obj, pid, 1, start, &id),
+                    None => prop_response(obj, pid, 0, start, &[]),
+                },
+            );
         }
         // Object-type discovery (PID 1 on each object).
         if pid == PID_OBJECT_TYPE {
@@ -819,6 +860,12 @@ fn on_t_connect(state: &Shared) {
         s.deaths_remaining -= 1;
     }
     s.exchanges_this_connection = 0;
+    // Verify mode lives with the transport connection: the device cleared it
+    // when the previous one closed (Resources 03_05_01 §4.2.14, issue #524).
+    // The first connection keeps what the test seeded.
+    if s.l4_connects > 0 {
+        s.device_control &= !DEVICE_CONTROL_VERIFY_MODE;
+    }
     s.l4_connects += 1;
     s.authorized = false;
     // The tool reconnecting after a reboot: the device is back up and answers
@@ -1003,6 +1050,76 @@ async fn run_full_flash(mode: LsmMode) -> Result<(), Box<dyn std::error::Error>>
 #[tokio::test]
 async fn flash_system7_memory_mapped_reaches_loaded() -> Result<(), Box<dyn std::error::Error>> {
     run_full_flash(LsmMode::MemoryMapped).await
+}
+
+/// `LdCtrlDelay` before the restart (issue #615): the executor pauses the
+/// given milliseconds between the step before it and the restart, sends
+/// nothing for it, and the flash still reaches Loaded.
+#[tokio::test]
+async fn test_flash_system7_delay_pauses_before_restart() -> Result<(), Box<dyn std::error::Error>>
+{
+    set_sys7_lsm_env(LsmMode::MemoryMapped);
+    let (mut bus, state, handle) = setup(LsmMode::MemoryMapped, Fault::None).await?;
+    let target: bussard_model::IndividualAddress = "1.1.99".parse()?;
+    let source: bussard_model::IndividualAddress = "0.0.255".parse()?;
+    let mut app = mdt_canonical_app()?;
+    let ops = &mut app.load_procedures[0].ops;
+    let restart = ops
+        .iter()
+        .position(|op| matches!(op, bussard_prod::application::LoadOp::Restart))
+        .ok_or("the procedure restarts")?;
+    ops.insert(
+        restart,
+        bussard_prod::application::LoadOp::Delay {
+            milliseconds: Some(200),
+        },
+    );
+    let plan = plan_flash(
+        &app,
+        "1.1.99",
+        MASK_0705,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    let delay = plan
+        .steps
+        .iter()
+        .position(|s| *s == FlashStep::Delay { milliseconds: 200 })
+        .ok_or("the delay lowers to a step")?;
+    assert_eq!(plan.steps.get(delay + 1), Some(&FlashStep::Restart));
+
+    let l4 = Layer4Connection::connect(&mut bus, target, source).await?;
+    let mut session = authed_session(l4).await?;
+    let mut started: Vec<(std::time::Instant, String)> = Vec::new();
+    let outcome = flash(
+        &mut session,
+        &plan,
+        bussard_download::FlashOptions::default(),
+        |p| {
+            if let bussard_download::Progress::Step { label, .. } = p {
+                started.push((std::time::Instant::now(), label));
+            }
+        },
+    )
+    .await?;
+    assert!(outcome.ok(), "flash should reach Loaded: {outcome:?}");
+    let at = started
+        .iter()
+        .position(|(_, l)| l.contains("wait 200 ms"))
+        .ok_or("the progress names the pause")?;
+    let (wait_start, _) = &started[at];
+    let (restart_start, label) = started.get(at + 1).ok_or("a step follows the pause")?;
+    assert!(label.contains("restart"), "{label}");
+    assert!(
+        restart_start.duration_since(*wait_start) >= Duration::from_millis(200),
+        "the restart must wait out the 200 ms"
+    );
+    assert_eq!(lock(&state).restarts_seen, 1, "one terminal restart");
+    drop(handle);
+    let _ = session.into_disconnect().await;
+    Ok(())
 }
 
 #[tokio::test]
@@ -1307,6 +1424,7 @@ async fn sys7_preflight_then_flash(
         authorize: Some(authorize),
         max_apdu,
         max_apdu_absent: l4.max_apdu_absence() == Some(bussard_mgmt::MaxApduAbsence::Answered),
+        association_pdt: resident.association_pdt,
     };
     let mut session = if adopt {
         Session::adopt_with_facts(connector, l4, None, facts).await?
@@ -3548,6 +3666,69 @@ async fn test_flash_sys7_leaves_verify_mode_alone_when_already_on()
     Ok(())
 }
 
+#[tokio::test]
+async fn test_flash_sys7_compares_every_verify_echo() -> Result<(), Box<dyn std::error::Error>> {
+    // Issue #524: every segment write's echo is compared (DMP_MemWrite_RCoV).
+    let (outcome, state) = run_parity_flash(LsmMode::Property, 0x00).await?;
+    assert!(outcome.ok(), "flash should reach Loaded: {outcome:?}");
+    let echoes = outcome.verify_echoes.ok_or("no verify echo counts")?;
+    let s = lock(&state);
+    assert!(echoes.chunks_written > 0);
+    assert_eq!(echoes.echoes_compared, echoes.chunks_written);
+    assert_eq!(echoes.echoes_compared, s.verify_echoes_sent as u64);
+    assert_eq!(echoes.re_enabled, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_flash_sys7_fails_on_a_verify_echo_that_differs()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Issue #524: an echo that differs from the octets written fails the
+    // step, naming the address and both values.
+    let result = run_parity_flash_with(LsmMode::Property, 0x00, |s| s.corrupt_echo = true).await;
+    let err = match result {
+        Ok((outcome, _)) => return Err(format!("flash passed: {outcome:?}").into()),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("verify echo"), "{err}");
+    assert!(err.contains("wrote"), "{err}");
+    assert!(err.contains("device stored"), "{err}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_flash_sys7_sets_verify_mode_again_after_a_drop()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Issue #524: the device clears verify mode with the connection, so a
+    // resumed download sets it again before its next write and every write
+    // after the first verify-mode one still draws an echo.
+    let (outcome, state) =
+        run_parity_flash_with(LsmMode::Property, 0x00, |s| s.drop_after_echoes = Some(3)).await?;
+    assert!(
+        outcome.ok(),
+        "flash should resume and reach Loaded: {outcome:?}"
+    );
+    let echoes = outcome.verify_echoes.ok_or("no verify echo counts")?;
+    let s = lock(&state);
+    assert_eq!(
+        s.device_control_writes,
+        vec![DEVICE_CONTROL_VERIFY_MODE, DEVICE_CONTROL_VERIFY_MODE]
+    );
+    let first = s
+        .writes_in_verify_mode
+        .iter()
+        .position(|on| *on)
+        .ok_or("no write in verify mode")?;
+    assert!(
+        s.writes_in_verify_mode[first..].iter().all(|on| *on),
+        "a write went out without verify mode: {:?}",
+        s.writes_in_verify_mode
+    );
+    assert_eq!(echoes.re_enabled, 1);
+    assert_eq!(echoes.echoes_compared, echoes.chunks_written);
+    Ok(())
+}
+
 // --- issue #192: a gateway link loss in the post-restart reconnect phase -----
 
 /// Flashes the MDT app onto a rebooting System 7 device while a 1.5 s gateway
@@ -3873,5 +4054,120 @@ async fn test_write_sys7_task_segments_carry_the_product_identity()
         assert_eq!(tails, vec![(1, id), (2, id)]);
     }
     drop(handle);
+    Ok(())
+}
+
+/// Issue #488: a device that holds no loaded application gets no
+/// pre-download pass, as ETS gives none to a factory-fresh device (all 31
+/// System 7 sweep downloads): the first load event is the procedure's own
+/// unload of LSM 1, LSM 4 is never touched, and the device still reaches
+/// Loaded. With the pass (a device with an application) LSM 4 is unloaded
+/// first.
+#[tokio::test]
+async fn test_flash_sys7_skip_prelude_unloads_only_the_procedure_lsms()
+-> Result<(), Box<dyn std::error::Error>> {
+    set_sys7_lsm_env(LsmMode::Property);
+    let app = mdt_canonical_app()?;
+    let planned = plan_flash(
+        &app,
+        "1.1.99",
+        MASK_0705,
+        &no_overrides(),
+        &std::collections::BTreeMap::new(),
+        None,
+        &std::collections::BTreeMap::new(),
+    )?;
+    let target: bussard_model::IndividualAddress = "1.1.99".parse()?;
+    let source: bussard_model::IndividualAddress = "0.0.255".parse()?;
+    for skip in [true, false] {
+        let mut plan = planned.clone();
+        if skip {
+            plan.skip_sys7_prelude();
+        }
+        assert_eq!(
+            plan.steps
+                .iter()
+                .any(|s| matches!(s, FlashStep::Sys7PreDownloadRestart { .. })),
+            !skip
+        );
+        let (mut bus, state, handle) = setup(LsmMode::Property, Fault::None).await?;
+        let l4 = Layer4Connection::connect(&mut bus, target, source).await?;
+        let mut session = authed_session(l4).await?;
+        let outcome = flash(
+            &mut session,
+            &plan,
+            bussard_download::FlashOptions::default(),
+            |_p| {},
+        )
+        .await?;
+        assert!(outcome.ok(), "{outcome:?}");
+        {
+            let s = lock(&state);
+            let lsm4 = s.lsm_events.iter().any(|(lsm, _)| *lsm == 4);
+            assert_eq!(lsm4, !skip, "{:?}", s.lsm_events);
+            if skip {
+                assert_eq!(s.lsm_events.first(), Some(&(1, 4)), "{:?}", s.lsm_events);
+            }
+            for lsm in [1u8, 2, 3] {
+                assert_eq!(s.lsm_state(lsm), LS_LOADED, "LSM {lsm}");
+            }
+        }
+        drop(handle);
+        let _ = session.into_disconnect().await;
+    }
+    Ok(())
+}
+
+/// Issue #481: a loaded System 7 device that answers `PID_PROGRAM_VERSION`
+/// of object 3 with another application's id is refused by that id, before
+/// any code sample; one that answers this application's id, or answers
+/// nothing, stays unidentified for the code sample to decide, as before. The
+/// probe writes nothing either way.
+#[tokio::test]
+async fn test_probe_resident_state_sys7_reads_the_application_id()
+-> Result<(), Box<dyn std::error::Error>> {
+    for mode in [LsmMode::Property, LsmMode::MemoryMapped] {
+        set_sys7_lsm_env(mode);
+        let plan = sys7_plan()?;
+        let own = plan.identity.program_version().ok_or("identity")?.to_vec();
+        for (held, refused_by_id) in [
+            (Some(vec![0x00, 0x83, 0x00, 0x0F, 0x23]), true),
+            (Some(vec![0x00, 0x83, 0x00, 0x0E, 0x24]), true),
+            (Some(own.clone()), false),
+            (Some(vec![0; 5]), false),
+            (None, false),
+        ] {
+            let (mut bus, state, handle) = setup(mode, Fault::None).await?;
+            {
+                let mut s = lock(&state);
+                s.lsm_states.insert(3, LS_LOADED);
+                s.program_version = held.clone();
+            }
+            let resident = sys7_probe(&mut bus, &plan).await?;
+            assert!(resident.unreadable.is_none(), "{resident:?}");
+            match bussard_download::assess_freshness(&resident, &plan.identity) {
+                bussard_download::Freshness::Resident {
+                    resident: id,
+                    reason,
+                    ..
+                } => {
+                    assert_eq!(id.is_some(), refused_by_id, "{held:?}: {id:?}");
+                    assert_eq!(
+                        reason.is_some_and(|r| r.contains("PID_PROGRAM_VERSION")),
+                        refused_by_id,
+                        "{held:?}"
+                    );
+                }
+                other => panic!("expected a refusal verdict, got {other:?}"),
+            }
+            assert_eq!(
+                bussard_download::needs_sys7_identity(&plan, &resident),
+                !refused_by_id,
+                "{held:?}"
+            );
+            assert_eq!(lock(&state).memory_writes_seen, 0);
+            drop(handle);
+        }
+    }
     Ok(())
 }

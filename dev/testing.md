@@ -23,6 +23,69 @@ without the data looks the same as a run with it. Run these tests before a
 release and after any change to the product parser, the image builder or the
 download planner.
 
+## ETS, bussard and knx-sim: the triangle
+
+Three implementations meet on the wire, and each pair checks the other:
+
+- **ETS** is the reference: what it writes to a device is what bussard must
+  write. It runs only in the owner's Windows VM and has no scripting
+  interface, so it is a capture tool, not a test runner.
+- **knx-sim** is an independent strict device, built from the KNX Standard,
+  the Wireshark dissector and ETS captures, never from bussard's code
+  (`knx-sim/README.md`).
+- **bussard** is the implementation under test.
+
+| pair | how it is checked |
+|---|---|
+| ETS vs sim | calibration replays: knx-sim must accept the request stream ETS sent in a capture, reach `Loaded` and hold the same image (`knx-sim/tests/ets_calibration.rs`, the `*_replay.rs` tests). The ETS sweep (`tools/ets-sweep`) produces such captures by having ETS download into knx-sim. |
+| bussard vs ETS | the offline oracle rows: a bussard dry run against the image an ETS capture holds, with a coverage figure ([rows](#the-offline-oracle-rows-bussard_oracle_rows), [coverage](#offline-oracle-coverage)). |
+| bussard vs sim | the [flash-then-plan loop](#the-flash-then-plan-loop-against-knx-sim-scriptssim-catalog-loopsh), the `sim-conformance` CI job, the `bussard-testkit` mock device and the `virtual-device` interop job. |
+
+The sim is calibrated against ETS, not against bussard, so a misreading of
+the standard that both bussard and the sim share still shows up as a
+difference to ETS.
+
+Most of the ETS side is gated on data that cannot be committed:
+
+- the house captures under `captures/` are the owner's installation;
+- the vendor `.knxprod` corpus is copyrighted (the oracle rows, `ets_golden`,
+  `flash_corpus` and the sim loop need it; even `ets_calibration.rs` skips
+  without the KNX Virtual product file);
+- the ETS sweep needs the VM and an ETS licence.
+
+For the corpus and the house, CI therefore runs the bussard-vs-sim leg and
+the committed request-stream fixtures, but no oracle row. A corpus product
+also bundles hundreds of constructs, so a sweep failure is hard to reduce to
+one regression test. The synthetic product catalogue below closes all three
+legs in CI without vendor data.
+
+### The synthetic product catalogue (#596)
+
+[Epic #596](https://github.com/tmbo/bussard/issues/596) plans to close the
+triangle without vendor data: a catalogue of small fabricated `.knxprod`
+files under the KNX test manufacturer `M-00FA`, one construct per product
+(a little-endian float, a `<choose>` that writes part of a segment, a
+master reset with an erase code, and so on, taken from the `needs-capture`
+backlog). ETS downloads each one into knx-sim in the VM once; the capture is
+ours and is committed under `captures/synthetic/` with a manifest of the ETS
+version, the simulator build and the product XML hash. CI replays the
+captures on every push (see [CI](#ci)): the oracle rows run `--check`
+ungated, knx-sim replays each capture as a calibration test, and the sim
+loop runs the catalogue. The epic's checklist tracks the products still to
+be captured.
+
+The products live in `tests-support/synthetic-products/`: one TOML spec per
+product, rendered by `generate.py` into committed product XML, which
+`bussard-prod` and knx-sim read in an ungated test each. Its README holds the
+spec schema, the id and master-data rules, the render, sign and capture flow
+and the catalogue table.
+
+The rule that holds now and after #596: ETS is a capture tool, CI runs on
+captures. A question about what ETS writes is answered by a capture (house,
+sweep or, once it exists, a synthetic product), never by reasoning about
+what ETS probably does. A capture is retaken when the product XML or the ETS
+version changes.
+
 ## The product corpus (`BUSSARD_PRODUCT_CORPUS`)
 
 The corpus is the vendor archives `tests-support/product-corpus/fetch.sh`
@@ -35,11 +98,11 @@ directory itself. Every gated test resolves all three to the vendor directory.
 $ export BUSSARD_PRODUCT_CORPUS="$PWD/tests-support/product-corpus"
 $ cargo nextest run --profile corpus \
     -p bussard-download -p bussard-prod -p bussard-cli \
-    -E 'binary(it) & test(/^(flash_corpus|flash_dryrun_system7|ets_golden|sys7_jung_m2_plan|param_readback_roundtrip|parameter_image|sys7_visible_parameters|selected|evaluator_conformance|flash_dry_run|offline_oracle)::/)'
+    -E 'binary(it) & test(/^(builtin_templates|flash_corpus|flash_dryrun_system7|ets_golden|sys7_jung_m2_plan|param_readback_roundtrip|parameter_image|sys7_visible_parameters|selected|evaluator_conformance|flash_dry_run|offline_oracle)::/)'
 ```
 
 The `corpus` nextest profile (`.config/nextest.toml`) allows a test 20 minutes:
-the three `flash_corpus` sweeps plan every application of ~500 archives and
+the three `flash_corpus` sweeps plan every application of ~900 archives and
 take several minutes each in a debug build. Run one file while iterating, for
 example `cargo nextest run --profile corpus -p bussard-download --test it
 sys7_jung_m2_plan::`.
@@ -88,8 +151,13 @@ $ BUSSARD_ORACLE_ROWS=captures/campaign/rows/rows-house-16.txt BUSSARD_ORACLE_RO
     cargo nextest run --profile corpus -p bussard-cli -E 'test(/^offline_oracle::/)'
 ```
 
-The ungated `test_offline_oracle_check_skips_a_row_without_its_capture` runs
-the script's `--check` path on every CI run (POSIX hosts with `python3`).
+Two oracle tests are ungated and run on every CI run (POSIX hosts with
+`python3`): `test_offline_oracle_check_skips_a_row_without_its_capture`
+checks the script's `--check` path, and
+`test_offline_oracle_synthetic_rows_pass_the_check` runs `--check` over the
+synthetic products' committed rows (`captures/synthetic/rows.txt`). A row's
+product field may name a product XML directory, which the script zips with
+the stub master.
 
 ## The flash-then-plan loop against knx-sim (`scripts/sim-catalog-loop.sh`)
 
@@ -192,6 +260,24 @@ plan for devices without a row are defined in
 write names its rows and their figures.
 
 ## CI
+
+The synthetic product catalogue (epic #596) is checked on every push and
+pull request, with no environment variable and no vendor data:
+
+| check | where |
+|---|---|
+| bussard vs ETS: `95-offline-oracle.sh --check --rows captures/synthetic/rows.txt` (`offline_oracle.rs`) | `test` job, ubuntu and macOS (Windows skips: bash) |
+| a product whose `xml/` changed since its capture fails, naming `capture.py` (`synthetic_captures.rs`) | `test` job, every OS |
+| ETS vs sim: knx-sim replays each committed capture's `requests.txt`, every object `Loaded`, segments and memory as ETS wrote them (`knx-sim/tests/synthetic_calibration.rs`) | `knx-sim` job and `sim-conformance` job |
+| bussard vs sim: the flash-then-plan loop with seeded configurations over every synthetic product (`sim_catalog_loop.rs`, `test_sim_catalog_loop_synthetic_catalogue_shard_<k>`) | `sim-conformance` job (`BUSSARD_KNX_SIM_BIN`) |
+| every product's XML reads in `bussard-prod` and knx-sim (`synthetic_products.rs`) | `test` job, `knx-sim` job |
+| the generator's unit tests (`test_generate.py`) and `generate.py --check`: a committed `xml/` or `signed.toml` that no longer matches its `product.toml` fails | `lint` job |
+
+The catalogue grows to about forty products, so a test that covers all of
+them must not run them one after another: the oracle rows run on four workers
+inside the test, the sim loop runs as four shards, and their shared nextest
+budget is an override in `.config/nextest.toml` sized for forty. A new
+catalogue-wide test follows the same rule.
 
 The `sim-conformance` job also runs the KNX IP interface loop
 (`sim_interface_loop`, issue #391): it builds knx-sim's `serve`, starts a

@@ -51,7 +51,7 @@ The signature files authenticate the archive to ETS. They stop third parties fro
 From each application program bussard reads the identity (id, application number and version, mask version, name), the communication objects, the parameter types, the parameters with their defaults and memory locations, the code segments (metadata only) and the load procedure `flash` follows.
 
 !!! note
-    A text parameter is written in the code page the program declares (`TextParameterEncoding`, for example `iso-8859-15` or `utf-8`). A character outside that code page, or a text longer than the field, is refused. A program that declares no encoding takes ASCII text only.
+    A text parameter is written in the code page the program declares (`TextParameterEncoding`, for example `iso-8859-15` or `utf-8`). A character outside that code page, or a text longer than the field, is refused. A program that declares no encoding is written in ISO 8859-1 (Latin-1), as ETS writes it; there a character whose octet differs between ISO 8859-1, Windows-1252 and ISO 8859-15 (the euro sign, for example) is refused.
 
 ??? note "Details"
     The program XML is streamed, never loaded as a whole document; 20 to 28 MB per program is normal. Com-objects are resolved from the `ComObject` base table and the `ComObjectRef` overrides into effective number, DPT, flags, size and text, the same way the `.knxproj` importer does. Parameter types cover `TypeNumber`, `TypeRestriction`, `TypeText`, `TypeFloat` and `TypeNone`; any other `Type*` element is kept by name. A parameter-ref `Value` or `Access` overrides the parameter's own. Code segments (`RelativeSegment`, `AbsoluteSegment`) keep their id, size, address or offset and load-state machine; the binary payload is dropped. The `LdCtrl*` load procedure is parsed into a typed op list, and unknown ops are kept verbatim.
@@ -124,9 +124,9 @@ With `--order-number`, bussard:
 3. asks for confirmation: a terminal prompt, or `--yes-download` to skip it. Without a terminal it refuses unless `--yes-download` is given;
 4. downloads to memory, with a hard 100 MiB cap;
 5. verifies the download's byte size and SHA-256 against the index. A mismatch is a hard error: the file is not the one the index vouches for, perhaps because the vendor re-published it;
-6. stores the verified file under `products/` and runs the normal import on it.
+6. stores the verified file under `products/` and runs the normal import on it. When the entry names an `inner` file of a ZIP download, that `.knxprod` is stored instead of the ZIP.
 
-The index covers about 26 product databases from MDT, Zennio, Lingg & Janke, Theben and Elsner, each verified by downloading it and computing its checksum. It points only at bare `.knxprod` downloads, so the checksum covers the exact file ETS would read. `BUSSARD_PRODUCT_INDEX` replaces the built-in index with your own, for a private mirror.
+The index covers about 900 product databases from MDT, Zennio, Lingg & Janke, Theben, Elsner, Siemens, ABB, Busch-Jaeger, Ekinex, Weinzierl and others, each verified by downloading it and computing its checksum. Most point at a bare `.knxprod`; some vendors serve a ZIP around it, and the checksum then covers the ZIP, which also covers the `.knxprod` inside. `BUSSARD_PRODUCT_INDEX` replaces the built-in index with your own, for a private mirror.
 
 ### Index schema
 
@@ -141,7 +141,8 @@ The index covers about 26 product databases from MDT, Zennio, Lingg & Janke, The
 | `url` | string | Vendor-hosted download URL for the `.knxprod`. |
 | `sha256` | string | Lower-case hex SHA-256 of the download. |
 | `size` | number | Exact byte size of the download. |
-| `filename` | string | The vendor's original file name; also the file name under `products/`. |
+| `filename` | string | The vendor's original file name; also the file name under `products/` unless `inner` is set. |
+| `inner` | string, optional | For a ZIP download, the entry name of the `.knxprod` inside it that the entry points at. `import-product` stores that file under its own name. Needed when the ZIP holds several. |
 | `application_ref` | string, optional | The application program ref an order number resolves to (documentation only). |
 | `redistributable` | bool | Whether bussard may mirror the file itself. Always `false` for vendor-hosted copyrighted data. |
 | `notes` | string, optional | Version and caveats. |

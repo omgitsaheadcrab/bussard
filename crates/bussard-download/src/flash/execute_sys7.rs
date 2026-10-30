@@ -122,8 +122,9 @@ pub(super) async fn flash_sys7<C: Connector, F: FnMut(Progress)>(
                         address,
                         size,
                         mem_type,
+                        access,
                         seg_flags,
-                        checksum_ctrl,
+                        seg_type,
                         image,
                     } => {
                         // 1. Allocate the absolute segment on the LSM. The captures pin
@@ -131,19 +132,14 @@ pub(super) async fn flash_sys7<C: Connector, F: FnMut(Progress)>(
                         //    per-segment attribute octets, which the plan takes from the
                         //    op's `Access`/`MemType`/`SegFlags` (ETS reproduces them
                         //    verbatim) or derives from the address when absent.
-                        let (seg_flags, checksum_ctrl) = (*seg_flags, *checksum_ctrl);
+                        let (access, seg_flags) = (*access, *seg_flags);
                         // Checked, not truncated: an out-of-range address used to go out as
                         // a wrong allocation frame before the following write refused.
                         let target = session.l4().target();
                         let seg_addr = sys7_u16(target, "segment address", *address)?;
                         let seg_size = sys7_u16(target, "segment size", *size)?;
                         let event = bussard_mgmt::encode_alloc_segment(
-                            bussard_mgmt::sys7::S7_SUB_ALLOC_DATA,
-                            seg_addr,
-                            seg_size,
-                            seg_flags,
-                            *mem_type,
-                            checksum_ctrl,
+                            *seg_type, seg_addr, seg_size, access, *mem_type, seg_flags,
                         );
                         let octet = lsm_octet(target, *idx)?;
                         lsm.send_control(session.l4(), octet, &event).await?;
@@ -156,14 +152,14 @@ pub(super) async fn flash_sys7<C: Connector, F: FnMut(Progress)>(
                             // Spot-check only unmasked, checksum-controlled segments
                             // written blind: a masked segment leaves device-owned
                             // bytes untouched, so the image's leading octets do not
-                            // equal the device's memory; a `checksum_ctrl == 0`
+                            // equal the device's memory; a `seg_flags == 0`
                             // segment is rewritten by the running application after
                             // the restart (1.1.36 `0x4916`: written `0c`, read back
                             // `00`), so its sample proves nothing. A read-compare
                             // write compared every octet already.
                             if blind
                                 && !ctx.segment_masks.contains_key(&img.segment_id)
-                                && checksum_ctrl != 0
+                                && seg_flags != 0
                                 && let Some(bytes) = plan.images.get(&img.segment_id)
                             {
                                 let part = image_part(bytes, img);
@@ -207,6 +203,32 @@ pub(super) async fn flash_sys7<C: Connector, F: FnMut(Progress)>(
                         let octet = lsm_octet(target, *idx)?;
                         lsm.send_control(session.l4(), octet, &event).await?;
                     }
+                    FlashStep::Sys7TaskPtr {
+                        lsm: idx,
+                        init,
+                        save,
+                        pei_handler,
+                    } => {
+                        let event = bussard_mgmt::encode_task_ptr(*init, *save, *pei_handler);
+                        let octet = lsm_octet(session.l4().target(), *idx)?;
+                        lsm.send_control(session.l4(), octet, &event).await?;
+                    }
+                    FlashStep::Sys7TaskCtrl2 {
+                        lsm: idx,
+                        callback,
+                        com_objects,
+                        segment_1,
+                        segment_2,
+                    } => {
+                        let event = bussard_mgmt::encode_task_ctrl2(
+                            *callback,
+                            *com_objects,
+                            *segment_1,
+                            *segment_2,
+                        );
+                        let octet = lsm_octet(session.l4().target(), *idx)?;
+                        lsm.send_control(session.l4(), octet, &event).await?;
+                    }
                     FlashStep::Sys7LoadCompleted { lsm: idx } => {
                         let octet = lsm_octet(session.l4().target(), *idx)?;
                         lsm.drive(session.l4(), octet, LoadControl::LoadCompleted)
@@ -232,6 +254,7 @@ pub(super) async fn flash_sys7<C: Connector, F: FnMut(Progress)>(
                         prop_id,
                         expected,
                         mask,
+                        start_element,
                     } => {
                         // The obj0/PID78 preflight and any other property compare: identical
                         // to System B (an interface-object property read + compare).
@@ -240,6 +263,7 @@ pub(super) async fn flash_sys7<C: Connector, F: FnMut(Progress)>(
                                 session.l4(),
                                 *object,
                                 *prop_id,
+                                *start_element,
                                 expected,
                                 mask.as_deref(),
                             )
@@ -360,15 +384,37 @@ pub(super) async fn flash_sys7<C: Connector, F: FnMut(Progress)>(
                         }
                     }
                     FlashStep::Sys7EnableVerifyMode => {
-                        if let bussard_mgmt::VerifyModeOutcome::Refused { previous } =
-                            bussard_mgmt::enable_verify_mode(session.l4()).await?
-                        {
-                            warnings.push(format!(
-                                "step {}: the device refused verify mode \
-                                 (PID_DEVICE_CONTROL stays {previous:#04X})",
-                                i + 1
-                            ));
+                        // From here every segment write's echo is compared
+                        // with the chunk (DMP_MemWrite_RCoV, Management
+                        // Procedures 03_05_02 §3.16.3), and the session sets
+                        // the mode again on every later connection (issue
+                        // #524). A device without it streams as before.
+                        match session.enable_verify_mode().await? {
+                            bussard_mgmt::VerifyModeOutcome::Refused { previous } => {
+                                warnings.push(format!(
+                                    "step {}: the device refused verify mode \
+                                     (PID_DEVICE_CONTROL stays {previous:#04X}); the segment \
+                                     writes were not verified by echo",
+                                    i + 1
+                                ));
+                            }
+                            bussard_mgmt::VerifyModeOutcome::Unsupported => {
+                                warnings.push(format!(
+                                    "step {}: the device has no readable PID_DEVICE_CONTROL; \
+                                     the segment writes were not verified by echo",
+                                    i + 1
+                                ));
+                            }
+                            _ => {}
                         }
+                    }
+                    // The KNXnet/IP parameters of an IP-enabled device (issue
+                    // #455, the COMIP2 on 0701), as on System B.
+                    FlashStep::KnxnetIpParameters { program } => {
+                        super::knxnet_ip::write_knxnet_ip(session.l4(), program).await?;
+                    }
+                    FlashStep::Delay { milliseconds } => {
+                        super::execute::delay_step(*milliseconds).await;
                     }
                     // System B steps never appear in a System 7 plan.
                     other => {
@@ -602,6 +648,7 @@ pub(super) async fn verify_sys7<C: Connector>(
         spot_checks_match,
         warnings: Vec::new(),
         reboot_readiness: Vec::new(),
+        verify_echoes: None,
         property_only: false,
     })
 }

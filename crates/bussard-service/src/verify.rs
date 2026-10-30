@@ -24,7 +24,10 @@
 //! - **Security object** (KNX Data Secure, issue #331): the element count of
 //!   the group key table (PID 53, whose keys are write-only), the security
 //!   individual address table (PID 54) and the group-object security flags
-//!   (PID 61), against the program the write sent.
+//!   (PID 61), against the program the write sent, and the object's load
+//!   state (PID 5, issue #534): anything but `Loaded` is a leftover, because
+//!   the device then ignores those tables and drops every secured group
+//!   telegram (KNX 3/5/1 §6.3.4, §6.3.7.4, §6.3.8.4; KNX 3/3/7 §5.5.2).
 //!
 //! What cannot be read (a device that refuses a property, an unsupported
 //! mask) is a note, not a difference: a plan treats it as "not compared" too.
@@ -36,11 +39,12 @@
 use std::collections::BTreeSet;
 
 use bussard_download::{
-    DesiredTables, FlashPlan, FlashStep, LiveRead, SecurityInputs, build_table_images,
+    DesiredTables, FlashPlan, FlashStep, LiveRead, PropObject, SecurityInputs, build_table_images,
     parameter_overrides, plan,
 };
+use bussard_mgmt::load::LoadState;
 use bussard_mgmt::property_ext::{
-    PID_GRP_KEY_TABLE, PropertyExtAddress, read_property_ext_element_count,
+    PID_GRP_KEY_TABLE, PropertyExtAddress, read_property_ext_element_count, security_load_state,
 };
 use bussard_mgmt::tables::DeviceTables;
 use bussard_mgmt::{ConnectionSeed, L4Channel, Layer4Connection};
@@ -143,12 +147,29 @@ pub struct ExpectedProperty {
 
 impl ExpectedProperty {
     /// The property writes of `flash` a read-back compares: those of a System
-    /// 7 or property-only plan. A System B plan's program-version writes keep
-    /// the read-back they had before issue #390 (none).
+    /// 7 or property-only plan, and the KNXnet/IP parameters of any plan. A
+    /// System B plan's program-version writes keep the read-back they had
+    /// before issue #390 (none).
     pub fn from_flash_plan(flash: &FlashPlan) -> Vec<ExpectedProperty> {
+        // The KNXnet/IP parameters of a device with a KNX IP interface built
+        // in (issue #455), on every plan: read back by object type 11, which
+        // finds the object whatever index the executor wrote it at.
+        let knxnet = flash.knxnet_ip().into_iter().flat_map(|program| {
+            program.writes.iter().map(|w| ExpectedProperty {
+                object: PropObject::Type {
+                    object_type: bussard_mgmt::knxnet::OT_KNXNET_IP_PARAMETER,
+                    occurrence: 0,
+                },
+                prop_id: u32::from(w.prop_id),
+                start: w.start,
+                count: w.count.max(1),
+                value: w.value.clone(),
+            })
+        });
         if !flash.is_sys7() && !flash.is_property_only() {
-            return Vec::new();
+            return knxnet.collect();
         }
+        let knxnet: Vec<ExpectedProperty> = knxnet.collect();
         flash
             .steps
             .iter()
@@ -169,6 +190,7 @@ impl ExpectedProperty {
                 }),
                 _ => None,
             })
+            .chain(knxnet)
             .collect()
     }
 
@@ -186,6 +208,9 @@ pub struct Expected<'a> {
     pub tables: Option<DesiredTables>,
     /// The group-object table's element count.
     pub group_objects: Option<u16>,
+    /// The System B group-object table image an `apply` reloaded (issue
+    /// #540): its count and every descriptor are compared.
+    pub object_table: Option<Vec<u8>>,
     /// The parameter values.
     pub parameters: Option<ExpectedParameters<'a>>,
     /// The security object.
@@ -241,6 +266,7 @@ impl<'a> Expected<'a> {
         Expected {
             tables,
             group_objects,
+            object_table: None,
             parameters: Some(ExpectedParameters {
                 product,
                 app,
@@ -268,6 +294,9 @@ pub enum LeftoverKind {
     GroupObjects,
     /// A System 7 group object's communication flag (C, in its CONFIG octet).
     CommunicationFlag,
+    /// A System B group-object descriptor, or the table it sits in (issue
+    /// #540).
+    GroupObjectDescriptor,
     /// A parameter value.
     Parameter,
     /// The group key table's (PID 53) element count.
@@ -276,6 +305,8 @@ pub enum LeftoverKind {
     SecureSender,
     /// A group object's security flag (PID 61).
     SecurityFlag,
+    /// The security object's load state (PID 5, issue #534).
+    SecurityLoadState,
     /// A property a load procedure wrote (issue #390).
     Property,
     /// The read-back itself could not be made.
@@ -331,6 +362,9 @@ pub struct Compared {
     /// Group objects flagged secured (PID 61).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secured_objects: Option<usize>,
+    /// The security object's load state as read (PID 5, issue #534).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_load_state: Option<String>,
     /// Properties a load procedure wrote (issue #390).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub properties: Option<usize>,
@@ -420,6 +454,9 @@ impl WriteReadback {
         if let Some(n) = c.secured_objects {
             parts.push(format!("{n} secured object(s) (PID 61)"));
         }
+        if let Some(state) = &c.security_load_state {
+            parts.push(format!("security object {state} (PID 5)"));
+        }
         if let Some(n) = c.properties {
             parts.push(format!("{n} load-procedure property value(s)"));
         }
@@ -483,6 +520,9 @@ pub async fn read_back<Ch: L4Channel>(
                 .notes
                 .push(format!("tables not compared: {}", chain(&err))),
         }
+    }
+    if let Some(model) = &expected.object_table {
+        compare_object_table(l4, &mut out, model).await;
     }
     if let Some(p) = &expected.parameters {
         let target = l4.target();
@@ -634,6 +674,57 @@ fn compare_tables(out: &mut WriteReadback, live: &DeviceTables, expected: &Expec
     }
 }
 
+/// The System B group-object table against the image an `apply` reloaded
+/// (issue #540): every descriptor that differs is a leftover, and so is a
+/// table that cannot be read (the reload cannot be confirmed).
+async fn compare_object_table<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    out: &mut WriteReadback,
+    model: &[u8],
+) {
+    let count = model
+        .get(..2)
+        .map_or(0, |w| usize::from(u16::from_be_bytes([w[0], w[1]])));
+    let read = match bussard_download::find_object_table(l4).await {
+        Ok(Some(index)) => bussard_download::read_object_table_at(l4, index, count)
+            .await
+            .map_err(|e| chain(&e)),
+        Ok(None) => Err("no group-object table object (type 9)".to_string()),
+        Err(e) => Err(chain(&e)),
+    };
+    let live = match read {
+        Ok(live) => live,
+        Err(why) => {
+            out.push(
+                LeftoverKind::GroupObjectDescriptor,
+                "group-object table".to_string(),
+                format!("no answer ({why})"),
+                entries(count),
+            );
+            return;
+        }
+    };
+    if let Some(change) = bussard_download::ObjectTableChange::between(&live, model) {
+        for c in &change.objects {
+            out.push(
+                LeftoverKind::GroupObjectDescriptor,
+                format!("object {} descriptor", c.object),
+                format!("{:04X}", c.from),
+                format!("{:04X}", c.to),
+            );
+        }
+        if change.from_count != change.to_count {
+            out.push(
+                LeftoverKind::GroupObjects,
+                "group-object table".to_string(),
+                entries(change.from_count),
+                entries(change.to_count),
+            );
+        }
+    }
+    out.compared.group_objects = Some(live.count);
+}
+
 /// The System 7 communication flags against the model's links: C on for
 /// every linked object, off for every object `s7` shows linked before but the
 /// model does not (see [`bussard_download::sys7_flag_writes`]). A device whose
@@ -686,6 +777,20 @@ fn compare_parameters(out: &mut WriteReadback, flashed: &FlashedParameters) {
             with_unit(&d.model),
         );
     }
+    if !flashed.kept.is_empty() {
+        let names: Vec<String> = flashed
+            .kept
+            .iter()
+            .map(|k| format!("{} ({})", k.key, k.name))
+            .collect();
+        out.notes.push(format!(
+            "{} parameter(s) kept on the device, not compared: the load procedure's branch \
+             does not write their octets, as ETS's download does not (issue #411), and after a \
+             fresh allocation the device holds whatever the allocation left there: {}",
+            names.len(),
+            names.join(", ")
+        ));
+    }
     out.compared.parameters = Some(flashed.compared);
 }
 
@@ -696,6 +801,7 @@ async fn compare_security<Ch: L4Channel>(
     out: &mut WriteReadback,
     expected: &ExpectedSecurity,
 ) {
+    compare_security_load_state(l4, out).await;
     match read_property_ext_element_count(l4, PropertyExtAddress::security(PID_GRP_KEY_TABLE)).await
     {
         Ok(count) => {
@@ -761,6 +867,37 @@ async fn compare_security<Ch: L4Channel>(
             );
         }
         out.compared.secured_objects = Some(held.len());
+    }
+}
+
+/// The security object's load state (PID 5) against `Loaded` (issue #534).
+/// A state that cannot be read is a leftover too: nothing then shows the
+/// device uses the tables just written.
+async fn compare_security_load_state<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    out: &mut WriteReadback,
+) {
+    let item = "security object load state (PID 5)".to_string();
+    let loaded = "Loaded".to_string();
+    match security_load_state(l4).await {
+        Ok(LoadState::Loaded) => out.compared.security_load_state = Some(loaded),
+        Ok(state) => {
+            out.push(
+                LeftoverKind::SecurityLoadState,
+                item,
+                format!(
+                    "{state} (it drops every secured group telegram until a write ends Loaded)"
+                ),
+                loaded,
+            );
+            out.compared.security_load_state = Some(state.to_string());
+        }
+        Err(err) => out.push(
+            LeftoverKind::SecurityLoadState,
+            item,
+            format!("no answer ({})", chain(&err)),
+            loaded,
+        ),
     }
 }
 

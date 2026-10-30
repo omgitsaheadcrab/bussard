@@ -1,26 +1,57 @@
 //! The connection-oriented transport (layer-4) state machine.
 //!
-//! This drives the KNX "style-1 rationalised" connection over any
+//! This drives the client side of a KNX transport-layer connection over any
 //! [`BusConnection`]: it opens a connection to one individual address with
 //! `T_Connect`, sends numbered data telegrams (NDT) and waits for the device's
 //! `T_ACK`, receives the device's response NDTs and acknowledges them, and tears
-//! the connection down cleanly with `T_Disconnect`.
+//! the connection down with `T_Disconnect`.
 //!
-//! # State machine (style-1 rationalised)
+//! # State machine (Style 3)
 //!
-//! - **Connect**: send `T_Connect`; the connection is established optimistically
-//!   (KNX `T_Connect` is unconfirmed). Sequence counters reset to 0 both ways.
-//! - **Send NDT**: send `T_Data_Connected` with the current send sequence; await
-//!   a `T_ACK` for that sequence within [`ACK_TIMEOUT`]; on timeout retransmit up
-//!   to [`MAX_REPETITIONS`] times; then advance the send sequence (mod 16).
-//! - **Receive NDT**: on an incoming NDT with the **expected** receive sequence,
-//!   reply `T_ACK` and deliver it, then advance the receive sequence. On an
-//!   incoming NDT with a wrong sequence, reply `T_ACK` with `expected - 1` and
-//!   drop it (a benign duplicate). Any `T_Disconnect` or protocol error tears the
-//!   connection down.
-//! - **Disconnect**: send `T_Disconnect`. The device also disconnects itself
-//!   after roughly six seconds of inactivity, so no idle heartbeat is needed —
-//!   we simply reconnect per procedure.
+//! The events and actions follow the Style 3 table of 03_03_04 Transport Layer
+//! §5.4.3 as amended by AN210 (TL Style 3 Rework, §2.2.1), the only style the
+//! transport-layer test specification (08_03_04 §3) still admits:
+//!
+//! - **Connect** (E25, A12): send `T_Connect`, sequence counters to 0. The
+//!   connection is used optimistically; a negative `L_Data.con` for the
+//!   `T_Connect` closes it at once (E20, A5: [`MgmtError::NotConfirmed`]).
+//! - **Send NDT** (E15, A7): send `T_Data_Connected` at `SeqNoSend` and wait
+//!   for its `T_ACK` within the acknowledge timeout ([`ACK_TIMEOUT`]).
+//!   - `T_ACK` at `SeqNoSend` (E08, A8): done, `SeqNoSend` advances.
+//!   - `T_ACK` at another sequence (E09): ignored (A0, the AN210 amendment;
+//!     the unamended table closed the connection here).
+//!   - `T_NAK` at `SeqNoSend` (E12, E13): repeat while fewer than
+//!     [`MAX_REPETITIONS`] repetitions went out (A9), otherwise close (A6).
+//!   - `T_NAK` at another sequence (E11): ignored (A0).
+//!   - acknowledge timeout (E17, E18): repeat up to [`MAX_REPETITIONS`] times
+//!     (A9), then close (A6).
+//! - **Receive NDT**: at `SeqNoRcv` (E04, A2) acknowledge, deliver, advance; at
+//!   `SeqNoRcv - 1` (E05, A3) acknowledge it again without delivering (the
+//!   peer missed our `T_ACK`); at any other sequence (E06, A4) answer `T_NAK`
+//!   with the received sequence and drop it.
+//! - **Peer `T_Disconnect`** (E02, A5): the connection is closed; nothing is
+//!   sent back.
+//! - **Close** (A6, E26/A14): every path that gives up on a connection the peer
+//!   holds open (acknowledge timeout or `T_NAK` exhausted, a broken channel)
+//!   sends one best-effort `T_Disconnect`, so the device does not sit in
+//!   OPEN_IDLE until its connection timeout and ignore the next `T_Connect`
+//!   from this address (E00, A0). Before the peer has shown itself the
+//!   connection is still CONNECTING in the table's terms, where the
+//!   acknowledge timeout is A0, so an absent address costs no extra frame.
+//!
+//! Both sides run a 6 s connection timeout ([`CONNECTION_TIMEOUT`], 03_03_04
+//! §5 local variables, E16): a device closes a connection that saw no traffic
+//! for 6 s. No idle heartbeat is sent. A request after a longer pause first
+//! reconnects (issue #575): the device's `T_Disconnect` from the timeout is
+//! drained, a `T_Disconnect` (for a device whose timer has not fired yet) and
+//! a fresh `T_Connect` go out, both sequence numbers restart at 0, and an
+//! `A_Authorize_Request` presented on the connection is presented again, so
+//! the access level the caller established carries over. A Data Secure
+//! session keeps its sync: the sequence numbers it protects are per address,
+//! not per transport connection.
+//!
+//! The control frames go out at system priority (§5.3 A2-A4, A6); the numbered
+//! data telegrams at [`Layer4Connection::data_priority`].
 //!
 //! The wire behaviour follows the published KNX transport-layer procedure
 //! (EN 50090 / the KNX standard). No GPL sources were consulted.
@@ -29,7 +60,7 @@ use std::time::Duration;
 
 use bussard_bus::{BusError, BusLease, FrameSubscription};
 use bussard_model::IndividualAddress;
-use bussard_transport::cemi::{Apdu, CemiFrame, Tpci};
+use bussard_transport::cemi::{Apdu, CemiFrame, Priority, Tpci};
 use bussard_transport::tpci::{self, TpciKind};
 use bussard_transport::{BusConnection, TimestampedFrame, TransportError};
 use tokio::time::{Instant, timeout};
@@ -39,22 +70,28 @@ use crate::error::{MgmtError, Result, SilenceKind};
 /// The outcome of an `A_Authorize_Request` (issue #52 finding #1).
 ///
 /// Authorization policy is **tolerate-absence, fail-on-denied**: a device that
-/// grants full access proceeds, a device that grants only limited access is a
-/// hard failure, and a device that does not implement authorize at all is
-/// tolerated (older/simpler devices never needed a key).
+/// grants an access level proceeds, a device that sets the minimum level (its
+/// answer to an invalid key) is a hard failure, and a device that does not
+/// implement authorize at all is tolerated (older/simpler devices never needed
+/// a key).
+///
+/// Levels run from 0 (maximum access) to 3 or 15 (minimum access), and the
+/// free key `FFFFFFFFh` maps to the highest level a device leaves unprotected,
+/// which can be above 0 (03_03_07 §3.5.7). A caller that needs a specific
+/// level compares with [`AuthorizeOutcome::grants`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorizeOutcome {
-    /// The device granted access at `level` (always `0` here — the full-access
-    /// level; any non-zero grant is [`AuthorizeOutcome::Denied`]).
+    /// The device granted access at `level` (0 = full access; any level below
+    /// the minimum).
     Granted {
         /// The granted access level (0 = full access).
         level: u8,
     },
-    /// The device answered but granted a **non-zero** access level: the presented
-    /// key does not unlock the access a management session needs. A real
-    /// access-denied — callers turn this into [`MgmtError::AccessDenied`].
+    /// The device answered with the minimum access level, 3 or 15, which is
+    /// what it sets for an invalid key (03_03_07 §3.5.7): the presented key
+    /// unlocks nothing. Callers turn this into [`MgmtError::AccessDenied`].
     Denied {
-        /// The non-zero level the device granted.
+        /// The minimum level the device set.
         level: u8,
     },
     /// The device does not implement authorize: it did not answer, or answered
@@ -68,10 +105,33 @@ pub enum AuthorizeOutcome {
 }
 
 impl AuthorizeOutcome {
-    /// Whether the device implements authorize and granted full access.
+    /// Whether the device implements authorize and granted an access level.
     pub fn granted(&self) -> bool {
         matches!(self, AuthorizeOutcome::Granted { .. })
     }
+
+    /// The access level the device answered with, granted or denied.
+    pub fn level(&self) -> Option<u8> {
+        match self {
+            AuthorizeOutcome::Granted { level } | AuthorizeOutcome::Denied { level } => {
+                Some(*level)
+            }
+            AuthorizeOutcome::Unsupported { .. } => None,
+        }
+    }
+
+    /// Whether the granted level allows an access that requires `required`
+    /// (a lower number is more access, 03_03_07 §3.5.7).
+    pub fn grants(&self, required: u8) -> bool {
+        matches!(self, AuthorizeOutcome::Granted { level } if *level <= required)
+    }
+}
+
+/// Whether `level` is a minimum access level: 3 on a device with four levels,
+/// 15 on one with sixteen (03_03_07 §3.5.7). A device sets it for an invalid
+/// key. A level above 15 is out of range and read the same way.
+fn is_minimum_access_level(level: u8) -> bool {
+    level == 3 || level >= 15
 }
 
 /// The two operations the layer-4 state machine needs from whatever carries its
@@ -174,6 +234,22 @@ pub const ACK_TIMEOUT: Duration = Duration::from_secs(3);
 /// timeout before the connection is considered dead.
 pub const MAX_REPETITIONS: u32 = 3;
 
+/// The transport-layer connection timeout (03_03_04 §5, `connection_timeout_timer`):
+/// a connection that sees no traffic for this long is closed by the device
+/// (E16, A6). [`Layer4Connection::idle_beyond_connection_timeout`] tells a
+/// caller that its peer has most likely done so.
+pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// How many queued frames [`Layer4Connection`] drains before an idle reconnect
+/// (issue #575): the device's timeout `T_Disconnect` and whatever else the
+/// line carried meanwhile. Bounded so a busy line cannot stall the reconnect.
+const IDLE_DRAIN_FRAMES: usize = 64;
+
+/// How long the drain before an idle reconnect waits for each further frame.
+/// Every frame of interest was sent at least a connection timeout ago, so
+/// this only has to outlast the gateway's delivery of one queued datagram.
+const IDLE_DRAIN_WAIT: Duration = Duration::from_millis(20);
+
 /// How long to wait for a device's response telegram (an incoming NDT) after
 /// our request has been acknowledged, before concluding the device will not
 /// answer.
@@ -199,18 +275,20 @@ pub struct Timeouts {
     pub max_repetitions: u32,
     /// How long to wait for the device's response NDT.
     pub response_timeout: Duration,
-    /// Whether a negative `L_Data.con` for our `T_Connect` or first numbered
-    /// telegram classifies the target as absent at once
-    /// ([`MgmtError::NotConfirmed`]) instead of waiting out `ack_timeout` and
-    /// the repetitions (issue #45).
+    /// Whether a negative `L_Data.con` for our first numbered telegram
+    /// classifies the target as absent at once ([`MgmtError::NotConfirmed`])
+    /// instead of waiting out `ack_timeout` and the repetitions (issue #45).
     ///
     /// Only a presence probe wants this: [`Timeouts::discovery`] sets it,
-    /// every other budget leaves it `false`, so a programming session or a
-    /// post-restart readiness probe keeps its timeout-and-retry behaviour
-    /// (there a negative con means "not up yet", issue #212). It only acts
-    /// before the first acknowledged exchange, and only when the interface
-    /// reports confirmations at all: a gateway that never sends a negative con
-    /// falls back to the ACK timeout automatically.
+    /// every other budget leaves it `false`, so a programming session keeps
+    /// its timeout-and-retry behaviour on a data telegram. It only acts before
+    /// the first acknowledged exchange, and only when the interface reports
+    /// confirmations at all: a gateway that never sends a negative con falls
+    /// back to the ACK timeout automatically.
+    ///
+    /// A negative con for the `T_Connect` itself fails the connection on
+    /// every budget (03_03_04 §5.4.3 E20, A5): the device never saw the
+    /// connect, so it would ignore every data telegram that follows.
     pub absent_on_negative_confirmation: bool,
 }
 
@@ -311,25 +389,42 @@ impl Default for SyncRetry {
         SyncRetry {
             attempts: 3,
             initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(4),
+            max_backoff: MAX_SYNC_BACKOFF,
         }
         .with_env_cap()
     }
 }
 
+/// The longest pause between two S-A_Sync_Req attempts (issue #575). An
+/// unanswered attempt idles the connection for the response timeout (3 s)
+/// and then the backoff; with at most 2 s the pause stays a second inside the
+/// device's 6 s connection timeout ([`CONNECTION_TIMEOUT`], 03_03_04 §5,
+/// E16), so the retry reaches the device on the connection it synced on.
+/// The sync loop also bounds every backoff by the connection's own timeouts.
+pub const MAX_SYNC_BACKOFF: Duration = Duration::from_secs(2);
+
+/// The headroom the sync loop keeps below the connection timeout: the
+/// response timeout plus the backoff never come closer to it than this.
+const SYNC_IDLE_MARGIN: Duration = Duration::from_secs(1);
+
 impl SyncRetry {
     /// The longer policy for the first connection after a restart bussard
-    /// itself triggered: five attempts, backing off 1, 2, 4 and 8 s. With the
-    /// standard 3 s response timeout the whole sync gives the device about 30 s
-    /// to bring its security layer up.
+    /// itself triggered: seven attempts, backing off 1 s, then 2 s
+    /// ([`MAX_SYNC_BACKOFF`]) five times. With the standard 3 s response
+    /// timeout the whole sync gives the device about 32 s to bring its
+    /// security layer up, the window the earlier 1-2-4-8 s schedule of five
+    /// attempts gave (30 s, live 1.1.12, 2026-09-24), without a pause the
+    /// device's 6 s connection timeout ends (issue #575): an unanswered
+    /// attempt leaves the connection idle for the response timeout plus the
+    /// backoff, at most 5 s.
     ///
     /// [`MGMT_TIMEOUT_MS_ENV`] caps both backoff bounds when set; the attempt
-    /// count stays five.
+    /// count stays seven.
     pub fn after_restart() -> Self {
         SyncRetry {
-            attempts: 5,
+            attempts: 7,
             initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(8),
+            max_backoff: MAX_SYNC_BACKOFF,
         }
         .with_env_cap()
     }
@@ -394,6 +489,10 @@ pub struct Layer4Connection<Ch: L4Channel> {
     /// receive sequence; [`recv_response`](Self::recv_response) drains this
     /// first so the folded answer is not lost.
     pending_response: Option<(u16, Vec<u8>)>,
+    /// Set for the duration of [`request_memory_write_echo`](Self::request_memory_write_echo):
+    /// the `A_Memory_Response` that follows the `A_Memory_Write` is the verify
+    /// echo the caller compares, not a stray to drain.
+    expect_memory_echo: bool,
     /// The device's advertised `PID_MAX_APDU_LENGTH` (NPDU octet budget), read
     /// once and cached for the life of this connection. `None` until
     /// [`negotiate_max_apdu`](Self::negotiate_max_apdu) runs; once negotiated it
@@ -405,9 +504,26 @@ pub struct Layer4Connection<Ch: L4Channel> {
     /// device offered no usable value, so a later call on this connection does
     /// not read it again (issue #215). `None` until it ran without a value.
     max_apdu_absent: Option<MaxApduAbsence>,
-    /// Set once the peer disconnects or a protocol error occurs, so a stale
-    /// `disconnect()` is a no-op.
+    /// Set once the peer disconnects or a protocol error occurs: no further
+    /// request is sent on this connection.
     closed: bool,
+    /// Whether the peer may still hold this connection open: it has shown
+    /// itself (any frame from it) and has not sent `T_Disconnect`. While set,
+    /// closing the connection owes the peer a `T_Disconnect` (03_03_04 §5.3
+    /// A6), even after a response timeout marked it `closed`.
+    peer_open: bool,
+    /// When a frame last went to or came from the peer, for the 6 s
+    /// [`CONNECTION_TIMEOUT`].
+    last_traffic: Instant,
+    /// The connection timeout the peer is assumed to run:
+    /// [`CONNECTION_TIMEOUT`] unless a test shortens it.
+    connection_timeout: Duration,
+    /// How often this connection reconnected after idling past
+    /// [`Self::connection_timeout`] (issue #575).
+    idle_reconnects: u32,
+    /// The key the last [`authorize`](Self::authorize) presented, presented
+    /// again after an idle reconnect.
+    authorize_key: Option<u32>,
     /// The KNX Data Secure wrapping layer (issue #71, spec §6.1). Plain by
     /// default (`SecureLayer::plain()`), so the send/receive paths are
     /// byte-identical to the pre-Secure behaviour; when the device is
@@ -426,6 +542,16 @@ pub struct Layer4Connection<Ch: L4Channel> {
     /// The outcome of the last [`authorize`](Self::authorize) on this
     /// connection, kept so the device facts can record the verdict.
     last_authorize: Option<AuthorizeOutcome>,
+    /// The priority of the numbered data telegrams. The transport layer
+    /// leaves it to its user (03_03_04 §5.3 A7); [`Priority::System`] by
+    /// default, as ETS sends them. The control frames are always system
+    /// priority (§5.3 A2-A4, A6).
+    data_priority: Priority,
+    /// Whether memory above `0xFFFF` goes over the user-memory services
+    /// (`A_UserMemory_*`, 20-bit address) instead of `A_MemoryExtended_*`:
+    /// set for an application that does not announce
+    /// `SupportsExtendedMemoryServices` (issue #472). `false` by default.
+    user_memory_above_64k: bool,
 }
 
 /// Why [`Layer4Connection::negotiate_max_apdu`] found no `PID_MAX_APDU_LENGTH`.
@@ -523,13 +649,21 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
             last_send_apci: 0,
             numbered_exchanges: 0,
             pending_response: None,
+            expect_memory_echo: false,
             max_apdu: None,
             max_apdu_absent: None,
             closed: false,
+            peer_open: false,
+            last_traffic: Instant::now(),
             secure,
             sync_retry: SyncRetry::default(),
             seed: None,
             last_authorize: None,
+            connection_timeout: CONNECTION_TIMEOUT,
+            idle_reconnects: 0,
+            authorize_key: None,
+            data_priority: Priority::System,
+            user_memory_above_64k: false,
         })
     }
 
@@ -571,6 +705,18 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
         self.closed = false;
     }
 
+    /// Sets the priority of the numbered data telegrams this connection sends
+    /// from now on ([`Priority::System`] unless changed). The transport-layer
+    /// control frames stay at system priority whatever is set here.
+    pub fn set_data_priority(&mut self, priority: Priority) {
+        self.data_priority = priority;
+    }
+
+    /// The priority of the numbered data telegrams this connection sends.
+    pub fn data_priority(&self) -> Priority {
+        self.data_priority
+    }
+
     /// The outcome of the last [`authorize`](Self::authorize) on this
     /// connection, `None` when none was presented.
     pub fn last_authorize(&self) -> Option<&AuthorizeOutcome> {
@@ -587,6 +733,9 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
             return Err(MgmtError::Disconnected {
                 address: self.target,
             });
+        }
+        if self.idle_beyond_connection_timeout() {
+            self.reconnect_after_idle().await?;
         }
         self.ensure_secure_sync().await?;
         self.last_send_apci = apci;
@@ -611,11 +760,13 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
     ) -> Result<()> {
         let seq = self.send_seq;
         let frame =
-            CemiFrame::t_data_connected(self.target, self.source, tpci_octet, wire_apci, wire_data);
+            CemiFrame::t_data_connected(self.target, self.source, tpci_octet, wire_apci, wire_data)
+                .with_priority(self.data_priority);
 
         let mut attempt = 0;
         loop {
             self.conn.send(frame.clone()).await?;
+            self.last_traffic = Instant::now();
             match self.await_ack(seq).await {
                 AckOutcome::Acked => {
                     self.send_seq = (self.send_seq + 1) & 0x0f;
@@ -623,36 +774,55 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
                     return Ok(());
                 }
                 AckOutcome::Nak => {
-                    // Style-1: a NAK asks for a repeat. Retransmit up to
-                    // `max_repetitions` times before giving up and tearing the
-                    // connection down.
+                    // E12/E13: a T_NAK at our sequence asks for a repeat (A9)
+                    // until the repetitions are spent, then the connection is
+                    // closed (A6).
                     if attempt >= self.timeouts.max_repetitions {
-                        self.mark_closed_disconnect().await;
+                        // A T_NAK proves a peer, also on a connection to our
+                        // own address: it is always told.
+                        self.peer_open = true;
+                        self.abandon().await;
                         return Err(MgmtError::Nak {
                             address: self.target,
                         });
                     }
                     attempt += 1;
                 }
-                AckOutcome::Disconnected => {
-                    self.closed = true;
+                AckOutcome::PeerDisconnected => {
+                    // E02, A5: the peer closed; nothing to send back.
+                    self.peer_closed();
+                    return Err(self.silence_error(SilenceKind::Disconnected));
+                }
+                AckOutcome::ChannelFailed => {
+                    // The frame channel failed under an open connection: tell
+                    // the peer, best-effort, before giving up (A6).
+                    self.abandon().await;
                     return Err(self.silence_error(SilenceKind::Disconnected));
                 }
                 AckOutcome::NotConfirmed => {
                     // The interface reported that the medium did not
                     // acknowledge our frame: nobody is at this address. As on
                     // a timeout, nothing is left to tear down.
-                    self.closed = true;
+                    self.peer_closed();
+                    return Err(MgmtError::NotConfirmed {
+                        address: self.target,
+                    });
+                }
+                AckOutcome::ConnectRejected => {
+                    // E20, A5: the T_Connect was not confirmed, so the device
+                    // never opened the connection.
+                    self.peer_closed();
                     return Err(MgmtError::NotConfirmed {
                         address: self.target,
                     });
                 }
                 AckOutcome::Timeout => {
                     if attempt >= self.timeouts.max_repetitions {
-                        // The very first send with no reaction at all means the
-                        // device is absent; after that, treat the silence as a
-                        // dead connection to a device that stopped answering.
-                        self.closed = true;
+                        // E18, A6. The very first send with no reaction at all
+                        // means the device is absent; after that, treat the
+                        // silence as a dead connection to a device that stopped
+                        // answering.
+                        self.abandon().await;
                         return Err(self.silence_error(SilenceKind::NoResponse));
                     }
                     attempt += 1;
@@ -677,6 +847,13 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
     /// [`AsduError::SyncUnanswered`](bussard_secure::AsduError::SyncUnanswered);
     /// a device that does not even acknowledge it is reported absent as usual.
     async fn ensure_secure_sync(&mut self) -> Result<()> {
+        // A session that found the device on its factory key stays refused
+        // (issue #532): it is never used under the FDSK.
+        if self.secure.on_factory_key() {
+            return Err(MgmtError::FactoryKeyActive {
+                address: self.target,
+            });
+        }
         if !self.secure.needs_sync() {
             return Ok(());
         }
@@ -705,7 +882,7 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
                         apci = format_args!("{apci:#05x}"),
                         "device answered the Data Secure sync request with something else"
                     );
-                    return Err(unanswered(self.target));
+                    break;
                 }
                 // T_ACKed but no Sync_Res: the device may still be bringing its
                 // security layer up after a reboot (issue #166).
@@ -717,9 +894,7 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
                 // A late Sync_Res that answers an earlier attempt's challenge
                 // does not verify against this one; the next attempt can.
                 Err(MgmtError::Secure { .. }) if attempt > 1 => {}
-                Err(MgmtError::MidSessionSilence { .. }) => {
-                    return Err(unanswered(self.target));
-                }
+                Err(MgmtError::MidSessionSilence { .. }) => break,
                 Err(other) => return Err(other),
             }
             if attempt == attempts {
@@ -735,8 +910,42 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
                 backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
                 "Data Secure sync request unanswered; retrying"
             );
-            tokio::time::sleep(backoff).await;
+            tokio::time::sleep(backoff.min(self.sync_backoff_bound())).await;
             backoff = backoff.saturating_mul(2).min(self.sync_retry.max_backoff);
+            // A pause the bound could not keep inside the connection timeout
+            // (a response timeout near it) reconnects before the next attempt.
+            if self.idle_beyond_connection_timeout() {
+                self.reconnect_after_idle().await?;
+            }
+        }
+        // Issue #532: the tool would "typically retry" under the other key
+        // (KNX 3/5/2 §4.1 NOTE 18). One fresh Sync under the FDSK finds a
+        // device that was reset to default; it is reported, never used.
+        if self.secure.switch_to_factory_key() {
+            self.closed = false;
+            let tpci_octet = tpci::ndt(self.send_seq);
+            let (wire_apci, wire_data) =
+                self.secure
+                    .sync_request(self.target, self.source, tpci_octet)?;
+            self.last_send_apci = wire_apci;
+            self.send_numbered(tpci_octet, wire_apci, &wire_data)
+                .await?;
+            match self.recv_response().await {
+                Ok(_) if self.secure.is_synced() => {
+                    tracing::warn!(
+                        target = %self.target,
+                        "the device answered the Data Secure sync under its FDSK, not the tool key"
+                    );
+                    return Err(MgmtError::FactoryKeyActive {
+                        address: self.target,
+                    });
+                }
+                Ok(_)
+                | Err(MgmtError::MidSessionSilence { .. })
+                | Err(MgmtError::NoResponse { .. })
+                | Err(MgmtError::Secure { .. }) => {}
+                Err(other) => return Err(other),
+            }
         }
         self.closed = true;
         Err(unanswered(self.target))
@@ -797,8 +1006,42 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
     /// or, if folded in during a later write's `T_ACK` wait, it is mistaken for
     /// that write's completion and desyncs the sequence.
     fn is_stale_memory_echo(&self, apci: u16) -> bool {
+        if self.expect_memory_echo {
+            return false;
+        }
+        // The user-memory twin (issue #472): an `A_UserMemory_Response` that
+        // answers no `A_UserMemory_Read` is a write's verify echo.
+        if apci == crate::apci::A_USER_MEMORY_RESPONSE {
+            return self.last_send_apci != crate::apci::A_USER_MEMORY_READ;
+        }
         (apci & crate::apci::APCI_SELECTOR_MASK) == crate::apci::A_MEMORY_RESPONSE
             && (self.last_send_apci & crate::apci::APCI_SELECTOR_MASK) != crate::apci::A_MEMORY_READ
+    }
+
+    /// Sends an `A_Memory_Write` and returns the device's verify-mode echo,
+    /// the `A_Memory_Response` a device in verify mode answers every write
+    /// with (Management Procedures 03_05_02 §3.16.3, DMP_MemWrite_RCoV).
+    ///
+    /// The echo is delivered whether the device sends it after its `T_ACK` or
+    /// folds it in before. Only the response to *this* write counts: a stray
+    /// echo from an earlier write cannot be pending, because every write on a
+    /// verify-mode connection goes through here and takes its own echo.
+    ///
+    /// # Errors
+    ///
+    /// As [`request`](Self::request); a device that acknowledges the write but
+    /// sends no echo within the response timeout ends in
+    /// [`MgmtError::NoResponse`] / [`MgmtError::MidSessionSilence`] and closes
+    /// the connection.
+    pub async fn request_memory_write_echo(
+        &mut self,
+        apci: u16,
+        data: &[u8],
+    ) -> Result<(u16, Vec<u8>)> {
+        self.expect_memory_echo = true;
+        let result = self.request(apci, data).await;
+        self.expect_memory_echo = false;
+        result
     }
 
     /// Extracts the inbound `(apci, data)` from `frame`, applying the KNX Data
@@ -844,7 +1087,8 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
             tpci_octet,
             wire_apci,
             &wire_data,
-        );
+        )
+        .with_priority(self.data_priority);
         self.conn.send(frame).await?;
         self.send_seq = (self.send_seq + 1) & 0x0f;
         self.numbered_exchanges = self.numbered_exchanges.saturating_add(1);
@@ -855,8 +1099,11 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
     /// it, and returns its decoded APDU.
     ///
     /// Frames unrelated to this connection (group traffic, telegrams from other
-    /// sources) are skipped. A wrong-sequence NDT is acknowledged with
-    /// `expected - 1` and dropped. Times out as [`MgmtError::NoResponse`].
+    /// sources) are skipped. A repeat of the previous NDT is acknowledged again
+    /// and dropped (E05, A3); an NDT at any other wrong sequence draws a
+    /// `T_NAK` with its sequence (E06, A4). Times out as
+    /// [`MgmtError::NoResponse`]; the peer still holds the connection then, so
+    /// a later [`disconnect`](Self::disconnect) sends its `T_Disconnect`.
     pub async fn recv_response(&mut self) -> Result<(u16, Vec<u8>)> {
         // A folded-ACK response that arrived while we were awaiting the T_ACK has
         // already been acknowledged and sequenced; hand it back first — unless it
@@ -879,22 +1126,33 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
             }
             let stamped = match timeout(remaining, self.conn.recv()).await {
                 Ok(Ok(stamped)) => stamped,
-                Ok(Err(err)) => return Err(self.map_recv_error(err)),
+                Ok(Err(err)) => {
+                    let err = self.map_recv_error(err);
+                    self.abandon().await;
+                    return Err(err);
+                }
                 Err(_elapsed) => {
                     self.closed = true;
                     return Err(self.silence_error(SilenceKind::NoResponse));
                 }
             };
             let frame = stamped.frame;
+            if self.is_connect_rejection(&frame) {
+                self.peer_closed();
+                return Err(MgmtError::NotConfirmed {
+                    address: self.target,
+                });
+            }
 
             // Ignore anything not from our peer addressed to us individually.
             if frame.source != self.target || frame.individual_destination() != Some(self.source) {
                 continue;
             }
+            self.note_peer_frame();
 
             match tpci::classify(frame.tpci_octet()) {
                 TpciKind::Disconnect => {
-                    self.closed = true;
+                    self.peer_closed();
                     return Err(self.silence_error(SilenceKind::Disconnected));
                 }
                 TpciKind::NumberedData(seq) => {
@@ -909,10 +1167,7 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
                         }
                         return Ok((apci, data));
                     } else {
-                        // Wrong sequence (a duplicate): ACK with expected-1 and
-                        // drop, per the style-1 procedure.
-                        let ack_seq = self.recv_seq.wrapping_sub(1) & 0x0f;
-                        self.send_control(tpci::t_ack(ack_seq)).await?;
+                        self.answer_wrong_sequence(seq).await?;
                         continue;
                     }
                 }
@@ -976,6 +1231,32 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
         self.recv_response().await
     }
 
+    /// [`request`](Self::request) for an optional service a device may
+    /// acknowledge but never answer: `Ok(None)` when the device stayed silent
+    /// after its `T_ACK`. The response timeout marks the connection closed;
+    /// since the device acknowledged the request the peer is alive and the
+    /// sequence numbers agree, so the connection is reopened, as
+    /// [`authorize`](Self::authorize) does for a device without authorize.
+    pub(crate) async fn request_optional(
+        &mut self,
+        apci: u16,
+        data: &[u8],
+    ) -> Result<Option<(u16, Vec<u8>)>> {
+        let exchanges_before = self.numbered_exchanges;
+        match self.request(apci, data).await {
+            Ok(pair) => Ok(Some(pair)),
+            Err(MgmtError::NoResponse { .. })
+            | Err(MgmtError::MidSessionSilence {
+                kind: SilenceKind::NoResponse,
+                ..
+            }) if self.numbered_exchanges > exchanges_before => {
+                self.closed = false;
+                Ok(None)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// Presents an access `key` with `A_Authorize_Request` and returns the
     /// authorization outcome (issue #52 finding #1).
     ///
@@ -990,9 +1271,11 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
     ///
     /// The policy is **tolerate-absence, fail-on-denied** (see
     /// [`AuthorizeOutcome`]):
-    /// - a level-0 grant → [`AuthorizeOutcome::Granted`];
-    /// - a non-zero level → [`AuthorizeOutcome::Denied`] (a real access problem,
-    ///   surfaced by callers as [`MgmtError::AccessDenied`]);
+    /// - a granted level (0, or any level above it short of the minimum) →
+    ///   [`AuthorizeOutcome::Granted`] carrying the level;
+    /// - the minimum level 3 or 15 → [`AuthorizeOutcome::Denied`] (the device's
+    ///   answer to an invalid key, surfaced by callers as
+    ///   [`MgmtError::AccessDenied`]);
     /// - a device that does not answer at all, or answers with a non-authorize
     ///   APCI (older/simpler devices that do not implement authorize) →
     ///   [`AuthorizeOutcome::Unsupported`], carrying the raw response detail for a
@@ -1004,6 +1287,7 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
     /// device declining to answer) still surfaces as an `Err`, since that is not
     /// an authorize outcome but a dead session.
     pub async fn authorize(&mut self, key: u32) -> Result<AuthorizeOutcome> {
+        self.authorize_key = Some(key);
         let outcome = self.authorize_exchange(key).await?;
         self.last_authorize = Some(outcome.clone());
         Ok(outcome)
@@ -1051,8 +1335,8 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
         }
 
         match crate::apci::decode_authorize_response(&data) {
-            Some(0) => Ok(AuthorizeOutcome::Granted { level: 0 }),
-            Some(level) => Ok(AuthorizeOutcome::Denied { level }),
+            Some(level) if is_minimum_access_level(level) => Ok(AuthorizeOutcome::Denied { level }),
+            Some(level) => Ok(AuthorizeOutcome::Granted { level }),
             None => Ok(AuthorizeOutcome::Unsupported {
                 detail: format!(
                     "A_Authorize_Response carried no level octet ({})",
@@ -1063,8 +1347,8 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
     }
 
     /// Presents `key` with [`authorize`](Self::authorize) and applies the
-    /// **tolerate-absence, fail-on-denied** policy directly: a granted (level-0)
-    /// or unsupported authorize returns `Ok`, a non-zero level returns
+    /// **tolerate-absence, fail-on-denied** policy directly: a granted or
+    /// unsupported authorize returns `Ok`, the minimum level returns
     /// [`MgmtError::AccessDenied`]. The `Unsupported` case is logged at debug.
     ///
     /// This is the one-call helper the management connect paths use so every
@@ -1309,6 +1593,36 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
         self.secure.is_active()
     }
 
+    /// Runs the Data Secure S-A_Sync handshake now, if it has not run on this
+    /// connection yet (spec §6.3); a no-op on a plain or synced connection.
+    ///
+    /// # Errors
+    ///
+    /// As the Sync before the first wrapped request.
+    pub async fn ensure_synced(&mut self) -> Result<()> {
+        if self.closed {
+            return Err(MgmtError::Disconnected {
+                address: self.target,
+            });
+        }
+        self.ensure_secure_sync().await
+    }
+
+    /// The Data Secure sequence the device is expected to send next: one above
+    /// the last it sent on this connection, or the one its Sync_Res reported.
+    /// `None` on a plain connection or before the Sync.
+    pub fn device_next_sequence(&self) -> Option<u64> {
+        self.secure.device_next_sequence(self.target)
+    }
+
+    /// Makes `next` the lowest Data Secure sequence accepted from the device
+    /// from now on: the step before a write of its
+    /// `PID_SEQUENCE_NUMBER_SENDING`, whose confirmation already carries the
+    /// value written (KNX 3/5/1 §6.3.13.3 NOTE 110, issue #535).
+    pub fn expect_device_sequence(&mut self, next: u64) {
+        self.secure.expect_device_sequence(self.target, next);
+    }
+
     /// Replaces this connection's timeout/retry budget.
     ///
     /// The budget is normally fixed at connect time, but a caller that uses an
@@ -1342,35 +1656,212 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
         self.max_apdu
     }
 
+    /// Sends memory above `0xFFFF` over the user-memory services
+    /// (`A_UserMemory_Read`/`_Write`, 20-bit address) instead of
+    /// `A_MemoryExtended_*`, the way ETS does for an application that does not
+    /// announce `SupportsExtendedMemoryServices` (issue #472). Memory up to
+    /// `0xFFFF` keeps `A_Memory_*` either way.
+    pub fn set_user_memory_above_64k(&mut self, user: bool) {
+        self.user_memory_above_64k = user;
+    }
+
+    /// Whether memory above `0xFFFF` goes over the user-memory services (see
+    /// [`set_user_memory_above_64k`](Self::set_user_memory_above_64k)).
+    pub fn user_memory_above_64k(&self) -> bool {
+        self.user_memory_above_64k
+    }
+
+    /// The `A_UserMemory_Write`/`_Read` data-octet cap for this connection:
+    /// scaled from `PID_MAX_APDU_LENGTH` up to the 15 octets of the 4-bit
+    /// count, else 10, the standard-frame floor.
+    pub fn max_user_memory_chunk(&self) -> u8 {
+        crate::apci::user_memory_chunk_for_apdu(
+            self.inner_max_apdu().unwrap_or(STANDARD_FRAME_APDU),
+        )
+    }
+
     // --- internals ---
 
+    /// The user's `T_Disconnect` (E26, A14): sent while the connection is in
+    /// use or the peer may still hold it open; a connection the peer already
+    /// closed, or that never reached it, sends nothing.
     async fn close(&mut self) -> Result<()> {
-        if self.closed {
+        let owed = !self.closed || self.peer_open;
+        self.closed = true;
+        self.peer_open = false;
+        if !owed {
             return Ok(());
         }
-        self.closed = true;
         let frame = CemiFrame::t_control(self.target, self.source, tpci::T_DISCONNECT);
         self.conn.send(frame).await?;
         Ok(())
+    }
+
+    /// Gives up on the connection (03_03_04 §5.3 A6): one best-effort
+    /// `T_Disconnect` when the peer may still hold the connection open, then
+    /// closed. A send that fails or hangs is not waited for longer than the
+    /// acknowledge timeout.
+    async fn abandon(&mut self) {
+        self.closed = true;
+        if !std::mem::replace(&mut self.peer_open, false) {
+            return;
+        }
+        let frame = CemiFrame::t_control(self.target, self.source, tpci::T_DISCONNECT);
+        let _ = timeout(self.timeouts.ack_timeout, self.conn.send(frame)).await;
+    }
+
+    /// The peer closed the connection or never opened it (A5): closed, and
+    /// no `T_Disconnect` is owed.
+    fn peer_closed(&mut self) {
+        self.closed = true;
+        self.peer_open = false;
+    }
+
+    /// Records a frame from the peer: it holds the connection open, and the
+    /// connection timeout restarts.
+    ///
+    /// A connection to our own address (the source-address probe) sees the
+    /// gateway's echoes of its own frames as its peer; it never owes a
+    /// `T_Disconnect` for them.
+    fn note_peer_frame(&mut self) {
+        self.last_traffic = Instant::now();
+        if !self.is_self_addressed() {
+            self.peer_open = true;
+        }
+    }
+
+    /// Whether this connection goes to our own address: the source-address
+    /// probe ([`crate::probe::probe_own_address`]).
+    fn is_self_addressed(&self) -> bool {
+        self.target == self.source
+    }
+
+    /// Whether this connection has seen no traffic for longer than the 6 s
+    /// [`CONNECTION_TIMEOUT`] while the peer held it open: a device has then
+    /// closed it on its side (03_03_04 §5.4.3 E16, A6) and answers the next
+    /// numbered telegram with nothing or a `T_Disconnect`.
+    pub fn idle_beyond_connection_timeout(&self) -> bool {
+        self.peer_open && self.last_traffic.elapsed() >= self.connection_timeout
+    }
+
+    /// The longest backoff between two S-A_Sync_Req attempts that keeps the
+    /// connection inside its timeout: the connection timeout less the response
+    /// timeout the unanswered attempt already waited and a margin (issue #575).
+    fn sync_backoff_bound(&self) -> Duration {
+        self.connection_timeout
+            .saturating_sub(self.timeouts.response_timeout)
+            .saturating_sub(SYNC_IDLE_MARGIN)
+    }
+
+    /// Sets the connection timeout the peer is assumed to run
+    /// ([`CONNECTION_TIMEOUT`] by default), so a mock-device test with a
+    /// shortened device timeout does not idle for whole seconds.
+    pub fn set_connection_timeout(&mut self, timeout: Duration) {
+        self.connection_timeout = timeout;
+    }
+
+    /// How often this connection reconnected after idling past the connection
+    /// timeout (issue #575).
+    pub fn idle_reconnects(&self) -> u32 {
+        self.idle_reconnects
+    }
+
+    /// Re-opens a connection that idled past the connection timeout (03_03_04
+    /// §5, E16; issue #575). The device has closed it (A6) and would answer
+    /// the next numbered telegram with `T_Disconnect` (CLOSED, A10), so the
+    /// request that follows runs on a fresh connection instead:
+    ///
+    /// 1. the frames that arrived while idle are drained, the device's
+    ///    timeout `T_Disconnect` among them, so it does not end the new
+    ///    connection;
+    /// 2. one `T_Disconnect` closes the connection on a device whose timer
+    ///    has not fired yet (a repeated `T_Connect` would be ignored there,
+    ///    E00 in OPEN_IDLE, and the sequence numbers would disagree), then a
+    ///    `T_Connect` opens the new one; both sequence numbers restart at 0;
+    /// 3. a key presented with [`authorize`](Self::authorize) is presented
+    ///    again: the access level belongs to the connection. A denial fails
+    ///    with [`MgmtError::AccessDenied`].
+    ///
+    /// The Data Secure layer keeps its sync and sequence numbers, which the
+    /// device tracks per address (KNX 3/5/1 §6.3), not per connection.
+    async fn reconnect_after_idle(&mut self) -> Result<()> {
+        let idle = self.last_traffic.elapsed();
+        tracing::info!(
+            target = %self.target,
+            idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX),
+            "no traffic for longer than the transport connection timeout; the device has closed \
+             the connection (03_03_04 §5, E16): reconnecting"
+        );
+        // A frame the device sent while we idled is already queued; waiting a
+        // short while per frame also catches one still in flight.
+        for _ in 0..IDLE_DRAIN_FRAMES {
+            match timeout(IDLE_DRAIN_WAIT, self.conn.recv()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        self.conn
+            .send(CemiFrame::t_control(
+                self.target,
+                self.source,
+                tpci::T_DISCONNECT,
+            ))
+            .await?;
+        self.conn
+            .send(CemiFrame::t_control(
+                self.target,
+                self.source,
+                tpci::T_CONNECT,
+            ))
+            .await?;
+        self.send_seq = 0;
+        self.recv_seq = 0;
+        self.pending_response = None;
+        self.peer_open = false;
+        self.closed = false;
+        self.last_traffic = Instant::now();
+        self.idle_reconnects = self.idle_reconnects.saturating_add(1);
+        if let Some(key) = self.authorize_key {
+            // Boxed: `authorize` sends through `send_data`, which called us.
+            let outcome = Box::pin(self.authorize(key)).await?;
+            if let AuthorizeOutcome::Denied { level } = outcome {
+                return Err(MgmtError::AccessDenied {
+                    address: self.target,
+                    level,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Answers a numbered data telegram whose sequence is not the expected
+    /// `SeqNoRcv`: a repeat of the previous one is acknowledged again (E05,
+    /// A3), any other sequence draws a `T_NAK` with the received sequence (E06,
+    /// A4). Neither is delivered.
+    async fn answer_wrong_sequence(&mut self, seq: u8) -> Result<()> {
+        let previous = self.recv_seq.wrapping_sub(1) & 0x0f;
+        let octet = if seq == previous {
+            tpci::t_ack(seq)
+        } else {
+            tpci::t_nak(seq)
+        };
+        self.send_control(octet).await
     }
 
     /// Sends a single transport-control octet to the peer.
     async fn send_control(&mut self, octet: u8) -> Result<()> {
         let frame = CemiFrame::t_control(self.target, self.source, octet);
         self.conn.send(frame).await?;
+        self.last_traffic = Instant::now();
         Ok(())
     }
 
-    /// Best-effort `T_Disconnect` after a NAK, ignoring send errors.
-    async fn mark_closed_disconnect(&mut self) {
-        self.closed = true;
-        let frame = CemiFrame::t_control(self.target, self.source, tpci::T_DISCONNECT);
-        let _ = self.conn.send(frame).await;
-    }
-
-    /// Waits for a `T_ACK`/`T_NAK` for `seq` from the peer, skipping unrelated
-    /// traffic. Incoming NDTs while waiting are acknowledged and dropped so the
-    /// device is not left retransmitting.
+    /// Waits for a `T_ACK`/`T_NAK` for `seq` from the peer (state OPEN_WAIT of
+    /// 03_03_04 §5.4.3 with AN210), skipping unrelated traffic. A `T_ACK` or
+    /// `T_NAK` at another sequence is ignored (E09, E11: A0). An NDT at the
+    /// expected receive sequence is the device's answer folded in before its
+    /// `T_ACK`; any other NDT is answered as in
+    /// [`answer_wrong_sequence`](Self::answer_wrong_sequence) and dropped.
     async fn await_ack(&mut self, seq: u8) -> AckOutcome {
         let deadline = Instant::now() + self.timeouts.ack_timeout;
         loop {
@@ -1380,20 +1871,32 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
             }
             let stamped = match timeout(remaining, self.conn.recv()).await {
                 Ok(Ok(stamped)) => stamped,
-                Ok(Err(_)) => return AckOutcome::Disconnected,
+                Ok(Err(_)) => return AckOutcome::ChannelFailed,
                 Err(_elapsed) => return AckOutcome::Timeout,
             };
             let frame = stamped.frame;
+            if self.is_connect_rejection(&frame) {
+                return AckOutcome::ConnectRejected;
+            }
             if self.is_absence_confirmation(&frame) {
                 return AckOutcome::NotConfirmed;
             }
             if frame.source != self.target || frame.individual_destination() != Some(self.source) {
                 continue;
             }
+            self.note_peer_frame();
             match tpci::classify(frame.tpci_octet()) {
+                // E08, A8.
                 TpciKind::Ack(acked) if acked == seq => return AckOutcome::Acked,
-                TpciKind::Nak(_) => return AckOutcome::Nak,
-                TpciKind::Disconnect => return AckOutcome::Disconnected,
+                // E09: AN210 §2.2.1 turns the A6 of the original table into A0,
+                // since a stray T_ACK is most likely a repetition on the medium.
+                TpciKind::Ack(_) => continue,
+                // E12/E13: the caller repeats or closes.
+                TpciKind::Nak(naked) if naked == seq => return AckOutcome::Nak,
+                // E11, A0.
+                TpciKind::Nak(_) => continue,
+                // E02, A5.
+                TpciKind::Disconnect => return AckOutcome::PeerDisconnected,
                 TpciKind::NumberedData(nseq) if nseq == self.recv_seq => {
                     // The device answered before we saw its ACK (some stacks fold
                     // the ACK into the response). Only a NDT at the *expected*
@@ -1432,16 +1935,15 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
                     self.pending_response = Some((apci, data));
                     return AckOutcome::Acked;
                 }
-                TpciKind::NumberedData(_) => {
-                    // A duplicate / out-of-window folded NDT: this is a
-                    // *re-delivery* of a previous response (our earlier T_ACK for it
-                    // was lost, so the device retransmitted), NOT confirmation that
-                    // our current request landed (#58). ACK expected-1 to quiet the
-                    // retransmit, then KEEP WAITING for our real T_ACK — returning
-                    // `Acked` here would falsely advance our send sequence off a
-                    // stale frame and desync the connection.
-                    let ack_seq = self.recv_seq.wrapping_sub(1) & 0x0f;
-                    let _ = self.send_control(tpci::t_ack(ack_seq)).await;
+                TpciKind::NumberedData(nseq) => {
+                    // A duplicate / out-of-window NDT is NOT confirmation that
+                    // our current request landed (#58): a repeat of the previous
+                    // response (our T_ACK for it was lost) is acknowledged again
+                    // (E05, A3), any other sequence is NAKed (E06, A4). Then KEEP
+                    // WAITING for our real T_ACK: returning `Acked` here would
+                    // falsely advance our send sequence off a stale frame and
+                    // desync the connection.
+                    let _ = self.answer_wrong_sequence(nseq).await;
                     continue;
                 }
                 _ => continue,
@@ -1463,6 +1965,20 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
             && self.numbered_exchanges == 0
             && frame.is_negative_confirmation()
             && frame.confirms(self.source, self.target)
+    }
+
+    /// Whether `frame` is a negative `L_Data.con` for our `T_Connect` (03_03_04
+    /// §5.4.3 E20): the device never received the connect, so the connection
+    /// is closed at once (A5) on every budget.
+    ///
+    /// Not for a connection to our own address: the source-address probe
+    /// classifies on echoes, not on confirmations ([`Timeouts::probe`]).
+    fn is_connect_rejection(&self, frame: &CemiFrame) -> bool {
+        !self.is_self_addressed()
+            && self.numbered_exchanges == 0
+            && frame.is_negative_confirmation()
+            && frame.confirms(self.source, self.target)
+            && tpci::classify(frame.tpci_octet()) == TpciKind::Connect
     }
 
     fn map_recv_error(&mut self, err: MgmtError) -> MgmtError {
@@ -1509,15 +2025,20 @@ impl<Ch: L4Channel> Layer4Connection<Ch> {
 enum AckOutcome {
     /// A `T_ACK` for our sequence arrived (or the device answered directly).
     Acked,
-    /// A `T_NAK` arrived.
+    /// A `T_NAK` for our sequence arrived.
     Nak,
-    /// The peer disconnected or the connection dropped.
-    Disconnected,
+    /// The peer sent `T_Disconnect`.
+    PeerDisconnected,
+    /// The frame channel failed.
+    ChannelFailed,
     /// No `T_ACK` arrived within the timeout.
     Timeout,
     /// The interface reported a negative `L_Data.con` for our frame and the
     /// budget classifies that as absent (issue #45).
     NotConfirmed,
+    /// The interface reported a negative `L_Data.con` for our `T_Connect`
+    /// (E20).
+    ConnectRejected,
 }
 
 /// Extracts the (apci, data) from a management frame, tolerating any APDU shape.
@@ -1762,15 +2283,42 @@ pub async fn read_device_descriptor_unsecured<Ch: L4Channel>(
     decode_device_descriptor(l4.target(), resp_apci, &data)
 }
 
+/// The descriptor type a device echoes to say it does not support the type
+/// asked for (03_03_07 §3.4.2.1).
+const DESCRIPTOR_TYPE_UNSUPPORTED: u16 = 0x3F;
+
 /// Decodes an `A_DeviceDescriptor_Response` for descriptor type 0.
+///
+/// The response echoes the descriptor type in its low six APCI bits (03_03_07
+/// §3.4.2.1): type 3Fh is the device saying it does not support the type,
+/// and a device without descriptor type 0 answers with its lowest supported
+/// type, whose value is not a mask version. Both fail with what the device
+/// said instead of being read as type 0.
 fn decode_device_descriptor(
     address: IndividualAddress,
     resp_apci: u16,
     data: &[u8],
 ) -> Result<u16> {
-    if resp_apci & crate::apci::APCI_SELECTOR_MASK != crate::apci::A_DEVICE_DESCRIPTOR_RESPONSE
-        || data.len() < 2
-    {
+    let is_response =
+        resp_apci & crate::apci::APCI_SELECTOR_MASK == crate::apci::A_DEVICE_DESCRIPTOR_RESPONSE;
+    let echoed_type = resp_apci & !crate::apci::APCI_SELECTOR_MASK;
+    if is_response && echoed_type == DESCRIPTOR_TYPE_UNSUPPORTED {
+        return Err(MgmtError::DescriptorTypeUnsupported {
+            address,
+            requested: 0,
+        });
+    }
+    if is_response && echoed_type != 0 {
+        return Err(MgmtError::MalformedResponse {
+            address,
+            reason: format!(
+                "answered descriptor type {echoed_type} instead of type 0 (a device without \
+                 type 0 answers with its lowest supported type): {}",
+                crate::error::raw_response_detail(resp_apci, data)
+            ),
+        });
+    }
+    if !is_response || data.len() < 2 {
         return Err(MgmtError::MalformedResponse {
             address,
             reason: crate::error::descriptor_response_reason(resp_apci, data),
@@ -1875,6 +2423,9 @@ mod tests {
     struct ScriptedBus {
         sent: Vec<CemiFrame>,
         inbox: VecDeque<CemiFrame>,
+        /// Fail `recv` with a closed channel once the script is empty, instead
+        /// of blocking.
+        fail_when_empty: bool,
     }
 
     impl ScriptedBus {
@@ -1882,6 +2433,7 @@ mod tests {
             ScriptedBus {
                 sent: Vec::new(),
                 inbox: inbox.into(),
+                fail_when_empty: false,
             }
         }
     }
@@ -1898,6 +2450,7 @@ mod tests {
                     received_at: SystemTime::now(),
                     frame,
                 }),
+                None if self.fail_when_empty => Err(TransportError::Closed),
                 // Empty: block forever so the caller's timeout elapses.
                 None => std::future::pending().await,
             }
@@ -1925,6 +2478,21 @@ mod tests {
     /// A device→tool numbered data response frame.
     fn ndt_from_dev(seq: u8, apci: u16, data: &[u8]) -> CemiFrame {
         CemiFrame::t_data_connected(tool(), dev(), tpci::ndt(seq), apci, data)
+    }
+
+    /// The `T_ACK`s and `T_NAK`s among `sent`, in order.
+    fn acks_and_naks(sent: &[CemiFrame]) -> Vec<TpciKind> {
+        sent.iter()
+            .map(|f| tpci::classify(f.tpci_octet()))
+            .filter(|k| matches!(k, TpciKind::Ack(_) | TpciKind::Nak(_)))
+            .collect()
+    }
+
+    /// How many `T_Disconnect`s `sent` holds.
+    fn disconnects(sent: &[CemiFrame]) -> usize {
+        sent.iter()
+            .filter(|f| f.tpci_octet() == tpci::T_DISCONNECT)
+            .count()
     }
 
     fn fast() -> Timeouts {
@@ -2028,15 +2596,17 @@ mod tests {
     }
 
     #[test]
-    fn test_restart_process_wait_is_bounded() -> std::result::Result<(), Box<dyn std::error::Error>>
-    {
-        let huge = crate::apci::RestartResponse {
+    fn test_restart_process_wait_is_at_least_the_process_time()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // KNX 3/5/2 §3.7.1.2.2: the process time is a minimum wait; above
+        // MAX_RESTART_PROCESS_WAIT it is logged, not clamped.
+        let long = crate::apci::RestartResponse {
             error_code: 0,
-            process_time_s: u16::MAX,
+            process_time_s: 90,
         };
         assert_eq!(
-            crate::load::restart_process_wait(&huge),
-            crate::load::MAX_RESTART_PROCESS_WAIT
+            crate::load::restart_process_wait(&long),
+            Duration::from_secs(90)
         );
         Ok(())
     }
@@ -2057,6 +2627,10 @@ mod tests {
             .err()
             .ok_or("expected an error")?;
         assert!(matches!(err, MgmtError::NoResponse { .. }), "got {err:?}");
+        // The device never showed itself: the connection is CONNECTING in the
+        // Style 3 table, where the acknowledge timeout is A0. No T_Disconnect.
+        l4.disconnect().await?;
+        assert_eq!(disconnects(&bus.sent), 0);
         // T_Connect + (1 initial + 1 retransmit) request sends = 3 frames.
         let ndt_sends = bus
             .sent
@@ -2081,17 +2655,12 @@ mod tests {
         let (_apci, data) = l4.request(0x300, &[0x00]).await?;
         // The wrong-seq frame was dropped; the correct one delivered.
         assert_eq!(data, vec![0x07, 0xB0]);
-        // Among sent frames there is a T_ACK for the wrong seq's expected-1 (0-1
-        // = 15) followed by the T_ACK(0) for the delivered frame.
-        let acks: Vec<u8> = bus
-            .sent
-            .iter()
-            .filter_map(|f| match tpci::classify(f.tpci_octet()) {
-                TpciKind::Ack(s) => Some(s),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(acks, vec![15, 0], "wrong-seq ACKed with expected-1, then 0");
+        // E06, A4: the out-of-window NDT(5) draws T_NAK(5); the delivered
+        // frame T_ACK(0).
+        assert_eq!(
+            acks_and_naks(&bus.sent),
+            vec![TpciKind::Nak(5), TpciKind::Ack(0)]
+        );
         Ok(())
     }
 
@@ -2154,20 +2723,11 @@ mod tests {
         // the real T_ACK(0), not by the stale duplicate.
         assert_eq!(l4.send_seq, 1);
         drop(l4);
-        // ACKs sent: expected-1 (15) for the stale duplicate while awaiting, then 0
-        // for the delivered real response.
-        let acks: Vec<u8> = bus
-            .sent
-            .iter()
-            .filter_map(|f| match tpci::classify(f.tpci_octet()) {
-                TpciKind::Ack(s) => Some(s),
-                _ => None,
-            })
-            .collect();
+        // The out-of-window NDT(5) is NAKed with its own sequence (E06, A4)
+        // while awaiting, then the real response ACKed with 0.
         assert_eq!(
-            acks,
-            vec![15, 0],
-            "stale duplicate ACKed with expected-1, then the real response with 0"
+            acks_and_naks(&bus.sent),
+            vec![TpciKind::Nak(5), TpciKind::Ack(0)]
         );
         Ok(())
     }
@@ -2188,6 +2748,7 @@ mod tests {
             .err()
             .ok_or("expected an error")?;
         assert!(matches!(err, MgmtError::Nak { .. }), "got {err:?}");
+        l4.disconnect().await?;
         // fast() has max_repetitions = 1: one initial send + one retransmit = 2
         // NDT sends before the NAK is fatal.
         let ndt_sends = bus
@@ -2196,6 +2757,222 @@ mod tests {
             .filter(|f| matches!(tpci::classify(f.tpci_octet()), TpciKind::NumberedData(_)))
             .count();
         assert_eq!(ndt_sends, 2, "one initial send plus one retransmit on NAK");
+        // E13, A6: one T_Disconnect, and none again on the user's disconnect.
+        assert_eq!(disconnects(&bus.sent), 1);
+        Ok(())
+    }
+
+    // --- Style 3 events (03_03_04 §5.4.3 with AN210 §2.2.1), issue #507 ---
+
+    #[tokio::test]
+    async fn test_await_ack_ignores_a_wrong_sequence_t_ack()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // E09 in OPEN_WAIT is A0 since AN210: a stray T_ACK(9) is ignored and
+        // the real T_ACK(0) completes the send.
+        let inbox = vec![
+            control_from_dev(tpci::t_ack(9)),
+            control_from_dev(tpci::t_ack(0)),
+        ];
+        let mut bus = ScriptedBus::new(inbox);
+        let mut l4 = Layer4Connection::connect_with(&mut bus, dev(), tool(), fast()).await?;
+        l4.send_data(0x300, &[]).await?;
+        assert_eq!(l4.send_seq, 1);
+        assert!(!l4.is_closed());
+        drop(l4);
+        assert_eq!(ndt_sends(&bus), 1);
+        assert_eq!(disconnects(&bus.sent), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_await_ack_ignores_a_wrong_sequence_t_nak()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // E11, A0: a T_NAK for another sequence neither repeats nor closes.
+        let inbox = vec![
+            control_from_dev(tpci::t_nak(4)),
+            control_from_dev(tpci::t_ack(0)),
+        ];
+        let mut bus = ScriptedBus::new(inbox);
+        let mut l4 = Layer4Connection::connect_with(&mut bus, dev(), tool(), fast()).await?;
+        l4.send_data(0x300, &[]).await?;
+        drop(l4);
+        assert_eq!(
+            ndt_sends(&bus),
+            1,
+            "a wrong-sequence T_NAK is not a repeat request"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_await_ack_repeats_on_a_matching_t_nak()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // E12, A9: T_NAK(0) repeats the stored frame, T_ACK(0) completes it.
+        let inbox = vec![
+            control_from_dev(tpci::t_nak(0)),
+            control_from_dev(tpci::t_ack(0)),
+        ];
+        let mut bus = ScriptedBus::new(inbox);
+        let mut l4 = Layer4Connection::connect_with(&mut bus, dev(), tool(), fast()).await?;
+        l4.send_data(0x300, &[0x01]).await?;
+        drop(l4);
+        let ndts: Vec<&CemiFrame> = bus
+            .sent
+            .iter()
+            .filter(|f| matches!(tpci::classify(f.tpci_octet()), TpciKind::NumberedData(0)))
+            .collect();
+        assert_eq!(ndts.len(), 2);
+        assert_eq!(ndts[0], ndts[1], "the repeat is the stored frame");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_recv_response_reacks_the_previous_sequence()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // E05, A3: after delivering NDT(0), a repeat of NDT(0) (our T_ACK was
+        // lost) is acknowledged with its own sequence and not delivered.
+        let inbox = vec![
+            control_from_dev(tpci::t_ack(0)),
+            ndt_from_dev(0, 0x340, &[0x07, 0xB0]),
+            control_from_dev(tpci::t_ack(1)),
+            ndt_from_dev(0, 0x340, &[0x07, 0xB0]),
+            ndt_from_dev(1, 0x340, &[0x07, 0xB1]),
+        ];
+        let mut bus = ScriptedBus::new(inbox);
+        let mut l4 = Layer4Connection::connect_with(&mut bus, dev(), tool(), fast()).await?;
+        l4.request(0x300, &[]).await?;
+        let (_, data) = l4.request(0x300, &[]).await?;
+        assert_eq!(data, vec![0x07, 0xB1]);
+        drop(l4);
+        assert_eq!(
+            acks_and_naks(&bus.sent),
+            vec![TpciKind::Ack(0), TpciKind::Ack(0), TpciKind::Ack(1)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ack_timeout_on_an_open_connection_sends_t_disconnect()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // E18, A6: the device answered the first request, then stops
+        // acknowledging. Giving up sends one T_Disconnect so the device does
+        // not sit in OPEN_IDLE and ignore our next T_Connect (E00, A0).
+        let inbox = vec![
+            control_from_dev(tpci::t_ack(0)),
+            ndt_from_dev(0, 0x340, &[0x07, 0xB0]),
+        ];
+        let mut bus = ScriptedBus::new(inbox);
+        let mut l4 = Layer4Connection::connect_with(&mut bus, dev(), tool(), fast()).await?;
+        l4.request(0x300, &[]).await?;
+        let err = l4
+            .send_data(0x300, &[])
+            .await
+            .err()
+            .ok_or("the second send goes unacknowledged")?;
+        assert!(
+            matches!(
+                err,
+                MgmtError::MidSessionSilence {
+                    kind: SilenceKind::NoResponse,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(l4.is_closed());
+        l4.disconnect().await?;
+        let last = bus.sent.last().ok_or("frames sent")?;
+        assert_eq!(last.tpci_octet(), tpci::T_DISCONNECT);
+        assert_eq!(disconnects(&bus.sent), 1, "exactly one T_Disconnect");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_peer_disconnect_is_not_answered()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // E02, A5: the device's T_Disconnect closes the connection; nothing is
+        // sent back, not even on the user's disconnect.
+        let inbox = vec![control_from_dev(tpci::T_DISCONNECT)];
+        let mut bus = ScriptedBus::new(inbox);
+        let mut l4 = Layer4Connection::connect_with(&mut bus, dev(), tool(), fast()).await?;
+        let err = l4.send_data(0x300, &[]).await.err().ok_or("disconnected")?;
+        assert!(matches!(err, MgmtError::Disconnected { .. }), "got {err:?}");
+        l4.disconnect().await?;
+        assert_eq!(disconnects(&bus.sent), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_response_timeout_leaves_the_t_disconnect_to_the_user()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // The device acknowledged but never answered: the connection is
+        // unusable, but the device still holds it open, so the user's
+        // disconnect sends the T_Disconnect it is owed.
+        let inbox = vec![control_from_dev(tpci::t_ack(0))];
+        let mut bus = ScriptedBus::new(inbox);
+        let mut l4 = Layer4Connection::connect_with(&mut bus, dev(), tool(), fast()).await?;
+        let err = l4.request(0x300, &[]).await.err().ok_or("no response")?;
+        assert!(
+            matches!(err, MgmtError::MidSessionSilence { .. }),
+            "got {err:?}"
+        );
+        assert!(l4.is_closed());
+        l4.disconnect().await?;
+        assert_eq!(disconnects(&bus.sent), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_channel_failure_on_an_open_connection_sends_t_disconnect()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // A broken frame channel under an open connection: one best-effort
+        // T_Disconnect (A6) before the error surfaces.
+        let inbox = vec![
+            control_from_dev(tpci::t_ack(0)),
+            ndt_from_dev(0, 0x340, &[0x07, 0xB0]),
+        ];
+        let mut bus = ScriptedBus::new(inbox);
+        bus.fail_when_empty = true;
+        let mut l4 = Layer4Connection::connect_with(&mut bus, dev(), tool(), fast()).await?;
+        l4.request(0x300, &[]).await?;
+        let err = l4
+            .send_data(0x300, &[])
+            .await
+            .err()
+            .ok_or("channel failed")?;
+        assert!(
+            matches!(
+                err,
+                MgmtError::MidSessionSilence {
+                    kind: SilenceKind::Disconnected,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        l4.disconnect().await?;
+        assert_eq!(disconnects(&bus.sent), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_idle_beyond_connection_timeout()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // 03_03_04 §5: the device closes a connection idle for 6 s.
+        let inbox = vec![control_from_dev(tpci::t_ack(0))];
+        let mut bus = ScriptedBus::new(inbox);
+        let mut l4 = Layer4Connection::connect_with(&mut bus, dev(), tool(), fast()).await?;
+        assert!(
+            !l4.idle_beyond_connection_timeout(),
+            "the peer never showed itself"
+        );
+        l4.send_data(0x300, &[]).await?;
+        assert!(!l4.idle_beyond_connection_timeout());
+        let earlier = Instant::now()
+            .checked_sub(CONNECTION_TIMEOUT + Duration::from_secs(1))
+            .ok_or("clock too young")?;
+        l4.last_traffic = earlier;
+        assert!(l4.idle_beyond_connection_timeout());
         Ok(())
     }
 
@@ -2355,6 +3132,47 @@ mod tests {
             err.device_present(),
             "access-denied means the device is present"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_authorize_minimum_level_15_is_denied()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // 03_03_07 §3.5.7: an invalid key sets the minimum level, 15 on a
+        // device with sixteen levels.
+        let inbox = vec![
+            control_from_dev(tpci::t_ack(0)),
+            ndt_from_dev(0, crate::apci::A_AUTHORIZE_RESPONSE, &[0x0F]),
+        ];
+        let mut bus = ScriptedBus::new(inbox);
+        let mut l4 = Layer4Connection::connect(&mut bus, dev(), tool()).await?;
+        let outcome = l4.authorize(0x0011_2233).await?;
+        assert_eq!(outcome, AuthorizeOutcome::Denied { level: 15 });
+        assert!(!outcome.grants(15));
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_device_descriptor_checks_the_echoed_type()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let ok = decode_device_descriptor(
+            dev(),
+            crate::apci::A_DEVICE_DESCRIPTOR_RESPONSE,
+            &[0x07, 0xB0],
+        )?;
+        assert_eq!(ok, 0x07B0);
+        let unsupported =
+            decode_device_descriptor(dev(), crate::apci::A_DEVICE_DESCRIPTOR_RESPONSE | 0x3F, &[]);
+        assert!(matches!(
+            unsupported,
+            Err(MgmtError::DescriptorTypeUnsupported { requested: 0, .. })
+        ));
+        let other = decode_device_descriptor(
+            dev(),
+            crate::apci::A_DEVICE_DESCRIPTOR_RESPONSE | 0x02,
+            &[0x07, 0xB0],
+        );
+        assert!(matches!(other, Err(MgmtError::MalformedResponse { .. })));
         Ok(())
     }
 
@@ -2803,6 +3621,69 @@ mod tests {
         Ok(())
     }
 
+    /// The PID 59 write of a device whose counter is ahead of `clock` writes
+    /// the device's counter, and the confirmation the device protects with
+    /// the value written verifies (issue #535, KNX 3/5/1 §6.3.13.3 NOTE 110).
+    async fn pid59_round_trip(device_sequence: u64, clock: u64) -> Result<u64> {
+        let key = [0x24u8; 16];
+        let expected = crate::ip_secure::sequence_number_to_write(clock, Some(device_sequence));
+        // The device answers the write already under the new value.
+        let mut device =
+            DataSecureSession::new(Key16::new(key)).with_send_sequence(Sequence::new(expected));
+        let (resp_apci, resp_asdu) = device
+            .wrap(
+                &dev_to_tool_addr(tpci::ndt(1)),
+                0x1CF,
+                &[0x00, 0x11, 0x00, 0x10, 0x3B, 0x01, 0x00, 0x01, 0x00],
+            )
+            .map_err(|source| MgmtError::Secure {
+                address: dev(),
+                source,
+            })?;
+        let inbox = vec![
+            control_from_dev(tpci::t_ack(1)),
+            ndt_from_dev(1, resp_apci, &resp_asdu),
+        ];
+        let mut bus = SyncingBus::new(key, inbox);
+        bus.device_sequence = device_sequence;
+        let tool_session =
+            DataSecureSession::new(Key16::new(key)).with_send_sequence(Sequence::new(1000));
+        let mut l4 = Layer4Connection::connect_with_secure(
+            &mut bus,
+            dev(),
+            tool(),
+            fast(),
+            crate::secure::SecureLayer::activated(tool_session),
+        )
+        .await?;
+        let written = crate::ip_secure::write_sequence_number(&mut l4, clock).await?;
+        assert_eq!(written, expected);
+        // A frame below the new value is now stale.
+        assert_eq!(l4.device_next_sequence(), Some(expected + 1));
+        Ok(written)
+    }
+
+    #[tokio::test]
+    async fn test_write_sequence_number_device_ahead_of_clock() -> Result<()> {
+        let device = 0x0000_F000_0000_0000 >> 16;
+        assert_eq!(pid59_round_trip(device, 1_000).await?, device);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_sequence_number_clock_ahead_of_device() -> Result<()> {
+        assert_eq!(pid59_round_trip(5, 1_000_000).await?, 1_000_000);
+        Ok(())
+    }
+
+    #[test]
+    fn test_sequence_number_to_write_never_lowers() {
+        use crate::ip_secure::sequence_number_to_write;
+        assert_eq!(sequence_number_to_write(100, None), 100);
+        assert_eq!(sequence_number_to_write(100, Some(7)), 100);
+        assert_eq!(sequence_number_to_write(100, Some(900)), 900);
+    }
+
     /// ACTIVATED PATH REJECTS A WRONG MAC: a secured response whose MAC does not
     /// verify (built with the wrong key) is rejected as an MgmtError::Secure, not
     /// accepted as an answer.
@@ -2900,13 +3781,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_request_negative_con_ignored_without_opt_in()
+    async fn test_request_negative_con_on_t_connect_fails_on_every_budget()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // Every budget but discovery (a programming session, the #168
-        // post-restart readiness probe): the negative con changes nothing, the
-        // ACK timeout and repetitions run as before and the error is the old
-        // NoResponse.
+        // 03_03_04 §5.4.3 E20, A5: the device never received the T_Connect,
+        // so it ignores every data telegram that follows. A programming
+        // session or a post-restart readiness probe fails at once, without
+        // the ACK wait, and sends no T_Disconnect (the connection never
+        // opened). The readiness probe's caller retries (#212).
         let mut bus = ScriptedBus::new(vec![con_for_dev(tpci::T_CONNECT, true)]);
+        let mut l4 = Layer4Connection::connect_with(&mut bus, dev(), tool(), fast()).await?;
+        let started = std::time::Instant::now();
+        let err = l4
+            .request(0x300, &[])
+            .await
+            .err()
+            .ok_or("a rejected connect must fail the request")?;
+        assert!(matches!(err, MgmtError::NotConfirmed { .. }), "got {err:?}");
+        assert!(
+            started.elapsed() < fast().ack_timeout,
+            "failed before the ACK timeout"
+        );
+        l4.disconnect().await?;
+        assert_eq!(ndt_sends(&bus), 1, "no repetition after a rejected connect");
+        assert!(
+            !bus.sent
+                .iter()
+                .any(|f| f.tpci_octet() == tpci::T_DISCONNECT),
+            "nothing to disconnect"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_negative_con_on_ndt_ignored_without_opt_in()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // A negative con for the first data telegram (not the connect) only
+        // classifies under discovery; every other budget keeps the ACK timeout
+        // and the repetitions, and the error is the old NoResponse.
+        let mut bus = ScriptedBus::new(vec![con_for_dev(tpci::ndt(0), true)]);
         let mut l4 = Layer4Connection::connect_with(&mut bus, dev(), tool(), fast()).await?;
         let err = l4
             .request(0x300, &[])
@@ -2916,25 +3828,6 @@ mod tests {
         assert!(matches!(err, MgmtError::NoResponse { .. }), "got {err:?}");
         drop(l4);
         assert_eq!(ndt_sends(&bus), 2, "one initial send plus one retransmit");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_request_negative_con_then_answer_is_not_absent_for_readiness_probe()
-    -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // A rebooting device: the interface reports a negative con, then the
-        // device comes up and answers. A budget without the opt-in (the #168
-        // readiness probe) must treat the con as "not up yet" and take the
-        // answer, never report the device absent.
-        let inbox = vec![
-            con_for_dev(tpci::T_CONNECT, true),
-            control_from_dev(tpci::t_ack(0)),
-            ndt_from_dev(0, 0x340, &[0x07, 0xB0]),
-        ];
-        let mut bus = ScriptedBus::new(inbox);
-        let mut l4 = Layer4Connection::connect_with(&mut bus, dev(), tool(), fast()).await?;
-        let (apci, data) = l4.request(0x300, &[]).await?;
-        assert_eq!((apci, data), (0x340, vec![0x07, 0xB0]));
         Ok(())
     }
 

@@ -224,6 +224,14 @@ exact bytes the executor sends: `0x<addr>.bin` for an absolute write,
 base), `table-obj<N>.bin` or `table-lsm<N>.bin` for the tables. A System 7
 segment with device-owned octets also gets a `.mask.bin`.
 
+`knxtrace image` also writes `resident.json`, what the device answered ETS
+before the download (the application objects' load states, `PID_PROGRAM_VERSION`,
+the first `PID_MCB_TABLE` entry per object). `flash --dry-run --resident
+out/ets/resident.json` plans against it as a live flash plans against its
+pre-flight probe (issue #490): a device that holds the application gets the
+product's `par` load procedure, and an object whose MCB already matches is not
+re-loaded. `95-offline-oracle.sh` passes it whenever the capture has one.
+
 `knxtrace image` composes what ETS wrote: one `.bin` per contiguous written
 region and `regions.json` with the allocation records. A relative segment's base
 is the `PID_TABLE_REFERENCE` ETS reads back after allocating it, and a
@@ -429,6 +437,55 @@ the form, the erase code and the answer handling against a loopback `bussard
 restart` capture of the same device. Until then, the mock tests in
 `bussard_service::restart` cover the confirmed (answered, unanswered, error
 code, Data Secure) and basic forms.
+
+**`LdCtrlMasterReset` on a vendor product** (issue #546). A procedure's
+master reset now goes out in the confirmed form of Management Procedures
+03_05_02 §3.7.1.2.3 (`A_Restart` restart type 1 with the op's erase code and
+channel number, answered by `A_Restart_Response`) on every device but KNX
+Virtual, which keeps the bare `A_Restart` its ETS capture shows. An error
+code 2 answer falls back to a basic restart (§3.7.1.2.3.1). No vendor
+application in the corpus carries the op, so no capture exists. This is the
+capture plan: when a product with `LdCtrlMasterReset` turns up, record its ETS
+download and a loopback `bussard flash` of it and compare the restart form,
+the erase code, the channel and the wait after the answer. Until then
+`flash_mock::test_flash_master_reset_uses_the_confirmed_form` pins the form.
+
+**Parameter-only download on System B** (issue #543). bussard's
+`flash --parameters-only` and the parameter part of `apply` run the partial
+download of Configuration Procedures 03_05_03 §3.5.3: Unload the parameter
+object, Load, the relative allocation in Mode 0 with no fill, the procedure's
+property writes, the differing octets at the base the device reports after
+the allocation, LoadCompleted, the MCB check, restart. The ETS side is on
+file: the #490 rows hold ETS `par` downloads of house devices
+(`rows-2026-10-26.txt` 1.1.18, `rows-2026-10-26-006plain.txt` 1.1.12,
+`rows-secure-s3.txt` 1.1.5, 1.1.7, 1.1.9, 1.1.16, 1.1.47, 1.1.48), each with
+obj 4 Unload, Load, `RelSegment` Mode 0 Fill 0, the writes and LoadCompleted.
+No oracle row compares bussard's partial download: the oracle plans offline,
+and a parameter-only plan needs the device's parameter memory. This is the
+capture plan: record one `bussard flash --parameters-only` of 1.1.18 under
+`00-preflight.sh` and compare its load-control records with the ETS `par`
+capture of the same device in knxtrace. Until then the mock tests in
+`bussard-download` (`flash_mock::test_parameters_only_*`) pin the sequence,
+the Mode 0 allocation and the base handling.
+
+**`LdCtrlWriteRelMem Size` below the segment size** (issue #564). Eight
+corpus applications declare an obj 4 `RelativeSegment` larger than what their
+procedure allocates and writes (`LdCtrlRelSegment Size`, `LdCtrlWriteRelMem
+Size`): the ABB Caldion controllers `M-0002_A-4980-17-A22E-O01EC` (135168,
+written 128444) and `A-4981-16-0AEB-O01EC` (135168, 125744), the ABB Energy
+Analyzer `M-0002_A-A0BF-10-D354` (65535, 17152), the Siemens
+`M-0001_A-9839-01-38C4`, `A-983B-01-6EF2`, `A-983C-01-D7C4` (16384, 512) and
+the M-00C9 `A-10D6-10-FA3B`, `A-10A9-11-77D2` (53248, 50432). bussard now
+streams the written `Size` and checks the MCB over the same length; a
+parameter value past it refuses the plan. The ETS side: the defaults sweep
+holds both Caldion downloads (128444 and 125744 octets, all
+`A_UserMemory_Write`, comparable since #472). This is the capture plan for a
+second manufacturer: run the defaults sweep on the Siemens `N528DB01`
+(`M-0001_A-9839-01-38C4`, 07B0, 512 of 16384 written) and compare its row with
+`tools/ets-sweep/oracle.py --filter A-9839-01`; expect `written 512` in the
+obj 4 region and an MCB length of 512. Until then
+`plan::tests::test_plan_flash_write_rel_mem_honours_size` pins the cut and the
+MCB length.
 
 ## Rehearsing on the simulator
 

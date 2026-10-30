@@ -15,8 +15,15 @@ row `1.1.1|<capture>|<product>|<application>`. The verdict, coverage and the
 region summary land in results/oracle.json, keyed by application id, with the
 load-control verdict and its differences under `loadctl` (issue #419). Nothing
 touches a bus; the model and the oracle output live next to the capture under
-captures/ (ignored), or under --work DIR/<application> (a worktree reads the
-main checkout's captures with --captures and writes nowhere under them).
+captures/ (ignored), or under --work DIR/<application>/<variant> (a worktree
+reads the main checkout's captures with --captures and writes nowhere under
+them).
+
+Each product file is imported once, into `.oracle-products/<sha>/` under
+--work (else under the captures directory), and every row's model links that
+import (`oracle_model.shared_import`): a row of the 152 MB ABB catalogue costs
+seconds instead of minutes and 1.6 GB. --seed-models takes the model the
+sweep imported next to a capture as that import.
 """
 from __future__ import annotations
 
@@ -24,7 +31,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -32,6 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import defaults  # noqa: E402
+import apply_rows  # noqa: E402
 import oracle_model  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
@@ -61,19 +68,46 @@ def load_control_summary(diff_json: Path) -> dict:
     return out
 
 
-def run_row(app: str, entry: dict, captures: Path, work: Path | None, seed: bool = False) -> dict:
-    run_dir = captures / app / "plain-defaults"
-    work_dir = work / app if work else run_dir
+def catalog_row_name(run_dir: Path) -> str | None:
+    """The catalog row ETS added the device from (its product text, the
+    device's name in the project): ETS writes it as the friendly name of an
+    IP-enabled device (bussard issue #455)."""
+    try:
+        driver = json.loads((run_dir / "driver.json").read_text())
+    except (OSError, ValueError):
+        return None
+    row = (driver.get("driver") or {}).get("catalog_add", {}).get("row") or {}
+    return row.get("name")
+
+
+def variant_links(run_dir: Path) -> dict:
+    """The links of a links-variant row: what ETS's object table showed after
+    the driver linked the objects (objects.json in the run directory)."""
+    try:
+        return apply_rows.links_from_objects(json.loads((run_dir / "objects.json").read_text()))
+    except (OSError, ValueError):
+        return {}
+
+
+def shared_root(captures: Path, work: Path | None) -> Path:
+    """Where the per-product imports live: under --work, else next to the
+    captures (both outside git)."""
+    return (work or captures) / ".oracle-products"
+
+
+def run_row(app: str, entry: dict, captures: Path, work: Path | None, seed: bool = False,
+            variant: str = "plain-defaults", links: dict | None = None) -> dict:
+    run_dir = captures / app / variant
+    work_dir = work / app / variant if work else run_dir
     capture = run_dir / "ets.pcapng"
     product = defaults.product_path(entry["file"])
-    model = work_dir / "model"
-    if seed and work and not model.exists() and (run_dir / "model" / "bussard.lock").exists():
-        # A copy of the model the sweep already imported: a large product
-        # takes minutes to import with a debug build.
-        shutil.copytree(run_dir / "model", model, symlinks=True)
-    lock = model / "bussard.lock"
-    if not (seed and lock.exists() and "[[device]]" in lock.read_text()):
-        model = oracle_model.build(model, product, app, mask=entry.get("mask", ""))
+    # The product file is imported once and shared by every row of it; with
+    # --seed-models the model the sweep imported for this row stands in for
+    # the import.
+    seed_dir = run_dir / "model" if seed else None
+    shared = oracle_model.shared_import(shared_root(captures, work), product, seed=seed_dir)
+    model = oracle_model.build(work_dir / "model", product, app, mask=entry.get("mask", ""),
+                               friendly_name=catalog_row_name(run_dir), shared=shared, links=links)
     row = f"1.1.1|{capture}|{product}|{app}"
     r = subprocess.run(["bash", str(ORACLE), "--dir", str(model), "--out", str(work_dir / "oracle"), "--row", row],
                        capture_output=True, text=True, timeout=1800, env={**os.environ, "BUSSARD_NO_DOTENV": "1"})
@@ -102,11 +136,15 @@ def main() -> int:
     ap.add_argument("--redo", action="store_true")
     ap.add_argument("--captures", type=Path, default=CAPTURES, help="the sweep captures (default %(default)s)")
     ap.add_argument("--work", type=Path, help="write the models and oracle output here, not next to the captures")
-    ap.add_argument("--out", type=Path, default=OUT, help="the results file (default %(default)s)")
+    ap.add_argument("--out", type=Path, help=f"the results file (default {OUT}, results/oracle-<variant>.json for a variant)")
     ap.add_argument("--seed-models", action="store_true",
-                    help="with --work: start from a copy of the model next to the capture instead of importing")
-    ap.add_argument("--defaults", type=Path, default=defaults.RESULTS, help="the sweep results (default %(default)s)")
+                    help="take the model the sweep imported next to a capture as the product import instead of importing (once per product file)")
+    ap.add_argument("--defaults", type=Path, help="the sweep results (default: the variant's, results/defaults.json)")
+    ap.add_argument("--variant", default="plain-defaults", choices=sorted(defaults.VARIANTS),
+                    help="links: the links variant (#478); each row's model gets the links ETS showed (objects.json)")
     args = ap.parse_args()
+    args.defaults = args.defaults or defaults.results_path(args.variant)
+    args.out = args.out or (OUT if args.variant == "plain-defaults" else OUT.with_name(f"oracle-{args.variant}.json"))
     res = json.loads(args.defaults.read_text())
     out = json.loads(args.out.read_text()) if args.out.exists() else {}
     wanted = [w.lower() for w in args.filter.split(",") if w]
@@ -118,7 +156,8 @@ def main() -> int:
         if app in out and not args.redo and out[app].get("capture_when") == entry["when"]:
             continue
         try:
-            v = run_row(app, entry, args.captures, args.work, args.seed_models)
+            v = run_row(app, entry, args.captures, args.work, args.seed_models, variant=args.variant,
+                        links=variant_links(args.captures / app / args.variant) if args.variant != "plain-defaults" else None)
         except Exception as exc:  # noqa: BLE001 - recorded, the next row runs
             v = {"verdict": "oracle-error", "error": str(exc)[:400]}
         v.update({"name": entry.get("name"), "mask": entry.get("mask"), "capture_when": entry["when"],

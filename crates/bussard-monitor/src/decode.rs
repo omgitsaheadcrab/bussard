@@ -13,7 +13,7 @@
 
 use std::time::SystemTime;
 
-use bussard_model::codec::{TypedValue, decode};
+use bussard_model::codec::{TypedValue, decode, validity_note};
 use bussard_model::{ApduSize, Dpt, GroupAddress, IndividualAddress, Model};
 use bussard_transport::TimestampedFrame;
 use bussard_transport::cemi::{Apdu, Destination, GroupData};
@@ -160,6 +160,11 @@ impl DecodedTelegram {
 
         // Decode the value using the DPT, if the service carries a payload.
         let (value, decode_note) = decode_value(apci, &payload, dpt);
+        // A Data Secure device's broadcast security report (issue #533).
+        let decode_note = decode_note.or_else(|| {
+            security_report(apci, &payload)
+                .map(|report| security_report_note(source, source_name.as_deref(), report))
+        });
 
         DecodedTelegram {
             timestamp: frame.received_at,
@@ -229,6 +234,51 @@ fn sending_object_name(
     None
 }
 
+/// `A_NetworkParameter_Response`, the APCI an `A_NetworkParameter_InfoReport`
+/// rides (KNX 3/3/7 §3.2.8).
+pub const A_NETWORK_PARAMETER_RESPONSE: u16 = 0x3DB;
+
+/// The security report octet (DPT_Security_Report, 21.1002) of a Data Secure
+/// device's InfoReport, or `None` for any other telegram (issue #533).
+///
+/// With its security report control (PID 58) enabled, a device announces
+/// every security failure with `DMP_InterfaceObjectInfoReport_RCl`: an
+/// `A_NetworkParameter_InfoReport` broadcast whose parameter type is the
+/// security interface object (type 17) and PID 57, `test_info` 00h and the
+/// report as `test_result` (KNX 3/5/1 §6.3.11.4).
+pub fn security_report(apci: ApciKind, payload: &[u8]) -> Option<u8> {
+    if apci != ApciKind::Other(A_NETWORK_PARAMETER_RESPONSE) {
+        return None;
+    }
+    match payload {
+        [0x00, 0x11, 57, _test_info, report, ..] => Some(*report),
+        _ => None,
+    }
+}
+
+/// The monitor line for a security report from `source` (issue #533).
+fn security_report_note(source: IndividualAddress, name: Option<&str>, report: u8) -> String {
+    let who = match name {
+        Some(n) => format!("{source} ({n})"),
+        None => source.to_string(),
+    };
+    let flags = if report & 0x01 != 0 {
+        "Security Failure set".to_string()
+    } else {
+        "no flag set".to_string()
+    };
+    let reserved = report & 0xFE;
+    let reserved = if reserved != 0 {
+        format!(", reserved bits {reserved:#04x}")
+    } else {
+        String::new()
+    };
+    format!(
+        "KNX Data Secure security report from {who}: {flags}{reserved}; `bussard secure diag \
+         {source}` reads its failures log"
+    )
+}
+
 /// Classifies an APDU into an [`ApciKind`] and extracts its raw payload bytes.
 fn classify(apdu: &Apdu) -> (ApciKind, Vec<u8>) {
     match apdu {
@@ -251,7 +301,9 @@ fn group_bytes(d: &GroupData) -> Vec<u8> {
 ///
 /// Reads carry no payload, so they decode to `None` with no note. When a DPT is
 /// known, a payload whose length disagrees with the DPT's declared size still
-/// decodes (best-effort) but records a note showing both sizes.
+/// decodes (best-effort) but records a note showing both sizes, and a payload
+/// a conforming receiver ignores (a reserved bit set, a field out of range)
+/// records why.
 fn decode_value(
     apci: ApciKind,
     payload: &[u8],
@@ -268,7 +320,15 @@ fn decode_value(
         return (Some(TypedValue::Raw(payload.to_vec())), None);
     };
 
-    let note = size_mismatch_note(&dpt, payload);
+    // A length mismatch and a malformed field (03_07_01 §2.4) can both apply.
+    let notes: Vec<String> = [
+        size_mismatch_note(&dpt, payload),
+        validity_note(&dpt, payload),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let note = (!notes.is_empty()).then(|| notes.join("; "));
     let value = decode(&dpt, payload);
     (Some(value), note)
 }
@@ -484,6 +544,63 @@ mod tests {
         assert_eq!(d.destination_name.as_deref(), Some("Meteodata"));
         assert!(matches!(d.apci, ApciKind::Other(_)));
         assert_eq!(d.value, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_frame_names_a_broadcast_security_report() -> TestResult {
+        // 1.1.5 broadcasts A_NetworkParameter_InfoReport: object type 17,
+        // PID 57, test_info 00, report 01 (Security Failure).
+        let hex: &[u8] = &[
+            0x29, 0x00, 0xB0, 0xE0, 0x11, 0x05, 0x00, 0x00, 0x06, 0x03, 0xDB, 0x00, 0x11, 0x39,
+            0x00, 0x01,
+        ];
+        let frame = stamped(CemiFrame::decode(hex)?);
+        let d = DecodedTelegram::from_frame(&frame, None);
+        assert_eq!(security_report(d.apci, &d.payload), Some(0x01));
+        let note = d.decode_note.ok_or("no note")?;
+        assert!(
+            note.starts_with("KNX Data Secure security report from 1.1.5: Security Failure set"),
+            "{note}"
+        );
+        assert!(note.contains("bussard secure diag 1.1.5"), "{note}");
+        // Another InfoReport (not the security object) gets no note.
+        assert_eq!(
+            security_report(d.apci, &[0x00, 0x0B, 0x39, 0x00, 0x01]),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_value_notes_malformed_payloads() -> TestResult {
+        // (DPT, payload, fragment of the note) per 03_07_01 §2.4.
+        let cases: &[(&str, &[u8], &str)] = &[
+            ("18.001", &[0x45], "reserved bits 0x40"),
+            ("17.001", &[0xC1], "reserved bits 0xc0"),
+            ("10.001", &[0x18, 0x00, 0x00], "hour 24 is outside 0..23"),
+            ("10.001", &[0x1F, 0x00, 0x00], "hour 31"),
+            ("11.001", &[0x01, 0x00, 0x18], "month 0 is outside 1..12"),
+            (
+                "19.001",
+                &[0x7D, 0x01, 0x01, 0x18, 0x00, 0x05, 0x00, 0x00],
+                "hour 24 with non-zero",
+            ),
+            ("5.006", &[0xFF], "tariff 255"),
+            ("20.102", &[0x05], "code 5 is reserved"),
+        ];
+        for (dpt, payload, fragment) in cases {
+            let (value, note) = decode_value(ApciKind::Write, payload, Some(dpt.parse()?));
+            assert!(value.is_some(), "{dpt} still decodes");
+            let note = note.ok_or_else(|| format!("{dpt}: no note"))?;
+            assert!(note.contains(fragment), "{dpt}: {note}");
+            assert!(note.contains("03_07_01 §2.4"), "{dpt}: {note}");
+        }
+        // Well-formed payloads carry no note.
+        for (dpt, payload) in [("18.001", &[0x85][..]), ("10.001", &[0x0C, 0x1E, 0x00])] {
+            let (_, note) = decode_value(ApciKind::Write, payload, Some(dpt.parse()?));
+            assert_eq!(note, None, "{dpt}");
+        }
         Ok(())
     }
 

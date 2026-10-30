@@ -30,7 +30,7 @@
 //!   non-decreasing within each block — the shape seen in the live association
 //!   table. An object with no GA at all contributes nothing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bussard_model::GroupAddress;
 use bussard_model::schema::Link;
@@ -203,39 +203,12 @@ pub fn app_program_version(
     [mfr[0], mfr[1], app[0], app[1], application_version]
 }
 
-/// KNX group-communication priority, the 2-bit priority field of a System B
-/// group-object descriptor.
-///
-/// The on-wire values are the KNX standard priority codes (`00` system, `01`
-/// high/urgent, `10` alarm, `11` low). ETS emits **Low** for every com-object of
-/// the DA.tp reference device (the product XML declares no `Priority`), so
-/// [`Default`] is [`Priority::Low`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Priority {
-    /// System priority (`00`) — used by ETS for device programming.
-    System,
-    /// High / urgent priority (`01`).
-    High,
-    /// Alarm priority (`10`).
-    Alarm,
-    /// Low priority (`11`) — the normal group-communication default.
-    #[default]
-    Low,
-}
-
-impl Priority {
-    /// The raw 2-bit priority code (`0`..=`3`); [`group_object_word`] shifts it
-    /// into bits 8-9 of the System B descriptor word, and the System 7 CONFIG
-    /// byte ([`crate::compute_sys7::sys7_config_byte`]) places it in bits 1-0.
-    pub fn code(self) -> u16 {
-        match self {
-            Priority::System => 0b00,
-            Priority::High => 0b01,
-            Priority::Alarm => 0b10,
-            Priority::Low => 0b11,
-        }
-    }
-}
+/// KNX transmission priority of a group object, the 2-bit field of a System
+/// B descriptor (bits 9-8) and a System 7 CONFIG octet (bits 1-0): `00`
+/// system, `01` normal (ETS `High`), `10` urgent (ETS `Alert`), `11` low.
+/// Each builder takes it from the product, the ref's `Priority` else the base
+/// object's, Low when neither declares one (issue #541).
+pub use bussard_model::Priority;
 
 /// One com-object's group-object-table descriptor input: its ASAP (com-object
 /// number) and the effective flags/size/priority the descriptor encodes.
@@ -247,7 +220,8 @@ pub struct GroupObjectDescriptor {
     pub flags: bussard_model::Flags,
     /// The object size code (see [`size_code_from_object_size`]).
     pub size_code: u8,
-    /// The group-communication priority (Low unless the product overrides it).
+    /// The transmission priority the product declares (Low when it declares
+    /// none).
     pub priority: Priority,
 }
 
@@ -335,33 +309,74 @@ pub fn compute_group_object_table(descriptors: &[GroupObjectDescriptor]) -> Opti
     Some(table_image_with_count(count, &body))
 }
 
-/// Maps an ETS `ObjectSize` string (e.g. `"1 Bit"`, `"1 Byte"`, `"4 Bit"`) to
-/// the KNX group-object descriptor size code (0 = 1 bit, 1 = 2 bits … per the
-/// standard's size-code table), defaulting to `0` (1 bit) when unrecognised.
+/// The value field type code of an ETS `ObjectSize` string (`"1 Bit"`,
+/// `"4 Bit"`, `"2 Bytes"`, `"5 Bytes"`), per KNX 3/5/1 Resources
+/// §4.18.6.2.4.1.4, Table 88, or `None` for a size the table has no code for.
 ///
-/// This is the inverse of the read side's size decoding; like the table itself
-/// it is unverified against a real device and exists so the descriptor carries a
-/// plausible size until the format is confirmed on the wire.
+/// Codes 0 to 6 are 1 to 7 bits, 7 to 14 are 1, 2, 3, 4, 6, 8, 10 and 14
+/// octets (the System 7 Type Octet table, §4.18.3.1.2.1, ends there), 15 to 20
+/// are 5, 7, 9, 11, 12 and 13 octets, 21 to 254 are 15 to 248 octets
+/// (code - 6), and 255 is 252 octets, the extended-frame maximum. A size with
+/// no code (`LegacyVarData`, 249 to 251 octets, a typo) is `None`.
+pub fn object_size_code(object_size: &str) -> Option<u8> {
+    let norm = object_size.trim().to_ascii_lowercase();
+    let (number, unit) = norm.split_once(' ')?;
+    let n: u16 = number.parse().ok()?;
+    match unit.trim() {
+        "bit" | "bits" => (1..=7).contains(&n).then(|| (n - 1) as u8),
+        "byte" | "bytes" | "octet" | "octets" => match n {
+            1 => Some(7),
+            2 => Some(8),
+            3 => Some(9),
+            4 => Some(10),
+            6 => Some(11),
+            8 => Some(12),
+            10 => Some(13),
+            14 => Some(14),
+            5 => Some(15),
+            7 => Some(16),
+            9 => Some(17),
+            11 => Some(18),
+            12 => Some(19),
+            13 => Some(20),
+            15..=248 => u8::try_from(n + 6).ok(),
+            252 => Some(255),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The value field type code for a com-object's `ObjectSize` (see
+/// [`object_size_code`]), `0` (1 bit) when the product declares none.
+///
+/// A declared size without a code also maps to `0` here, so the descriptor
+/// builders stay infallible; a System B flash plan first refuses an
+/// application that declares such a size ([`unknown_object_sizes`]), so no plan
+/// writes the fallback. (System 7 keeps the product's TYPE octet instead.)
 pub fn size_code_from_object_size(object_size: Option<&str>) -> u8 {
-    // The KNX size-code table (3/5/1) enumerates: 1 bit, 2 bits, 3 bits, 4 bits,
-    // 5 bits, 6 bits, 7 bits, 1 byte, 2 bytes, 3 bytes, 4 bytes, 6 bytes, 8
-    // bytes, 10 bytes, 14 bytes — codes 0..=14 in that order.
-    const TABLE: [&str; 15] = [
-        "1 bit", "2 bit", "3 bit", "4 bit", "5 bit", "6 bit", "7 bit", "1 byte", "2 byte",
-        "3 byte", "4 byte", "6 byte", "8 byte", "10 byte", "14 byte",
-    ];
-    let Some(raw) = object_size else { return 0 };
-    // Normalise: lower-case, singularise "bytes"/"bits" to "byte"/"bit".
-    let norm = raw
-        .to_ascii_lowercase()
-        .replace("bytes", "byte")
-        .replace("bits", "bit");
-    let norm = norm.trim();
-    TABLE
-        .iter()
-        .position(|entry| *entry == norm)
-        .map(|i| i as u8)
-        .unwrap_or(0)
+    object_size.and_then(object_size_code).unwrap_or(0)
+}
+
+/// The com-objects (and refs) of `app` whose declared `ObjectSize` has no
+/// value field type code (see [`object_size_code`]), as `(id, size)` pairs
+/// sorted by id. A System B flash plan refuses the application when this is
+/// not empty.
+pub fn unknown_object_sizes(app: &bussard_prod::ApplicationProgram) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = app
+        .com_objects
+        .values()
+        .filter_map(|o| Some((o.id.as_str(), o.object_size.as_deref()?)))
+        .chain(
+            app.com_object_refs
+                .values()
+                .filter_map(|r| Some((r.id.as_str(), r.object_size.as_deref()?))),
+        )
+        .filter(|(_, size)| object_size_code(size).is_none())
+        .map(|(id, size)| (id.to_string(), size.to_string()))
+        .collect();
+    out.sort();
+    out
 }
 
 /// Builds group-object descriptors from a device's resolved com-objects,
@@ -382,7 +397,7 @@ pub fn descriptors_for_linked_objects(
             asap: c.number(),
             flags: c.flags(),
             size_code: size_code_from_object_size(c.object_size()),
-            priority: Priority::default(),
+            priority: c.priority(),
         })
         .collect()
 }
@@ -499,7 +514,7 @@ pub fn expand_group_object_descriptors(
                 asap,
                 flags,
                 size_code,
-                priority: Priority::default(),
+                priority: cref.priority.or(base.priority).unwrap_or_default(),
             });
         }
     }
@@ -525,7 +540,8 @@ pub struct LinkedObject {
 /// Every com-object ref the evaluation reached gets a descriptor at its ASAP:
 /// the com-object's `Number`, plus, for a module com-object, the module
 /// instance's value for the argument its `BaseNumber` names. A com-object behind
-/// a branch that is not taken gets none. The flags are the ref merged onto the
+/// a branch that is not taken gets none, and so does an unlinked one whose
+/// flags are all disabled (issue #474). The flags are the ref merged onto the
 /// base, with Communication set exactly when the ASAP is linked (ETS registers
 /// a shown but unlinked object with Communication cleared, e.g. the F50's
 /// parameter-enabled object 7 as `1300`). The size code comes from the ref's
@@ -566,7 +582,7 @@ pub fn dynamic_group_object_descriptors(
             size_code: size_code_from_object_size(
                 cref.object_size.as_deref().or(base.object_size.as_deref()),
             ),
-            priority: Priority::default(),
+            priority: cref.priority.or(base.priority).unwrap_or_default(),
         }
     };
 
@@ -575,18 +591,31 @@ pub fn dynamic_group_object_descriptors(
         let Some((base, cref)) = app.resolve(&active.com_object_ref_id) else {
             continue;
         };
-        let offset = base
-            .base_number_ref
-            .as_deref()
-            .map(|arg| arg.strip_prefix(&format!("{}_", app.id)).unwrap_or(arg))
-            .and_then(|arg| config.module_args(active.module)?.get(arg).copied())
-            .unwrap_or(0);
+        // A `BaseNumber` its instance has no value for (issue #449) gets no
+        // descriptor here; the parameter image refuses the configuration.
+        let offset = match base.base_number_ref.as_deref() {
+            Some(arg) => match bussard_prod::module_argument(app, config, active.module, arg) {
+                Some(v) => v,
+                None => continue,
+            },
+            None => 0,
+        };
         let Some(asap) = u16::try_from(i64::from(base.number) + offset)
             .ok()
             .filter(|&a| a != 0)
         else {
             continue;
         };
+        // An unlinked object whose product flags are all disabled gets no
+        // descriptor: ETS leaves it out of the table (issue #474, the Zennio
+        // Flat push buttons' "dummy" objects behind `Flat_AlwaysFALSE`, which
+        // ETS writes as `00 00`). The full sweep oracle separates this from a
+        // `<choose>` rule: ETS takes the same default-only branch on a
+        // read-only, never-shown parameter in the Busch-Jaeger `A-A072` and
+        // ABB `A-A00F`, whose objects carry flags.
+        if !linked.contains_key(&asap) && base.flags.merge(cref.flags).to_flags().is_empty() {
+            continue;
+        }
         by_asap.insert(asap, descriptor(asap, base, cref));
     }
     for (&asap, link) in linked {
@@ -686,9 +715,48 @@ pub fn dynamic_group_object_table_with(
     memo: &bussard_prod::dynamic::DynamicMemo<'_, bussard_prod::ApplicationProgram>,
 ) -> Option<Vec<u8>> {
     let config = memo.evaluate_for(app, overrides);
-    let descriptors = dynamic_group_object_descriptors(app, &config, linked);
+    let mut descriptors = dynamic_group_object_descriptors(app, &config, linked);
+    if app.ets_download_plugin {
+        ets_download_plugin_descriptors(app, &mut descriptors);
+    }
     let count = group_object_table_count(app, &descriptors);
     compute_group_object_table_with_count(&descriptors, count)
+}
+
+/// The group-object table of a program with an ETS download plugin (issue
+/// #565): ETS sets the communication flag on every declared object. A shown
+/// object keeps its flags with C added; a declared object the configuration
+/// does not show gets `04 00` (C only, system priority, size code 0); only
+/// the numbers no object declares stay `00 00`.
+///
+/// From the defaults sweep of the four Busch-Jaeger DALI gateways
+/// (`M-0007_A-A0AA`..`A0AD`, `<Extension EtsDownloadPlugin="">`): A0AA's 1058
+/// unshown objects were written `04 00`, its shown unlinked ones `17`, `5f`,
+/// `4f` where the plain rule writes `13`, `5b`, `4b`. The likely writer is the
+/// plugin; what it does in a non-default configuration is not captured.
+fn ets_download_plugin_descriptors(
+    app: &bussard_prod::ApplicationProgram,
+    descriptors: &mut Vec<GroupObjectDescriptor>,
+) {
+    use bussard_model::Flags;
+    for d in descriptors.iter_mut() {
+        d.flags |= Flags::COMMUNICATION;
+    }
+    let shown: BTreeSet<u16> = descriptors.iter().map(|d| d.asap).collect();
+    let declared: BTreeSet<u16> = app
+        .com_objects
+        .values()
+        .filter(|c| c.base_number_ref.is_none() && !c.id.contains("_MD-"))
+        .map(|c| c.number)
+        .filter(|&n| n != 0 && !shown.contains(&n))
+        .collect();
+    descriptors.extend(declared.into_iter().map(|asap| GroupObjectDescriptor {
+        asap,
+        flags: Flags::COMMUNICATION,
+        size_code: 0,
+        priority: Priority::System,
+    }));
+    descriptors.sort_by_key(|d| d.asap);
 }
 
 /// The declared default value of a parameter a `<choose>` gates, by its
@@ -828,9 +896,57 @@ mod tests {
         assert_eq!(size_code_from_object_size(Some("4 Bit")), 3);
         assert_eq!(size_code_from_object_size(Some("1 Byte")), 7);
         assert_eq!(size_code_from_object_size(Some("2 Bytes")), 8);
-        // Unknown / absent default to 1-bit (code 0).
-        assert_eq!(size_code_from_object_size(Some("weird")), 0);
         assert_eq!(size_code_from_object_size(None), 0);
+    }
+
+    #[test]
+    fn test_object_size_code_covers_table_88() {
+        // Resources §4.18.6.2.4.1.4, Table 88, every listed row.
+        let rows: [(&str, u8); 24] = [
+            ("1 Bit", 0),
+            ("2 Bit", 1),
+            ("3 Bit", 2),
+            ("4 Bit", 3),
+            ("5 Bit", 4),
+            ("6 Bit", 5),
+            ("7 Bit", 6),
+            ("1 Byte", 7),
+            ("2 Bytes", 8),
+            ("3 Bytes", 9),
+            ("4 Bytes", 10),
+            ("6 Bytes", 11),
+            ("8 Bytes", 12),
+            ("10 Bytes", 13),
+            ("14 Bytes", 14),
+            ("5 Bytes", 15),
+            ("7 Bytes", 16),
+            ("9 Bytes", 17),
+            ("11 Bytes", 18),
+            ("12 Bytes", 19),
+            ("13 Bytes", 20),
+            ("15 Bytes", 21),
+            ("16 Bytes", 22),
+            ("17 Bytes", 23),
+        ];
+        for (size, code) in rows {
+            assert_eq!(object_size_code(size), Some(code), "{size}");
+        }
+        assert_eq!(object_size_code("248 Bytes"), Some(254));
+        assert_eq!(object_size_code("252 Bytes"), Some(255));
+    }
+
+    #[test]
+    fn test_object_size_code_refuses_sizes_without_a_code() {
+        for size in [
+            "LegacyVarData",
+            "249 Bytes",
+            "251 Bytes",
+            "8 Bit",
+            "0 Bytes",
+            "weird",
+        ] {
+            assert_eq!(object_size_code(size), None, "{size}");
+        }
     }
 
     #[test]
@@ -858,6 +974,47 @@ mod tests {
         // obj2: absent -> 0x0000.
         // obj3: C|T|Low -> bit10|bit14|(3<<8) = 0x4400|0x0300 = 0x4700, size 7.
         assert_eq!(table, vec![0x00, 0x03, 0x17, 0x00, 0x00, 0x00, 0x47, 0x07]);
+        Ok(())
+    }
+
+    /// The product's `Priority` reaches bits 9-8 of the System B descriptor
+    /// (issue #541): `High` is the standard's normal (`01`), `Alert` urgent
+    /// (`10`), and an object that declares none stays Low (`11`). The ref's
+    /// priority overrides the base's.
+    #[test]
+    fn test_compute_group_object_table_writes_the_declared_priority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let xml = r#"<KNX><ApplicationProgram Id="A" MaskVersion="MV-07B0">
+          <Static>
+           <ComObjectTable>
+            <ComObject Id="A_O-1" Number="1" ObjectSize="1 Bit" Priority="High" CommunicationFlag="Enabled" />
+            <ComObject Id="A_O-2" Number="2" ObjectSize="1 Bit" Priority="Low" CommunicationFlag="Enabled" />
+            <ComObject Id="A_O-3" Number="3" ObjectSize="1 Bit" CommunicationFlag="Enabled" />
+           </ComObjectTable>
+           <ComObjectRefs>
+            <ComObjectRef Id="A_O-1_R-1" RefId="A_O-1" />
+            <ComObjectRef Id="A_O-2_R-1" RefId="A_O-2" Priority="Alert" />
+            <ComObjectRef Id="A_O-3_R-1" RefId="A_O-3" />
+           </ComObjectRefs>
+          </Static>
+          <Dynamic><ChannelIndependentBlock><ParameterBlock Id="A_PB-1">
+           <ComObjectRefRef RefId="A_O-1_R-1" />
+           <ComObjectRefRef RefId="A_O-2_R-1" />
+           <ComObjectRefRef RefId="A_O-3_R-1" />
+          </ParameterBlock></ChannelIndependentBlock></Dynamic>
+         </ApplicationProgram></KNX>"#;
+        let app = bussard_prod::parse_application_program("A", xml.as_bytes())?;
+
+        // The flat builder, every object linked: C (bit 10) plus the priority.
+        let linked = std::collections::BTreeSet::from([1u16, 2, 3]);
+        let descriptors = descriptors_for_linked_objects(&app.resolved_com_objects(), &linked);
+        let table = compute_group_object_table(&descriptors).ok_or("empty table")?;
+        assert_eq!(table, vec![0x00, 0x03, 0x05, 0x00, 0x06, 0x00, 0x07, 0x00]);
+
+        // The Dynamic builder, nothing linked: C cleared, priority kept.
+        let table = dynamic_group_object_table(&app, &BTreeMap::new(), &BTreeMap::new())
+            .ok_or("empty table")?;
+        assert_eq!(table, vec![0x00, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00]);
         Ok(())
     }
 
@@ -1104,6 +1261,73 @@ mod tests {
             app_program_version(0x00FA, 9472, 16),
             [0x00, 0xFA, 0x25, 0x00, 0x10]
         );
+    }
+
+    /// Issue #565: a program with `<Extension EtsDownloadPlugin>` (the
+    /// Busch-Jaeger DALI gateway A0AA) gets C on every declared object: the
+    /// shown ones keep their flags with C (`5f 00`, `17 00`), the unshown
+    /// ones `04 00`, the undeclared numbers `00 00`. Without the plugin the
+    /// same program keeps the plain rule.
+    #[test]
+    fn test_dynamic_group_object_table_ets_download_plugin_sets_c_everywhere()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let xml = |extension: &str| {
+            format!(
+                r#"<KNX xmlns="http://knx.org/xml/project/21">
+         <ApplicationProgram Id="A" MaskVersion="MV-07B0" Name="dali">
+          <Static>
+           <Parameters><Parameter Id="A_P-1" Name="sel" Value="0" /></Parameters>
+           <ParameterRefs><ParameterRef Id="A_P-1_R-1" RefId="A_P-1" /></ParameterRefs>
+           <ComObjects>
+            <ComObject Id="A_O-1" Number="1" ObjectSize="1 Bit" ReadFlag="Enabled" TransmitFlag="Enabled" CommunicationFlag="Enabled" />
+            <ComObject Id="A_O-2" Number="2" ObjectSize="1 Bit" ReadFlag="Enabled" WriteFlag="Enabled" TransmitFlag="Enabled" CommunicationFlag="Enabled" />
+            <ComObject Id="A_O-3" Number="3" ObjectSize="1 Bit" WriteFlag="Enabled" CommunicationFlag="Enabled" />
+            <ComObject Id="A_O-7" Number="7" ObjectSize="1 Bit" WriteFlag="Enabled" CommunicationFlag="Enabled" />
+           </ComObjects>
+           <ComObjectRefs>
+            <ComObjectRef Id="A_O-1_R-1" RefId="A_O-1" /><ComObjectRef Id="A_O-2_R-2" RefId="A_O-2" />
+            <ComObjectRef Id="A_O-3_R-3" RefId="A_O-3" /><ComObjectRef Id="A_O-7_R-7" RefId="A_O-7" />
+           </ComObjectRefs>
+           {extension}
+          </Static>
+          <Dynamic>
+           <ChannelIndependentBlock><ParameterBlock Id="A_PB-1">
+            <ParameterRefRef RefId="A_P-1_R-1" />
+            <ComObjectRefRef RefId="A_O-2_R-2" />
+            <ComObjectRefRef RefId="A_O-7_R-7" />
+            <choose ParamRefId="A_P-1_R-1">
+             <when test="1"><ComObjectRefRef RefId="A_O-1_R-1" /><ComObjectRefRef RefId="A_O-3_R-3" /></when>
+            </choose>
+           </ParameterBlock></ChannelIndependentBlock>
+          </Dynamic>
+         </ApplicationProgram></KNX>"#
+            )
+        };
+        let table = |extension: &str| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let app = bussard_prod::parse_application_program("A", xml(extension).as_bytes())?;
+            Ok(
+                dynamic_group_object_table(&app, &BTreeMap::new(), &BTreeMap::new())
+                    .ok_or("empty table")?,
+            )
+        };
+        let plugin =
+            table(r#"<Extension EtsDownloadPlugin="" EtsUiPlugin="" EtsDataHandler="" />"#)?;
+        assert_eq!(
+            plugin,
+            vec![
+                0x00, 0x07, 0x04, 0x00, 0x5f, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x17, 0x00
+            ]
+        );
+        let plain = table("")?;
+        assert_eq!(
+            plain,
+            vec![
+                0x00, 0x07, 0x00, 0x00, 0x5b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x13, 0x00
+            ]
+        );
+        Ok(())
     }
 
     /// The Jung F50 shape (issue #123): placeholder application com-objects

@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bussard_download::{FlashStep, Session, flash, plan_flash};
+use bussard_download::{FlashStep, SegmentFill, Session, flash, plan_flash};
 use bussard_mgmt::connection::Layer4Connection;
 use bussard_mgmt::load::{LoadState, WriteError};
 use bussard_prod::application::{ApplicationProgram, parse_application_program};
@@ -55,6 +55,8 @@ const CHANNEL: u8 = 0x33;
 const A_PROPERTY_VALUE_READ: u16 = 0x3D5;
 const A_PROPERTY_VALUE_RESPONSE: u16 = 0x3D6;
 const A_PROPERTY_VALUE_WRITE: u16 = 0x3D7;
+const A_PROPERTY_DESCRIPTION_READ: u16 = 0x3D8;
+const A_PROPERTY_DESCRIPTION_RESPONSE: u16 = 0x3D9;
 const A_MEMORY_READ_SEL: u16 = 0x200;
 const A_MEMORY_RESPONSE: u16 = 0x240;
 const A_MEMORY_WRITE_SEL: u16 = 0x280;
@@ -64,6 +66,11 @@ const A_MEMORY_EXTENDED_WRITE: u16 = 0x1FB;
 const A_MEMORY_EXTENDED_WRITE_RESPONSE: u16 = 0x1FC;
 const A_MEMORY_EXTENDED_READ: u16 = 0x1FD;
 const A_MEMORY_EXTENDED_READ_RESPONSE: u16 = 0x1FE;
+// A_UserMemory_* (20-bit address, 03_03_07 §3.5.6): what ETS uses above
+// 0xFFFF for an application without extended memory services (issue #472).
+const A_USER_MEMORY_READ: u16 = 0x2C0;
+const A_USER_MEMORY_RESPONSE: u16 = 0x2C1;
+const A_USER_MEMORY_WRITE: u16 = 0x2C2;
 // A_Authorize_Request/Response (issue #52 finding #1): ETS presents a key before
 // any configuration access. De-mirrored from the spec here so the mock models an
 // authorization gate — config writes are refused until an authorize is granted.
@@ -260,6 +267,16 @@ struct DeviceState {
     /// The size (octets) of the most-recently allocated segment, so a
     /// `PID_MCB_TABLE` read can CRC exactly the segment the device stored.
     last_segment_size: u32,
+    /// The segment the last `Unload` freed, `(base, size)` (issue #543): a
+    /// Mode 0 re-allocation of the same size lands at that base again and
+    /// keeps the memory contents (Configuration Procedures 03_05_03
+    /// §3.5.1.2).
+    freed_segment: Option<(u32, u32)>,
+    /// Place a re-allocation at a fresh base instead (issue #543): the device
+    /// moved the segment.
+    relocate_on_realloc: bool,
+    /// Every relative allocation as `(size, mode octet)`.
+    rel_segments: Vec<(u32, u8)>,
     /// Sparse device memory: 24-bit address → octet.
     memory: HashMap<u32, u8>,
     fault: Fault,
@@ -306,6 +323,11 @@ struct DeviceState {
     /// Count of `A_MemoryExtended_Write` frames seen — a test asserts the extended
     /// service (not the plain `A_Memory_Write`) carried the >0xFFFF segment.
     extended_writes_seen: usize,
+    /// `A_UserMemory_Write`s the device stored (issue #472).
+    user_writes_seen: usize,
+    /// The device leaves `A_MemoryExtended_*` unanswered: its application
+    /// announces no extended memory services (issue #472).
+    no_extended_memory: bool,
     /// If set, the device answers `PID_MAX_APDU_LENGTH` (PID 56 on obj0) with this
     /// value, so the tool scales its extended-write chunks to it (e.g. 233 -> 228).
     /// `None` (the default) leaves the property absent — the tool falls back to the
@@ -534,10 +556,15 @@ struct DeviceState {
     /// The connection-level events an activated device saw, in order: a
     /// readable log of the wire sequence around a restart.
     secure_log: Vec<String>,
-    /// Objects whose `PID_LOAD_STATE_CONTROL` read answers zero elements (the
-    /// property is absent), so the resident-state probe gets no state from
-    /// them (issue #213 fallback test).
+    /// Objects whose `PID_LOAD_STATE_CONTROL` read and write answer zero
+    /// elements (the property or the object is absent), so the resident-state
+    /// probe gets no state from them (issue #213 fallback test) and a
+    /// load control to them is refused (issue #614).
     load_state_absent: Vec<u8>,
+    /// Objects that answer an `Unload`, and every load-state read, with the
+    /// load `Error` state (issue #614: a mapped unload still fails on any
+    /// answer but count 0).
+    unload_error: Vec<u8>,
 }
 
 type Shared = Arc<Mutex<DeviceState>>;
@@ -698,8 +725,8 @@ fn handle_request(state: &Shared, req_apci: u16, data: &[u8]) -> Reaction {
             s.last_segment_base = 0;
             s.last_segment_size = 0;
         }
-        // error_code = 0x00, process_time = 0x0064 (100, a plausible reboot time).
-        return Reaction::Answer(A_RESTART_RESPONSE, vec![0x00, 0x00, 0x64]);
+        // error_code = 0x00, process_time = 1 s (the tool waits at least that).
+        return Reaction::Answer(A_RESTART_RESPONSE, vec![0x00, 0x00, 0x01]);
     }
     // Basic restart (bare A_Restart, 0x380, no payload). This is BOTH the terminal
     // restart AND — matching ETS→KNX-Virtual — the mid-procedure master reset
@@ -765,6 +792,56 @@ fn handle_request(state: &Shared, req_apci: u16, data: &[u8]) -> Reaction {
         let mut payload = addr.to_be_bytes().to_vec();
         payload.extend_from_slice(&out);
         return Reaction::Answer(A_MEMORY_RESPONSE | (count as u16 & 0x3f), payload);
+    }
+
+    // A device without the extended services refuses them (issue #472), so
+    // a test fails loudly when one goes out.
+    if s.no_extended_memory
+        && (req_apci == A_MEMORY_EXTENDED_READ || req_apci == A_MEMORY_EXTENDED_WRITE)
+    {
+        return Reaction::Nak;
+    }
+
+    // User memory read: [ext:4|count:4][addr:2]. Answer with an
+    // A_UserMemory_Response carrying the header and the octets.
+    if req_apci == A_USER_MEMORY_READ {
+        if data.len() < 3 {
+            return Reaction::Nak;
+        }
+        let count = usize::from(data[0] & 0x0F);
+        let addr =
+            (u32::from(data[0] >> 4) << 16) | u32::from(u16::from_be_bytes([data[1], data[2]]));
+        let mut payload = data[..3].to_vec();
+        for i in 0..count {
+            payload.push(*s.memory.get(&addr.wrapping_add(i as u32)).unwrap_or(&0));
+        }
+        return Reaction::Answer(A_USER_MEMORY_RESPONSE, payload);
+    }
+
+    // User memory write: [ext:4|count:4][addr:2][data]. Acknowledged only,
+    // like the plain write (the mock is not in verify mode).
+    if req_apci == A_USER_MEMORY_WRITE {
+        if !s.authorized && !s.authorize_unsupported {
+            return Reaction::Nak;
+        }
+        if s.fault == Fault::NakMemoryWrite || data.len() < 3 {
+            return Reaction::Nak;
+        }
+        let count = usize::from(data[0] & 0x0F);
+        let addr =
+            (u32::from(data[0] >> 4) << 16) | u32::from(u16::from_be_bytes([data[1], data[2]]));
+        let Some(value) = data.get(3..3 + count) else {
+            return Reaction::Nak;
+        };
+        for (i, b) in value.iter().enumerate() {
+            s.memory.insert(addr.wrapping_add(i as u32), *b);
+        }
+        s.memory_writes_seen += 1;
+        s.user_writes_seen += 1;
+        if s.write_phase_exchanges.is_none() {
+            s.write_phase_exchanges = Some(0);
+        }
+        return Reaction::Ack;
     }
 
     // Extended memory read: [count][addr:3 BE]. Answer with an
@@ -873,6 +950,12 @@ fn handle_request(state: &Shared, req_apci: u16, data: &[u8]) -> Reaction {
             return Reaction::Answer(
                 A_PROPERTY_VALUE_RESPONSE,
                 prop_response(oi, pid, 0, start, &[]),
+            );
+        }
+        if pid == PID_LOAD_STATE_CONTROL && s.unload_error.contains(&oi) {
+            return Reaction::Answer(
+                A_PROPERTY_VALUE_RESPONSE,
+                prop_response(oi, pid, 1, start, &[LS_ERROR]),
             );
         }
         if pid == PID_LOAD_STATE_CONTROL {
@@ -1015,6 +1098,18 @@ fn handle_request(state: &Shared, req_apci: u16, data: &[u8]) -> Reaction {
             s.load_control_targets.push(oi);
             let event = value.first().copied().unwrap_or(0);
             s.load_events.push((oi, event));
+            if s.load_state_absent.contains(&oi) {
+                return Reaction::Answer(
+                    A_PROPERTY_VALUE_RESPONSE,
+                    prop_response(oi, pid, 0, start, &[]),
+                );
+            }
+            if event == LE_UNLOAD && s.unload_error.contains(&oi) {
+                return Reaction::Answer(
+                    A_PROPERTY_VALUE_RESPONSE,
+                    prop_response(oi, pid, 1, start, &[LS_ERROR]),
+                );
+            }
             let is_app = loadable_object_index(&s) == Some(oi);
             let fault = s.fault;
 
@@ -1074,13 +1169,25 @@ fn handle_request(state: &Shared, req_apci: u16, data: &[u8]) -> Reaction {
                 } else {
                     0
                 };
-                let base = s
-                    .segment_base_override
+                let mode = value.get(6).copied().unwrap_or(0);
+                s.rel_segments.push((size, mode));
+                let kept = s
+                    .freed_segment
                     .take()
-                    .unwrap_or(s.next_segment_base);
+                    .filter(|(_, freed)| mode == 0 && *freed == size && !s.relocate_on_realloc);
+                let base = match kept {
+                    Some((base, _)) => base,
+                    None => {
+                        let base = s
+                            .segment_base_override
+                            .take()
+                            .unwrap_or(s.next_segment_base);
+                        s.next_segment_base = base.wrapping_add(size.max(1));
+                        base
+                    }
+                };
                 s.last_segment_base = base;
                 s.last_segment_size = size;
-                s.next_segment_base = base.wrapping_add(size.max(1));
                 // Normally stays in Loading; the LoadedOnAllocate fault drops to
                 // Loaded here, so the allocate's own re-read trips the strict check.
                 if fault == Fault::LoadedOnAllocate && is_app {
@@ -1135,6 +1242,11 @@ fn handle_request(state: &Shared, req_apci: u16, data: &[u8]) -> Reaction {
                     }
                     LE_UNLOAD => {
                         s.app_load_state = LS_UNLOADED;
+                        // The reference reads zero until the next allocation.
+                        if s.last_segment_base != 0 {
+                            s.freed_segment = Some((s.last_segment_base, s.last_segment_size));
+                        }
+                        s.last_segment_base = 0;
                         LS_UNLOADED
                     }
                     _ => s.app_load_state,
@@ -1154,6 +1266,16 @@ fn handle_request(state: &Shared, req_apci: u16, data: &[u8]) -> Reaction {
         return Reaction::Answer(
             A_PROPERTY_VALUE_RESPONSE,
             prop_response(oi, pid, _count, start, value),
+        );
+    }
+
+    // A_PropertyDescription_Read: this device describes no property ("no
+    // such property", zero elements), so the pre-flight keeps the default
+    // association table format.
+    if req_apci == A_PROPERTY_DESCRIPTION_READ && data.len() == 3 {
+        return Reaction::Answer(
+            A_PROPERTY_DESCRIPTION_RESPONSE,
+            vec![data[0], data[1], data[2], 0, 0, 0, 0],
         );
     }
 
@@ -1714,6 +1836,9 @@ fn fresh_device(fault: Fault) -> Shared {
         next_segment_base: 0x4000,
         last_segment_base: 0,
         last_segment_size: 0,
+        freed_segment: None,
+        relocate_on_realloc: false,
+        rel_segments: Vec::new(),
         memory: HashMap::new(),
         fault,
         control_writes: 0,
@@ -1726,6 +1851,8 @@ fn fresh_device(fault: Fault) -> Shared {
         write_phase_exchanges: None,
         memory_writes_seen: 0,
         extended_writes_seen: 0,
+        user_writes_seen: 0,
+        no_extended_memory: false,
         max_apdu: None,
         segment_base_override: None,
         drop_loading_on_reconnect: false,
@@ -1790,6 +1917,7 @@ fn fresh_device(fault: Fault) -> Shared {
         plain_descriptor_reads: 0,
         secure_log: Vec::new(),
         load_state_absent: Vec::new(),
+        unload_error: Vec::new(),
     }))
 }
 
@@ -1935,16 +2063,17 @@ fn app_with_write_prop() -> TestResult<ApplicationProgram> {
 
 /// A single-application System B app whose procedure carries an
 /// `LdCtrlMasterReset` (EraseCode 4, ChannelNumber 0) mid-procedure, in the
-/// KNX-Virtual shape: allocate the segment, master-reset the device, then write
+/// KNX-Virtual shape (a KNX Virtual `M-00FA_A-25xx` id, so the bare
+/// `A_Restart`, issue #605): allocate the segment, master-reset the device, then write
 /// the segment and complete the load. The master reset reboots the device and
 /// drops the L4 connection, so the download engine must reconnect and resume.
 fn app_with_master_reset() -> TestResult<ApplicationProgram> {
     let xml = r#"<KNX xmlns="http://knx.org/xml/project/23">
-     <ApplicationProgram Id="M-5_A-1" ApplicationNumber="1" ApplicationVersion="1"
+     <ApplicationProgram Id="M-00FA_A-2505" ApplicationNumber="1" ApplicationVersion="1"
         MaskVersion="MV-07B0" Name="MasterReset" LoadProcedureStyle="ProductDefault">
       <Static>
        <Code>
-        <RelativeSegment Id="M-5_A-1_RS-1" Size="6" LoadStateMachine="4" Offset="0"><Data>AAECAwQF</Data></RelativeSegment>
+        <RelativeSegment Id="M-00FA_A-2505_RS-1" Size="6" LoadStateMachine="4" Offset="0"><Data>AAECAwQF</Data></RelativeSegment>
        </Code>
        <LoadProcedures>
         <LoadProcedure>
@@ -1961,7 +2090,7 @@ fn app_with_master_reset() -> TestResult<ApplicationProgram> {
        </LoadProcedures>
       </Static>
      </ApplicationProgram></KNX>"#;
-    Ok(parse_application_program("M-5_A-1", xml.as_bytes())?)
+    Ok(parse_application_program("M-00FA_A-2505", xml.as_bytes())?)
 }
 
 async fn setup(fault: Fault) -> TestResult<(Transport, Shared, MockGateway)> {
@@ -2049,6 +2178,65 @@ async fn flash_happy_path_loads_and_verifies() -> TestResult {
     assert_eq!(code, vec![0, 1, 2, 3, 4, 5]);
     assert_eq!(*s.memory.get(&0x4006).unwrap_or(&0), 7); // parameter default 7
 
+    drop(handle);
+    Ok(())
+}
+
+/// `LdCtrlDelay` before the restart on System B (issue #615): the executor
+/// pauses the given milliseconds before the restart and the flash verifies.
+#[tokio::test]
+async fn test_flash_delay_pauses_before_restart() -> TestResult {
+    let (mut bus, _state, handle) = setup(Fault::None).await?;
+    let target: bussard_model::IndividualAddress = "1.1.4".parse()?;
+    let source: bussard_model::IndividualAddress = "0.0.255".parse()?;
+
+    let mut app = fabricated_app()?;
+    let ops = &mut app.load_procedures[0].ops;
+    let restart = ops
+        .iter()
+        .position(|op| matches!(op, bussard_prod::application::LoadOp::Restart))
+        .ok_or("the procedure restarts")?;
+    ops.insert(
+        restart,
+        bussard_prod::application::LoadOp::Delay {
+            milliseconds: Some(200),
+        },
+    );
+    let plan = plan_flash(
+        &app,
+        "1.1.4",
+        0x07B0,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+
+    let l4 = Layer4Connection::connect(&mut bus, target, source).await?;
+    let mut session = authed_session(l4).await?;
+    let mut started: Vec<(std::time::Instant, String)> = Vec::new();
+    let outcome = flash(
+        &mut session,
+        &plan,
+        bussard_download::FlashOptions::default(),
+        |p| {
+            if let bussard_download::Progress::Step { label, .. } = p {
+                started.push((std::time::Instant::now(), label));
+            }
+        },
+    )
+    .await?;
+    let _ = session.into_disconnect().await;
+
+    assert!(outcome.ok(), "flash must verify: {outcome:?}");
+    let at = started
+        .iter()
+        .position(|(_, l)| l.contains("wait 200 ms"))
+        .ok_or("the progress names the pause")?;
+    let (wait_start, _) = &started[at];
+    let (next_start, label) = started.get(at + 1).ok_or("a step follows the pause")?;
+    assert!(label.contains("restart"), "{label}");
+    assert!(next_start.duration_since(*wait_start) >= Duration::from_millis(200));
     drop(handle);
     Ok(())
 }
@@ -2668,7 +2856,13 @@ async fn plan_only_touches_no_load_state() -> TestResult {
     assert!(!plan.steps.is_empty());
     // The first supported device step is the unload of the application object
     // (LsmIdx=4 in the fabricated app).
-    assert_eq!(plan.steps[0], FlashStep::Unload { target: Some(4) });
+    assert_eq!(
+        plan.steps[0],
+        FlashStep::Unload {
+            target: Some(4),
+            absent_ok: false
+        }
+    );
 
     let s = lock(&state)?;
     assert_eq!(
@@ -3473,6 +3667,165 @@ async fn flash_master_reset_reconnects_and_reaches_loaded() -> TestResult {
     Ok(())
 }
 
+/// A load procedure's `LdCtrlMasterReset` on a device other than KNX Virtual
+/// goes out in the confirmed form (KNX 3/5/2 §3.7.1.2.3): `A_Restart` master
+/// reset with the op's erase code and channel number, answered by
+/// `A_Restart_Response`; the flash waits the process time, reconnects and
+/// resumes (issue #546).
+#[tokio::test]
+async fn test_flash_master_reset_uses_the_confirmed_form() -> TestResult {
+    flash_master_reset_expecting_confirmed_form("M-0083_A-0005").await
+}
+
+/// Issue #605: an `M-00FA` application outside the KNX Virtual `A-25xx` range
+/// (the synthetic DA.tp clone of #596) is not KNX Virtual, so its master reset
+/// takes the confirmed form too.
+#[tokio::test]
+async fn test_flash_master_reset_uses_the_confirmed_form_for_a_non_virtual_00fa_app() -> TestResult
+{
+    flash_master_reset_expecting_confirmed_form("M-00FA_A-2600-10-731A").await
+}
+
+/// Issue #623: a re-flash onto a device that already holds the application,
+/// with the differential download on, of a product whose procedure sends a
+/// Master Reset with erase code 4 (reset the application program). The
+/// resident MCB matches the image, but the reset erases the object, so the
+/// object is re-downloaded in full instead of skipped, and the flash verifies.
+#[tokio::test]
+async fn test_flash_master_reset_erase_code_4_over_loaded_device_redownloads() -> TestResult {
+    // SAFETY of env: nextest runs this test in its own process; the var only
+    // shortens the post-reboot poll.
+    unsafe {
+        std::env::set_var("BUSSARD_FLASH_REBOOT_WAIT_MS", "50");
+    }
+    let image = [0u8, 1, 2, 3, 4, 5];
+    let (handle, state, gw) = setup_bus_with(preloaded_device(&image)?).await?;
+    lock(&state)?.wipe_app_on_master_reset = true;
+    let target: bussard_model::IndividualAddress = "1.1.4".parse()?;
+    let source = bussard_bus::ops::group_source(&handle);
+
+    // `app_with_master_reset` with the write naming object 4, the object the
+    // mock keeps the resident MCB on, and a vendor id (the confirmed form).
+    let xml = r#"<KNX xmlns="http://knx.org/xml/project/23">
+     <ApplicationProgram Id="M-0083_A-0005" ApplicationNumber="5" ApplicationVersion="1"
+        MaskVersion="MV-07B0" Name="MasterReset" LoadProcedureStyle="ProductDefault">
+      <Static>
+       <Code>
+        <RelativeSegment Id="M-0083_A-0005_RS-1" Size="6" LoadStateMachine="4" Offset="0"><Data>AAECAwQF</Data></RelativeSegment>
+       </Code>
+       <LoadProcedures>
+        <LoadProcedure>
+         <LdCtrlConnect />
+         <LdCtrlUnload LsmIdx="4" />
+         <LdCtrlLoad LsmIdx="4" />
+         <LdCtrlRelSegment LsmIdx="4" Size="6" />
+         <LdCtrlMasterReset EraseCode="4" ChannelNumber="0" />
+         <LdCtrlWriteRelMem ObjIdx="4" Offset="0" Size="6" />
+         <LdCtrlLoadCompleted LsmIdx="4" />
+         <LdCtrlRestart />
+         <LdCtrlDisconnect />
+        </LoadProcedure>
+       </LoadProcedures>
+      </Static>
+     </ApplicationProgram></KNX>"#;
+    let app = parse_application_program("M-0083_A-0005", xml.as_bytes())?;
+    let plan = plan_flash(
+        &app,
+        "1.1.4",
+        0x07B0,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    assert!(plan.erases_resident_objects());
+    let connector = LeaseConnector::plain(handle.clone(), target, source, None);
+    let mut session = Session::open_with_key(connector, None).await?;
+    let outcome = flash(
+        &mut session,
+        &plan,
+        bussard_download::FlashOptions {
+            skip_matching_mcb: true,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .await?;
+    let _ = session.into_disconnect().await;
+    assert!(
+        outcome.ok(),
+        "the object the reset erases must be re-downloaded: {outcome:?}"
+    );
+    assert_eq!(outcome.load_state, LoadState::Loaded);
+    {
+        let s = lock(&state)?;
+        assert_eq!(s.master_resets_seen, 1, "the product's reset is still sent");
+        assert!(
+            s.memory_writes_seen > 0,
+            "the erased object must be streamed again, not skipped on its MCB"
+        );
+    }
+    let _ = handle.close().await;
+    drop(gw);
+    unsafe {
+        std::env::remove_var("BUSSARD_FLASH_REBOOT_WAIT_MS");
+    }
+    Ok(())
+}
+
+/// Flashes [`app_with_master_reset`] under the application id `id` and asserts
+/// the master reset went out in the confirmed form.
+async fn flash_master_reset_expecting_confirmed_form(id: &str) -> TestResult {
+    // SAFETY of env: nextest runs this test in its own process; the var only
+    // shortens the post-reboot poll.
+    unsafe {
+        std::env::set_var("BUSSARD_FLASH_REBOOT_WAIT_MS", "50");
+    }
+    let (handle, state, gw) = setup_bus(Fault::None).await?;
+    lock(&state)?.wipe_app_on_master_reset = true;
+    let target: bussard_model::IndividualAddress = "1.1.4".parse()?;
+    let source = bussard_bus::ops::group_source(&handle);
+
+    let mut app = app_with_master_reset()?;
+    app.id = id.to_string();
+    let plan = plan_flash(
+        &app,
+        "1.1.4",
+        0x07B0,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    let connector = LeaseConnector::plain(handle.clone(), target, source, None);
+    let mut session = Session::open_with_key(connector, None).await?;
+    let outcome = flash(
+        &mut session,
+        &plan,
+        bussard_download::FlashOptions::default(),
+        |_| {},
+    )
+    .await?;
+    let _ = session.into_disconnect().await;
+    assert!(outcome.ok(), "{outcome:?}");
+    {
+        let s = lock(&state)?;
+        assert_eq!(s.master_resets_seen, 1);
+        assert_eq!(
+            s.last_master_reset_payload,
+            vec![4, 0],
+            "the confirmed form carries the erase code and the channel number"
+        );
+        assert!(s.connects >= 2, "reconnected after the reboot");
+    }
+    let _ = handle.close().await;
+    drop(gw);
+    unsafe {
+        std::env::remove_var("BUSSARD_FLASH_REBOOT_WAIT_MS");
+    }
+    Ok(())
+}
+
 /// The #168 readiness probe after a master reset, behind an interface that
 /// reports negative `L_Data.con`s (issue #45): while the device boots, every
 /// probe frame comes back negatively confirmed. The probe must read that as
@@ -3823,6 +4176,7 @@ async fn test_open_with_facts_reuses_the_preflight_table_and_authorize_verdict()
         }),
         max_apdu: None,
         max_apdu_absent: false,
+        association_pdt: None,
     };
     let app = fabricated_app()?;
     let plan = plan_flash(
@@ -4643,11 +4997,11 @@ fn app_da_tp_with(extra: &str) -> TestResult<ApplicationProgram> {
     let data = base64_ff_256();
     let xml = format!(
         r#"<KNX xmlns="http://knx.org/xml/project/23">
-     <ApplicationProgram Id="M-00FA_A-DA" ApplicationNumber="9472" ApplicationVersion="16"
+     <ApplicationProgram Id="M-00FA_A-2500-10-51CB" ApplicationNumber="9472" ApplicationVersion="16"
         MaskVersion="MV-07B0" Name="Dimming" LoadProcedureStyle="MergedProcedure">
       <Static>
        <Code>
-        <RelativeSegment Id="M-00FA_A-DA_RS-04" Size="256" LoadStateMachine="4" Offset="0"><Data>{data}</Data></RelativeSegment>
+        <RelativeSegment Id="M-00FA_A-2500-10-51CB_RS-04" Size="256" LoadStateMachine="4" Offset="0"><Data>{data}</Data></RelativeSegment>
        </Code>
        <LoadProcedures>
         <LoadProcedure MergeId="2">
@@ -4662,7 +5016,10 @@ fn app_da_tp_with(extra: &str) -> TestResult<ApplicationProgram> {
       </Static>
      </ApplicationProgram></KNX>"#
     );
-    Ok(parse_application_program("M-00FA_A-DA", xml.as_bytes())?)
+    Ok(parse_application_program(
+        "M-00FA_A-2500-10-51CB",
+        xml.as_bytes(),
+    )?)
 }
 
 /// A full 4-object flash of the KNX-Virtual DA.tp shape: the master `Load/all`
@@ -4988,6 +5345,7 @@ async fn da_tp_preflight_then_flash(
         authorize: Some(authorize),
         max_apdu,
         max_apdu_absent: l4.max_apdu_absence() == Some(bussard_mgmt::MaxApduAbsence::Answered),
+        association_pdt: resident.association_pdt,
     };
     if phase == WritePhase::AdoptClosed {
         // The device goes silent on this connection; the next request times
@@ -5182,6 +5540,15 @@ fn base64_encode(bytes: &[u8]) -> String {
 /// a flash chunks it (with the extended service, into ~228-octet pieces). The
 /// data is a deterministic ramp so a test can byte-compare what landed.
 fn app_with_segment_of(size: usize) -> TestResult<(ApplicationProgram, Vec<u8>)> {
+    app_with_segment_of_options(size, r#"<Options SupportsExtendedMemoryServices="true" />"#)
+}
+
+/// [`app_with_segment_of`] with `options` as the program's `<Options>`
+/// element (empty: the application announces no extended memory services).
+fn app_with_segment_of_options(
+    size: usize,
+    options: &str,
+) -> TestResult<(ApplicationProgram, Vec<u8>)> {
     let data: Vec<u8> = (0..size).map(|i| (i as u8).wrapping_mul(3)).collect();
     let b64 = base64_encode(&data);
     let xml = format!(
@@ -5192,6 +5559,7 @@ fn app_with_segment_of(size: usize) -> TestResult<(ApplicationProgram, Vec<u8>)>
        <Code>
         <RelativeSegment Id="M-1_A-EXT_RS-1" Size="{size}" LoadStateMachine="4" Offset="0"><Data>{b64}</Data></RelativeSegment>
        </Code>
+       {options}
        <LoadProcedures>
         <LoadProcedure>
          <LdCtrlConnect />
@@ -5280,6 +5648,61 @@ async fn flash_extended_memory_segment_above_64k_loads_and_verifies() -> TestRes
         .map(|i| *s.memory.get(&(0x01_6000u32 + i)).unwrap_or(&0))
         .collect();
     assert_eq!(landed, data, "the image landed verbatim at 0x016000");
+    drop(handle);
+    Ok(())
+}
+
+/// Issue #472: an application without `SupportsExtendedMemoryServices`
+/// (the Zennio DIMinBOX shape, its parameters at 0x10000) is written above
+/// 0xFFFF with `A_UserMemory_Write`, 15 octets per request, and read back
+/// with `A_UserMemory_Read`; the device does not answer the extended
+/// services at all.
+#[tokio::test]
+async fn test_flash_user_memory_above_64k_without_extended_services() -> TestResult {
+    let (mut bus, state, handle) = setup(Fault::None).await?;
+    {
+        let mut s = lock(&state)?;
+        s.max_apdu = Some(233);
+        s.segment_base_override = Some(0x01_0000);
+        s.no_extended_memory = true;
+    }
+    let target: bussard_model::IndividualAddress = "1.1.4".parse()?;
+    let source: bussard_model::IndividualAddress = "0.0.255".parse()?;
+
+    let (app, data) = app_with_segment_of_options(40, "")?;
+    let plan = plan_flash(
+        &app,
+        "1.1.4",
+        0x07B0,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    assert!(plan.user_memory_above_64k());
+
+    let mut l4 = Layer4Connection::connect(&mut bus, target, source).await?;
+    l4.negotiate_max_apdu().await?;
+    let mut session = authed_session(l4).await?;
+    let outcome = flash(
+        &mut session,
+        &plan,
+        bussard_download::FlashOptions::default(),
+        |_| {},
+    )
+    .await?;
+    let _ = session.into_disconnect().await;
+
+    assert!(outcome.ok(), "user-memory flash must verify: {outcome:?}");
+    assert!(outcome.spot_checks_match);
+    let s = lock(&state)?;
+    assert_eq!(s.extended_writes_seen, 0);
+    // 40 octets at 15 per A_UserMemory_Write: 15 + 15 + 10.
+    assert_eq!(s.user_writes_seen, 3);
+    let landed: Vec<u8> = (0..data.len() as u32)
+        .map(|i| *s.memory.get(&(0x01_0000u32 + i)).unwrap_or(&0))
+        .collect();
+    assert_eq!(landed, data, "the image landed verbatim at 0x010000");
     drop(handle);
     Ok(())
 }
@@ -5709,6 +6132,39 @@ async fn test_flash_after_a_fresh_probe_is_unchanged() -> TestResult {
         .collect();
     assert_eq!(code, vec![0, 1, 2, 3, 4, 5]);
     drop(handle);
+    Ok(())
+}
+
+/// The manufacturer check of the download procedure (Configuration Procedures
+/// §3.5.2 step 04, issue #547): a fresh device that reports another
+/// manufacturer than the application's is refused before anything is
+/// unloaded; one that reports the application's passes.
+#[tokio::test]
+async fn test_probe_resident_state_manufacturer_check() -> TestResult {
+    let app = identified_app()?;
+    let plan = identified_plan(&app)?;
+    for (device, refused) in [(0x0004u16, true), (0x00FA, false)] {
+        let state = fresh_device(Fault::None);
+        lock(&state)?
+            .compare_props
+            .insert((0, 12), device.to_be_bytes().to_vec());
+        let (mut bus, state, handle) = setup_device(state).await?;
+        let resident = probe(&mut bus).await?;
+        assert_eq!(resident.manufacturer_id, Some(device));
+        let verdict = bussard_download::assess_freshness(&resident, &plan.identity);
+        assert_eq!(
+            matches!(verdict, bussard_download::Freshness::Mismatch { .. }),
+            refused,
+            "{device:04X}: {verdict:?}"
+        );
+        if refused {
+            assert!(!verdict.allows_flash());
+            assert!(format!("{verdict:?}").contains("M-0004"), "{verdict:?}");
+        }
+        // Read-only: nothing unloaded or written.
+        assert_eq!(lock(&state)?.load_events.len(), 0);
+        drop(handle);
+    }
     Ok(())
 }
 
@@ -6313,9 +6769,13 @@ fn test_plan_flash_skips_program_version_of_an_unloaded_object() -> TestResult {
         .collect();
     assert_eq!(pid13_objects, vec![4], "PID 13 only on the loaded object 4");
     assert!(
-        plan.steps
-            .iter()
-            .any(|s| matches!(s, FlashStep::Unload { target: Some(5) })),
+        plan.steps.iter().any(|s| matches!(
+            s,
+            FlashStep::Unload {
+                target: Some(5),
+                ..
+            }
+        )),
         "object 5 is still unloaded, as ETS does"
     );
     assert!(!plan.steps.iter().any(|s| matches!(
@@ -6393,7 +6853,7 @@ fn test_plan_flash_streams_a_companion_pei_program() -> TestResult {
         FlashStep::AllocateSegment {
             size: 4,
             target: Some(5),
-            fill: Some(0)
+            fill: SegmentFill { mode: 1, fill: 0 }
         }
     )));
     let write5 = plan
@@ -6634,12 +7094,106 @@ async fn test_parameters_only_download_writes_only_the_changed_parameter() -> Te
         .map(|a| s.memory.get(&a).copied().unwrap_or(0))
         .collect();
     assert_eq!(code, vec![0, 1, 2, 3, 4, 5]);
-    // StartLoading then LoadCompleted on the app object: no Unload, no
-    // allocation, no table object touched.
+    // The partial download of Configuration Procedures 03_05_03 §3.5.3 on
+    // the app object (issue #543): Unload, StartLoading, the Mode 0
+    // allocation of the parameter segment, LoadCompleted; no table object.
     let events: Vec<u8> = s.load_events.iter().map(|(_, e)| *e).collect();
-    assert_eq!(events, vec![LE_START_LOADING, LE_LOAD_COMPLETED]);
+    assert_eq!(
+        events,
+        vec![
+            LE_UNLOAD,
+            LE_START_LOADING,
+            LE_ADDITIONAL,
+            LE_LOAD_COMPLETED
+        ]
+    );
     assert!(s.load_events.iter().all(|(oi, _)| *oi == 3));
+    assert_eq!(s.rel_segments.last(), Some(&(1, 0)), "Mode 0, size 1");
     assert!(s.saw_basic_restart, "the device is restarted");
+    Ok(())
+}
+
+/// Plans the fabricated app with its parameter at 9, reads the parameter
+/// regions off `device` and runs the parameter-only download (issue #543).
+async fn run_partial_download(
+    device: Shared,
+    configure: impl FnOnce(&mut DeviceState),
+) -> TestResult<(Result<bussard_download::FlashOutcome, WriteError>, Shared)> {
+    let (mut bus, state, handle) = setup_device(device).await?;
+    let app = fabricated_app()?;
+    let overrides = BTreeMap::from([("P-0_R-0".to_string(), "9".to_string())]);
+    let full = plan_flash(
+        &app,
+        "1.1.4",
+        0x07B0,
+        &overrides,
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    let l4 = Layer4Connection::connect(&mut bus, "1.1.4".parse()?, "0.0.255".parse()?).await?;
+    let mut session = authed_session(l4).await?;
+    let regions = bussard_download::read_parameter_regions(session.l4(), &full).await;
+    let partial = full.parameters_only(&regions)?;
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.load_events.clear();
+        s.memory_writes_seen = 0;
+        configure(&mut s);
+    }
+    let result = flash(
+        &mut session,
+        &partial,
+        bussard_download::FlashOptions::default(),
+        |_| {},
+    )
+    .await;
+    let _ = session.into_disconnect().await;
+    drop(handle);
+    Ok((result, state))
+}
+
+#[tokio::test]
+async fn test_parameters_only_download_writes_the_whole_image_where_the_segment_moved() -> TestResult
+{
+    // Issue #543: the base read before the download no longer holds after the
+    // allocation, so the diff against the old memory proves nothing there.
+    let (result, state) = run_partial_download(device_running_fabricated_app(7), |s| {
+        s.relocate_on_realloc = true;
+    })
+    .await?;
+    let outcome = result?;
+    assert!(outcome.ok(), "{outcome:?}");
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("moved from 0x4006")),
+        "{:?}",
+        outcome.warnings
+    );
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    let base = s.last_segment_base;
+    assert_ne!(base, 0x4006);
+    assert_eq!(s.memory.get(&base).copied(), Some(9));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_parameters_only_download_refuses_an_unloaded_object() -> TestResult {
+    // Issue #543: a partial download rewrites a resident application; an
+    // object that is not Loaded is refused before anything is unloaded.
+    let (result, state) = run_partial_download(device_running_fabricated_app(7), |s| {
+        s.app_load_state = LS_ERROR;
+    })
+    .await?;
+    assert!(
+        matches!(result, Err(WriteError::NotLoaded { .. })),
+        "{result:?}"
+    );
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(s.load_events.is_empty(), "{:?}", s.load_events);
+    assert_eq!(s.memory_writes_seen, 0);
     Ok(())
 }
 
@@ -7066,6 +7620,7 @@ fn app_with_filled_segment(image: &[u8]) -> TestResult<ApplicationProgram> {
        <Code>
         <RelativeSegment Id="M-2_A-9_RS-1" Size="{size}" LoadStateMachine="4" Offset="0"><Data>{b64}</Data></RelativeSegment>
        </Code>
+       <Options SupportsExtendedMemoryServices="true" />
        <LoadProcedures>
         <LoadProcedure MergeId="1">
          <LdCtrlConnect />
@@ -7423,10 +7978,98 @@ fn test_plan_flash_plain_app_with_filled_segment_unloads_and_restarts_basic() ->
     assert!(!steps[0].contains("confirmed"), "{steps:?}");
     assert!(!plan.uses_confirmed_restart());
     assert!(
-        plan.steps
-            .iter()
-            .any(|s| matches!(s, FlashStep::AllocateSegment { fill: Some(_), .. })),
+        plan.steps.iter().any(
+            |s| matches!(s, FlashStep::AllocateSegment { fill, .. } if fill.prefill().is_some())
+        ),
         "the fixture allocates a filled segment"
     );
+    Ok(())
+}
+
+/// The fabricated plan with an unload of object 5 in front whose absent object
+/// is no error (`LdCtrlMapError`, issue #614).
+fn plan_with_mapped_unload() -> TestResult<bussard_download::FlashPlan> {
+    let app = fabricated_app()?;
+    let mut plan = plan_flash(
+        &app,
+        "1.1.4",
+        0x07B0,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    plan.steps.insert(
+        0,
+        FlashStep::Unload {
+            target: Some(5),
+            absent_ok: true,
+        },
+    );
+    Ok(plan)
+}
+
+/// A device without object 5 answers its unload with count 0; the mapped
+/// unload completes with a warning, goes to object 5 itself (not to the
+/// application object in its place), and the download verifies.
+#[tokio::test]
+async fn test_flash_mapped_unload_of_an_absent_object_succeeds() -> TestResult {
+    let (mut bus, state, handle) = setup(Fault::None).await?;
+    lock(&state)?.load_state_absent = vec![5];
+    let plan = plan_with_mapped_unload()?;
+    let l4 = Layer4Connection::connect(&mut bus, "1.1.4".parse()?, "0.0.255".parse()?).await?;
+    let mut session = authed_session(l4).await?;
+    let outcome = flash(
+        &mut session,
+        &plan,
+        bussard_download::FlashOptions::default(),
+        |_| {},
+    )
+    .await?;
+    let _ = session.into_disconnect().await;
+    assert!(outcome.ok(), "flash must verify: {outcome:?}");
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("object 5 absent")),
+        "{:?}",
+        outcome.warnings
+    );
+    let s = lock(&state)?;
+    assert_eq!(s.load_control_targets.first(), Some(&5));
+    assert_eq!(
+        s.load_control_targets.iter().filter(|&&o| o == 5).count(),
+        1
+    );
+    drop(s);
+    drop(handle);
+    Ok(())
+}
+
+/// The mapping covers the absent object only: an object that answers the
+/// unload with the load `Error` state still fails the step.
+#[tokio::test]
+async fn test_flash_mapped_unload_still_fails_on_another_error() -> TestResult {
+    let (mut bus, state, handle) = setup(Fault::None).await?;
+    lock(&state)?.unload_error = vec![5];
+    let plan = plan_with_mapped_unload()?;
+    let l4 = Layer4Connection::connect(&mut bus, "1.1.4".parse()?, "0.0.255".parse()?).await?;
+    let mut session = authed_session(l4).await?;
+    let result = flash(
+        &mut session,
+        &plan,
+        bussard_download::FlashOptions::default(),
+        |_| {},
+    )
+    .await;
+    let _ = session.into_disconnect().await;
+    match result {
+        Err(WriteError::LoadError {
+            object_index: 5, ..
+        }) => {}
+        other => return Err(format!("expected LoadError on object 5, got {other:?}").into()),
+    }
+    drop(handle);
     Ok(())
 }

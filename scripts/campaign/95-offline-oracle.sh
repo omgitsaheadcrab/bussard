@@ -15,6 +15,13 @@
 # `flash --dry-run --dump-images` (no gateway is resolved, no connection is
 # opened) and knxtrace composes the ETS image from the capture offline.
 #
+# The device state ETS read before its download (the application objects'
+# load states, PID_PROGRAM_VERSION, the MCB entries) is what bussard's
+# pre-flight probe reads live: knxtrace writes it as `resident.json` and the
+# dry run plans against it (`--resident`, issue #490), so a device that
+# already holds the application gets the product's `par` load procedure and
+# an object whose MCB already matches is skipped, as on the bus.
+#
 # A row is `device|capture|product|application|note|coverage|options`, one per
 # line in the rows file (a line starting with `#` is a comment, blank lines are
 # skipped; the last two fields are optional):
@@ -24,7 +31,16 @@
 #   product      the vendor .knxprod, or a .knxproj project export (it carries
 #                the product data of every device in the project, so name the
 #                application); `wrapper.zip!inner/path.knxprod` picks an inner
-#                file out of a ZIP wrapper; `-` means there is no product data
+#                file out of a ZIP wrapper; a directory is the product XML of a
+#                synthetic product (`tests-support/synthetic-products/<name>/xml`,
+#                epic #596), zipped with the stub `knx_master.xml` (`<KNX/>`)
+#                into $OUT/.products/<name>.knxprod before the dry run. Its
+#                application is the rendered id (`..._A-2700-10-0000`), not the
+#                signed one ETS imported (`..._A-2700-10-D80E`): the signer's
+#                fingerprint never reaches the wire, PID_PROGRAM_VERSION
+#                carries the manufacturer, the application number and the
+#                version only (checked against the syn-minimal capture,
+#                2026-10-30); `-` means there is no product data
 #                (the row is reported as not comparable, with the note). Paths
 #                may contain spaces (ETS names exports `Name  Project_date`);
 #                only the `|` separators and the ends of a field are trimmed.
@@ -51,6 +67,15 @@
 #                                (identical, differs or not-comparable);
 #                                unchecked when absent. For a row whose
 #                                load-control records are known to differ
+#                state=fresh     the capture programs a factory-fresh device
+#                                (a synthetic or ETS-sweep knx-sim capture).
+#                                ETS reads no load state on System 7 before
+#                                its download, so knxtrace records none; the
+#                                dry run then plans against a record with LSMs
+#                                1 to 4 Unloaded, as the pre-flight probe reads
+#                                a fresh device, and drops the pre-download
+#                                pass (issue #488). A resident.json knxtrace
+#                                wrote wins. For System 7 rows
 #                run=secure-on|secure-off  compare `bussard interface secure
 #                                on|off --dry-run` (issue #398) instead of a
 #                                flash: the KNXnet/IP Secure property writes
@@ -58,6 +83,24 @@
 #                                against the capture's, key material by hash.
 #                                The product field is `-`; the verdict is the
 #                                property parity
+#                run=apply       a partial download (issue #469): knx-sim
+#                                ($KNX_SIM_BIN, default knx-sim/target/debug/
+#                                knx-sim) starts from ETS's state before the
+#                                step (base=, replayed), `bussard apply` runs
+#                                against it on loopback with the model in dir=,
+#                                and `knxtrace statediff` compares the device
+#                                state after it, and the load-control records,
+#                                with the capture's (ETS's partial download).
+#                                Not frame by frame: ETS rewrites a table in
+#                                12-octet chunks where bussard writes an octet.
+#                                run=apply-line: the same through line mode
+#                                (`apply --line <area.line>`)
+#                                base=A,B      the captures that led to the step,
+#                                              in order (comma-separated)
+#                                dir=MODEL     the model of the step (its links)
+#                                lsm=memory|property  the sim's load-state
+#                                              realisation (default property;
+#                                              memory for mask 0701)
 #                phase=fdsk|tool with run=: compare only bussard's writes under
 #                                that key (the decoded half of a capture whose
 #                                other half ran in a KNXnet/IP Secure session)
@@ -85,7 +128,10 @@
 # ETS read and never wrote in the capture equals ETS's image; knxtrace compares
 # bussard's planned octets against those separately and reports their own
 # coverage and verdict (`confirmed` column; same thin rule). A written octet is
-# never a confirmed one, even when ETS read it first.
+# never a confirmed one, even when ETS read it first. When none of a row's
+# read-confirmed octets differs, they also count toward the row's coverage
+# (issue #422): a page whose placed octets ETS only read and kept (the 0701
+# association table) is compared, not blind.
 #
 # --check turns the run into a gate (the corpus-gated CI test uses it): every
 # row whose capture and product exist must give its expected verdict, its
@@ -301,9 +347,39 @@ with open(path, "w", encoding="utf-8") as fh:
 PY
 }
 
-# Resolves `wrapper.zip!inner` to an extracted file under $OUT/.products.
+# Resolves `wrapper.zip!inner` to an extracted file under $OUT/.products, and
+# a product XML directory (a synthetic product's committed `xml/`) to a
+# .knxprod zipped from it with the stub master, also under $OUT/.products.
 resolve_product() {
   local spec="$1"
+  if [ -d "$spec" ]; then
+    local name dest
+    name="$(basename "$(dirname "$(cd "$spec" && pwd)")")"
+    dest="$OUT/.products/$name.knxprod"
+    "$PYTHON" - "$spec" "$dest" <<'EOF' || return 1
+import os, sys, zipfile
+src, dest = sys.argv[1:3]
+entries = sorted(
+    os.path.relpath(os.path.join(root, f), src).replace(os.sep, "/")
+    for root, _, files in os.walk(src) for f in files
+)
+if not any(e.endswith(".xml") and "/" in e for e in entries):
+    sys.exit(f"{src}: no <manufacturer>/*.xml product files")
+os.makedirs(os.path.dirname(dest), exist_ok=True)
+# The stub master data (tests-support/synthetic-products/README.md): bussard
+# reads no master data and plans the mask procedure from its built-in
+# template (#607).
+stamp = (1980, 1, 1, 0, 0, 0)
+with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+    zf.writestr(zipfile.ZipInfo("knx_master.xml", stamp), "<KNX/>")
+    for e in entries:
+        if e != "knx_master.xml":
+            with open(os.path.join(src, e), "rb") as fh:
+                zf.writestr(zipfile.ZipInfo(e, stamp), fh.read())
+print(dest)
+EOF
+    return
+  fi
   case "$spec" in
     *'!'*)
       local zip="${spec%%!*}" inner="${spec#*!}"
@@ -324,6 +400,77 @@ EOF
   esac
 }
 
+# A run=apply row (issue #469): knx-sim starts from ETS's state before the
+# step (the base captures replayed into the device), `bussard apply` runs
+# against it on loopback, and knxtrace compares the device state after it with
+# the state after ETS's partial download (the row's capture). The sim records
+# bussard's session as $dir/sim/bussard.pcap.
+apply_row() {
+  local dir="$1" device="$2" capture="$3" product="$4" application="$5" base="$6" model="$7" lsm="$8" how="${9:-apply}"
+  local sim_bin="${KNX_SIM_BIN:-$REPO/knx-sim/target/debug/knx-sim}"
+  if [ ! -x "$sim_bin" ]; then
+    not_comparable "$dir" "$device" "no knx-sim at $sim_bin (cargo build in knx-sim/, or export KNX_SIM_BIN)"
+    return 0
+  fi
+  if [ -z "$model" ] || [ ! -d "$model" ]; then
+    not_comparable "$dir" "$device" "run=apply needs dir=<model of the step>${model:+ ($model not found)}"
+    return 0
+  fi
+  local prod
+  if ! prod="$(resolve_product "$product")" || [ ! -f "$prod" ]; then
+    not_comparable "$dir" "$device" "product file not found"
+    return 0
+  fi
+  local b base_args=()
+  IFS=',' read -r -a bases <<<"$base"
+  for b in ${bases+"${bases[@]}"}; do
+    [ -f "$b" ] || { not_comparable "$dir" "$device" "base capture not found: $b"; return 0; }
+    base_args+=(--base "$b")
+  done
+  local sim="$dir/sim" port pid
+  ensure_dir "$sim"
+  port="$("$PYTHON" -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+  # JSON is YAML: the sim reads it as its config.
+  "$PYTHON" - "$sim/sim.yaml" "$port" "$device" "$prod" "$application" "${lsm:-property}" "$base" <<'PY'
+import json, os, sys
+path, port, device, prod, app, lsm, base = sys.argv[1:8]
+dev = {"address": device, "knxprod": os.path.abspath(prod), "initial_state": "unloaded", "lsm_access": lsm}
+if app:
+    dev["application"] = app
+cfg = {"gateway": {"host": "127.0.0.1", "port": int(port), "tunnel_address": "1.1.254", "pcap": "bussard.pcap"},
+       "devices": [dev], "replay": [os.path.abspath(p) for p in base.split(",") if p]}
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh, indent=1)
+PY
+  RUST_LOG=info NO_COLOR=1 "$sim_bin" "$sim/sim.yaml" >"$sim/sim.log" 2>&1 &
+  pid=$!
+  local waited=0
+  while ! grep -q "gateway listening" "$sim/sim.log" 2>/dev/null; do
+    if ! kill -0 "$pid" 2>/dev/null || [ "$waited" -ge 600 ]; then
+      kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+      not_comparable "$dir" "$device" "knx-sim did not start: $(grep -v '^\s*$' "$sim/sim.log" | tail -1 | cut -c1-160)"
+      return 0
+    fi
+    sleep 0.2; waited=$((waited + 1))
+  done
+  note "knx-sim on 127.0.0.1:$port, $(grep -c 'replayed' "$sim/sim.log") capture(s) replayed"
+  # run=apply-line goes through line mode (`apply --line`), which has its own
+  # path to the tables (#478); the model holds the one device.
+  local target=("$device")
+  [ "$how" = apply-line ] && target=(--line "${device%.*}")
+  local rc=0
+  env -u BUSSARD_KEYRING BUSSARD_NO_DOTENV=1 "$BUSSARD_BIN" --gateway "127.0.0.1:$port" \
+    apply "${target[@]}" --dir "$model" --yes >"$dir/apply.log" 2>"$dir/apply.err" || rc=$?
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  # A refused apply writes nothing; the state comparison then says so.
+  [ "$rc" = 0 ] || note "bussard apply exited $rc: $(grep -v '^\s*$' "$dir/apply.err" | tail -1 | cut -c1-160)"
+  "$PYTHON" "$KNXTRACE" statediff ${base_args+"${base_args[@]}"} --ets "$capture" \
+    --bussard "$sim/bussard.pcap" --device "$device" --json >"$dir/diff.json" || true
+  "$PYTHON" "$KNXTRACE" statediff ${base_args+"${base_args[@]}"} --ets "$capture" \
+    --bussard "$sim/bussard.pcap" --device "$device" >"$dir/diff.txt" || true
+  sed 's/^/  /' "$dir/diff.txt"
+}
+
 # Runs one row into $OUT/<key> (the device address, with ~2, ~3 for a device
 # that has more than one row).
 run_row() {
@@ -333,7 +480,7 @@ run_row() {
   product="$(trim "${product:-}")"; application="$(trim "${application:-}")"
   note_text="$(trim "${note_text:-}")"; recorded="$(trim "${recorded:-}")"
   options="$(trim "${options:-}")"
-  local expect="" confirmed="" props="" loadctl="" scope="" run="" phase="" word
+  local expect="" confirmed="" props="" loadctl="" scope="" run="" phase="" base="" rowdir="" lsm="" devstate="" word
   for word in $options; do
     case "$word" in
       expect=*)    expect="${word#expect=}" ;;
@@ -343,15 +490,23 @@ run_row() {
       run=*)       run="${word#run=}" ;;
       phase=*)     phase="${word#phase=}" ;;
       scope=*)     scope="${word#scope=}" ;;
-      *)           die "$device: unknown row option: $word (expect=..., confirmed=..., props=..., loadctl=..., run=..., phase=..., scope=...)" ;;
+      base=*)      base="${word#base=}" ;;
+      dir=*)       rowdir="${word#dir=}" ;;
+      lsm=*)       lsm="${word#lsm=}" ;;
+      state=*)     devstate="${word#state=}" ;;
+      *)           die "$device: unknown row option: $word (expect=..., confirmed=..., props=..., loadctl=..., run=..., phase=..., scope=..., base=..., dir=..., lsm=..., state=...)" ;;
     esac
   done
   local scope_args=()
   [ -n "$scope" ] && scope_args=(--scope "$scope")
   [ -n "$phase" ] && scope_args+=(--phase "$phase")
+  case "$devstate" in
+    ""|fresh) ;;
+    *) die "$device: unknown state=$devstate (fresh)" ;;
+  esac
   case "$run" in
-    ""|secure-on|secure-off) ;;
-    *) die "$device: unknown run=$run (secure-on or secure-off)" ;;
+    ""|secure-on|secure-off|apply|apply-line) ;;
+    *) die "$device: unknown run=$run (secure-on, secure-off, apply or apply-line)" ;;
   esac
   [ -n "$device" ] || return 0
   local dir="$OUT/$key"
@@ -378,6 +533,10 @@ PY
   if [ ! -f "$capture" ]; then
     not_comparable "$dir" "$device" "capture not found"
     mark_skipped "$dir" "capture not found"
+    return 0
+  fi
+  if [ "$run" = apply ] || [ "$run" = apply-line ]; then
+    apply_row "$dir" "$device" "$capture" "$product" "$application" "$base" "$rowdir" "$lsm" "$run"
     return 0
   fi
 
@@ -407,6 +566,17 @@ PY
     fi
     local app_args=()
     [ -n "$application" ] && app_args=(--application "$application")
+    # The device state ETS read before its download (issue #490): bussard
+    # plans against it as a live flash plans against its pre-flight probe.
+    # state=fresh (issue #488): a factory-fresh System 7 device, whose LSMs the
+    # probe would read Unloaded; ETS read none, so knxtrace recorded none.
+    if [ -f "$dir/ets/resident.json" ]; then
+      app_args+=(--resident "$dir/ets/resident.json")
+    elif [ "$devstate" = fresh ]; then
+      printf '%s\n' '{"objects": [{"index": 1, "state": 0}, {"index": 2, "state": 0}, {"index": 3, "state": 0}, {"index": 4, "state": 0}]}' \
+        >"$dir/fresh.json"
+      app_args+=(--resident "$dir/fresh.json")
+    fi
     # No --keyring and no $BUSSARD_KEYRING: the model's key store decides.
     if ! env -u BUSSARD_KEYRING "$BUSSARD_BIN" flash "$device" --product "$prod" \
          ${app_args+"${app_args[@]}"} \

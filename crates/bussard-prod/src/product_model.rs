@@ -407,6 +407,10 @@ struct Model<'a> {
     /// read by the `L002` topology lint to total a line's draw.
     #[serde(skip_serializing_if = "Option::is_none")]
     bus_current_ma: Option<u32>,
+    /// The Data Secure table capacities of a Data-Secure-capable application
+    /// (issue #537); absent for any other.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_secure: Option<bussard_model::param_model::DataSecureCapacity>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     com_objects: BTreeMap<u16, ComObjectModel>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -424,6 +428,12 @@ struct Model<'a> {
         serialize_with = "bussard_model::dynamic_compact::unions::serialize"
     )]
     unions: Vec<Union>,
+    /// The `<Allocator>`s by app-relative id (issue #449).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    allocators: BTreeMap<&'a str, bussard_model::dynamic::Allocator>,
+    /// The module arguments' `Allocates` by app-relative id (issue #449).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    argument_allocates: BTreeMap<&'a str, i64>,
     /// The application's Dynamic section (issue #345), appended by
     /// [`serialize_model`] one flow-style node per line.
     #[serde(skip)]
@@ -466,6 +476,10 @@ struct ComObjectModel {
     /// The object size, carried when there is no DPT to imply it.
     #[serde(skip_serializing_if = "Option::is_none")]
     size: Option<String>,
+    /// The transmission priority (ref overrides base), carried only when it
+    /// is not Low, the default of an object that declares none (issue #541).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<bussard_model::Priority>,
     /// The application ref id this com-object resolves through (stable handle).
     ref_id: String,
 }
@@ -484,6 +498,9 @@ struct ParameterModel {
     default: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     memory: Option<MemoryModel>,
+    /// A text parameter's `InitialValue`, translated (issue #473).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_value: Option<String>,
     /// The `BaseValue` argument, app-relative (issue #126).
     #[serde(skip_serializing_if = "Option::is_none")]
     base_value: Option<String>,
@@ -494,6 +511,10 @@ struct ParameterModel {
     /// Whether that integer is signed.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     signed: bool,
+    /// Whether the parameter is virtual: no memory, no property and no
+    /// union place (format 12, issue #474).
+    #[serde(rename = "virtual", skip_serializing_if = "std::ops::Not::not")]
+    is_virtual: bool,
     /// The refs that point at this parameter, app-relative.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     refs: BTreeMap<String, RefModel>,
@@ -548,6 +569,10 @@ enum ParamTypeModel {
         max: Option<f64>,
     },
     None,
+    /// A `<TypeColor>` of a known space (format 11, issue #616).
+    Color {
+        space: bussard_ets::application::ColorSpace,
+    },
     Other {
         kind: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -590,11 +615,28 @@ fn build_model<'a>(app: &'a ApplicationProgram, product: &ProductData) -> Model<
         },
         order_numbers: order_numbers_for(app, product),
         bus_current_ma: bus_current_for(app, product),
+        data_secure: app.is_secure_enabled.then_some(
+            bussard_model::param_model::DataSecureCapacity {
+                group_key_table_entries: app.security_capacity.group_key_table_entries,
+                individual_address_entries: app.security_capacity.individual_address_entries,
+                p2p_key_table_entries: app.security_capacity.p2p_key_table_entries,
+            },
+        ),
         com_objects,
         parameters: parameters_for(app),
         load_procedure: load_procedure_summary(&app.load_procedures),
         com_object_refs,
         unions: unions_for(app),
+        allocators: app
+            .allocators
+            .iter()
+            .map(|(id, a)| (id.as_str(), *a))
+            .collect(),
+        argument_allocates: app
+            .argument_allocates
+            .iter()
+            .map(|(id, n)| (id.as_str(), *n))
+            .collect(),
         dynamic: &app.dynamic,
         module_dynamics: app
             .module_dynamics
@@ -716,7 +758,8 @@ fn dynamic_object_refs(nodes: &[DynamicNode]) -> Vec<String> {
             match node {
                 DynamicNode::ComObjectRefRef(reference) => out.push(reference.clone()),
                 DynamicNode::Channel { children, .. }
-                | DynamicNode::ParameterBlock { children, .. } => stack.push(children),
+                | DynamicNode::ParameterBlock { children, .. }
+                | DynamicNode::Repeat { children, .. } => stack.push(children),
                 DynamicNode::Choose { whens, .. } => {
                     stack.extend(whens.iter().map(|w| w.children.as_slice()));
                 }
@@ -745,6 +788,7 @@ fn com_object_model(rc: &ResolvedComObject<'_>) -> ComObjectModel {
         } else {
             None
         },
+        priority: Some(rc.priority()).filter(|p| *p != bussard_model::Priority::Low),
         ref_id: rc.cref.id.clone(),
     }
 }
@@ -788,12 +832,14 @@ fn parameters_for(app: &ApplicationProgram) -> Vec<ParameterModel> {
                     offset: m.offset,
                     bit_offset: m.bit_offset,
                 }),
+                initial_value: param.initial_value.clone(),
                 base_value: param
                     .base_value
                     .as_deref()
                     .map(|b| b.strip_prefix(&prefix).unwrap_or(b).to_string()),
                 bits: width.map(|(bits, _)| bits),
                 signed: width.is_some_and(|(_, signed)| signed),
+                is_virtual: DynamicSource::is_virtual(app, &param.id),
                 refs,
             }
         })
@@ -859,6 +905,7 @@ fn param_type_model(app: &ApplicationProgram, type_id: Option<&str>) -> ParamTyp
             max: *max,
         },
         ParameterType::None => ParamTypeModel::None,
+        ParameterType::Color { space } => ParamTypeModel::Color { space: *space },
         ParameterType::Other {
             kind, size_bits, ..
         } => ParamTypeModel::Other {
@@ -885,6 +932,7 @@ fn load_op_summary(op: &LoadOp) -> String {
         LoadOp::Connect => "connect".to_string(),
         LoadOp::Disconnect => "disconnect".to_string(),
         LoadOp::Restart => "restart".to_string(),
+        LoadOp::Delay { milliseconds } => format!("delay ms={}", opt(milliseconds)),
         LoadOp::Merge { merge_id } => {
             format!("merge id={}", merge_id.as_deref().unwrap_or("?"))
         }
@@ -912,6 +960,32 @@ fn load_op_summary(op: &LoadOp) -> String {
             opt(address),
             opt(count)
         ),
+        LoadOp::TaskPtr {
+            lsm_idx,
+            init_ptr,
+            save_ptr,
+            serial_ptr,
+        } => format!(
+            "task_ptr lsm={} init={} save={} serial={}",
+            opt(lsm_idx),
+            opt(init_ptr),
+            opt(save_ptr),
+            opt(serial_ptr)
+        ),
+        LoadOp::TaskCtrl2 {
+            lsm_idx,
+            callback,
+            address,
+            seg0,
+            seg1,
+        } => format!(
+            "task_ctrl2 lsm={} callback={} addr={} seg0={} seg1={}",
+            opt(lsm_idx),
+            opt(callback),
+            opt(address),
+            opt(seg0),
+            opt(seg1)
+        ),
         LoadOp::RelSegment {
             lsm_idx,
             size,
@@ -922,8 +996,11 @@ fn load_op_summary(op: &LoadOp) -> String {
             opt(lsm_idx),
             opt(size),
             applies_to.as_deref().unwrap_or("-"),
-            fill.map(|b| format!("0x{b:02X}"))
-                .unwrap_or_else(|| "-".to_string())
+            match (fill.mode, fill.fill) {
+                (0, 0) => "-".to_string(),
+                (1, b) => format!("0x{b:02X}"),
+                (m, b) => format!("mode={m}:0x{b:02X}"),
+            }
         ),
         LoadOp::AbsSegment {
             lsm_idx,
@@ -932,6 +1009,7 @@ fn load_op_summary(op: &LoadOp) -> String {
             access,
             mem_type,
             seg_flags,
+            ..
         } => format!(
             "abs_segment lsm={} addr={} size={} access={} mem_type={} seg_flags={}",
             opt(lsm_idx),
@@ -1037,6 +1115,18 @@ fn load_op_summary(op: &LoadOp) -> String {
             opt(prop_id),
             opt(count)
         ),
+        LoadOp::MapError {
+            original_error,
+            mapped_error,
+        } => {
+            let code =
+                |c: &Option<u32>| c.map_or_else(|| "-".to_string(), |c| format!("{c:#010X}"));
+            format!(
+                "map_error original={} mapped={}",
+                code(original_error),
+                code(mapped_error)
+            )
+        }
         LoadOp::Raw { name, attrs } => {
             let joined: Vec<String> = attrs.iter().map(|(k, v)| format!("{k}={v}")).collect();
             format!("raw {name} [{}]", joined.join(" "))
@@ -1128,6 +1218,37 @@ mod tests {
             applications: Vec::new(),
             order_numbers: Vec::new(),
         }
+    }
+
+    /// Issue #537: a Data-Secure-capable application's model carries its
+    /// table capacities and reads them back; any other carries none.
+    #[test]
+    fn test_model_yaml_data_secure_capacity_round_trip() -> TestResult {
+        let mut app = ApplicationProgram {
+            id: "M-00FA_A-0001-01-0000".to_string(),
+            is_secure_enabled: true,
+            ..ApplicationProgram::default()
+        };
+        app.security_capacity.group_key_table_entries = Some(1500);
+        app.security_capacity.individual_address_entries = Some(64);
+        let product = ProductData::default();
+        let yaml = model_yaml(&app, &product)?;
+        assert!(yaml.contains("data_secure:"), "{yaml}");
+        let model = bussard_model::param_model::ProductModel::from_yaml(&yaml, &app.id)?;
+        assert_eq!(
+            model.data_secure,
+            Some(bussard_model::param_model::DataSecureCapacity {
+                group_key_table_entries: Some(1500),
+                individual_address_entries: Some(64),
+                p2p_key_table_entries: None,
+            })
+        );
+        app.is_secure_enabled = false;
+        let plain = model_yaml(&app, &product)?;
+        assert!(!plain.contains("data_secure"));
+        let model = bussard_model::param_model::ProductModel::from_yaml(&plain, &app.id)?;
+        assert_eq!(model.data_secure, None);
+        Ok(())
     }
 
     #[test]

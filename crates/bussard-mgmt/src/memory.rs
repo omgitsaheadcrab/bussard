@@ -60,20 +60,55 @@ pub fn select_extended_memory(addr: u32, len: usize) -> bool {
     top > 0xFFFF
 }
 
+/// The memory service an access goes out on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryService {
+    /// `A_Memory_Read`/`_Write`: 16-bit address, up to 63 octets.
+    Plain,
+    /// `A_MemoryExtended_Read`/`_Write`: 24-bit address, confirmed inline.
+    Extended,
+    /// `A_UserMemory_Read`/`_Write`: 20-bit address, up to 15 octets, for an
+    /// application without extended memory services (issue #472).
+    User,
+}
+
+/// The service an access at `addr` spanning `len` octets uses on `l4`: plain
+/// up to `0xFFFF` ([`select_extended_memory`]), above it the user-memory
+/// services when the connection is set to them
+/// ([`Layer4Connection::set_user_memory_above_64k`]), else the extended ones.
+pub fn memory_service(
+    l4: &Layer4Connection<impl L4Channel>,
+    addr: u32,
+    len: usize,
+) -> MemoryService {
+    if !select_extended_memory(addr, len) {
+        MemoryService::Plain
+    } else if l4.user_memory_above_64k() {
+        MemoryService::User
+    } else {
+        MemoryService::Extended
+    }
+}
+
 /// The data-octet chunk this connection may carry for an access at `addr`
-/// spanning `len` octets, on whichever service [`select_extended_memory`] picks.
+/// spanning `len` octets, on whichever service [`memory_service`] picks.
 ///
-/// Both caps come from the negotiated `PID_MAX_APDU_LENGTH` (issue #58) and fall
+/// The caps come from the negotiated `PID_MAX_APDU_LENGTH` (issue #58) and fall
 /// back to the conservative standard-frame floor when it was never read. The
 /// result is clamped to `1..=255` because the single-telegram primitives take a
 /// `u8` count.
-pub(crate) fn chunk_for(l4: &Layer4Connection<impl L4Channel>, addr: u32, len: usize) -> usize {
-    let raw = if select_extended_memory(addr, len) {
-        usize::from(l4.max_extended_memory_chunk())
-    } else {
-        usize::from(l4.max_memory_chunk())
+pub fn memory_chunk_for(l4: &Layer4Connection<impl L4Channel>, addr: u32, len: usize) -> usize {
+    let raw = match memory_service(l4, addr, len) {
+        MemoryService::Plain => usize::from(l4.max_memory_chunk()),
+        MemoryService::Extended => usize::from(l4.max_extended_memory_chunk()),
+        MemoryService::User => usize::from(l4.max_user_memory_chunk()),
     };
     raw.clamp(1, usize::from(u8::MAX))
+}
+
+/// [`memory_chunk_for`] under its historical crate-internal name.
+pub(crate) fn chunk_for(l4: &Layer4Connection<impl L4Channel>, addr: u32, len: usize) -> usize {
+    memory_chunk_for(l4, addr, len)
 }
 
 /// Reads `len` octets of device memory starting at `addr` over a borrowed
@@ -90,8 +125,10 @@ pub async fn read_memory<Ch: L4Channel>(
     addr: u32,
     len: u8,
 ) -> Result<Vec<u8>> {
-    if select_extended_memory(addr, usize::from(len)) {
-        return read_memory_extended(l4, addr, len).await;
+    match memory_service(l4, addr, usize::from(len)) {
+        MemoryService::Extended => return read_memory_extended(l4, addr, len).await,
+        MemoryService::User => return read_memory_user(l4, addr, len).await,
+        MemoryService::Plain => {}
     }
     let addr16 = addr as u16;
     let (req_apci, payload) = apci::encode_memory_read(addr16, len);
@@ -118,6 +155,85 @@ pub async fn read_memory<Ch: L4Channel>(
             ),
         })
     })?;
+    if resp.is_refusal() && len > 0 {
+        tracing::debug!(
+            target = %l4.target(),
+            addr = format_args!("{addr16:#06X}"),
+            "the device refused the memory read (A_Memory_Response with number 0)"
+        );
+    }
+    Ok(resp.data)
+}
+
+/// [`read_memory`] for a caller that needs the octets: the device's defined
+/// refusal (an `A_Memory_Response` with number 0, 03_03_07 §3.5.3) fails
+/// with [`MgmtError::MemoryRefused`] instead of returning no data, so it is
+/// not mistaken for a short or malformed answer.
+///
+/// [`read_memory`] keeps returning the empty answer for the callers that
+/// treat it as a soft outcome (a read-back compare that reports a mismatch).
+pub async fn read_memory_strict<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    addr: u32,
+    len: u8,
+) -> Result<Vec<u8>> {
+    let got = read_memory(l4, addr, len).await?;
+    if got.is_empty() && len > 0 && !select_extended_memory(addr, usize::from(len)) {
+        return Err(WriteError::Mgmt(MgmtError::MemoryRefused {
+            address: l4.target(),
+            op: "read",
+            addr,
+            count: len,
+        }));
+    }
+    Ok(got)
+}
+
+/// Reads up to 15 octets at the 20-bit `addr` via `A_UserMemory_Read` (03_03_07
+/// §3.5.6.2). The answer must name the requested address; a late verify-mode
+/// echo of an earlier write (it names that write's address) is skipped, and
+/// the device's refusal (count 0) fails with [`MgmtError::MemoryRefused`].
+async fn read_memory_user<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    addr: u32,
+    len: u8,
+) -> Result<Vec<u8>> {
+    if addr.saturating_add(u32::from(len).max(1) - 1) > apci::MAX_USER_MEMORY_ADDRESS {
+        return Err(WriteError::AddressOutOfRange {
+            address: l4.target(),
+            detail: format!("user-memory read of {len} octet(s) at {addr:#X} past 20 bits"),
+        });
+    }
+    let len = len.min(apci::MAX_USER_MEMORY_LEN);
+    let (req_apci, payload) = apci::encode_user_memory_read(addr, len);
+    let (mut resp_apci, mut data) = l4.request(req_apci, &payload).await?;
+    for _ in 0..STALE_ECHO_SKIPS {
+        match apci::decode_user_memory(resp_apci, &data) {
+            Some(echo) if resp_apci == apci::A_USER_MEMORY_RESPONSE && echo.addr != addr => {
+                (resp_apci, data) = l4.recv_response().await?;
+            }
+            _ => break,
+        }
+    }
+    let resp = apci::decode_user_memory(resp_apci, &data)
+        .filter(|r| resp_apci == apci::A_USER_MEMORY_RESPONSE && r.addr == addr)
+        .ok_or_else(|| {
+            WriteError::Mgmt(MgmtError::MalformedResponse {
+                address: l4.target(),
+                reason: format!(
+                    "expected A_UserMemory_Response for {addr:#07X} ({})",
+                    raw_response_detail(resp_apci, &data)
+                ),
+            })
+        })?;
+    if resp.count == 0 && len > 0 {
+        return Err(WriteError::Mgmt(MgmtError::MemoryRefused {
+            address: l4.target(),
+            op: "read",
+            addr,
+            count: len,
+        }));
+    }
     Ok(resp.data)
 }
 
@@ -145,12 +261,14 @@ async fn read_memory_extended<Ch: L4Channel>(
         })
     })?;
     if resp.return_code != 0 {
-        return Err(WriteError::Mgmt(MgmtError::MalformedResponse {
+        // A negative code names the failure and carries no data (03_03_07
+        // §3.4.9.1.1).
+        return Err(WriteError::Mgmt(MgmtError::MemoryReturnCode {
             address: l4.target(),
-            reason: format!(
-                "A_MemoryExtended_Read at {addr:#08X} returned non-zero code {:#04X}",
-                resp.return_code
-            ),
+            service: "A_MemoryExtended_Read",
+            addr,
+            code: resp.return_code,
+            name: crate::error::return_code_name(resp.return_code),
         }));
     }
     Ok(resp.data)
@@ -204,7 +322,7 @@ pub async fn read_memory_range<Ch: L4Channel>(
                 address: l4.target(),
                 detail: format!("read chunk at {addr:#X} + {}", out.len()),
             })?;
-        let got = read_memory(l4, at, want as u8).await?;
+        let got = read_memory_strict(l4, at, want as u8).await?;
         if got.is_empty() {
             return Err(WriteError::Mgmt(MgmtError::MalformedResponse {
                 address: l4.target(),
@@ -276,23 +394,174 @@ pub async fn write_memory_chunked<Ch: L4Channel, F: FnMut(usize)>(
     // `select_extended_memory`): a segment that fits 16 bits stays byte-identical
     // to the historical plain `A_Memory_Write` path; one that runs past `0xFFFF`
     // uses the System B extended service.
-    let extended = select_extended_memory(addr, data.len());
+    let service = memory_service(l4, addr, data.len());
     // Scale the chunk to the device's negotiated max APDU (issue #58). The plain
     // service caps at 63 (the 6-bit count field); the extended service scales to
-    // the 228-octet extended-frame budget ETS uses. Both fall back to the
-    // conservative cap when `PID_MAX_APDU_LENGTH` was never negotiated.
-    let write_chunk = if extended {
-        usize::from(l4.max_extended_memory_chunk())
-    } else {
-        usize::from(l4.max_memory_chunk())
-    };
+    // the 228-octet extended-frame budget ETS uses; the user-memory service to
+    // the 15 octets of its 4-bit count. All fall back to the conservative cap
+    // when `PID_MAX_APDU_LENGTH` was never negotiated.
+    let write_chunk = memory_chunk_for(l4, addr, data.len());
     let mut offset = 0usize;
     while offset < data.len() {
         let take = write_chunk.min(data.len() - offset);
         let piece = &data[offset..offset + take];
-        write_one_chunk(l4, addr, offset, piece, extended).await?;
+        write_one_chunk(l4, addr, offset, piece, service).await?;
         offset += take;
         on_written(offset);
+    }
+    Ok(())
+}
+
+/// Writes `data` to device memory at `addr` like [`write_memory_chunked`],
+/// and compares every verify-mode echo with the chunk it answers.
+///
+/// This is the write half of Management Procedures 03_05_02 §3.16.3
+/// (DMP_MemWrite_RCoV): the caller has switched the device's verify mode on
+/// ([`crate::enable_verify_mode`]) on **this** connection, so the device
+/// answers each plain `A_Memory_Write` with an `A_Memory_Response` carrying
+/// the octets it stored. Each echo must name the chunk's address and carry
+/// exactly the octets written; a different echo fails with
+/// [`MgmtError::MemoryEchoMismatch`], a missing one with the connection's
+/// silence error (the response timeout closes the connection). A write whose
+/// top address needs the extended service is confirmed inline by
+/// `A_MemoryExtended_Write_Response` already and goes through
+/// [`write_memory_chunked`] unchanged.
+pub async fn write_memory_echoed<Ch: L4Channel, F: FnMut(usize)>(
+    l4: &mut Layer4Connection<Ch>,
+    addr: u32,
+    data: &[u8],
+    mut on_written: F,
+) -> Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let service = memory_service(l4, addr, data.len());
+    if service == MemoryService::Extended {
+        return write_memory_chunked(l4, addr, data, on_written).await;
+    }
+    let write_chunk = memory_chunk_for(l4, addr, data.len());
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let take = write_chunk.min(data.len() - offset);
+        let piece = &data[offset..offset + take];
+        if service == MemoryService::User {
+            write_one_user_chunk_echoed(l4, addr, offset, piece).await?;
+        } else {
+            write_one_chunk_echoed(l4, addr, offset, piece).await?;
+        }
+        offset += take;
+        on_written(offset);
+    }
+    Ok(())
+}
+
+/// Writes one `A_UserMemory_Write` chunk at `base + offset` and checks the
+/// device's verify-mode `A_UserMemory_Response` against it (03_03_07
+/// §3.5.6.3: in verify mode the device reads the area back after writing it).
+async fn write_one_user_chunk_echoed<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    base: u32,
+    offset: usize,
+    piece: &[u8],
+) -> Result<()> {
+    let chunk_addr = user_chunk_address(l4, base, offset, piece.len())?;
+    let (req_apci, payload) = apci::encode_user_memory_write(chunk_addr, piece);
+    let (resp_apci, data) = l4.request_memory_write_echo(req_apci, &payload).await?;
+    let echo = apci::decode_user_memory(resp_apci, &data)
+        .filter(|_| resp_apci == apci::A_USER_MEMORY_RESPONSE)
+        .ok_or_else(|| {
+            WriteError::Mgmt(MgmtError::MalformedResponse {
+                address: l4.target(),
+                reason: format!(
+                    "expected the verify echo (A_UserMemory_Response) of the write at \
+                     {chunk_addr:#07X} ({})",
+                    raw_response_detail(resp_apci, &data)
+                ),
+            })
+        })?;
+    if echo.addr == chunk_addr && echo.count == 0 && !piece.is_empty() {
+        return Err(WriteError::Mgmt(MgmtError::MemoryRefused {
+            address: l4.target(),
+            op: "write",
+            addr: chunk_addr,
+            count: piece.len() as u8,
+        }));
+    }
+    if echo.addr != chunk_addr || echo.data != piece {
+        return Err(WriteError::Mgmt(MgmtError::MemoryEchoMismatch {
+            address: l4.target(),
+            addr: chunk_addr,
+            echo_addr: echo.addr,
+            expected: piece.to_vec(),
+            got: echo.data,
+        }));
+    }
+    Ok(())
+}
+
+/// `base + offset` for a user-memory chunk of `len` octets, refused when the
+/// chunk would run past the 20-bit address space of the service.
+fn user_chunk_address<Ch: L4Channel>(
+    l4: &Layer4Connection<Ch>,
+    base: u32,
+    offset: usize,
+    len: usize,
+) -> Result<u32> {
+    let at = chunk_address(l4, base, offset)?;
+    let top = u64::from(at) + len.max(1) as u64 - 1;
+    if top > u64::from(apci::MAX_USER_MEMORY_ADDRESS) {
+        return Err(WriteError::AddressOutOfRange {
+            address: l4.target(),
+            detail: format!("user-memory write of {len} octet(s) at {at:#X} past 20 bits"),
+        });
+    }
+    Ok(at)
+}
+
+/// Writes one plain chunk at `base + offset` and checks the device's
+/// verify-mode echo against it (see [`write_memory_echoed`]).
+async fn write_one_chunk_echoed<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    base: u32,
+    offset: usize,
+    piece: &[u8],
+) -> Result<()> {
+    let chunk_addr = chunk_address(l4, base, offset)?;
+    let addr16 = u16::try_from(chunk_addr).map_err(|_| {
+        WriteError::Mgmt(MgmtError::MalformedResponse {
+            address: l4.target(),
+            reason: format!("plain memory write at {chunk_addr:#X} exceeds 16 bits"),
+        })
+    })?;
+    let (req_apci, payload) = apci::encode_memory_write(addr16, piece);
+    let (resp_apci, data) = l4.request_memory_write_echo(req_apci, &payload).await?;
+    let echo = apci::decode_memory_response(resp_apci, &data).ok_or_else(|| {
+        WriteError::Mgmt(MgmtError::MalformedResponse {
+            address: l4.target(),
+            reason: format!(
+                "expected the verify echo (A_Memory_Response) of the write at {chunk_addr:#06X} \
+                 ({})",
+                raw_response_detail(resp_apci, &data)
+            ),
+        })
+    })?;
+    if echo.addr == addr16 && echo.is_refusal() && !piece.is_empty() {
+        // The defined negative answer to the write (03_03_07 §3.5.4).
+        return Err(WriteError::Mgmt(MgmtError::MemoryRefused {
+            address: l4.target(),
+            op: "write",
+            addr: chunk_addr,
+            count: piece.len() as u8,
+        }));
+    }
+    if echo.addr != addr16 || echo.data != piece {
+        return Err(WriteError::Mgmt(MgmtError::MemoryEchoMismatch {
+            address: l4.target(),
+            addr: chunk_addr,
+            echo_addr: u32::from(echo.addr),
+            expected: piece.to_vec(),
+            got: echo.data,
+        }));
     }
     Ok(())
 }
@@ -315,10 +584,10 @@ pub async fn write_memory_verified<Ch: L4Channel, F: FnMut(usize)>(
 
 /// Writes one memory chunk at `base + offset`.
 ///
-/// When `extended` is false this is the historical plain `A_Memory_Write` path,
+/// On [`MemoryService::Plain`] this is the historical plain `A_Memory_Write` path,
 /// byte-identical to before: a fire-and-forget write whose optional echo is
 /// discarded (integrity is confirmed later by the MCB CRC and the end-of-segment
-/// spot-check). When `extended` is true it sends `A_MemoryExtended_Write` (APCI
+/// spot-check). On [`MemoryService::Extended`] it sends `A_MemoryExtended_Write` (APCI
 /// `0x1FB`, 3-octet address) and awaits the device's inline
 /// `A_MemoryExtended_Write_Response` (`0x1FC`), failing on a non-zero return code
 /// — the extended service confirms every chunk on the wire, so no separate
@@ -328,29 +597,24 @@ async fn write_one_chunk<Ch: L4Channel>(
     base: u32,
     offset: usize,
     piece: &[u8],
-    extended: bool,
+    service: MemoryService,
 ) -> Result<()> {
+    if service == MemoryService::User {
+        // Acknowledged only outside verify mode (03_03_07 §3.5.6.3), like the
+        // plain write: integrity comes from the MCB check and the read-back.
+        // A verify-mode echo the device sends anyway is dropped.
+        let chunk_addr = user_chunk_address(l4, base, offset, piece.len())?;
+        let (req_apci, payload) = apci::encode_user_memory_write(chunk_addr, piece);
+        l4.send_data(req_apci, &payload).await?;
+        l4.discard_pending_response();
+        return Ok(());
+    }
     let chunk_addr = chunk_address(l4, base, offset)?;
-    if extended {
+    if service == MemoryService::Extended {
         let (req_apci, payload) = apci::encode_memory_extended_write(chunk_addr, piece);
         let (resp_apci, data) = l4.request(req_apci, &payload).await?;
-        let resp = apci::decode_memory_extended_response(resp_apci, &data).ok_or_else(|| {
-            WriteError::Mgmt(MgmtError::MalformedResponse {
-                address: l4.target(),
-                reason: format!(
-                    "expected A_MemoryExtended_Write_Response ({})",
-                    raw_response_detail(resp_apci, &data)
-                ),
-            })
-        })?;
-        if resp.return_code != 0 {
-            return Err(WriteError::Mgmt(MgmtError::MemoryVerifyFailed {
-                address: l4.target(),
-                addr: chunk_addr,
-                expected: piece.to_vec(),
-                got: Vec::new(),
-            }));
-        }
+        check_extended_write_response(l4.target(), chunk_addr, &payload, resp_apci, &data)
+            .map_err(WriteError::Mgmt)?;
         return Ok(());
     }
     let addr16 = chunk_addr as u16;
@@ -369,6 +633,96 @@ async fn write_one_chunk<Ch: L4Channel>(
     // recv_response with the wrong APDU (a "malformed response").
     l4.discard_pending_response();
     Ok(())
+}
+
+/// Checks the device's answer to an `A_MemoryExtended_Write` whose request
+/// payload (`[count][address:3][data…]`) was `request` (03_03_07
+/// §3.4.9.2.1): `E_SUCCESS` (00h) is a success, `E_SUCCESS_WITH_CRC` (01h) is
+/// a success whose CRC16-CCITT over the received count, address and data must
+/// match the one over `request`, and every other code fails with its name.
+///
+/// The footnote gives the parameters (polynomial 1021h, initial value FFFFh,
+/// nothing reflected or XORed) and calls it the System B CRC. Those
+/// parameters read as CRC-16/CCITT-FALSE, while the System B MCB CRC the
+/// devices compute is the augmented form ([`crate::load::crc16_ccitt`],
+/// checked against every flashed device). No capture of a device answering
+/// 01h exists yet, so either form is accepted; a CRC matching neither fails.
+///
+/// # Errors
+///
+/// [`MgmtError::MalformedResponse`] for an answer that is not a write
+/// response or lacks the CRC, [`MgmtError::MemoryWriteCrc`] for a CRC that
+/// differs, [`MgmtError::MemoryReturnCode`] for any other return code.
+pub(crate) fn check_extended_write_response(
+    target: bussard_model::IndividualAddress,
+    addr: u32,
+    request: &[u8],
+    resp_apci: u16,
+    data: &[u8],
+) -> std::result::Result<(), MgmtError> {
+    let resp = apci::decode_memory_extended_response(resp_apci, data).ok_or_else(|| {
+        MgmtError::MalformedResponse {
+            address: target,
+            reason: format!(
+                "expected A_MemoryExtended_Write_Response ({})",
+                raw_response_detail(resp_apci, data)
+            ),
+        }
+    })?;
+    match resp.return_code {
+        0x00 => Ok(()),
+        0x01 => {
+            let [hi, lo, ..] = resp.data[..] else {
+                return Err(MgmtError::MalformedResponse {
+                    address: target,
+                    reason: format!(
+                        "A_MemoryExtended_Write_Response with E_SUCCESS_WITH_CRC carries no CRC \
+                         ({})",
+                        raw_response_detail(resp_apci, data)
+                    ),
+                });
+            };
+            let got = u16::from_be_bytes([hi, lo]);
+            let expected = crate::load::crc16_ccitt(request);
+            if got == expected || got == crc16_ccitt_false(request) {
+                Ok(())
+            } else {
+                Err(MgmtError::MemoryWriteCrc {
+                    address: target,
+                    addr,
+                    expected,
+                    got,
+                })
+            }
+        }
+        // The return code names the failure (03_03_07 §3.4.9.2.1): an
+        // access or sizing problem is not a verify mismatch.
+        code => Err(MgmtError::MemoryReturnCode {
+            address: target,
+            service: "A_MemoryExtended_Write",
+            addr,
+            code,
+            name: crate::error::return_code_name(code),
+        }),
+    }
+}
+
+/// CRC-16/CCITT-FALSE (polynomial 1021h, initial value FFFFh, no
+/// augmentation, nothing reflected or XORed): the literal reading of the
+/// 03_03_07 §3.4.9.2.1 footnote. Check value for `"123456789"`: `0x29B1`.
+fn crc16_ccitt_false(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    for &octet in data {
+        crc ^= u16::from(octet) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
 }
 
 /// Computes `base + offset` as a device address, failing if it runs past the
@@ -411,5 +765,55 @@ mod tests {
         // A zero-length access is treated as one octet at `addr`.
         assert!(!select_extended_memory(0xFFFF, 0));
         assert!(select_extended_memory(0x1_0000, 0));
+    }
+
+    #[test]
+    fn test_crc16_ccitt_false_check_value() {
+        assert_eq!(crc16_ccitt_false(b"123456789"), 0x29B1);
+    }
+
+    #[test]
+    fn test_check_extended_write_response_accepts_success_with_crc()
+    -> std::result::Result<(), MgmtError> {
+        let target = bussard_model::IndividualAddress::from_raw(0x1105);
+        let (_, request) = apci::encode_memory_extended_write(0x01_60A6, &[0x11, 0x22]);
+        for crc in [
+            crate::load::crc16_ccitt(&request),
+            crc16_ccitt_false(&request),
+        ] {
+            let (resp_apci, mut data) =
+                apci::encode_memory_extended_write_response(0x01, 0x01_60A6);
+            data.extend_from_slice(&crc.to_be_bytes());
+            check_extended_write_response(target, 0x01_60A6, &request, resp_apci, &data)?;
+        }
+        let (resp_apci, data) = apci::encode_memory_extended_write_response(0x00, 0x01_60A6);
+        check_extended_write_response(target, 0x01_60A6, &request, resp_apci, &data)
+    }
+
+    #[test]
+    fn test_check_extended_write_response_refuses_a_wrong_crc() {
+        let target = bussard_model::IndividualAddress::from_raw(0x1105);
+        let (_, request) = apci::encode_memory_extended_write(0x01_60A6, &[0x11, 0x22]);
+        let (resp_apci, mut data) = apci::encode_memory_extended_write_response(0x01, 0x01_60A6);
+        let bad = crate::load::crc16_ccitt(&request) ^ 0x0101;
+        data.extend_from_slice(&bad.to_be_bytes());
+        let err = check_extended_write_response(target, 0x01_60A6, &request, resp_apci, &data);
+        assert!(
+            matches!(err, Err(MgmtError::MemoryWriteCrc { got, .. }) if got == bad),
+            "{err:?}"
+        );
+        // 01h without the CRC is malformed, any other code names itself.
+        let (resp_apci, data) = apci::encode_memory_extended_write_response(0x01, 0x01_60A6);
+        let err = check_extended_write_response(target, 0x01_60A6, &request, resp_apci, &data);
+        assert!(
+            matches!(err, Err(MgmtError::MalformedResponse { .. })),
+            "{err:?}"
+        );
+        let (resp_apci, data) = apci::encode_memory_extended_write_response(0xFC, 0x01_60A6);
+        let err = check_extended_write_response(target, 0x01_60A6, &request, resp_apci, &data);
+        assert!(
+            matches!(err, Err(MgmtError::MemoryReturnCode { code: 0xFC, .. })),
+            "{err:?}"
+        );
     }
 }

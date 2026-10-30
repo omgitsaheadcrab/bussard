@@ -30,18 +30,21 @@ pub mod compute_sys7;
 pub mod device_plan;
 pub mod flash;
 pub mod model_params;
+pub mod object_table;
 pub mod param_decode;
 pub mod param_plan;
 pub mod plan;
 pub mod preflight;
 pub mod program;
 pub mod security;
+pub mod security_diag;
 pub mod sweep;
 pub mod tables_sys7;
 
 pub use apply::{
-    TableObjectIndexes, VerifyOutcome, apply_tables, apply_tables_secured, discover_table_objects,
-    negotiate_session_apdu, read_states,
+    SystemBLoad, TableObjectIndexes, VerifyOutcome, apply_tables, apply_tables_secured,
+    apply_tables_with, discover_table_objects, negotiate_session_apdu, read_states,
+    uses_user_memory,
 };
 pub use apply_sys7::{
     SYS7_ADDRESS_LSM, SYS7_ASSOCIATION_LSM, Sys7ApplyError, Sys7FlagWrite, Sys7TableImages,
@@ -59,26 +62,30 @@ pub use compute::{
     app_program_version, compute_group_object_table, compute_group_object_table_with_count,
     compute_tables, descriptors_for_linked_objects, dynamic_group_object_descriptors,
     dynamic_group_object_table, dynamic_group_object_table_with, expand_group_object_descriptors,
-    group_object_table_count, size_code_from_object_size, table_image_with_count,
+    group_object_table_count, object_size_code, size_code_from_object_size, table_image_with_count,
+    unknown_object_sizes,
 };
 pub use compute_sys7::{
     SYS7_ADDRESS_REGION_LEN, SYS7_ADDRESS_TABLE_ADDR, SYS7_ASSOCIATION_REGION_LEN,
     SYS7_ASSOCIATION_TABLE_ADDR, Sys7DecodeError, Sys7GroupObject, decode_sys7_address_table,
     decode_sys7_association_table, decode_sys7_group_object_table, sys7_address_table,
-    sys7_association_table, sys7_config_byte, sys7_group_object_table, sys7_group_objects,
+    sys7_association_table, sys7_config_byte, sys7_group_object_table,
 };
 pub use device_plan::{
-    ChangeMark, ChangeSubject, DevicePlan, FullImage, PlanChange, PlanWrites, object_changes,
-    sort_changes, state_hash,
+    ChangeMark, ChangeSubject, DevicePlan, FullImage, ObjectTableWrite, PlanChange, PlanWrites,
+    object_changes, sort_changes, state_hash, state_hash_with,
 };
 pub use flash::{
-    AppIdentity, Connector, DeviceFacts, FlashOptions, FlashOutcome, FlashPlan, FlashStep,
-    ImageKind, ImageRef, LoadControlForm, LoadControlRecord, PartialPlanError, PlanError, Progress,
-    PropObject, RebootReadiness, RestartForm, RestartKind, Session, SingleConnector, Sys7Context,
-    Sys7TableBases, compare_property_value, discover_application_object, flash, plan_flash,
-    plan_flash_sys7_with_hawk, plan_flash_with_memo, plan_flash_with_object_flags,
-    read_property_value, restart_form, same_program, select_application, sys7_profile_from_hawk,
-    sys7_table_bases, trace, write_property_value,
+    AppIdentity, Connector, DeviceFacts, ETS_PROJECT_INSTALLATION_ID, ETS_ROUTING_MULTICAST,
+    ETS_ROUTING_TTL, FlashOptions, FlashOutcome, FlashPlan, FlashStep, ImageKind, ImageRef,
+    KeptOctets, KnxnetIpProgram, KnxnetIpWrite, LoadControlForm, LoadControlRecord,
+    PartialPlanError, PlanError, Progress, PropObject, RebootReadiness, RestartForm, RestartKind,
+    SegmentFill, Session, SingleConnector, Sys7Context, Sys7TableBases, VerifyEchoes,
+    allocation_change, compare_property_value, discover_application_object, flash, kept_octets,
+    knxnet_ip_program, plan_flash, plan_flash_sys7_with_hawk, plan_flash_with_memo,
+    plan_flash_with_object_flags, read_property_value, restart_form, same_program,
+    select_application, sys7_profile_from_hawk, sys7_table_bases, trace, write_knxnet_ip,
+    write_property_value,
 };
 pub use model_params::{
     OrderNumberError, Sys7Identity, build_module_obj3_descriptors, build_table_images,
@@ -87,6 +94,11 @@ pub use model_params::{
     parameter_overrides, plan_for_readback, plan_for_readback_with, product_display, region_rows,
     resolve_by_order_number, runtime_segments, sys7_code_mismatch, sys7_identity, template_ops_for,
     verify_readback, write_parameter_memory_backup,
+};
+pub use object_table::{
+    DescriptorChange, LiveObjectTable, OBJECT_TABLE_INDEX, ObjectTableChange, ObjectTableCheck,
+    ObjectTableOutcome, check_object_table, find_object_table, object_table_image,
+    read_object_table_at, write_object_table,
 };
 pub use param_decode::{
     DecodedParameters, OctetOwner, OctetRange, OctetRole, attribute_octets, attribute_octets_with,
@@ -112,11 +124,16 @@ pub use program::{
     write_tables_secured, write_tables_seeded,
 };
 pub use security::{
-    DeviceSecurityView, GO_FLAGS_SECURE, GroupKeyEntry, MAX_SEQUENCE, SecureSenderEntry,
-    SecurityInputs, SecurityPlanError, SecurityProgram, SecurityReadback, build_security_program,
-    decode_sender_table, device_security_view, program_security_object, read_security_flags,
-    read_security_object, read_security_sender_table, secured_senders, security_inputs_for,
-    sender_table_bytes,
+    Capacity, DeviceSecurityView, GO_FLAGS_SECURE, GroupKeyEntry, MAX_SEQUENCE, SecureSenderEntry,
+    SecurityInputs, SecurityPlanError, SecurityProgram, SecurityReadback, TableCapacity,
+    build_security_program, check_planned_capacity, decode_sender_table, device_security_view,
+    prepare_security_program, program_security_object, read_security_flags, read_security_object,
+    read_security_sender_table, resolve_table_capacity, secured_senders, security_inputs_for,
+    sender_table_bytes, write_security_program,
+};
+pub use security_diag::{
+    FailureCounters, FailureKind, LatestFailure, SecurityDiagnostics, clear_security_diagnostics,
+    read_security_diagnostics,
 };
 pub use sweep::{
     AppSweep, FamilyCoverage, ImageClass, ParseClass, PlanClass, ProductSweep, RankedReason,

@@ -287,6 +287,24 @@ pub enum WriteError {
         actual: LoadState,
     },
 
+    /// A write stopped after the security object's `Unload` and before its
+    /// `LoadCompleted` (issue #534). Outside `Loaded` the device treats its
+    /// group key and security individual address tables as empty (KNX 3/5/1
+    /// §6.3.4, §6.3.7.4, §6.3.8.4; KNX 3/3/7 §5.5.2), so the message names
+    /// that consequence and the remedy next to the step error.
+    #[error(
+        "{cause}. {address}'s Data Secure security object is not Loaded after this failure: until \
+         the next successful `bussard apply {address}` the device drops every secured group \
+         telegram it receives and cannot send on its secured group addresses. Run `bussard apply \
+         {address}` again"
+    )]
+    SecurityObjectNotLoaded {
+        /// The device.
+        address: IndividualAddress,
+        /// The step error that stopped the write.
+        cause: Box<WriteError>,
+    },
+
     /// The Data Secure security-object program could not be built for the
     /// device (a secured group address without a key, a group object outside
     /// the table). Nothing was written to the security object.
@@ -660,7 +678,32 @@ pub async fn read_program_version<Ch: L4Channel>(
     Ok(Some(resp.data))
 }
 
-/// Realises an `LdCtrlMasterReset` op the way ETS→KNX-Virtual does on the wire:
+/// Reads the device's `PID_MANUFACTURER_ID` (device object 0, PID 12, two
+/// octets; Resources §4.2.12), the value the download procedure compares to
+/// the expected manufacturer before its first Unload (Configuration
+/// Procedures §3.5.2 step 04).
+///
+/// `Ok(None)` when the device answers without a value (zero elements or a
+/// short one). A transport failure propagates as [`WriteError`].
+pub async fn read_manufacturer_id<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+) -> Result<Option<u16>> {
+    let resp = property_request(
+        l4,
+        crate::apci::DEVICE_OBJECT_INDEX,
+        crate::apci::PID_MANUFACTURER_ID,
+        1,
+        1,
+    )
+    .await?;
+    if resp.count == 0 || resp.data.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(u16::from_be_bytes([resp.data[0], resp.data[1]])))
+}
+
+/// Realises an `LdCtrlMasterReset` op the way ETS→KNX-Virtual does on the wire
+/// (only there; every other device gets the confirmed [`master_reset`]):
 /// as a **bare `A_Restart`** (APCI [`A_RESTART`](crate::apci::A_RESTART) = `0x380`,
 /// no payload), not the confirmed master-reset `A_Restart` (`0x381` + erase/channel).
 ///
@@ -691,17 +734,35 @@ pub async fn master_reset_via_basic_restart<Ch: L4Channel>(
     Ok(())
 }
 
-/// The longest bussard waits on a device's `A_Restart_Response` process time.
+/// The process time above which bussard warns before it waits it out.
 ///
-/// The process time is a 16-bit count of seconds, so a corrupt or hostile answer
-/// could ask for 18 hours. The ETS captures (issue #117) show 8 s for a factory
-/// reset and 0 s for a confirmed restart; a minute is well past both.
+/// KNX 3/5/2 §3.7.1.2.2 makes the process time a minimum the client waits
+/// before further services, so bussard waits the whole announced time. The
+/// ETS captures (issue #117) show 8 s for a factory reset and 0 s for a
+/// confirmed restart; a device announcing more than a minute is unusual (or
+/// its answer is corrupt: the field reaches 18 hours), so the wait is logged
+/// as a warning rather than silently clamped.
 pub const MAX_RESTART_PROCESS_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long to wait before the next service after a restart that announced
+/// `seconds` of process time: at least that time (KNX 3/5/2 §3.7.1.2.2),
+/// with a warning above [`MAX_RESTART_PROCESS_WAIT`].
+pub fn process_time_wait(seconds: u16) -> std::time::Duration {
+    let wait = std::time::Duration::from_secs(u64::from(seconds));
+    if wait > MAX_RESTART_PROCESS_WAIT {
+        tracing::warn!(
+            process_time_s = seconds,
+            "the device announced a restart process time above {} s; waiting it out",
+            MAX_RESTART_PROCESS_WAIT.as_secs()
+        );
+    }
+    wait
+}
+
 /// How long to wait after a confirmed master reset before reconnecting: the
-/// device's reported process time, capped at [`MAX_RESTART_PROCESS_WAIT`].
+/// device's reported process time, as a minimum ([`process_time_wait`]).
 pub fn restart_process_wait(response: &RestartResponse) -> std::time::Duration {
-    std::time::Duration::from_secs(u64::from(response.process_time_s)).min(MAX_RESTART_PROCESS_WAIT)
+    process_time_wait(response.process_time_s)
 }
 
 /// Sends a **confirmed master reset**: `A_Restart` with the master-reset
@@ -720,8 +781,9 @@ pub fn restart_process_wait(response: &RestartResponse) -> std::time::Duration {
 /// [`WriteError::RestartRefused`]; a response with another APCI is
 /// [`MgmtError::MalformedResponse`]; silence surfaces the connection's own error.
 ///
-/// `LdCtrlMasterReset` ops in a load procedure keep using
-/// [`master_reset_via_basic_restart`], which is what KNX Virtual expects.
+/// A load procedure's `LdCtrlMasterReset` uses this form with the op's erase
+/// code and channel number on every device but KNX Virtual, which gets
+/// [`master_reset_via_basic_restart`] as its capture shows.
 pub async fn master_reset<Ch: L4Channel>(
     l4: &mut Layer4Connection<Ch>,
     erase_code: u8,
@@ -756,7 +818,8 @@ pub async fn master_reset<Ch: L4Channel>(
 /// `expected`, honouring an optional `mask` — the execution of a vendor
 /// `LdCtrlCompareProp` op (the verify twin of [`write_property`]).
 ///
-/// Reads element 1 of `property_id` on `object_index` via `A_PropertyValue_Read`
+/// Reads element `start` (1-based; the procedure's `StartElement`) of
+/// `property_id` on `object_index` via `A_PropertyValue_Read`
 /// (the same primitive [`read_load_state`] and [`read_mcb_table`] use), then
 /// compares the first `expected.len()` returned octets against `expected`. When
 /// `mask` is `Some`, each position is compared only where the mask byte is
@@ -773,11 +836,12 @@ pub async fn compare_property<Ch: L4Channel>(
     l4: &mut Layer4Connection<Ch>,
     object_index: u8,
     property_id: u8,
+    start: u16,
     expected: &[u8],
     mask: Option<&[u8]>,
 ) -> Result<()> {
     let address = l4.target();
-    let resp = property_request(l4, object_index, property_id, 1, 1).await?;
+    let resp = property_request(l4, object_index, property_id, start, 1).await?;
 
     let actual: Vec<u8> = resp.data.iter().take(expected.len()).copied().collect();
     let mask_note = match mask {
@@ -919,10 +983,11 @@ pub async fn compare_rel_mem<Ch: L4Channel>(
                 detail: format!("read chunk at {start:#X} + {}", actual.len()),
             }
         })?;
-        let got = read_memory(l4, addr, want as u8).await?;
+        // A refusal (number 0, 03_03_07 §3.5.3) fails as such; an extended
+        // read that returns no octets cannot satisfy the compare either: stop
+        // and let the length check below report the shortfall.
+        let got = read_memory_strict(l4, addr, want as u8).await?;
         if got.is_empty() {
-            // A device that answers a read with zero octets cannot satisfy the
-            // compare: stop and let the length check below report the shortfall.
             break;
         }
         actual.extend_from_slice(&got);
@@ -1018,7 +1083,6 @@ pub async fn write_load_control<Ch: L4Channel>(
     object_index: u8,
     control: LoadControl,
 ) -> Result<LoadState> {
-    let address = l4.target();
     let control_value = control.encode_full();
     let resp = property_write_request(
         l4,
@@ -1029,7 +1093,53 @@ pub async fn write_load_control<Ch: L4Channel>(
         &control_value,
     )
     .await?;
-    let state = match echoed_load_state(control, &resp) {
+    confirm_load_control(l4, object_index, control, &resp).await
+}
+
+/// [`write_load_control`] for a step whose procedure maps the device's
+/// refusal to success (`LdCtrlMapError`, issue #614): an answer with element
+/// count 0, the negative answer of a device that has no object
+/// `object_index` (issue #178), returns `Ok(None)` without a read. Every other
+/// answer is confirmed as [`write_load_control`] confirms it, so a device that
+/// has the object and lands in the wrong state still fails.
+///
+/// # Errors
+///
+/// As [`write_load_control`], except for the count-0 answer.
+pub async fn write_load_control_unless_absent<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    object_index: u8,
+    control: LoadControl,
+) -> Result<Option<LoadState>> {
+    let control_value = control.encode_full();
+    let resp = property_write_request(
+        l4,
+        object_index,
+        PID_LOAD_STATE_CONTROL,
+        1,
+        1,
+        &control_value,
+    )
+    .await?;
+    if resp.count == 0 {
+        return Ok(None);
+    }
+    confirm_load_control(l4, object_index, control, &resp)
+        .await
+        .map(Some)
+}
+
+/// Confirms the state a load-control write left `object_index` in: the state
+/// its answer `resp` carries, else a read, then the check of
+/// [`write_load_control`].
+async fn confirm_load_control<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+    object_index: u8,
+    control: LoadControl,
+    resp: &crate::apci::PropertyValueResponse,
+) -> Result<LoadState> {
+    let address = l4.target();
+    let state = match echoed_load_state(control, resp) {
         Some(state) => state,
         None => read_load_state(l4, object_index).await?,
     };
@@ -1074,43 +1184,41 @@ pub async fn write_load_control<Ch: L4Channel>(
 /// Procedures", `AdditionalLoadControls` sub-command `0x0B`): the tool asks the
 /// device to allocate a backing segment of a given size and the device chooses
 /// the address, which is read back afterwards via [`PID_TABLE_REFERENCE`]. The
-/// structure carries a big-endian `u32` size at `data[2..6]`, a fill flag at
-/// `data[6]` and a fill byte at `data[7]` (see [`encode_rel_segment`]).
+/// structure carries a big-endian `u32` size at `data[2..6]`, the `Mode` octet
+/// at `data[6]` and the `Fill` octet at `data[7]` (see [`encode_rel_segment`]).
 pub const LD_CTRL_REL_SEGMENT: u8 = 0x0B;
-
-/// The fill flag `data[6]` of a relative allocation: `0x01` fills the freshly
-/// allocated segment with the fill byte, `0x00` leaves it untouched (KNX 3/5/2
-/// `LdCtrlRelSegment`).
-const LD_CTRL_FILL: u8 = 0x01;
 
 /// Encodes the 10-octet `AdditionalLoadControls` property value for a
 /// **relative** segment allocation (`LdCtrlRelSegment`), written to
 /// `PID_LOAD_STATE_CONTROL` while the object is in [`LoadState::Loading`].
 ///
-/// Layout (KNX 3/5/2 `LdCtrlRelSegment`):
+/// Layout (KNX 3/5/2 `LdCtrlRelSegment`; Mode and Fill: 3/5/3 §3.5.1.2):
 ///
 /// | octet | field                | value                                    |
 /// |-------|----------------------|------------------------------------------|
 /// | 0     | load event           | [`LoadControl::AdditionalLoadControls`] (3) |
 /// | 1     | sub-command          | [`LD_CTRL_REL_SEGMENT`] (`0x0B`)         |
 /// | 2..6  | size (u32, BE)       | `((data[2]<<24)|…|data[5])`              |
-/// | 6     | fill flag            | `0x01` = fill, else no fill              |
-/// | 7     | fill byte            | the byte written when the fill flag set  |
+/// | 6     | `Mode`               | bit 0 set: fill the segment              |
+/// | 7     | `Fill`               | the fill byte, sent as given in any mode |
 /// | 8..10 | reserved (`0x00`)    | pads the structure to the standard 10    |
 ///
 /// The property value is exactly 10 octets. Octets 8–9 are reserved zero in the
 /// relative form (only `data[0..8]` is significant); they keep the structure at
 /// the standard `AdditionalLoadControls` width so a stricter device that expects
 /// the full 10-octet write still accepts it.
-pub fn encode_rel_segment(size: u32, fill_byte: Option<u8>) -> [u8; 10] {
+///
+/// `mode` and `fill` are the product's `LdCtrlRelSegment` `@Mode` and `@Fill`,
+/// copied verbatim as ETS does: also a `Mode` 0 record carries the product's
+/// `Fill` octet (ETS sends `00 ff` for `Mode="0" Fill="255"`, issue #480).
+#[must_use]
+pub fn encode_rel_segment(size: u32, mode: u8, fill: u8) -> [u8; 10] {
     let mut v = [0u8; 10];
     v[0] = LoadControl::AdditionalLoadControls.octet();
     v[1] = LD_CTRL_REL_SEGMENT;
     v[2..6].copy_from_slice(&size.to_be_bytes());
-    if let Some(byte) = fill_byte {
-        v[6] = LD_CTRL_FILL;
-        v[7] = byte;
-    }
+    v[6] = mode;
+    v[7] = fill;
     v
 }
 
@@ -1152,8 +1260,9 @@ pub struct SegmentAllocation {
 ///    writes the table content with
 ///    [`crate::device::DeviceConnection::write_memory`].
 ///
-/// `fill_byte` mirrors the relative structure's fill flag/byte: `Some(b)` asks
-/// the device to pre-fill the segment with `b`, `None` leaves it uninitialised.
+/// `mode` and `fill` are the structure's `Mode` and `Fill` octets (see
+/// [`encode_rel_segment`]): bit 0 of `mode` asks the device to pre-fill the
+/// segment with `fill`; with it clear the segment keeps its contents.
 ///
 /// Load-state handling: the object must stay *open* after the allocation write
 /// — `Loading` on a conformant device, or `Loaded` on a lenient stack (KNX
@@ -1167,12 +1276,13 @@ pub async fn allocate_segment<Ch: L4Channel>(
     l4: &mut Layer4Connection<Ch>,
     object_index: u8,
     size: u32,
-    fill_byte: Option<u8>,
+    mode: u8,
+    fill: u8,
 ) -> Result<SegmentAllocation> {
     let address = l4.target();
 
     // 1-2. Write the 10-octet relative-allocation structure.
-    let structure = encode_rel_segment(size, fill_byte);
+    let structure = encode_rel_segment(size, mode, fill);
     let resp =
         property_write_request(l4, object_index, PID_LOAD_STATE_CONTROL, 1, 1, &structure).await?;
 
@@ -1252,15 +1362,23 @@ pub async fn read_table_reference<Ch: L4Channel>(
 //
 // Reference: KNX 3/5/2 "Management Procedures" (`LdCtrlLoadImageProp`) and 3/5/1
 // (interface-object property definitions). The System B `PID_MCB_TABLE` (27) is a
-// **read-only, device-computed** `PDT_GENERIC_08` (8-octet) property, readable
-// while the object is `Loaded`, laid out as:
+// `PDT_GENERIC_08` (8-octet) array property, readable while the object is
+// `Loaded`, laid out as:
 //
 // | octet | field           | value                                           |
 // |-------|-----------------|-------------------------------------------------|
 // | 0..4  | segment size    | u32 **big-endian**                              |
 // | 4     | CRC control     | `0x00` ("always valid")                         |
-// | 5     | access          | `0xFF` (read 4 bits + write 4 bits)             |
+// | 5     | access          | the product's (read 4 bits + write 4 bits)      |
 // | 6..8  | CRC             | CRC-16/AUG-CCITT over the segment bytes — BE    |
+//
+// It is not read-only everywhere: 685 load procedures of the product corpus
+// seed it with `LdCtrlWriteProp PropId=27` before the segment is written (the
+// house's Jung 07B0 applications write object 4's entries with access `0x33`,
+// the ETS capture of `M-0002_A-0001-01` writes `00 00 00 1a 00 32 00 00`,
+// access `0x32`), and the device fills in the CRC over what it stores. The
+// access octet is therefore the product's, not a fixed `0xFF` (#482).
+// Verification compares the CRC only, so it holds whatever the access is.
 //
 // The CRC is **CRC-16/AUG-CCITT** (the message is augmented with 16 zero bits
 // before reduction): width 16, polynomial `0x1021`, initial value `0xFFFF`, input
@@ -1275,7 +1393,8 @@ pub async fn read_table_reference<Ch: L4Channel>(
 /// `PID_MCB_TABLE` (27) — a loadable object's memory-control-block table, an
 /// array of 8-octet entries each describing a segment (size, access, and a
 /// CRC-16/AUG-CCITT the device computes over the segment's stored bytes).
-/// Read-only and device-computed on System B (KNX 3/5/1).
+/// Many load procedures seed the entries with `LdCtrlWriteProp PropId=27`; the
+/// device computes the CRC (KNX 3/5/1).
 pub const PID_MCB_TABLE: u8 = 27;
 
 /// The octet width of one `PID_MCB_TABLE` entry (`PDT_GENERIC_08`).
@@ -1311,19 +1430,21 @@ pub fn crc16_ccitt(data: &[u8]) -> u16 {
 
 /// Builds the 8-octet `PID_MCB_TABLE` entry a device is expected to report for a
 /// segment holding exactly `segment_data`, per the System B layout (KNX 3/5/1):
-/// `[size:u32 BE][crc_control=0x00][access=0xFF][crc16:u16 BE]`.
+/// `[size:u32 BE][crc_control=0x00][access][crc16:u16 BE]`.
 ///
 /// `crc16` is [`crc16_ccitt`] over `segment_data`; `size` is `segment_data.len()`
-/// (the device reports the segment size it stored). Used to validate a
-/// `LdCtrlLoadImageProp` step: the tool computes this over the bytes it wrote and
-/// compares it to what [`read_mcb_table`] reads back.
-pub fn mcb_entry(segment_data: &[u8]) -> [u8; MCB_ENTRY_LEN] {
+/// (the device reports the segment size it stored); `access` is the product's
+/// access octet, the one its procedure seeds with `LdCtrlWriteProp PropId=27`
+/// (`0x33` on the house's Jung applications, `0x32` on `M-0002_A-0001-01`;
+/// issue #482). [`read_mcb_table`] compares the CRC only, so the access octet
+/// never decides a verification.
+pub fn mcb_entry(segment_data: &[u8], access: u8) -> [u8; MCB_ENTRY_LEN] {
     let size = segment_data.len() as u32;
     let crc = crc16_ccitt(segment_data);
     let mut v = [0u8; MCB_ENTRY_LEN];
     v[0..4].copy_from_slice(&size.to_be_bytes());
     v[4] = 0x00; // CRC control byte: always valid.
-    v[5] = 0xFF; // read/write access.
+    v[5] = access; // read/write access levels, the product's.
     v[6..8].copy_from_slice(&crc.to_be_bytes());
     v
 }
@@ -1368,8 +1489,9 @@ impl McbEntry {
 /// [`WriteError::ImagePropMismatch`]; a device that answers with no readable MCB
 /// entry surfaces [`WriteError::WriteNotConfirmed`]-style malformed responses.
 ///
-/// The MCB property is device-computed and read-only on System B, so this never
-/// writes it — it reads and checks. `expected` is `None` for objects whose image
+/// The device computes the MCB's CRC (a procedure may seed the entry with
+/// `LdCtrlWriteProp PropId=27`, but never its CRC), so this never writes it —
+/// it reads and checks. `expected` is `None` for objects whose image
 /// the tool did not itself write (e.g. an object the procedure names but for
 /// which bussard streamed no segment); those entries are read but not
 /// CRC-checked, so the step still confirms the property is present.
@@ -1476,8 +1598,8 @@ pub async fn read_mcb_table<Ch: L4Channel>(
 // resolving.
 
 pub use crate::memory::{
-    read_memory, read_memory_range, select_extended_memory, write_memory, write_memory_chunked,
-    write_memory_verified,
+    read_memory, read_memory_range, read_memory_strict, select_extended_memory, write_memory,
+    write_memory_chunked, write_memory_verified,
 };
 
 /// Whether an error is a connection-death — a mid-session silence, a dropped ACK,
@@ -1511,7 +1633,10 @@ pub fn is_connection_death(err: &WriteError) -> bool {
     match err {
         WriteError::Mgmt(MgmtError::MidSessionSilence { .. })
         | WriteError::Mgmt(MgmtError::Disconnected { .. })
-        | WriteError::Mgmt(MgmtError::NoResponse { .. }) => true,
+        | WriteError::Mgmt(MgmtError::NoResponse { .. })
+        // A T_Connect the medium did not confirm (03_03_04 §5.4.3 E20): the
+        // device is not up yet, as with a silent one (issue #507).
+        | WriteError::Mgmt(MgmtError::NotConfirmed { .. }) => true,
         WriteError::Mgmt(MgmtError::Transport(e)) => e.is_link_loss(),
         _ => false,
     }
@@ -1648,7 +1773,7 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         // event=3, sub=0x0B, size u32 BE, fill flag + byte, reserved tail
         // (KNX 3/5/2 LdCtrlRelSegment).
-        let v = encode_rel_segment(0x0000_0140, Some(0xEE));
+        let v = encode_rel_segment(0x0000_0140, 0x01, 0xEE);
         assert_eq!(v.len(), 10);
         assert_eq!(v[0], LoadControl::AdditionalLoadControls.octet());
         assert_eq!(v[1], LD_CTRL_REL_SEGMENT);
@@ -1658,7 +1783,7 @@ mod tests {
         assert_eq!(&v[8..10], &[0x00, 0x00]); // reserved
 
         // No fill: flag and byte are zero.
-        let v = encode_rel_segment(0x10, None);
+        let v = encode_rel_segment(0x10, 0x00, 0x00);
         assert_eq!(&v[2..6], &[0x00, 0x00, 0x00, 0x10]);
         assert_eq!(v[6], 0x00);
         assert_eq!(v[7], 0x00);
@@ -1667,9 +1792,30 @@ mod tests {
         // `030b000028c1 01 00 0000`: size 0x28c1, fill flag 0x01, fill byte 0x00.
         // A `Fill="1"` (FillByte default 0) allocation must encode to exactly
         // those first 8 octets, byte-for-byte with the ETS capture.
-        let v = encode_rel_segment(0x0000_28C1, Some(0x00));
+        let v = encode_rel_segment(0x0000_28C1, 0x01, 0x00);
         assert_eq!(&v[0..8], &[0x03, 0x0B, 0x00, 0x00, 0x28, 0xC1, 0x01, 0x00]);
         Ok(())
+    }
+
+    #[test]
+    fn test_encode_rel_segment_mode_0_keeps_fill_octet() {
+        // `syn-relseg-fill` allocates its parameter segment with
+        // `LdCtrlRelSegment Size="256" Mode="0" Fill="255"`; ETS sends
+        // `03 0b 00 00 01 00 00 ff 00 00` (captures/synthetic/syn-relseg-fill/
+        // defaults/ops.txt op 17, issue #480): mode 00, fill octet ff.
+        assert_eq!(
+            encode_rel_segment(256, 0x00, 0xFF),
+            [0x03, 0x0B, 0x00, 0x00, 0x01, 0x00, 0x00, 0xFF, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn test_encode_rel_segment_mode_1() {
+        // Mode 1, Fill 255: the device fills the segment with ff.
+        assert_eq!(
+            encode_rel_segment(0x0400, 0x01, 0xFF),
+            [0x03, 0x0B, 0x00, 0x00, 0x04, 0x00, 0x01, 0xFF, 0x00, 0x00]
+        );
     }
 
     #[test]
@@ -1805,21 +1951,22 @@ mod tests {
 
     #[test]
     fn mcb_entry_matches_spec_layout() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // [size u32 BE][crc_ctrl=0x00][access=0xFF][crc16 u16 BE], 8 octets
-        // (KNX 3/5/1 System B PID_MCB_TABLE).
+        // [size u32 BE][crc_ctrl=0x00][access][crc16 u16 BE], 8 octets
+        // (KNX 3/5/1 System B PID_MCB_TABLE); access 0x33 as the house's Jung
+        // applications seed it.
         let data = b"123456789";
-        let e = mcb_entry(data);
+        let e = mcb_entry(data, 0x33);
         assert_eq!(e.len(), MCB_ENTRY_LEN);
         assert_eq!(&e[0..4], &(data.len() as u32).to_be_bytes()); // size = 9
         assert_eq!(e[4], 0x00); // CRC control: always valid
-        assert_eq!(e[5], 0xFF); // access
+        assert_eq!(e[5], 0x33); // access
         assert_eq!(&e[6..8], &0xE5CCu16.to_be_bytes()); // CRC-16/AUG-CCITT of "123456789"
 
         // Round-trips through the decoder.
         let dec = McbEntry::decode(&e).ok_or("missing value")?;
         assert_eq!(dec.segment_size, 9);
         assert_eq!(dec.crc_control, 0x00);
-        assert_eq!(dec.access, 0xFF);
+        assert_eq!(dec.access, 0x33);
         assert_eq!(dec.crc16, 0xE5CC);
         Ok(())
     }

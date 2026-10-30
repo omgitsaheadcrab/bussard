@@ -26,10 +26,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bussard_mgmt::property_ext::{
-    A_FUNCTION_PROPERTY_EXT_COMMAND, A_FUNCTION_PROPERTY_EXT_STATE_RESPONSE,
-    A_PROPERTY_EXT_VALUE_READ, A_PROPERTY_EXT_VALUE_RESPONSE, A_PROPERTY_EXT_VALUE_WRITE_CON,
-    A_PROPERTY_EXT_VALUE_WRITE_CON_RESPONSE, OT_SECURITY, PID_GO_SECURITY_FLAGS, PID_GRP_KEY_TABLE,
-    PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE, PID_SECURITY_LOAD_STATE_CONTROL,
+    A_FUNCTION_PROPERTY_EXT_COMMAND, A_FUNCTION_PROPERTY_EXT_STATE_READ,
+    A_FUNCTION_PROPERTY_EXT_STATE_RESPONSE, A_PROPERTY_EXT_DESCRIPTION_READ,
+    A_PROPERTY_EXT_DESCRIPTION_RESPONSE, A_PROPERTY_EXT_VALUE_READ, A_PROPERTY_EXT_VALUE_RESPONSE,
+    A_PROPERTY_EXT_VALUE_WRITE_CON, A_PROPERTY_EXT_VALUE_WRITE_CON_RESPONSE, OT_SECURITY,
+    PID_GO_SECURITY_FLAGS, PID_GRP_KEY_TABLE, PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE,
+    PID_SECURITY_LOAD_STATE_CONTROL,
 };
 use bussard_model::GroupAddress;
 use bussard_secure::{Key16, SecurityAlgorithm, Sequence, encode_group};
@@ -52,9 +54,9 @@ const APP_OBJECT: u8 = 4;
 
 include!("support/param_app.rs");
 
-/// Zips the synthetic application into `<dir>/products/param-test.knxprod`
+/// Zips the application XML `xml` into `<dir>/products/param-test.knxprod`
 /// and returns its SHA-256, for the lock to pin.
-fn store_product(dir: &Path) -> TestResult<String> {
+fn store_product_xml(dir: &Path, xml: &str) -> TestResult<String> {
     use sha2::Digest as _;
     let store = dir.join("products");
     std::fs::create_dir_all(&store)?;
@@ -64,7 +66,7 @@ fn store_product(dir: &Path) -> TestResult<String> {
         "M-00FA/M-00FA_A-0002.xml",
         zip::write::SimpleFileOptions::default(),
     )?;
-    zip.write_all(APP_XML.as_bytes())?;
+    zip.write_all(xml.as_bytes())?;
     zip.finish()?;
     Ok(sha2::Sha256::digest(std::fs::read(&path)?)
         .iter()
@@ -102,6 +104,11 @@ fn group_key() -> TestResult<Key16> {
 /// A fresh model directory: device 1.1.10 (security activated) sending 1/2/0
 /// from object 20 and listening on the secured 1/2/3 with object 22.
 fn model_dir(tag: &str) -> TestResult<PathBuf> {
+    model_dir_with(tag, APP_XML)
+}
+
+/// [`model_dir`] whose product holds the application XML `xml`.
+fn model_dir_with(tag: &str, xml: &str) -> TestResult<PathBuf> {
     let dir = std::env::temp_dir().join(format!(
         "bussard-mcp-secure-{tag}-{}-{}",
         std::process::id(),
@@ -129,7 +136,7 @@ fn model_dir(tag: &str) -> TestResult<PathBuf> {
          [links]\n20.send = \"1/2/0\"\n22.listen = [\"1/2/3\"]\n",
     )?;
     // The device runs the synthetic application; the lock pins its archive.
-    let sha = store_product(&dir)?;
+    let sha = store_product_xml(&dir, xml)?;
     std::fs::write(
         dir.join("bussard.lock"),
         format!(
@@ -159,11 +166,27 @@ struct SecurityLog {
     /// The group-object security flags (PID 61) the device holds, one octet
     /// per group object, as the writes leave it (issue #331).
     pid61: Vec<u8>,
+    /// How many times PID 61 was read (its element count, the first read of
+    /// every table read; issue #336).
+    pid61_reads: usize,
     /// The group key table's (PID 53) element count, as the writes leave it
     /// (the keys themselves are write-only, issue #349).
     pid53: u16,
     /// What the device acknowledges and then drops (issue #349).
     dropped: Option<Dropped>,
+    /// The security object's load state (PID 5) as the device reports it
+    /// to a state read (issue #534); `None` until the first transition
+    /// (the object then reads `Loaded`).
+    load_state: Option<u8>,
+    /// The state the device answers `LoadCompleted` with, and keeps, in
+    /// place of `Loaded` (issue #534).
+    completes_to: Option<u8>,
+    /// The state the device falls back to after it answered
+    /// `LoadCompleted` (a device that does not persist the object, #534).
+    reverts_to: Option<u8>,
+    /// The `max_nr_of_elem` the property description of PID 54 reports
+    /// (issue #537); `None` answers the default description (0 elements).
+    pid54_capacity: Option<u16>,
 }
 
 /// A write the mock device acknowledges as written and does not store, so
@@ -281,14 +304,29 @@ fn secure_device_with(
             }
             let header = data.get(..5)?.to_vec();
             match apci {
+                A_FUNCTION_PROPERTY_EXT_STATE_READ if pid == PID_SECURITY_LOAD_STATE_CONTROL => {
+                    let state = log.lock().ok()?.load_state.unwrap_or(0x01);
+                    let mut out = header;
+                    out.extend_from_slice(&[0x00, state]);
+                    Some(Reaction::Answer(
+                        A_FUNCTION_PROPERTY_EXT_STATE_RESPONSE,
+                        out,
+                    ))
+                }
                 A_FUNCTION_PROPERTY_EXT_COMMAND if pid == PID_SECURITY_LOAD_STATE_CONTROL => {
                     let event = *data.get(5)?;
+                    let completes_to = log.lock().ok()?.completes_to;
                     let state = match event {
-                        0x04 => 0x00, // Unload -> Unloaded
-                        0x01 => 0x02, // StartLoading -> Loading
-                        _ => 0x01,    // LoadCompleted -> Loaded
+                        0x04 => 0x00,                      // Unload -> Unloaded
+                        0x01 => 0x02,                      // StartLoading -> Loading
+                        _ => completes_to.unwrap_or(0x01), // LoadCompleted -> Loaded
                     };
                     if let Ok(mut log) = log.lock() {
+                        log.load_state = Some(if event == 0x02 {
+                            log.reverts_to.unwrap_or(state)
+                        } else {
+                            state
+                        });
                         log.controls.push(event);
                         // Unload empties the group key table.
                         if event == 0x04 && log.dropped != Some(Dropped::Pid(PID_GRP_KEY_TABLE)) {
@@ -302,14 +340,34 @@ fn secure_device_with(
                         out,
                     ))
                 }
+                A_PROPERTY_EXT_DESCRIPTION_READ if pid == PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE => {
+                    let max = log.lock().ok()?.pid54_capacity?;
+                    let desc = bussard_mgmt::property_ext::PropertyExtDescription {
+                        addr: bussard_mgmt::property_ext::PropertyExtAddress::decode(data)?,
+                        description_type: 0,
+                        property_index: 5,
+                        dpt_main: 0,
+                        dpt_sub: 0,
+                        write_enable: true,
+                        pdt: 0x18,
+                        max_elements: max,
+                        read_level: 3,
+                        write_level: 0,
+                    };
+                    Some(Reaction::Answer(
+                        A_PROPERTY_EXT_DESCRIPTION_RESPONSE,
+                        bussard_mgmt::property_ext::encode_property_ext_description_response(&desc),
+                    ))
+                }
                 A_PROPERTY_EXT_VALUE_READ if pid == PID_GO_SECURITY_FLAGS => {
                     // The element count (start 0), or the flags the device
                     // holds (issue #331).
                     let count = *data.get(5)?;
                     let start = u16::from_be_bytes([*data.get(6)?, *data.get(7)?]);
-                    let log = log.lock().ok()?;
+                    let mut log = log.lock().ok()?;
                     let mut out = header;
                     if start == 0 {
+                        log.pid61_reads += 1;
                         out.extend_from_slice(&[1, 0, 0]);
                         out.extend_from_slice(&GO_COUNT.to_be_bytes());
                     } else {
@@ -990,10 +1048,24 @@ fn test_mcp_unsecure_a_group_address_end_to_end() -> TestResult {
         &store_path,
     )?;
 
+    let pid61_reads =
+        || -> TestResult<usize> { Ok(log.lock().map_err(|_| "log poisoned")?.pid61_reads) };
+
     // The device already runs the model: both GAs secured.
     let plan = plan_when_connected(&mut server, "1.1.10")?;
     assert_eq!(plan["ok"], true, "plan: {plan}");
     assert_eq!(plan["noop"], true, "plan: {plan}");
+    assert_eq!(pid61_reads()?, 1, "the first plan reads PID 61");
+    // The read budget (issue #336): no security change pending, so a second
+    // plan takes the cached read and does not read PID 61 again.
+    let again = server.call("knx_plan_device", json!({"address": "1.1.10"}))?;
+    assert_eq!(again["noop"], true, "plan: {again}");
+    assert_eq!(again["state_hash"], plan["state_hash"], "plan: {again}");
+    assert_eq!(
+        pid61_reads()?,
+        1,
+        "a plan without a pending change reads no PID 61"
+    );
 
     // Security off for 1/2/3: one model change, the key out of the store.
     let set = server.call("knx_set_group", json!({"ga": "1/2/3", "secure": false}))?;
@@ -1047,8 +1119,10 @@ fn test_mcp_unsecure_a_group_address_end_to_end() -> TestResult {
     assert!(!exported.group_keys.contains_key(&ga("1/2/3")?));
     assert!(exported.group_keys.contains_key(&ga("1/2/4")?));
 
-    // The plan: exactly one change, the security object.
+    // The plan: exactly one change, the security object. The change is
+    // pending, so the device is read again.
     let plan = server.call("knx_plan_device", json!({"address": "1.1.10"}))?;
+    assert_eq!(pid61_reads()?, 2, "a pending security change reads PID 61");
     assert_eq!(plan["ok"], true, "plan: {plan}");
     assert_eq!(plan["noop"], false, "plan: {plan}");
     let changes = plan["changes"].as_array().ok_or("no changes")?;
@@ -1101,9 +1175,19 @@ fn test_mcp_unsecure_a_group_address_end_to_end() -> TestResult {
         assert_eq!(secured, vec![23], "{log:?}");
     }
 
-    // Nothing left to do.
+    // Nothing left to do. The apply dropped the cache, so this plan reads
+    // the device once; the next one does not.
+    let reads = pid61_reads()?;
     let replan = server.call("knx_plan_device", json!({"address": "1.1.10"}))?;
     assert_eq!(replan["noop"], true, "replan: {replan}");
+    assert_eq!(
+        pid61_reads()?,
+        reads + 1,
+        "the plan after an apply reads PID 61"
+    );
+    let replan = server.call("knx_plan_device", json!({"address": "1.1.10"}))?;
+    assert_eq!(replan["noop"], true, "replan: {replan}");
+    assert_eq!(pid61_reads()?, reads + 1, "and caches it");
 
     // A group write on 1/2/3 now goes out plain.
     let write = server.call("knx_write_group", json!({"ga": "1/2/3", "value": "50%"}))?;
@@ -1143,10 +1227,26 @@ fn dropping_bench(
     dropped: Option<Dropped>,
     admit: bool,
 ) -> TestResult<(MockGateway, Arc<Mutex<SecurityLog>>, PathBuf)> {
-    let log = Arc::new(Mutex::new(SecurityLog {
-        dropped,
-        ..SecurityLog::default()
-    }));
+    faulty_bench(
+        rt,
+        tag,
+        SecurityLog {
+            dropped,
+            ..SecurityLog::default()
+        },
+        admit,
+    )
+}
+
+/// [`dropping_bench`] with the device's security object starting from
+/// `log` (its faults, issue #534).
+fn faulty_bench(
+    rt: &tokio::runtime::Runtime,
+    tag: &str,
+    log: SecurityLog,
+    admit: bool,
+) -> TestResult<(MockGateway, Arc<Mutex<SecurityLog>>, PathBuf)> {
+    let log = Arc::new(Mutex::new(log));
     let gw = rt.block_on(
         MockGateway::builder()
             .channel(0x59)
@@ -1194,6 +1294,14 @@ fn apply_over_cli(
 ) -> TestResult<(bool, String, String)> {
     let rt = tokio::runtime::Runtime::new()?;
     let (gw, _log, dir) = dropping_bench(&rt, tag, dropped, admit)?;
+    let run = run_cli_apply(&gw, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    run
+}
+
+/// `bussard apply 1.1.10 --yes --keyring` on `dir` against `gw`: whether it
+/// succeeded, its stdout and its stderr.
+fn run_cli_apply(gw: &MockGateway, dir: &Path) -> TestResult<(bool, String, String)> {
     let out = Command::new(env!("CARGO_BIN_EXE_bussard"))
         .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
         .env("BUSSARD_ADDRESS_PROBE_MS", "200")
@@ -1204,14 +1312,13 @@ fn apply_over_cli(
         .arg("1.1.10")
         .arg("--yes")
         .arg("--dir")
-        .arg(&dir)
+        .arg(dir)
         .arg("--gateway")
         .arg(format!("127.0.0.1:{}", gw.port()))
         .arg("--keyring")
         .arg(keyring_path())
         .stdin(Stdio::null())
         .output()?;
-    let _ = std::fs::remove_dir_all(&dir);
     Ok((
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1306,7 +1413,8 @@ fn test_cli_apply_readback_reports_the_counts_when_healthy() -> TestResult {
     );
     assert!(
         stdout.contains(
-            "1 group key(s) (PID 53), 1 secure sender(s) (PID 54), 1 secured object(s) (PID 61)"
+            "1 group key(s) (PID 53), 1 secure sender(s) (PID 54), 1 secured object(s) (PID 61), \
+             security object Loaded (PID 5)"
         ),
         "{stdout}"
     );
@@ -1357,5 +1465,294 @@ fn test_cli_apply_readback_names_a_dropped_link() -> TestResult {
 fn test_cli_apply_readback_names_a_dropped_parameter() -> TestResult {
     let run = apply_over_cli("cli-drop-param", Some(Dropped::Parameters), false)?;
     assert_cli_names(&run, "thr");
+    Ok(())
+}
+
+/// `bussard apply 1.1.10 --secure-sender 1.1.30` with tunnel admission on:
+/// two PID 54 entries, the tunnel address and 1.1.30.
+fn run_cli_apply_two_senders(gw: &MockGateway, dir: &Path) -> TestResult<(bool, String, String)> {
+    let out = Command::new(env!("CARGO_BIN_EXE_bussard"))
+        .env("BUSSARD_MGMT_TIMEOUT_MS", "300")
+        .env("BUSSARD_ADDRESS_PROBE_MS", "200")
+        .env("BUSSARD_KEYRING_PASSWORD", PASSWORD)
+        .env_remove("BUSSARD_ALLOW_REAL_GATEWAY")
+        .env_remove("BUSSARD_KEYRING")
+        .arg("apply")
+        .arg("1.1.10")
+        .arg("--yes")
+        .arg("--secure-sender")
+        .arg("1.1.30")
+        .arg("--dir")
+        .arg(dir)
+        .arg("--gateway")
+        .arg(format!("127.0.0.1:{}", gw.port()))
+        .arg("--keyring")
+        .arg(keyring_path())
+        .stdin(Stdio::null())
+        .output()?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+/// Issue #537: the device's PID 54 holds one entry (its property
+/// description says so) and the apply needs two: refused with the counts
+/// before the security object, or any table, is opened.
+#[test]
+fn test_cli_apply_refuses_a_sender_table_over_the_described_capacity() -> TestResult {
+    let rt = tokio::runtime::Runtime::new()?;
+    let (gw, log, dir) = faulty_bench(
+        &rt,
+        "cli-capacity-desc",
+        SecurityLog {
+            pid54_capacity: Some(1),
+            ..SecurityLog::default()
+        },
+        true,
+    )?;
+    let run = run_cli_apply_two_senders(&gw, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    let (success, stdout, stderr) = run?;
+    assert!(!success, "the apply must refuse: {stdout}\n{stderr}");
+    assert!(
+        stderr.contains(
+            "the security individual address table (PID 54) needs 2 entries but the device \
+             holds at most 1 (property description)"
+        ),
+        "{stderr}"
+    );
+    let log = log.lock().map_err(|_| "log poisoned")?;
+    assert!(
+        log.controls.is_empty(),
+        "nothing unloaded: {:?}",
+        log.controls
+    );
+    assert!(log.writes.is_empty(), "nothing written");
+    // The address table was never opened (2 = Loading).
+    let address_state = gw.with_device(ia("1.1.10")?, |dev| dev.load_state(1))?;
+    assert_ne!(address_state, 2);
+    Ok(())
+}
+
+/// Issue #537: the product declares one PID 54 entry: the apply refuses at
+/// plan time, before it contacts the gateway.
+#[test]
+fn test_cli_apply_refuses_a_sender_table_over_the_product_capacity() -> TestResult {
+    let rt = tokio::runtime::Runtime::new()?;
+    let log = Arc::new(Mutex::new(SecurityLog::default()));
+    let gw = rt.block_on(
+        MockGateway::builder()
+            .channel(0x5A)
+            .tunnel_address(0x11C8)
+            .keep_serving()
+            .idle_timeout(Duration::from_secs(120))
+            .device(secure_device(Arc::clone(&log))?)
+            .start(),
+    )?;
+    let xml = APP_XML.replacen(
+        "<ApplicationProgram ",
+        "<ApplicationProgram IsSecureEnabled=\"true\" MaxSecurityIndividualAddressEntries=\"1\" ",
+        1,
+    );
+    let dir = model_dir_with("cli-capacity-product", &xml)?;
+    std::fs::write(
+        dir.join("bussard.toml"),
+        "[connection]\ntransport = \"tunnel\"\ngateway = \"192.0.2.1:3671\"\n\
+         admit_tunnel_senders = true\n",
+    )?;
+    let run = run_cli_apply_two_senders(&gw, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    let (success, stdout, stderr) = run?;
+    assert!(!success, "the apply must refuse: {stdout}\n{stderr}");
+    assert!(
+        stderr.contains(
+            "the security individual address table (PID 54) needs 2 entries but the device \
+             holds at most 1 (product data)"
+        ),
+        "{stderr}"
+    );
+    let log = log.lock().map_err(|_| "log poisoned")?;
+    assert!(log.controls.is_empty() && log.writes.is_empty());
+    Ok(())
+}
+
+/// Issue #534: a security object that answers `LoadCompleted` with state
+/// Error stops the apply between `Unload` and `LoadCompleted`. The error
+/// names the consequence and the remedy, and the lock records no PID 54.
+#[test]
+fn test_cli_apply_load_completed_error_names_the_dead_secured_addresses() -> TestResult {
+    let rt = tokio::runtime::Runtime::new()?;
+    let (gw, _log, dir) = faulty_bench(
+        &rt,
+        "cli-complete-error",
+        SecurityLog {
+            completes_to: Some(0x03),
+            ..SecurityLog::default()
+        },
+        true,
+    )?;
+    let (success, stdout, stderr) = run_cli_apply(&gw, &dir)?;
+    let lock = std::fs::read_to_string(dir.join("bussard.lock"))?;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!success, "the apply must fail: {stdout}\n{stderr}");
+    assert!(
+        stderr.contains("did not reach Loaded after LoadCompleted (device reports Error)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("drops every secured group telegram")
+            && stderr.contains("Run `bussard apply 1.1.10` again"),
+        "{stderr}"
+    );
+    assert!(!lock.contains("secure_senders"), "{lock}");
+    Ok(())
+}
+
+/// Issue #534: a device that confirms `LoadCompleted` but reads back
+/// another load state is not verified; the read-back names PID 5.
+#[test]
+fn test_cli_apply_readback_names_a_security_object_left_unloaded() -> TestResult {
+    let rt = tokio::runtime::Runtime::new()?;
+    let (gw, _log, dir) = faulty_bench(
+        &rt,
+        "cli-reverts",
+        SecurityLog {
+            reverts_to: Some(0x00),
+            ..SecurityLog::default()
+        },
+        false,
+    )?;
+    let run = run_cli_apply(&gw, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    let run = run?;
+    assert_cli_names(&run, "security object load state (PID 5)");
+    assert!(run.2.contains("the device holds Unloaded"), "{}", run.2);
+    Ok(())
+}
+
+/// Issue #534 over MCP: the same not-Loaded object is a read-back leftover.
+#[test]
+fn test_mcp_apply_readback_names_a_security_object_left_unloaded() -> TestResult {
+    let rt = tokio::runtime::Runtime::new()?;
+    let (gw, _log, dir) = faulty_bench(
+        &rt,
+        "mcp-reverts",
+        SecurityLog {
+            reverts_to: Some(0x03),
+            ..SecurityLog::default()
+        },
+        false,
+    )?;
+    let mut server = Server::start(&dir, gw.port(), &["--allow-programming"])?;
+    let plan = plan_when_connected(&mut server, "1.1.10")?;
+    let digest = plan["plan_digest"].as_str().ok_or("no plan_digest")?;
+    let applied = server.call(
+        "knx_apply_device",
+        json!({"address": "1.1.10", "plan_digest": digest}),
+    )?;
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_mcp_names(
+        &applied,
+        "security_load_state",
+        "security object load state (PID 5)",
+    );
+    Ok(())
+}
+
+/// Issue #316: a secured write whose admission the lock and the key store
+/// cannot tell reads the receiver's PID 54 first. Listing only an ETS
+/// sender, it refuses with the remedy and records the table in the lock;
+/// after the apply that admits the tunnel addresses the write is admitted.
+#[test]
+fn test_mcp_write_reads_pid54_on_an_unknown_admission_then_refuses() -> TestResult {
+    let rt = tokio::runtime::Runtime::new()?;
+    let log = Arc::new(Mutex::new(SecurityLog::default()));
+    let gw = rt.block_on(
+        MockGateway::builder()
+            .channel(0x58)
+            .tunnel_address(0x11C8)
+            .keep_serving()
+            .idle_timeout(Duration::from_secs(120))
+            .device(secure_device_with(
+                Arc::clone(&log),
+                &["1/2/0", "1/2/3"],
+                &[(1, 20), (2, 22)],
+                &[12, 0],
+                &[22],
+            )?)
+            .start(),
+    )?;
+    // PID 54 as ETS left it: one device sender, 1.1.16, not the tunnel.
+    log.lock().map_err(|_| "log poisoned")?.pid54 = vec![0x11, 0x10, 0, 0, 0, 0, 0, 0];
+    let dir = model_dir("pid54-on-unknown")?;
+    std::fs::write(
+        dir.join("bussard.toml"),
+        "[connection]\ntransport = \"tunnel\"\ngateway = \"192.0.2.1:3671\"\n\
+         admit_tunnel_senders = true\n",
+    )?;
+    // A key store without the ETS group assignment of the tunnelling user, so
+    // nothing but the device can tell.
+    let mut store = bussard_project::KeyStore::new("Synthetic");
+    store.merge_keyring(&keyring()?);
+    for interface in &mut store.interfaces {
+        interface.gas.clear();
+    }
+    let stripped = dir.join("stripped.keys");
+    std::fs::write(&stripped, store.to_xml(PASSWORD)?)?;
+    let mut server = Server::start_with(
+        &dir,
+        gw.port(),
+        &["--allow-programming", "--allow-writes"],
+        &stripped,
+    )?;
+    let plan = plan_when_connected(&mut server, "1.1.10")?;
+    assert_eq!(plan["ok"], true, "plan: {plan}");
+    let reads_before = log.lock().map_err(|_| "log poisoned")?.pid54_reads;
+
+    let refused = server.call("knx_write_group", json!({"ga": "1/2/3", "value": "50%"}))?;
+    assert_eq!(refused["ok"], false, "write: {refused}");
+    assert_eq!(refused["refused"], true, "write: {refused}");
+    assert_eq!(refused["admission"], "refused", "write: {refused}");
+    let reason = refused["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("1.1.10 does not list the tunnel address 1.1.200"),
+        "{refused}"
+    );
+    let hint = refused["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("admit_tunnel_senders = true"), "{refused}");
+    assert!(
+        log.lock().map_err(|_| "log poisoned")?.pid54_reads > reads_before,
+        "PID 54 is read before the refusal"
+    );
+    let lock = std::fs::read_to_string(dir.join("bussard.lock"))?;
+    assert!(
+        lock.contains("secure_senders = [\n  { address = \"1.1.16\", sequence = 0 },\n]"),
+        "{lock}"
+    );
+
+    // Apply the admission change, then the write is admitted.
+    let plan = server.call("knx_plan_device", json!({"address": "1.1.10"}))?;
+    let digest = plan["plan_digest"].as_str().ok_or("no plan_digest")?;
+    let applied = server.call(
+        "knx_apply_device",
+        json!({"address": "1.1.10", "plan_digest": digest}),
+    )?;
+    assert_eq!(applied["verified"], true, "apply: {applied}");
+    let mut write = Value::Null;
+    for _ in 0..50 {
+        write = server.call("knx_write_group", json!({"ga": "1/2/3", "value": "50%"}))?;
+        if write["admission"] == "admitted" {
+            break;
+        }
+        // The server's model handle picks the lock change up on its next poll.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(write["ok"], true, "write: {write}");
+    assert_eq!(write["admission"], "admitted", "write: {write}");
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }

@@ -11,12 +11,13 @@ use super::session::{
     Connector, MAX_RESUME_RECONNECTS, RestartKind, Session, allocate_with_context_resumable,
     read_load_state_resumable, reconnect_exchange_threshold, resumable_death,
     start_loading_resumable, write_load_control_resumable,
+    write_load_control_unless_absent_resumable,
 };
 use super::verify::{
     WrittenSample, advisory_mcb_warning, mcb_read_object, mcb_skip_target, resident_match_objects,
     take_sample, verify_after_reboot, verify_outcome,
 };
-use super::{FlashOptions, FlashOutcome, FlashPlan, FlashStep, ImageKind, Progress};
+use super::{FlashOptions, FlashOutcome, FlashPlan, FlashStep, ImageKind, Progress, SegmentFill};
 use bussard_mgmt::MgmtError;
 use bussard_mgmt::connection::{L4Channel, Layer4Connection};
 use bussard_mgmt::load::{
@@ -161,6 +162,13 @@ pub(super) async fn confirm_app_object<C: Connector>(
     }
 }
 
+/// Runs a [`FlashStep::Delay`]: logs the pause at info level, so `-v` shows
+/// it in the trace between the frames around it, and sleeps. Nothing is sent.
+pub(super) async fn delay_step(milliseconds: u32) {
+    tracing::info!(milliseconds, "LdCtrlDelay: pausing before the next step");
+    tokio::time::sleep(std::time::Duration::from_millis(u64::from(milliseconds))).await;
+}
+
 /// Resolves the op-carried `LsmIdx`/`ObjIdx` to the device interface-object index
 /// the step should act on, by **index**, not by object type — the divergence-#2 fix.
 ///
@@ -237,9 +245,50 @@ pub async fn flash<C: Connector, F: FnMut(Progress)>(
     options: FlashOptions,
     progress: F,
 ) -> Result<FlashOutcome, WriteError> {
-    let mut outcome = flash_steps(session, plan, options, progress).await?;
+    // An application without extended memory services is written and read
+    // above 0xFFFF with A_UserMemory_* on every connection of the flash, as
+    // ETS does (issue #472).
+    session.set_user_memory_above_64k(plan.user_memory_above_64k());
+    // Set between the security object's `Unload` and its `LoadCompleted`: a
+    // failure there leaves the device dropping every secured group telegram,
+    // and the error says so (issue #534).
+    let mut security_open = false;
+    let mut outcome = flash_steps(session, plan, options, progress, &mut security_open)
+        .await
+        .map_err(|err| {
+            if security_open {
+                crate::security::left_not_loaded(session.l4().target(), err)
+            } else {
+                err
+            }
+        })?;
     outcome.reboot_readiness = session.reboot_readiness().to_vec();
+    outcome.verify_echoes = session.verify_echoes();
     Ok(outcome)
+}
+
+/// Refuses a plan whose security tables exceed the device's capacity (issue
+/// #537), reading the capacities the product does not declare from the device.
+async fn check_security_capacity<C: Connector>(
+    session: &mut Session<C>,
+    plan: &FlashPlan,
+) -> Result<(), WriteError> {
+    let (keys, senders) = plan.security_table_counts();
+    let known = plan.security_capacity();
+    let capacity = if known.is_complete() {
+        known
+    } else {
+        crate::security::resolve_table_capacity(session.l4(), known)
+            .await
+            .map_err(WriteError::Mgmt)?
+    };
+    let target = session.l4().target();
+    capacity
+        .check_counts(target, keys, senders)
+        .map_err(|e| WriteError::SecurityProgram {
+            address: target,
+            reason: e.to_string(),
+        })
 }
 
 /// The body of [`flash`]: runs the plan and verifies it.
@@ -248,6 +297,7 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
     plan: &FlashPlan,
     options: FlashOptions,
     mut progress: F,
+    security_open: &mut bool,
 ) -> Result<FlashOutcome, WriteError> {
     // System 7 has its own memory-mapped, absolute-addressed executor: the LSM
     // control, absolute streaming and read-back verify all differ from System B.
@@ -306,14 +356,14 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
     // address — before the resumed `WriteRelMem` targets it. `None` until the
     // first `AllocateSegment`.
     let mut last_alloc_size: Option<u32> = None;
-    // The pre-fill (`Mode`/`Fill`) the most-recent `AllocateSegment`
-    // requested, so a `MasterReset` re-allocation reproduces the same fill flag
-    // as the original op rather than silently dropping it. `None` = no-fill (the
-    // DA.tp default).
-    let mut last_alloc_fill: Option<u8> = None;
-    // The pre-fill each object's segment was allocated with, so its
-    // `WriteRelMem` streams only what differs from the fill (issue #123).
-    let mut segment_fills: BTreeMap<u8, Option<u8>> = BTreeMap::new();
+    // The `Mode`/`Fill` the most-recent `AllocateSegment` sent, so a
+    // `MasterReset` re-allocation reproduces the same record as the original
+    // op rather than silently dropping it. `NONE` = no-fill (the DA.tp
+    // default).
+    let mut last_alloc_fill = SegmentFill::NONE;
+    // The `Mode`/`Fill` each object's segment was allocated with, so its
+    // `WriteRelMem` streams only what differs from the pre-fill (issue #123).
+    let mut segment_fills: BTreeMap<u8, SegmentFill> = BTreeMap::new();
     // The object index the most-recent `AllocateSegment` targeted, so a
     // `MasterReset` re-opens and re-allocates *that* object (the one whose segment
     // the reset dropped) rather than the type-discovered application object. On
@@ -334,6 +384,9 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
     // device (after which it is unreachable and cannot be verified). `None` until
     // then; the post-loop verify runs only if it is still `None`.
     let mut verified: Option<FlashOutcome> = None;
+    // The objects a parameter-only download found `Loaded` before its first
+    // `Unload` (issue #543), so a replayed `Unload` does not check again.
+    let mut partial_checked: BTreeSet<u8> = BTreeSet::new();
 
     // The proactive-reconnect exchange threshold (0 = disabled, the default for
     // every device but KNX Virtual, issue #116), read once.
@@ -350,12 +403,27 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
     //
     // A plan that factory-resets the device first erases every object, so no
     // resident image can survive to be matched: the pre-pass is skipped and every
-    // object streams in full.
-    let skip_objects: BTreeSet<u8> = if options.skip_matching_mcb && !plan.has_factory_reset() {
+    // object streams in full. The same holds for a product `LdCtrlMasterReset`
+    // whose erase code resets loaded objects (issue #623, the rule and its
+    // evidence are on `FlashPlan::erases_resident_objects`): skipping an object
+    // the reset then erases leaves the device without it.
+    // A parameter-only download diffs against the resident memory instead.
+    let skip_objects: BTreeSet<u8> = if options.skip_matching_mcb
+        && !plan.erases_resident_objects()
+        && !plan.is_parameters_only()
+    {
         resident_match_objects(session, plan, app_obj, &object_table).await?
     } else {
         BTreeSet::new()
     };
+
+    // Data Secure (issue #537): the group key table and the security
+    // individual address table must fit the device. A capacity the product
+    // does not declare is read from the property description, over the
+    // tool-key connection, before the first step erases or unloads anything.
+    if plan.has_security_program() {
+        check_security_capacity(session, plan).await?;
+    }
 
     for (i, step) in plan.steps.iter().enumerate() {
         // A resident-match object (its MCB already matched the image bussard
@@ -446,7 +514,13 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
             let step_result: Result<(), WriteError> = async {
                 match step {
                     FlashStep::SecurityLoadControl { control } => {
+                        if *control == LoadControl::Unload {
+                            *security_open = true;
+                        }
                         crate::security::security_transition(session.l4(), *control).await?;
+                        if *control == LoadControl::LoadCompleted {
+                            *security_open = false;
+                        }
                     }
                     FlashStep::SecurityClearAddressTable => {
                         crate::security::clear_security_address_table(session.l4()).await?;
@@ -464,7 +538,36 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
                         crate::security::write_go_security_flags(session.l4(), flags, |_| {})
                             .await?;
                     }
-                    FlashStep::Unload { target } => {
+                    // The procedure maps this unload's refusal to success
+                    // (`LdCtrlMapError`, issue #614): it goes to the object it
+                    // names, present in the discovery or not, and a device
+                    // without that object answers count 0, which completes it.
+                    FlashStep::Unload {
+                        target,
+                        absent_ok: true,
+                    } => {
+                        // The planner only maps an unload naming an object
+                        // 1..=255; anything else keeps the application object.
+                        let obj = target
+                            .and_then(|idx| u8::try_from(idx).ok())
+                            .filter(|idx| *idx != 0)
+                            .unwrap_or(app_obj);
+                        if write_load_control_unless_absent_resumable(
+                            session,
+                            obj,
+                            LoadControl::Unload,
+                        )
+                        .await?
+                        .is_none()
+                        {
+                            warnings.push(format!(
+                                "step {}: object {obj} absent on the device, nothing to unload \
+                                 (the procedure's LdCtrlMapError makes that no error)",
+                                i + 1
+                            ));
+                        }
+                    }
+                    FlashStep::Unload { target, .. } => {
                         // Skip a load-control op that names an object index the device
                         // does not expose (a template LSM5 op on a device without obj5).
                         let Some(obj) = resolve_object_target_opt(
@@ -475,6 +578,22 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
                         ) else {
                             return Ok(());
                         };
+                        // A parameter-only download rewrites the resident
+                        // application (Configuration Procedures 03_05_03
+                        // §3.5.3): the object must hold it, or the diff against
+                        // the memory read before the download means nothing.
+                        // Checked once, before anything is unloaded.
+                        if plan.is_parameters_only() && !partial_checked.contains(&obj) {
+                            let actual = read_load_state_resumable(session, obj).await?;
+                            if actual != LoadState::Loaded {
+                                return Err(WriteError::NotLoaded {
+                                    address: session.l4().target(),
+                                    object_index: obj,
+                                    actual,
+                                });
+                            }
+                            partial_checked.insert(obj);
+                        }
                         write_load_control_resumable(session, obj, LoadControl::Unload).await?;
                     }
                     FlashStep::StartLoading { target } => {
@@ -538,10 +657,10 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
                             .unwrap_or(0);
                         // The fill the target segment was allocated with (the
                         // most-recent allocation's for the single-object shape).
-                        let fill = match obj.and_then(|obj| segment_fills.get(&obj).copied()) {
-                            Some(fill) => fill,
-                            None => last_alloc_fill,
-                        };
+                        let fill = obj
+                            .and_then(|obj| segment_fills.get(&obj).copied())
+                            .unwrap_or(last_alloc_fill)
+                            .prefill();
                         // The device-supplied segment base plus the vendor offset must fit
                         // the 24-bit extended-memory space. `write_image` picks the plain
                         // A_Memory_Write (≤0xFFFF, byte-identical to before) or the
@@ -555,23 +674,78 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
                                 address: session.l4().target(),
                                 detail: format!("segment base {base:#X} + offset {offset:#X}"),
                             })?;
-                        let bytes = plan
+                        // The step streams its own part of the image: the whole
+                        // image, or the `[offset, offset + len)` a `<choose>`
+                        // branch writes of a segment it writes in part (issue
+                        // #411); the baseline is cut the same way.
+                        let whole = plan
                             .images
                             .get(&image.segment_id)
-                            .cloned()
+                            .map(Vec::as_slice)
                             .unwrap_or_default();
-                        match fill {
+                        let bytes = image_part(whole, image).to_vec();
+                        let partial = plan.baseline.get(&image.segment_id).map(|current| {
+                            (
+                                image_part(current, image),
+                                plan.baseline_address(&image.segment_id)
+                                    .map(|a| a + image.offset as u32),
+                            )
+                        });
+                        match (partial, fill) {
+                            // A parameter-only download (issue #543): the
+                            // allocation in Mode 0 kept the memory contents at
+                            // the base it reported (Configuration Procedures
+                            // 03_05_03 §3.5.1.2, §3.5.3). A zero reference means
+                            // the allocation failed; nothing is written.
+                            (Some(_), _) if base == 0 => {
+                                return Err(WriteError::AddressOutOfRange {
+                                    address: session.l4().target(),
+                                    detail: format!(
+                                        "PID_TABLE_REFERENCE reads 0 after the allocation of \
+                                         segment {} (the device did not allocate it); run a \
+                                         full `bussard flash`",
+                                        image.segment_id
+                                    ),
+                                });
+                            }
+                            // Where the base read before the download holds,
+                            // write only the octets that differ from it.
+                            (Some((current, expected)), _) if expected == Some(addr) => {
+                                let caps = ChunkCaps::of(session.l4());
+                                let chunk =
+                                    |start: usize, len: usize| caps.at(addr + start as u32, len);
+                                let regions =
+                                    diff_regions(&bytes, current, None, sparse_merge_gap(), &chunk);
+                                for (start, end) in regions {
+                                    write_image(
+                                        session,
+                                        addr + start as u32,
+                                        &bytes[start..end],
+                                        &mut progress,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            // The device placed the segment elsewhere: what it
+                            // holds there is unknown, so the whole image goes.
+                            (Some((_, expected)), _) => {
+                                warnings.push(format!(
+                                    "segment {} moved from {} to {addr:#X} on the allocation; \
+                                     the whole parameter image was written",
+                                    image.segment_id,
+                                    expected.map_or("an unknown base".to_string(), |a| format!(
+                                        "{a:#X}"
+                                    )),
+                                ));
+                                write_image(session, addr, &bytes, &mut progress).await?;
+                            }
                             // A pre-filled segment already holds the fill byte
                             // everywhere: write only the runs that differ, as ETS
                             // does (the F50 obj4 image is 276 of 6152 octets).
-                            Some(fill) => {
-                                let (plain, extended) = (
-                                    session.l4().max_memory_chunk(),
-                                    session.l4().max_extended_memory_chunk(),
-                                );
-                                let chunk = |start: usize, len: usize| {
-                                    chunk_at(addr + start as u32, len, plain, extended)
-                                };
+                            (None, Some(fill)) => {
+                                let caps = ChunkCaps::of(session.l4());
+                                let chunk =
+                                    |start: usize, len: usize| caps.at(addr + start as u32, len);
                                 let regions =
                                     fill_regions(&bytes, fill, sparse_merge_gap(), &chunk);
                                 for (start, run) in regions {
@@ -579,7 +753,9 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
                                         .await?;
                                 }
                             }
-                            None => write_image(session, addr, &bytes, &mut progress).await?,
+                            (None, None) => {
+                                write_image(session, addr, &bytes, &mut progress).await?
+                            }
                         }
                         if let Some(sample) = bytes.first().map(|_| take_sample(&bytes)) {
                             written_samples.push(WrittenSample {
@@ -609,13 +785,9 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
                             // A parameter-only download (issue #119): write only
                             // the octets that differ from what the device holds.
                             Some(current) => {
-                                let (plain, extended) = (
-                                    session.l4().max_memory_chunk(),
-                                    session.l4().max_extended_memory_chunk(),
-                                );
-                                let chunk = |start: usize, len: usize| {
-                                    chunk_at(addr + start as u32, len, plain, extended)
-                                };
+                                let caps = ChunkCaps::of(session.l4());
+                                let chunk =
+                                    |start: usize, len: usize| caps.at(addr + start as u32, len);
                                 let regions =
                                     diff_regions(&bytes, current, None, sparse_merge_gap(), &chunk);
                                 for (start, end) in regions {
@@ -703,6 +875,7 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
                         prop_id,
                         expected,
                         mask,
+                        start_element,
                     } => {
                         // Read the named interface object's property and compare it
                         // against the vendor's expected data. A `Range`-only op has no
@@ -714,6 +887,7 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
                                 session.l4(),
                                 *object,
                                 *prop_id,
+                                *start_element,
                                 expected,
                                 mask.as_deref(),
                             )
@@ -842,6 +1016,7 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
                             }
                         }
                     }
+                    FlashStep::Delay { milliseconds } => delay_step(*milliseconds).await,
                     FlashStep::LoadCompleted { target } => {
                         // Skip a completion for an object the device does not expose (a
                         // template LSM5 completion on a device without obj5).
@@ -863,17 +1038,26 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
                         erase_code,
                         channel_number,
                     } => {
-                        // Send the master reset as a BARE A_Restart (0x380), exactly as
-                        // ETS→KNX-Virtual does on the wire for an LdCtrlMasterReset — NOT
-                        // the confirmed master-reset A_Restart (0x381 + erase/channel).
-                        // The device T_ACKs it at the transport layer and then reboots,
-                        // dropping the L4 connection — the SPEC-REQUIRED single reconnect:
-                        // wait out the reboot, re-establish the connection and re-authorize.
-                        master_reset_via_basic_restart(session.l4(), *erase_code, *channel_number)
+                        // KNX 3/5/2 §3.7.1.2.3: a Master Reset is the confirmed
+                        // A_Restart (restart type 1) with the op's erase code and
+                        // channel number, answered by A_Restart_Response with an
+                        // error code and a process time. KNX Virtual alone gets the
+                        // bare A_Restart (0x380) its ETS capture shows. Either way
+                        // the device reboots and drops the L4 connection: wait it
+                        // out, reconnect and re-authorize. The support rule (error
+                        // code 2 falls back to a basic restart) is in the
+                        // `restart_form` module docs.
+                        if plan.targets_knx_virtual() {
+                            master_reset_via_basic_restart(
+                                session.l4(),
+                                *erase_code,
+                                *channel_number,
+                            )
                             .await?;
-                        // Wait out the reboot with a bounded poll (not a fixed
-                        // sleep) and re-establish the authorized connection.
-                        session.reconnect_after_reboot().await?;
+                            session.reconnect_after_reboot().await?;
+                        } else {
+                            master_reset_confirmed(session, *erase_code, *channel_number).await?;
+                        }
 
                         // The master reset ERASES the app object's load state (back to
                         // `Unloaded`) and drops the segment allocated before it (erase
@@ -1076,11 +1260,16 @@ async fn flash_steps<C: Connector, F: FnMut(Progress)>(
                     }
                     // System 7 steps are executed by `flash_sys7` (dispatched at the
                     // top of `flash`); a System B plan never carries them.
+                    FlashStep::KnxnetIpParameters { program } => {
+                        super::knxnet_ip::write_knxnet_ip(session.l4(), program).await?;
+                    }
                     FlashStep::Sys7Unload { .. }
                     | FlashStep::Sys7StartLoading { .. }
                     | FlashStep::Sys7AbsSegment { .. }
                     | FlashStep::Sys7TaskSegment { .. }
                     | FlashStep::Sys7TaskCtrl1 { .. }
+                    | FlashStep::Sys7TaskPtr { .. }
+                    | FlashStep::Sys7TaskCtrl2 { .. }
                     | FlashStep::Sys7LoadCompleted { .. }
                     | FlashStep::Sys7CompareMem { .. }
                     | FlashStep::Sys7PreDownloadRestart { .. }
@@ -1255,6 +1444,16 @@ pub(super) fn fill_regions<'a>(
         .collect()
 }
 
+/// The part of `bytes` (a segment's image, or the device's octets of it) a
+/// System B write step streams: `[image.offset, image.offset + image.len)`,
+/// cut to what `bytes` holds. The whole image for every step but the part
+/// writes of a segment a `<choose>` branch writes in part (issue #411).
+pub(super) fn image_part<'a>(bytes: &'a [u8], image: &super::ImageRef) -> &'a [u8] {
+    let start = image.offset.min(bytes.len());
+    let end = image.offset.saturating_add(image.len).min(bytes.len());
+    &bytes[start..end.max(start)]
+}
+
 /// The octet ranges `[start, end)` of `image` that differ from `current`, the
 /// memory the device holds today, in ascending order (issue #119). With a
 /// `mask`, only octets whose mask byte is `0xFF` are considered. Ranges are
@@ -1277,14 +1476,38 @@ pub(super) fn diff_regions(
     })
 }
 
-/// The write chunk [`write_image`] uses for a run of `len` octets at `addr`:
-/// the extended service's chunk when the run reaches past `0xFFFF`, else the
-/// plain one (see [`bussard_mgmt::write_memory_chunked`]).
-fn chunk_at(addr: u32, len: usize, plain: u8, extended: u16) -> usize {
-    if bussard_mgmt::select_extended_memory(addr, len) {
-        usize::from(extended)
-    } else {
-        usize::from(plain)
+/// The write chunks of a connection, per memory service, so the region
+/// planners can size runs without borrowing the session.
+#[derive(Debug, Clone, Copy)]
+struct ChunkCaps {
+    plain: u8,
+    extended: u16,
+    user: u8,
+    user_above_64k: bool,
+}
+
+impl ChunkCaps {
+    fn of<Ch: bussard_mgmt::L4Channel>(l4: &bussard_mgmt::Layer4Connection<Ch>) -> ChunkCaps {
+        ChunkCaps {
+            plain: l4.max_memory_chunk(),
+            extended: l4.max_extended_memory_chunk(),
+            user: l4.max_user_memory_chunk(),
+            user_above_64k: l4.user_memory_above_64k(),
+        }
+    }
+
+    /// The write chunk [`write_image`] uses for a run of `len` octets at
+    /// `addr`: the plain service's up to `0xFFFF`, above it the user-memory
+    /// (issue #472) or the extended service's (see
+    /// [`bussard_mgmt::write_memory_chunked`]).
+    fn at(&self, addr: u32, len: usize) -> usize {
+        if !bussard_mgmt::select_extended_memory(addr, len) {
+            usize::from(self.plain)
+        } else if self.user_above_64k {
+            usize::from(self.user)
+        } else {
+            usize::from(self.extended)
+        }
     }
 }
 
@@ -1323,21 +1546,43 @@ pub(super) async fn write_image<C: Connector, F: FnMut(Progress)>(
         // (reset the stall bound) from one that did not.
         let base = confirmed;
         let mut call_confirmed = confirmed;
+        let mut chunks = 0u64;
         let mut on_written = |written_in_call: usize| {
             call_confirmed = base + written_in_call;
+            chunks += 1;
             progress(Progress::Bytes {
                 written: call_confirmed,
                 total,
             });
         };
         let tail_addr = addr.saturating_add(confirmed as u32);
-        let result = bussard_mgmt::write_memory_chunked(
-            session.l4(),
-            tail_addr,
-            &bytes[confirmed..],
-            &mut on_written,
-        )
-        .await;
+        // A System 7 download in verify mode compares every echo (issue #524,
+        // Management Procedures 03_05_02 §3.16.3); a new connection sets the
+        // mode again first. Every other download writes as before.
+        let (echoed, result) = match session.ensure_verify_mode().await {
+            Ok(true) => (
+                true,
+                bussard_mgmt::write_memory_echoed(
+                    session.l4(),
+                    tail_addr,
+                    &bytes[confirmed..],
+                    &mut on_written,
+                )
+                .await,
+            ),
+            Ok(false) => (
+                false,
+                bussard_mgmt::write_memory_chunked(
+                    session.l4(),
+                    tail_addr,
+                    &bytes[confirmed..],
+                    &mut on_written,
+                )
+                .await,
+            ),
+            Err(e) => (false, Err(e)),
+        };
+        session.note_memory_chunks(chunks, echoed);
         let made_progress = call_confirmed > confirmed;
         confirmed = call_confirmed;
         match result {
@@ -1354,6 +1599,49 @@ pub(super) async fn write_image<C: Connector, F: FnMut(Progress)>(
                 session.reconnect().await?;
             }
             Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Runs a load procedure's `LdCtrlMasterReset` in the confirmed form (KNX
+/// 3/5/2 §3.7.1.2.3) and waits out the reboot.
+///
+/// - Error code 0: wait at least the announced process time (§3.7.1.2.2),
+///   then reconnect.
+/// - Error code 2, "unsupported erase code": the device does not support this
+///   Master Reset, so, as §3.7.1.2.3.1 requires of a client that finds no
+///   support, only a Basic Restart is sent.
+/// - Any other error code (access denied, invalid channel) fails the flash.
+/// - No answer: the device may have rebooted without one; the bounded
+///   reboot poll decides, as for the confirmed restart at the end.
+async fn master_reset_confirmed<C: Connector>(
+    session: &mut Session<C>,
+    erase_code: u8,
+    channel_number: u8,
+) -> Result<(), WriteError> {
+    match bussard_mgmt::master_reset(session.l4(), erase_code, channel_number).await {
+        Ok(response) => {
+            session
+                .reconnect_after_master_reset(
+                    RestartKind::MasterReset,
+                    bussard_mgmt::restart_process_wait(&response),
+                )
+                .await
+        }
+        Err(WriteError::RestartRefused { error_code: 2, .. }) => {
+            tracing::warn!(
+                erase_code,
+                channel_number,
+                "master reset answered \"unsupported erase code\"; sending a basic restart \
+                 instead (KNX 3/5/2 §3.7.1.2.3.1)"
+            );
+            master_reset_via_basic_restart(session.l4(), erase_code, channel_number).await?;
+            session.reconnect_after_reboot().await
+        }
+        Err(err @ WriteError::RestartRefused { .. }) => Err(err),
+        Err(err) => {
+            tracing::debug!(%err, "master reset not answered; polling for the reboot");
+            session.reconnect_after_reboot().await
         }
     }
 }

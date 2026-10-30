@@ -21,8 +21,15 @@ pub(super) fn step_label(step: &FlashStep) -> String {
                 bussard_mgmt::LoadControl::LoadCompleted => "complete load",
                 _ => "load control",
             };
+            // The read-back after the flash reads the state again (issue #534).
+            let check = if *control == bussard_mgmt::LoadControl::LoadCompleted {
+                "; the read-back checks it is still Loaded"
+            } else {
+                ""
+            };
             format!(
-                "Data Secure: {what} security object (A_FunctionPropertyExt_Command type 17 PID 5)"
+                "Data Secure: {what} security object (A_FunctionPropertyExt_Command type 17 PID \
+                 5{check})"
             )
         }
         FlashStep::SecurityClearAddressTable => {
@@ -68,12 +75,22 @@ pub(super) fn step_label(step: &FlashStep) -> String {
                 flags.len()
             )
         }
-        FlashStep::Unload { target } => format!("unload{}", target_suffix(*target)),
+        FlashStep::Unload {
+            target,
+            absent_ok: false,
+        } => format!("unload{}", target_suffix(*target)),
+        FlashStep::Unload {
+            target,
+            absent_ok: true,
+        } => format!(
+            "unload{} (an absent object is no error: LdCtrlMapError)",
+            target_suffix(*target)
+        ),
         FlashStep::StartLoading { target } => {
             format!("open for loading{}", target_suffix(*target))
         }
         FlashStep::AllocateSegment { size, target, fill } => {
-            let fill_note = match fill {
+            let fill_note = match fill.prefill() {
                 Some(b) => format!(", fill 0x{b:02X}"),
                 None => String::new(),
             };
@@ -130,8 +147,13 @@ pub(super) fn step_label(step: &FlashStep) -> String {
             object,
             prop_id,
             expected,
+            start_element,
             ..
         } => match expected {
+            Some(bytes) if *start_element > 1 => format!(
+                "verify property ({object}, PID {prop_id} element {start_element} == {} byte(s))",
+                bytes.len()
+            ),
             Some(bytes) => format!(
                 "verify property ({object}, PID {prop_id} == {} byte(s))",
                 bytes.len()
@@ -178,6 +200,9 @@ pub(super) fn step_label(step: &FlashStep) -> String {
             format!("complete load{}", target_suffix(*target))
         }
         FlashStep::Restart => "restart device".to_string(),
+        FlashStep::Delay { milliseconds } => {
+            format!("wait {milliseconds} ms (LdCtrlDelay), nothing sent")
+        }
         FlashStep::FactoryReset { erase_code } => format!(
             "factory reset (A_Restart master reset, erase code {erase_code}): erase application, \
              parameters and links, keep the individual address; wait for the reboot and reconnect \
@@ -219,6 +244,25 @@ pub(super) fn step_label(step: &FlashStep) -> String {
             address,
             count,
         } => format!("[S7] task control 1 at {address:#06X} x{count} on LSM {lsm}"),
+        FlashStep::Sys7TaskPtr {
+            lsm,
+            init,
+            save,
+            pei_handler,
+        } => format!(
+            "[S7] task pointers on LSM {lsm}: init {init:#06X}, save {save:#06X}, PEI handler \
+             {pei_handler:#06X}"
+        ),
+        FlashStep::Sys7TaskCtrl2 {
+            lsm,
+            callback,
+            com_objects,
+            segment_1,
+            segment_2,
+        } => format!(
+            "[S7] task control 2 on LSM {lsm}: callback {callback:#06X}, group objects \
+             {com_objects:#06X}, segments {segment_1:#06X}/{segment_2:#06X}"
+        ),
         FlashStep::Sys7LoadCompleted { lsm } => format!("[S7] complete load of LSM {lsm}"),
         FlashStep::Sys7CompareMem { address, expected } => format!(
             "[S7] verify memory at {address:#06X} == {} byte(s)",
@@ -236,6 +280,22 @@ pub(super) fn step_label(step: &FlashStep) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        FlashStep::KnxnetIpParameters { program } => {
+            let mut pids: Vec<String> = Vec::new();
+            for w in &program.writes {
+                let pid = w.prop_id.to_string();
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+            format!(
+                "write the KNXnet/IP parameters of [knxnet] ({}: PIDs {}, {} write(s), each read \
+                 back)",
+                program.object,
+                pids.join(", "),
+                program.writes.len()
+            )
+        }
         FlashStep::Sys7EnableVerifyMode => {
             "[S7] enable verify mode (object 0 PID_DEVICE_CONTROL bit 2, written only when clear)"
                 .to_string()

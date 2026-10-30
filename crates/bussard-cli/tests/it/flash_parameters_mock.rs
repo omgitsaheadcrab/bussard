@@ -9,8 +9,8 @@
 //! load-state machines, `PID_TABLE_REFERENCE` / `PID_PROGRAM_VERSION`, the two
 //! link tables (`PID_TABLE`), and `A_Memory_Read` / `A_Memory_Write`. Every
 //! load event and memory write is recorded, which is how the tests prove a
-//! parameter-only download unloads nothing, allocates nothing, touches no table
-//! and writes only the changed octet.
+//! parameter-only download unloads and re-allocates only the application
+//! object (issue #543), touches no table and writes only the changed octet.
 //!
 //! The synthetic `.knxprod` is zipped with the `zip` CLI at test time; the
 //! tests skip green when `zip` is unavailable, like `flash_dry_run.rs`. The
@@ -47,17 +47,14 @@ fn test_flash_parameters_only_writes_only_the_changed_octet() -> TestResult {
     assert_eq!(dev.memory_writes, vec![(PARAM_BASE, 1)], "{stderr}");
     assert_eq!(dev.memory.get(&PARAM_BASE).copied(), Some(12));
     assert_eq!(dev.memory.get(&(PARAM_BASE + 1)).copied(), Some(0));
-    // StartLoading + LoadCompleted on the app object only: no Unload, no
-    // segment allocation, no table object.
+    // The partial download of 03_05_03 §3.5.3 on the app object only
+    // (issue #543): Unload, StartLoading, the Mode 0 allocation,
+    // LoadCompleted; no table object.
     assert_eq!(
         dev.load_events,
-        vec![
-            (APP_OBJECT, LE_START_LOADING),
-            (APP_OBJECT, LE_LOAD_COMPLETED)
-        ],
+        PARTIAL_DOWNLOAD_EVENTS.to_vec(),
         "{stderr}"
     );
-    assert!(!dev.load_events.iter().any(|(_, e)| *e == LE_ADDITIONAL));
     assert!(dev.property_writes.is_empty(), "{:?}", dev.property_writes);
     assert_eq!(dev.restarts, 1, "the device restarts");
     assert_eq!(dev.load_states.get(&APP_OBJECT).copied(), Some(LS_LOADED));
@@ -114,7 +111,9 @@ fn test_flash_parameters_only_reads_on_the_preflight_and_write_sessions() -> Tes
     assert_eq!(dev.memory_writes, vec![(PARAM_BASE, 1)], "{stderr}");
     // The pre-flight, the write session, and the write session's
     // reconnect after the restart (whose first probe finds the device up).
-    assert_eq!(connects, 4, "{stderr}");
+    // `M-00FA_A-0002` is not a KNX Virtual application (issue #605), so the
+    // write session holds one connection instead of cycling it.
+    assert_eq!(connects, 3, "{stderr}");
     Ok(())
 }
 
@@ -153,9 +152,8 @@ fn flash_yes_run(
     };
     let mut args = vec!["flash", "1.1.4", "--product", bench.product()?, "--yes"];
     args.extend_from_slice(extra);
-    // The synthetic application is a KNX Virtual one (M-00FA), whose flashes
-    // cycle the connection every 10 exchanges (issue #116); 0 holds one
-    // connection, as for every other device.
+    // Holds one connection whatever the application (issue #116); the test app
+    // `M-00FA_A-0002` is not KNX Virtual (issue #605) and would hold one anyway.
     let mut env = vec![("BUSSARD_FLASH_RECONNECT_EXCHANGES", "0")];
     if !handover {
         env.push(("BUSSARD_FLASH_NO_HANDOVER", "1"));
@@ -271,9 +269,11 @@ fn test_flash_parameters_only_piped_output_is_unchanged() -> TestResult {
          \x20     Threshold: 7 to 12\n\
          \x20 memory      :\n\
          \x20     M-00FA_A-0002_RS-2 at 0x004006: 1 of 2 octet(s) change\n\
-         \x20 procedure   : open for loading (obj 4); write the differing parameter octets \
-         (segment of 2 bytes) at 0x4006; complete load (obj 4); restart device (no unload, no \
-         table write)\n\
+         \x20 procedure   : check obj4 is Loaded, then unload it (partial download, kept \
+         memory); open for loading (obj 4); re-allocate the 2-octet segment of obj4 in Mode 0 \
+         (keeps its contents); write the differing parameter octets (segment of 2 bytes) at the \
+         allocated base + 0x0, 0x4006 before the download; complete load (obj 4); restart device \
+         (no table write)\n\
          parameter backup written to <backup>\n\
          \n\
          parameters verified: 1 changed octet(s) read back from 1.1.4; the application is Loaded\n"
@@ -287,11 +287,14 @@ fn test_flash_parameters_only_piped_output_is_unchanged() -> TestResult {
     );
     assert_eq!(
         progress,
-        "  [1/4] open for loading (obj 4)\n\
-         \x20 [2/4] write the differing parameter octets (segment of 2 bytes) at 0x4006\n\
+        "  [1/6] check obj4 is Loaded, then unload it (partial download, kept memory)\n\
+         \x20 [2/6] open for loading (obj 4)\n\
+         \x20 [3/6] re-allocate the 2-octet segment of obj4 in Mode 0 (keeps its contents)\n\
+         \x20 [4/6] write the differing parameter octets (segment of 2 bytes) at the allocated \
+         base + 0x0, 0x4006 before the download\n\
          \r      1/1 bytes\n\
-         \x20 [3/4] complete load (obj 4)\n\
-         \x20 [4/4] restart device\n"
+         \x20 [5/6] complete load (obj 4)\n\
+         \x20 [6/6] restart device\n"
     );
     Ok(())
 }
@@ -665,10 +668,16 @@ fn test_reconstruct_without_key_on_a_secure_device_fails_with_hint() -> TestResu
 
 /// The synthetic application with a `size`-octet parameter segment (a multiple
 /// of 3, so its zero `Data` is `AAAA` repeated). The two parameters stay at
-/// offsets 0 and 1.
+/// offsets 0 and 1. It announces extended memory services, as the 07B0
+/// actuators it models do, so its segment above `0xFFFF` goes over
+/// `A_MemoryExtended_*` (issue #472).
 fn large_app_xml(size: usize) -> String {
     let data = "AAAA".repeat(size / 3);
     APP_XML
+        .replace(
+            "</Code>",
+            r#"</Code><Options SupportsExtendedMemoryServices="true" />"#,
+        )
         .replace(
             r#"<RelativeSegment Id="M-00FA_A-0002_RS-2" Size="2" LoadStateMachine="4" Offset="0"><Data>AAA=</Data>"#,
             &format!(
@@ -846,10 +855,7 @@ fn test_apply_writes_only_the_differing_parameter_octet() -> TestResult {
     // Only the application object loads: the link tables are left alone.
     assert_eq!(
         dev.load_events,
-        vec![
-            (APP_OBJECT, LE_START_LOADING),
-            (APP_OBJECT, LE_LOAD_COMPLETED)
-        ],
+        PARTIAL_DOWNLOAD_EVENTS.to_vec(),
         "{stderr}"
     );
     assert!(dev.property_writes.is_empty(), "{:?}", dev.property_writes);

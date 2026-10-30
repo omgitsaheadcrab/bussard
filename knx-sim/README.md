@@ -44,6 +44,19 @@ architecture.
   future read-only HTML visualization will consume. Today a `TracingSink` logs
   every telegram + state change to stdout.
 - File-driven config (`src/config`) that spins up a bus + devices from YAML.
+- Start from a recorded download (`src/replay.rs`): `replay: [a.pcap, b.pcap]`
+  at the top of the config replays every tunnelled `L_Data.req` of those
+  captures (classic pcap or pcapng; retransmissions once, answers dropped)
+  into the devices before the gateway opens, so a device begins in the state
+  the recorded tool left it in: load states, tables, table references and
+  properties. The ETS partial-download oracle uses it to run `bussard apply`
+  against ETS's state after a full download (bussard issues #469, #478).
+
+In bussard's testing, knx-sim is the third corner of a triangle with ETS and
+bussard: its calibration tests replay ETS captures, so it stays honest against
+ETS rather than against bussard, and bussard's flash-then-plan loop runs
+against it. See `dev/testing.md` in the bussard repository ("ETS, bussard and
+knx-sim: the triangle") and the synthetic product catalogue planned in #596.
 
 ## Run
 

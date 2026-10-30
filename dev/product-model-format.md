@@ -86,16 +86,19 @@ Field notes:
   device file) and its `application` (pinned in `bussard.lock`) both point here.
 - `com_objects`: keyed by com-object number, in the same field style as the `objects`
   of `bussard.lock`. `dpt` and `flags` (compact `CRWTUI` string) are the effective, ref-resolved
-  values. The System B group-object descriptor also carries a transmission priority
-  (Resources 3/5/1 §4.18.6, Table 87, bits 9 to 8); the model does not carry the product's
-  `Priority` yet, so every descriptor is written Low (#541). `size` appears only when there is
+  values. `priority` (format 8, #541) is the object's transmission priority: the ref's
+  `Priority`, else the base object's, in the product schema's terms: `High` (the standard's
+  normal, `01`), `Alert` (urgent, `10`) or `System` (`00`). It is left out when it is
+  `Low` (`11`), which is also what an object that declares none gets. The download writes
+  it into bits 9 to 8 of a System B group-object descriptor (Resources 3/5/1 §4.18.6,
+  Table 87) and bits 1 to 0 of a System 7 CONFIG octet (§4.18.3.1.2.1). `size` appears only when there is
   no DPT to imply it (the DPT main number fixes the format and so the size, the sub number only
   range and unit: KNX 03_07_02 Datapoint Types §1.1 and the format column of §1.4). `ref_id` is the
   application ref the value was resolved through.
 - `parameters`: each with its resolved `type`, `default`, and `memory` location. The
   `type` is a tagged union: `!int {min, max, size, signed}`,
   `!enum {values: [{value, text}]}`, `!text {size}`, `!float {encoding, min, max}`,
-  `!none`, or `!other {kind, size}`. `memory` (`segment` + `offset` + `bit_offset`) is
+  `!none`, `!color {space}` (format 11) or `!other {kind, size}`. `memory` (`segment` + `offset` + `bit_offset`) is
   what the parameter phase needs to place the value into the device's parameter memory.
 - `load_procedure`: the ordered op summary, a faithful view of the download script.
   `bussard flash` executes the supported subset; the op set and the standard clause behind
@@ -131,6 +134,43 @@ model as it runs over the application XML (`bussard_model::dynamic::DynamicSourc
   (`TextParameterRefId`), `param_ref` (block) and `nodes`; `module` is a `<Module>`
   with its `id`, `def` and `args`; `assign` an `<Assign>` with `target` and `source`
   or `value`. All ids are app-relative; absent attributes are left out.
+
+Format 7 adds a text type's `encoding` (#401). Format 8 adds a com-object's
+`priority` (#541). The download takes the priority from the parsed application
+program, whose cache format moved to `bussard-parsed-product-v5` with it; the model
+carries it so a view shows what the descriptor will hold.
+
+Format 9 adds `data_secure:` to an application that declares `IsSecureEnabled`
+(#537): its Data Secure table capacities, `max_group_key_table_entries`,
+`max_individual_address_entries` and `max_p2p_key_table_entries`, the
+application's `MaxSecurity*` attributes (each left out when the product gives no
+figure). `describe` shows them; the download checks the group key table (PID 53)
+and the security individual address table (PID 54) against the parsed
+application program, whose cache format moved to `bussard-parsed-product-v6`.
+
+Format 10 adds ETS module allocation (#449). `dynamic` and `module_dynamics` gain
+`repeat` (a `<Repeat>` with its `id`, the `ref` whose value is the count or a literal
+`count`, and `nodes`) and a module's `computed` arguments (`arg` with an `allocator`,
+or a literal `value`, plus an optional `base`, the `BaseValue` argument of the
+enclosing instance). `allocators` lists each `<Allocator>`'s `start` and
+`max_inclusive`, `argument_allocates` each module argument's `Allocates`. A
+submodule's `module_dynamics` entry is keyed by its own id (`MD-1_SM-1`). The parsed
+application program carries the same, in cache format `bussard-parsed-product-v7`.
+A text parameter's `initial_value` is its
+`InitialValue` in the import language (#473): the value a new device starts with,
+which wins over the `Value`s as the default.
+
+Format 11 gives a `<TypeColor>` parameter its own type, `color` with the declared
+`space` (`RGB`, `RGBW` or `HSV`), where format 10 wrote `other {kind: TypeColor}`
+(#616). Its value is `#` and two hex digits per component (`#FF0000`), placed in
+memory as one octet per component in the written order. The parsed application
+program carries the type in cache format `bussard-parsed-product-v8`.
+
+Format 12 marks a virtual parameter, one with no `memory`, no interface-object
+property and no union place, with `virtual: true` (#474). With the
+`identity.mask_version`, it lets the evaluator apply the System B rule for a
+`<choose>` whose only branch is the default one on a parameter no page shows: ETS
+takes no branch of it (see the module docs of `bussard_model::dynamic`).
 
 Format 6 drops `blocks`, `parameter_when` and `ref_values`, and a
 parameter's `default` is its own `Value` (format 5 and older gave a parameter with one

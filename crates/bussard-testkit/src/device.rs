@@ -33,12 +33,12 @@ use crate::consts::{
     A_PROPERTY_DESCRIPTION_RESPONSE, A_PROPERTY_EXT_DESCRIPTION_READ,
     A_PROPERTY_EXT_DESCRIPTION_RESPONSE, A_PROPERTY_EXT_VALUE_READ, A_PROPERTY_EXT_VALUE_RESPONSE,
     A_PROPERTY_EXT_VALUE_WRITE_CON, A_PROPERTY_EXT_VALUE_WRITE_CON_RESPONSE, A_PROPERTY_VALUE_READ,
-    A_PROPERTY_VALUE_RESPONSE, A_PROPERTY_VALUE_WRITE, A_RESTART, APCI_SELECTOR, LE_ADDITIONAL,
-    LE_LOAD_COMPLETED, LE_START_LOADING, LE_UNLOAD, LS_LOADED, LS_LOADING, LS_UNLOADED,
-    OT_ADDRESS_TABLE, OT_ASSOCIATION_TABLE, OT_DEVICE, OT_GROUP_OBJECT_TABLE,
-    OT_KNXNET_IP_PARAMETER, PID_IO_LIST, PID_LOAD_STATE_CONTROL, PID_MANUFACTURER_ID,
-    PID_OBJECT_TYPE, PID_ORDER_INFO, PID_PROGMODE, PID_SERIAL_NUMBER, PID_TABLE,
-    PID_TABLE_REFERENCE, SUB_REL_SEGMENT,
+    A_PROPERTY_VALUE_RESPONSE, A_PROPERTY_VALUE_WRITE, A_RESTART, A_USER_MEMORY_READ,
+    A_USER_MEMORY_RESPONSE, A_USER_MEMORY_WRITE, APCI_SELECTOR, LE_ADDITIONAL, LE_LOAD_COMPLETED,
+    LE_START_LOADING, LE_UNLOAD, LS_LOADED, LS_LOADING, LS_UNLOADED, OT_ADDRESS_TABLE,
+    OT_ASSOCIATION_TABLE, OT_DEVICE, OT_GROUP_OBJECT_TABLE, OT_KNXNET_IP_PARAMETER, PID_IO_LIST,
+    PID_LOAD_STATE_CONTROL, PID_MANUFACTURER_ID, PID_OBJECT_TYPE, PID_ORDER_INFO, PID_PROGMODE,
+    PID_SERIAL_NUMBER, PID_TABLE, PID_TABLE_REFERENCE, SUB_REL_SEGMENT,
 };
 
 /// The Data Secure SCF octet of an `S-A_Sync_Req` (tool access).
@@ -176,8 +176,18 @@ pub struct MockDevice {
     /// Where memory writes may land.
     pub memory_write_policy: MemoryWritePolicy,
     /// Answer `A_Memory_Write` with an `A_Memory_Response` echo (verify mode)
-    /// instead of a bare `T_ACK`.
+    /// instead of a bare `T_ACK`. `A_UserMemory_Write` likewise.
     pub echo_memory_writes: bool,
+    /// Whether the device serves `A_MemoryExtended_Read`/`_Write`. A device
+    /// whose application does not announce the services leaves them
+    /// unanswered (issue #472); `true` by default.
+    pub extended_memory: bool,
+    /// Where `LdCtrlRelSegment` places an object's segment instead of
+    /// [`segment_base_for`] (e.g. above `0xFFFF`, as the Zennio DALIBOX
+    /// places its parameter segment at `0x10000`).
+    pub segment_bases: HashMap<u8, u32>,
+    /// `A_UserMemory_Write`s seen, across every connection.
+    pub user_memory_writes: usize,
     /// The group-object table's element count, served as its `PID_TABLE` count.
     pub go_count: u16,
     /// `T_NAK` every memory write into a segment of this object type.
@@ -247,6 +257,38 @@ pub struct MockDevice {
     hook: Option<Hook>,
     control_hook: Option<ControlHook>,
     data_secure: Option<Arc<Mutex<DataSecureSession>>>,
+    /// How `A_MemoryExtended_Write` is confirmed (issue #575).
+    pub ext_write_confirmation: ExtWriteConfirmation,
+    /// The transport-layer connection timeout this device runs (03_03_04 §5,
+    /// E16), `None` for none (the default, every older test). See
+    /// [`MockDevice::with_connection_timeout`].
+    pub connection_timeout: Option<Duration>,
+    /// When the device last saw a frame of its connection, for
+    /// [`Self::connection_timeout`].
+    pub last_traffic: Option<std::time::Instant>,
+    /// How many further `S-A_Sync_Req`s the device acknowledges and drops,
+    /// as a device whose security layer is not up yet after a restart does
+    /// (issue #166). Counts down with every dropped request.
+    pub drop_sync_requests: usize,
+    /// How many numbered data telegrams arrived after the connection timed
+    /// out and were answered with `T_Disconnect` (03_03_04 §5.4.3, CLOSED,
+    /// A10).
+    pub timed_out_requests: usize,
+}
+
+/// How a [`MockDevice`] confirms an `A_MemoryExtended_Write` (03_03_07
+/// §3.4.9.2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExtWriteConfirmation {
+    /// `E_SUCCESS` (00h), the address and nothing else.
+    #[default]
+    Success,
+    /// `E_SUCCESS_WITH_CRC` (01h) with the CRC16-CCITT over the received
+    /// count, address and data, in the System B form.
+    SuccessWithCrc,
+    /// `E_SUCCESS_WITH_CRC` (01h) with a CRC that does not match: a chunk
+    /// that arrived damaged.
+    SuccessWithWrongCrc,
 }
 
 impl fmt::Debug for MockDevice {
@@ -318,6 +360,8 @@ pub struct MockPropertyDescription {
 /// interface at 1.1.200 with two tunnels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MockKnxnet {
+    /// PID 51 (project installation id).
+    pub project_installation_id: u16,
     /// PID 52.
     pub individual_address: IndividualAddress,
     /// PID 53.
@@ -347,6 +391,7 @@ pub struct MockKnxnet {
 impl Default for MockKnxnet {
     fn default() -> Self {
         MockKnxnet {
+            project_installation_id: 0,
             individual_address: IndividualAddress::from_raw(0x11C8),
             tunnels: vec![
                 IndividualAddress::from_raw(0x1116),
@@ -376,6 +421,7 @@ impl MockKnxnet {
             .collect();
         name.resize(30, 0);
         vec![
+            (51, 2, self.project_installation_id.to_be_bytes().to_vec()),
             (52, 2, self.individual_address.raw().to_be_bytes().to_vec()),
             (
                 53,
@@ -404,9 +450,11 @@ impl MockKnxnet {
 }
 
 /// The PIDs of the KNXnet/IP parameter object a writable mock interface
-/// takes writes on: the tunnelling addresses, the assignment method, the
-/// static address set and the friendly name.
-const KNXNET_WRITABLE: [u8; 6] = [53, 55, 60, 61, 62, 76];
+/// takes writes on: the project installation id, the tunnelling addresses,
+/// the assignment method, the static address set, the routing multicast
+/// address and TTL (the writes of an IP-enabled device's download, issue
+/// #455) and the friendly name.
+const KNXNET_WRITABLE: [u8; 9] = [51, 53, 55, 60, 61, 62, 66, 67, 76];
 
 /// The property descriptions of a mock KNXnet/IP parameter object, in
 /// property order: the values of `knxnet`, PID 53 with `tunnel_slots`
@@ -540,6 +588,9 @@ impl MockDevice {
             memory: HashMap::new(),
             memory_write_policy: MemoryWritePolicy::Anywhere,
             echo_memory_writes: true,
+            extended_memory: true,
+            segment_bases: HashMap::new(),
+            user_memory_writes: 0,
             go_count: 0,
             nak_writes_into: None,
             silent: false,
@@ -567,6 +618,11 @@ impl MockDevice {
             hook: None,
             control_hook: None,
             data_secure: None,
+            ext_write_confirmation: ExtWriteConfirmation::Success,
+            connection_timeout: None,
+            last_traffic: None,
+            drop_sync_requests: 0,
+            timed_out_requests: 0,
         }
     }
 
@@ -752,6 +808,20 @@ impl MockDevice {
         self
     }
 
+    /// Leaves `A_MemoryExtended_Read`/`_Write` unanswered: an application
+    /// without extended memory services (issue #472).
+    pub fn without_extended_memory(mut self) -> Self {
+        self.extended_memory = false;
+        self
+    }
+
+    /// Places `object_index`'s segment at `base` when `LdCtrlRelSegment`
+    /// allocates it.
+    pub fn with_segment_base(mut self, object_index: u8, base: u32) -> Self {
+        self.segment_bases.insert(object_index, base);
+        self
+    }
+
     /// Places a System B table image (count word plus elements) for
     /// `object_index` at [`segment_base_for`] and marks it `Loaded`, as if a
     /// download had run.
@@ -782,6 +852,41 @@ impl MockDevice {
         self.data_secure = Some(Arc::new(Mutex::new(DataSecureSession::new(Key16::new(
             tool_key,
         )))));
+        self
+    }
+
+    /// Confirms `A_MemoryExtended_Write` as `confirmation` says (issue #575).
+    pub fn with_ext_write_confirmation(mut self, confirmation: ExtWriteConfirmation) -> Self {
+        self.ext_write_confirmation = confirmation;
+        self
+    }
+
+    /// Runs a transport-layer connection timeout of `timeout` (03_03_04 §5,
+    /// 6 s on a real device): a connection that saw no frame for that long is
+    /// closed, and the next numbered data telegram that arrives without a new
+    /// `T_Connect` is answered with `T_Disconnect` and not processed (CLOSED,
+    /// A10), as the Style 3 server of knx-sim does.
+    pub fn with_connection_timeout(mut self, timeout: Duration) -> Self {
+        self.connection_timeout = Some(timeout);
+        self
+    }
+
+    /// Whether the connection timed out before the frame now arriving, and
+    /// restarts the timer. A device without a connection timeout never does.
+    pub fn connection_timed_out(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let last = self.last_traffic.replace(now);
+        match (self.connection_timeout, last) {
+            (Some(timeout), Some(last)) => now.duration_since(last) >= timeout,
+            _ => false,
+        }
+    }
+
+    /// Acknowledges and drops the first `count` `S-A_Sync_Req`s, as a Data
+    /// Secure device does while its security layer comes up after a restart
+    /// (issue #166).
+    pub fn with_dropped_sync_requests(mut self, count: usize) -> Self {
+        self.drop_sync_requests = count;
         self
     }
 
@@ -1016,9 +1121,16 @@ impl MockDevice {
             Err(poisoned) => poisoned.into_inner(),
         };
         if data.first() == Some(&SCF_SYNC_REQ) {
+            if self.drop_sync_requests > 0 {
+                self.drop_sync_requests -= 1;
+                return Reaction::Ack;
+            }
+            // A Sync_Req under another key does not verify: the transport
+            // layer acknowledges it, the security layer drops it (the shape
+            // `AsduError::SyncUnanswered` describes, issue #532).
             return match session.answer_sync_request(&req_addr, data, &resp_addr) {
                 Ok((rapci, rdata)) => Reaction::Answer(rapci, rdata),
-                Err(_) => Reaction::Silent,
+                Err(_) => Reaction::Ack,
             };
         }
         let Ok(UnwrapOutcome::Secured {
@@ -1067,8 +1179,13 @@ impl MockDevice {
             return self.memory_write(data);
         }
         match apci {
+            A_MEMORY_EXTENDED_READ | A_MEMORY_EXTENDED_WRITE if !self.extended_memory => {
+                Reaction::Silent
+            }
             A_MEMORY_EXTENDED_READ => self.memory_extended_read(data),
             A_MEMORY_EXTENDED_WRITE => self.memory_extended_write(data),
+            A_USER_MEMORY_READ => self.user_memory_read(data),
+            A_USER_MEMORY_WRITE => self.user_memory_write(data),
             A_PROPERTY_VALUE_READ => self.property_read(data),
             A_PROPERTY_EXT_VALUE_READ => self.property_ext_read(data),
             A_PROPERTY_EXT_VALUE_WRITE_CON => self.property_ext_write(data),
@@ -1141,6 +1258,44 @@ impl MockDevice {
         Reaction::Answer(A_MEMORY_RESPONSE | (value.len() as u16 & 0x3f), payload)
     }
 
+    /// The 20-bit address and the count of a user-memory header.
+    fn user_memory_header(data: &[u8]) -> Option<(u32, usize)> {
+        let h = data.get(..3)?;
+        let addr = (u32::from(h[0] >> 4) << 16) | u32::from(u16::from_be_bytes([h[1], h[2]]));
+        Some((addr, usize::from(h[0] & 0x0F)))
+    }
+
+    fn user_memory_read(&self, data: &[u8]) -> Reaction {
+        let Some((addr, count)) = Self::user_memory_header(data) else {
+            return Reaction::Nak;
+        };
+        let mut payload = data[..3].to_vec();
+        payload.extend_from_slice(&self.read_mem(addr, count));
+        Reaction::Answer(A_USER_MEMORY_RESPONSE, payload)
+    }
+
+    fn user_memory_write(&mut self, data: &[u8]) -> Reaction {
+        self.writes += 1;
+        self.user_memory_writes += 1;
+        let Some((addr, count)) = Self::user_memory_header(data) else {
+            return Reaction::Nak;
+        };
+        let Some(value) = data.get(3..3 + count) else {
+            return Reaction::Nak;
+        };
+        if !self.write_mem(addr, value) {
+            return Reaction::Nak;
+        }
+        if !self.echo_memory_writes {
+            return Reaction::Ack;
+        }
+        // Verify mode: the device reads the area back and answers with it
+        // (03_03_07 §3.5.6.3).
+        let mut payload = data[..3].to_vec();
+        payload.extend_from_slice(&self.read_mem(addr, count));
+        Reaction::Answer(A_USER_MEMORY_RESPONSE, payload)
+    }
+
     fn memory_extended_read(&self, data: &[u8]) -> Reaction {
         if data.len() < 4 {
             return Reaction::Nak;
@@ -1162,10 +1317,19 @@ impl MockDevice {
         if data.len() < 4 + count || !self.write_mem(addr, &data[4..4 + count]) {
             return Reaction::Nak;
         }
-        Reaction::Answer(
-            A_MEMORY_EXTENDED_WRITE_RESPONSE,
-            vec![0x00, data[1], data[2], data[3]],
-        )
+        let request = &data[..4 + count];
+        let answer = match self.ext_write_confirmation {
+            ExtWriteConfirmation::Success => vec![0x00, data[1], data[2], data[3]],
+            ExtWriteConfirmation::SuccessWithCrc | ExtWriteConfirmation::SuccessWithWrongCrc => {
+                let mut crc = crate::consts::crc16_system_b(request);
+                if self.ext_write_confirmation == ExtWriteConfirmation::SuccessWithWrongCrc {
+                    crc ^= 0x0101;
+                }
+                let [hi, lo] = crc.to_be_bytes();
+                vec![0x01, data[1], data[2], data[3], hi, lo]
+            }
+        };
+        Reaction::Answer(A_MEMORY_EXTENDED_WRITE_RESPONSE, answer)
     }
 
     /// The extended property `object_type`/`pid` of instance 1: the shared
@@ -1468,7 +1632,12 @@ impl MockDevice {
                         self.memory.remove(&old_base.wrapping_add(i));
                     }
                 }
-                self.segments.insert(oi, (segment_base_for(oi), size));
+                let base = self
+                    .segment_bases
+                    .get(&oi)
+                    .copied()
+                    .unwrap_or_else(|| segment_base_for(oi));
+                self.segments.insert(oi, (base, size));
             }
             return answer(self.load_state(oi));
         }

@@ -340,12 +340,44 @@ class TestApciDecoding(unittest.TestCase):
         self.assertEqual(apdu.fields["addr"], "0x012345")
         self.assertEqual(apdu.fields["count"], 4)
 
+    def test_decode_apdu_user_memory(self):
+        """The 20-bit address form ETS uses above 64 KB on an application
+        without extended memory services (issue #472)."""
+        payload = bytes([0x13, 0x00, 0x10]) + b"\xaa\xbb\xcc"
+        write = self.apdu(numbered(0, 0x2C2, payload)).apdu
+        self.assertEqual(write.name, "A_UserMemory_Write")
+        self.assertEqual(write.fields["addr"], "0x010010")
+        self.assertEqual((write.fields["count"], write.fields["data"]), (3, "aabbcc"))
+        read = self.apdu(numbered(0, 0x2C0, bytes([0x12, 0x34, 0x56]))).apdu
+        self.assertEqual((read.name, read.fields["addr"], read.fields["count"]), ("A_UserMemory_Read", "0x013456", 2))
+        resp = self.apdu(numbered(0, 0x2C1, payload)).apdu
+        self.assertEqual((resp.name, resp.fields["data"]), ("A_UserMemory_Response", "aabbcc"))
+        op = norm.op_from_apdu(write, "req", 0.0)
+        self.assertEqual((op.kind, op.detail["addr_int"], op.data), (norm.KIND_MEM_WRITE, 0x10010, b"\xaa\xbb\xcc"))
+        self.assertTrue(op.detail["user"])
+
     def test_decode_apdu_restart_variants(self):
         basic = self.apdu(numbered(0, 0x380)).apdu
         self.assertEqual(basic.fields["type"], "basic")
         master = self.apdu(numbered(0, 0x381, b"\x01\x00")).apdu
         self.assertEqual(master.fields["type"], "master-reset")
         self.assertEqual(master.fields["erase_code"], 1)
+
+    def test_decode_apdu_memory_bit_write_and_adc(self):
+        # 03_03_07 section 2: 0x3D0 is A_MemoryBit_Write; A_ADC_Read/_Response
+        # are the 4-bit codes 0110/0111 with the channel in the low 6 bits.
+        self.assertEqual(self.apdu(numbered(0, 0x3D0)).apdu.name, "A_MemoryBit_Write")
+        adc = self.apdu(numbered(0, 0x182, b"\x08")).apdu
+        self.assertEqual(adc.name, "A_ADC_Read")
+        self.assertEqual(adc.fields["channel"], 2)
+        resp = self.apdu(numbered(0, 0x1C2, b"\x08\x01\x00")).apdu
+        self.assertEqual(resp.name, "A_ADC_Response")
+        self.assertEqual(resp.fields["channel"], 2)
+        # The exact codes in the 0111 range stay their own services.
+        self.assertEqual(
+            self.apdu(numbered(0, 0x1D1)).apdu.name, "A_PropertyExtValue_InfoReport"
+        )
+        self.assertEqual(self.apdu(numbered(0, 0x3E4)).apdu.name, "A_NetworkParameter_Write")
 
     def test_decode_apdu_individual_address(self):
         apdu = self.apdu(numbered(0, 0x0C0, struct.pack("!H", ia("1.1.47")))).apdu
@@ -944,22 +976,65 @@ class TestReadConfirmed(unittest.TestCase):
         self.assertEqual(ets.confirmed, {0x4000: 0xAA, 0x4002: 0xCC, 0x4003: 0xDD})
         self.assertEqual(ets.get(0x4001), 0x11)
 
-    def test_compare_confirmed_identical_while_written_is_thin(self):
+    def test_compare_confirmed_equal_octets_count_toward_coverage(self):
+        # 1 of 4 placed octets written; the other 3 read-confirmed and equal
+        # (issue #422): they count, so the row is compared in full.
         report = memimage.compare(self.plan(b"\xaa\x11\xcc\xdd"), self.image())
-        self.assertEqual(report["verdict"], memimage.NOT_COMPARABLE)  # 1 of 4 written
+        self.assertEqual(report["verdict"], memimage.IDENTICAL)
+        cov = report["coverage"]
+        self.assertEqual((cov["compared"], cov["written_compared"], cov["confirmed_counted"], cov["percent"]),
+                         (4, 1, 3, 100.0))
         conf = report["confirmed"]
         self.assertEqual((conf["verdict"], conf["octets"], conf["compared"], conf["placed"]),
                          (memimage.IDENTICAL, 3, 3, 4))
         self.assertEqual(conf["percent"], 75.0)
         text = "\n".join(memimage.render(report))
-        self.assertIn("written: not-comparable, confirmed: identical (3 octets)", text)
+        self.assertIn("written: identical, confirmed: identical (3 octets)", text)
+        self.assertIn("4 of 4 placed octets compared, 3 of them read-confirmed", text)
         self.assertIn("confirmed coverage 75.0 %", text)
+
+    def test_compare_confirmed_equal_page_is_not_blind(self):
+        # The association table of a 0701 read-compare download: one page
+        # written in full, the other page's placed octets only read and equal.
+        path = tempfile.mkstemp(suffix=".pcapng")[1]
+        self.addCleanup(os.unlink, path)
+        tool, dev = "0.0.0", "1.1.5"
+        frames = [
+            cemi_ldata(tool, dev, t_connect()),
+            cemi_ldata(tool, dev, mem_write(0x4000, b"\x01\x02\x03\x04", seq=0)),
+            cemi_ldata(tool, dev, mem_read(0x4100, 2, seq=1)),
+            cemi_ldata(dev, tool, mem_response(0x4100, b"\x05\x06", seq=0), mc=0x29),
+            cemi_ldata(tool, dev, t_disconnect()),
+        ]
+        udp_capture(path, [(tunneling_request(f, seq=n), True) for n, f in enumerate(frames)])
+        out = self.tmpdir()
+        self.assertEqual(main(["image", path, "--device", "1.1.5", "--out", out]), 0)
+        plan_dir = self.tmpdir()
+        steps = []
+        for n, (addr, data) in enumerate(((0x4000, b"\x01\x02\x03\x04"), (0x4100, b"\x05\x06"))):
+            with open(os.path.join(plan_dir, "p%d.bin" % n), "wb") as fh:
+                fh.write(data)
+            steps.append({"index": n + 1, "label": "", "image": {
+                "image_kind": "parameters", "object": None, "offset": 0, "address": addr,
+                "file": "p%d.bin" % n, "length": len(data), "mask_file": None}})
+        with open(os.path.join(plan_dir, "plan.json"), "w") as fh:
+            json.dump({"device": "1.1.5", "system": "7", "application": {"id": "M-00FA_A-1"},
+                       "steps": steps, "tables": []}, fh)
+        report = memimage.compare(plan_dir, out)
+        self.assertEqual(report["verdict"], memimage.IDENTICAL)
+        self.assertEqual(report["coverage"]["blind_pages"], [])
+        # The page's region itself still says ETS wrote nothing there.
+        self.assertEqual(report["regions"][1]["verdict"], memimage.NOT_COMPARABLE)
 
     def test_compare_confirmed_mismatch_is_reported_separately(self):
         report = memimage.compare(self.plan(b"\xaa\x11\xcc\x00"), self.image())
         par = report["regions"][0]
         # The written octet matches; the confirmed side names the mismatch.
         self.assertEqual(par["verdict"], memimage.IDENTICAL)
+        # A differing read-confirmed octet: the coverage is the written
+        # octets' alone, 1 of 4, so the row is thin.
+        self.assertEqual(report["verdict"], memimage.NOT_COMPARABLE)
+        self.assertEqual((report["coverage"]["compared"], report["coverage"]["confirmed_counted"]), (1, 0))
         conf = report["confirmed"]
         self.assertEqual(conf["verdict"], memimage.DIFFERS)
         self.assertEqual(conf["mismatches"], [{"address": 0x4003, "offset": 3, "bussard": "00",
@@ -2161,6 +2236,52 @@ class TestIpSecureCompare(unittest.TestCase):
         self.assertIn("clock", props["matched"][0]["why"])
 
 
+class TestResidentState(unittest.TestCase):
+    """`resident.json`: what the device answered before the download (#490)."""
+
+    def image_dir(self, frames) -> str:
+        path = tempfile.mkstemp(suffix=".pcapng")[1]
+        self.addCleanup(os.unlink, path)
+        udp_capture(path, [(tunneling_request(f, seq=n), True) for n, f in enumerate(frames)])
+        out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        self.assertEqual(main(["image", path, "--device", "1.1.5", "--out", out]), 0)
+        return out
+
+    def test_compose_writes_the_reads_before_the_first_load_control(self):
+        tool, dev = "0.0.0", "1.1.5"
+        mcb = bytes.fromhex("000005f600330b93")
+        frames = [
+            cemi_ldata(tool, dev, t_connect()),
+            cemi_ldata(dev, tool, prop_response(4, 5, 1, 1, b"\x01", seq=0), mc=0x29),
+            cemi_ldata(dev, tool, prop_response(4, 13, 1, 1, bytes.fromhex("000420de22"), seq=1),
+                       mc=0x29),
+            cemi_ldata(dev, tool, prop_response(5, 5, 1, 1, b"\x00", seq=2), mc=0x29),
+            cemi_ldata(dev, tool, prop_response(3, 27, 1, 1, mcb, seq=3), mc=0x29),
+            cemi_ldata(tool, dev, prop_write(4, 5, 1, 1, bytes([4]) + bytes(9), seq=0)),
+            # After the first load control: not the resident state.
+            cemi_ldata(dev, tool, prop_response(1, 27, 1, 1, mcb, seq=4), mc=0x29),
+            cemi_ldata(tool, dev, t_disconnect()),
+        ]
+        with open(os.path.join(self.image_dir(frames), memimage.RESIDENT_FILE)) as fh:
+            resident = json.load(fh)
+        self.assertEqual(resident, {
+            "objects": [{"index": 4, "state": 1}, {"index": 5, "state": 0}],
+            "mcb": {"3": mcb.hex()},
+            "app_id": "000420de22",
+        })
+
+    def test_compose_writes_no_resident_state_without_a_load_state_read(self):
+        tool, dev = "0.0.0", "1.1.5"
+        frames = [
+            cemi_ldata(tool, dev, t_connect()),
+            cemi_ldata(tool, dev, prop_write(4, 5, 1, 1, bytes([4]) + bytes(9), seq=0)),
+            cemi_ldata(tool, dev, t_disconnect()),
+        ]
+        out = self.image_dir(frames)
+        self.assertFalse(os.path.exists(os.path.join(out, memimage.RESIDENT_FILE)))
+
+
 class TestLoadControls(unittest.TestCase):
     """`load_controls.json` and the load-control parity (issue #419)."""
 
@@ -2268,6 +2389,73 @@ class TestLoadControls(unittest.TestCase):
         lc = memimage.compare_load_controls(plan, ets)
         self.assertEqual(lc["verdict"], memimage.IDENTICAL, lc)
         self.assertTrue(lc["notes"])
+
+
+class TestStateDiff(unittest.TestCase):
+    """`statediff`: the device state after a partial download (issue #469)."""
+
+    START = bytes([1]) + bytes(9)
+    DONE = bytes([2]) + bytes(9)
+    # AbsSegment of the address table at 0x4000, 0x20 octets.
+    SEG = bytes.fromhex("030040000020ff038000")
+
+    def capture(self, writes, records=()) -> str:
+        """A capture of 1.1.5: the load-control records of object 1, then the
+        memory writes."""
+        path = tempfile.mkstemp(suffix=".pcapng")[1]
+        self.addCleanup(os.unlink, path)
+        tool, dev = "0.0.0", "1.1.5"
+        frames = [cemi_ldata(tool, dev, t_connect())]
+        seq = 0
+        for rec in records:
+            frames.append(cemi_ldata(tool, dev, prop_write(1, 5, 1, 1, rec, seq=seq)))
+            seq += 1
+        for addr, data in writes:
+            frames.append(cemi_ldata(tool, dev, mem_write(addr, data, seq=seq)))
+            seq += 1
+        frames.append(cemi_ldata(tool, dev, t_disconnect()))
+        udp_capture(path, [(tunneling_request(f, seq=n), True) for n, f in enumerate(frames)])
+        return path
+
+    def run_cli(self, *argv) -> dict:
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main(["statediff", *argv, "--device", "1.1.5", "--json"])
+        return json.loads(buf.getvalue())
+
+    def test_statediff_chunked_rewrite_equals_single_octet(self):
+        # The base holds a table; ETS rewrites all of it, bussard one octet,
+        # and both end in the same state.
+        base = self.capture([(0x4000, b"\x02\x0a\x0b\x0c")], [self.START, self.SEG, self.DONE])
+        ets = self.capture([(0x4000, b"\x02\x0a"), (0x4002, b"\x1b\x0c")], [self.START, self.SEG, self.DONE])
+        ours = self.capture([(0x4002, b"\x1b")], [self.START, self.SEG, self.DONE])
+        r = self.run_cli("--base", base, "--ets", ets, "--bussard", ours)
+        self.assertEqual(r["verdict"], memimage.IDENTICAL)
+        self.assertEqual([(g["region"], g["compared"]) for g in r["regions"]], [("address table", 4)])
+        self.assertEqual(r["load_controls"]["verdict"], memimage.IDENTICAL)
+
+    def test_statediff_value_and_unknown_octets_differ(self):
+        base = self.capture([(0x4000, b"\x02\x0a")])
+        ets = self.capture([(0x4000, b"\x03")])
+        # bussard writes the count wrong and an octet ETS never had a value for.
+        ours = self.capture([(0x4000, b"\x04"), (0x4010, b"\x11")])
+        r = self.run_cli("--base", base, "--ets", ets, "--bussard", ours)
+        self.assertEqual(r["verdict"], memimage.DIFFERS)
+        reg = r["regions"][0]
+        self.assertEqual((reg["diff_octets"], reg["unknown_octets"]), (2, 1))
+        self.assertEqual(reg["differences"][1], {"address": 0x4010, "bussard": "11", "ets": "--"})
+
+    def test_statediff_load_control_ets_only(self):
+        base = self.capture([(0x4000, b"\x02")])
+        ets = self.capture([(0x4000, b"\x02")], [self.START, self.DONE])
+        ours = self.capture([(0x4000, b"\x02")])
+        r = self.run_cli("--base", base, "--ets", ets, "--bussard", ours)
+        self.assertEqual(r["verdict"], memimage.IDENTICAL)
+        self.assertEqual(r["load_controls"]["verdict"], memimage.DIFFERS)
+        self.assertEqual([d["kind"] for d in r["load_controls"]["differences"]], ["ets-only", "ets-only"])
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ use crate::connection::{
     describe_object_properties, property_description_request, property_request,
     property_write_request,
 };
-use crate::error::{MgmtError, Result, raw_response_detail};
+use crate::error::{MgmtError, Result};
 
 /// A management client bound to a single device over a connection-oriented
 /// session.
@@ -299,7 +299,15 @@ impl<Ch: L4Channel> DeviceConnection<Ch> {
     ///
     /// An empty `data` is a no-op.
     pub async fn write_memory(&mut self, addr: u32, data: &[u8]) -> Result<()> {
-        let chunk = usize::from(apci::MAX_MEMORY_WRITE_LEN);
+        // An application without extended memory services is written above
+        // 0xFFFF with A_UserMemory_Write, 15 octets at most (issue #472).
+        let user = crate::memory::memory_service(&self.inner, addr, data.len())
+            == crate::memory::MemoryService::User;
+        let chunk = if user {
+            usize::from(apci::MAX_USER_MEMORY_LEN)
+        } else {
+            usize::from(apci::MAX_MEMORY_WRITE_LEN)
+        };
         let mut offset = 0usize;
         while offset < data.len() {
             let take = chunk.min(data.len() - offset);
@@ -319,38 +327,37 @@ impl<Ch: L4Channel> DeviceConnection<Ch> {
             // from the address, keeping the ≤16-bit path byte-identical. The
             // extended write is confirmed inline; the plain write is verified by a
             // separate read-back compare (the historical dump-primitive discipline).
-            if crate::memory::select_extended_memory(chunk_addr, take) {
+            if !user && crate::memory::select_extended_memory(chunk_addr, take) {
                 let (req_apci, payload) = apci::encode_memory_extended_write(chunk_addr, piece);
                 let (resp_apci, resp) = self.inner.request(req_apci, &payload).await?;
-                let parsed =
-                    apci::decode_memory_extended_response(resp_apci, &resp).ok_or_else(|| {
-                        MgmtError::MalformedResponse {
-                            address: self.inner.target(),
-                            reason: format!(
-                                "expected A_MemoryExtended_Write_Response ({})",
-                                raw_response_detail(resp_apci, &resp)
-                            ),
-                        }
-                    })?;
-                if parsed.return_code != 0 {
-                    return Err(MgmtError::MemoryVerifyFailed {
-                        address: self.inner.target(),
-                        addr: chunk_addr,
-                        expected: piece.to_vec(),
-                        got: Vec::new(),
-                    });
-                }
+                crate::memory::check_extended_write_response(
+                    self.inner.target(),
+                    chunk_addr,
+                    &payload,
+                    resp_apci,
+                    &resp,
+                )?;
                 offset += take;
                 continue;
             }
 
-            let (req_apci, payload) = apci::encode_memory_write(chunk_addr as u16, piece);
-            // A_Memory_Write is acknowledged (T_ACK) but not answered, so send it
-            // and wait only for the ACK; the read-back is the confirmation.
+            let (req_apci, payload) = if user {
+                apci::encode_user_memory_write(chunk_addr, piece)
+            } else {
+                apci::encode_memory_write(chunk_addr as u16, piece)
+            };
+            // A_Memory_Write (and A_UserMemory_Write) is acknowledged (T_ACK) but
+            // not answered, so send it and wait only for the ACK; the read-back
+            // is the confirmation.
             self.inner.send_data(req_apci, &payload).await?;
+            if user {
+                self.inner.discard_pending_response();
+            }
 
             // Verify: read the same address back and compare octet-for-octet.
-            let got = self.read_memory(chunk_addr, take as u8).await?;
+            let got = crate::memory::read_memory_strict(&mut self.inner, chunk_addr, take as u8)
+                .await
+                .map_err(|e| self.memory_error(e))?;
             if got != piece {
                 return Err(MgmtError::MemoryVerifyFailed {
                     address: self.inner.target(),

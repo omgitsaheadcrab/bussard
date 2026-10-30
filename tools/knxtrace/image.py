@@ -1,8 +1,8 @@
 """Memory images: what a download wrote, and how it compares to bussard's plan.
 
 `compose` turns one device's normalized operation sequence into the memory it
-wrote: one region per contiguous run of `A_Memory_Write`/`A_MemoryExtended_Write`
-octets (later writes win, like the device), plus the segment allocation records
+wrote: one region per contiguous run of `A_Memory_Write`/`A_MemoryExtended_Write`/
+`A_UserMemory_Write` octets (later writes win, like the device), plus the segment allocation records
 seen along the way. A System B `LdCtrlRelSegment` does not name an address; the
 device picks the base and the tool reads it back as `PID_TABLE_REFERENCE`, so
 the first table reference read for that object after the allocation is taken as
@@ -78,7 +78,11 @@ default). A row whose images match but whose coverage is below the threshold
 (50 % of the placed octets by default), or that has a page with placed octets
 and none compared, is "not comparable" (thin), never "identical": ETS
 read-compared or skipped what the device already held, so the capture carries
-no evidence for those octets.
+no evidence for those octets. A read-confirmed octet is such evidence (issue
+#422): when every read-confirmed octet of the row equals bussard's, those
+octets count as compared next to the written ones (`confirmed_counted`), so a
+page whose placed octets ETS only read and kept is not blind. One differing
+read-confirmed octet and the coverage is the written octets' alone.
 """
 
 from __future__ import annotations
@@ -92,7 +96,15 @@ import struct
 from typing import Dict, List, Optional, Tuple
 
 from datasecure import PID_SECURITY_INDIVIDUAL_ADDRESS_TABLE, SECURITY_OBJECT_TYPE, is_key_material
-from normalize import KIND_ALLOC, KIND_MEM_WRITE, DeviceOps, coalesce
+from normalize import (
+    KIND_ALLOC,
+    KIND_LOAD_EVENT,
+    KIND_MEM_WRITE,
+    KIND_PROP_READ,
+    KIND_RESTART,
+    DeviceOps,
+    coalesce,
+)
 
 # LdCtrl subtypes of an `AdditionalLoadControls` (event 3) record.
 # AbsSegment, data (00h) or stack (01h, SegType 1): [3][sub][start:2][len:2][acc][mem][attr][0]
@@ -212,7 +224,11 @@ def table_refs(ops: DeviceOps) -> Dict[int, int]:
 
 # Responses that carry memory the device holds (an extended write response
 # carries a return code and maybe a CRC, never memory).
-MEMORY_READ_RESPONSES = ("A_Memory_Response", "A_MemoryExtended_Read_Response")
+MEMORY_READ_RESPONSES = (
+    "A_Memory_Response",
+    "A_MemoryExtended_Read_Response",
+    "A_UserMemory_Response",
+)
 
 
 def memory_reads(ops: DeviceOps) -> List[Tuple[int, bytes]]:
@@ -407,6 +423,65 @@ def load_control_writes(ops: DeviceOps) -> List[Dict[str, object]]:
     return out
 
 
+# The device state the tool read before the download (issue #490), the file
+# `compose` writes and `bussard flash --dry-run --resident` reads.
+RESIDENT_FILE = "resident.json"
+PID_PROGRAM_VERSION = 13
+PID_MCB_TABLE = 27
+MCB_ENTRY_LEN = 8
+
+
+def resident_state(ops: DeviceOps) -> Optional[Dict[str, object]]:
+    """What the device answered the tool before the download, in the form
+    `bussard flash --dry-run --resident` reads (issue #490): the
+    `PID_LOAD_STATE_CONTROL` octet of every object whose load state was read,
+    the `PID_PROGRAM_VERSION` of the first loaded object that answered one,
+    and the first `PID_MCB_TABLE` entry per object, all hex.
+
+    Only the answers between the last restart before the download and the
+    first load-control write count: a factory reset ETS opens a download with
+    erases what was read before it. `None` when no load state was read (the
+    dry run then plans without a device state, as before).
+    """
+    states: Dict[int, int] = {}
+    versions: Dict[int, bytes] = {}
+    mcb: Dict[int, bytes] = {}
+    for op in ops.ops:
+        if op.direction == "req" and op.kind in (KIND_LOAD_EVENT, KIND_ALLOC, KIND_MEM_WRITE):
+            break
+        if op.direction == "req" and op.kind == KIND_RESTART:
+            states.clear()
+            versions.clear()
+            mcb.clear()
+            continue
+        apdu = op.apdu
+        if op.direction != "res" or op.kind != KIND_PROP_READ or apdu is None or not op.data:
+            continue
+        f = apdu.fields
+        if apdu.name != "A_PropertyValue_Response" or f.get("truncated") or "obj_type" in f:
+            continue
+        obj, pid = f.get("obj"), f.get("pid")
+        if not isinstance(obj, int) or not isinstance(pid, int):
+            continue
+        if pid == PID_LOAD_STATE_CONTROL:
+            states[obj] = op.data[0]
+        elif pid == PID_PROGRAM_VERSION:
+            versions[obj] = op.data
+        elif pid == PID_MCB_TABLE and len(op.data) >= MCB_ENTRY_LEN:
+            mcb[obj] = op.data[:MCB_ENTRY_LEN]
+    if not states:
+        return None
+    out: Dict[str, object] = {
+        "objects": [{"index": obj, "state": state} for obj, state in sorted(states.items())],
+        "mcb": {str(obj): entry.hex() for obj, entry in sorted(mcb.items())},
+    }
+    for obj in sorted(versions):
+        if states.get(obj) == 1 and any(versions[obj]):
+            out["app_id"] = versions[obj].hex()
+            break
+    return out
+
+
 def compose(ops: DeviceOps, out_dir: str, source: str = "") -> Dict[str, object]:
     """Writes the composed image of one device's download into `out_dir`.
 
@@ -468,6 +543,15 @@ def compose(ops: DeviceOps, out_dir: str, source: str = "") -> Dict[str, object]
     with open(os.path.join(out_dir, LOAD_CONTROLS_FILE), "w", encoding="utf-8") as fh:
         json.dump(load_control_writes(ops), fh, indent=2)
         fh.write("\n")
+
+    resident = resident_state(ops)
+    resident_path = os.path.join(out_dir, RESIDENT_FILE)
+    if resident is not None:
+        with open(resident_path, "w", encoding="utf-8") as fh:
+            json.dump(resident, fh, indent=2)
+            fh.write("\n")
+    elif os.path.exists(resident_path):
+        os.remove(resident_path)
 
     props = property_writes(ops)
     with open(os.path.join(out_dir, "properties.json"), "w", encoding="utf-8") as fh:
@@ -648,6 +732,7 @@ def compare(
                 rec = _result(step, name, ours, NOT_COMPARABLE, "no ETS base for object %s" % obj)
                 rec["compared"] = 0
                 _add_coverage(rec, placed_offsets, set(), None, "obj%s" % obj, page_size)
+                rec["with_confirmed"] = {k: rec[k] for k in ("placed", "placed_compared", "pages")}
                 results.append(rec)
                 continue
             addr = base + int(image.get("offset") or 0)
@@ -688,6 +773,13 @@ def compare(
         conf_known = {i for i in placed_offsets if (addr + i) in ets.confirmed}
         conf_rec: Dict[str, object] = {}
         _add_coverage(conf_rec, placed_offsets, conf_known, addr, None, page_size)
+        # The coverage when read-confirmed octets that equal bussard's count
+        # as compared (issue #422); the row takes it only when none of its
+        # read-confirmed octets differs (see `compare` below).
+        with_confirmed: Dict[str, object] = {}
+        equal = {i for i in conf_known if ets.confirmed[addr + i] == ours[i]}
+        _add_coverage(with_confirmed, placed_offsets, known | equal, addr, None, page_size)
+        rec["with_confirmed"] = with_confirmed
         conf_rec.update(
             {
                 "verdict": DIFFERS if conf_mismatches else IDENTICAL if conf_compared
@@ -731,9 +823,25 @@ def compare(
         r["in_scope"] = scope is None or region_short(r["region"]) in scope
     judged = [r for r in results if r["in_scope"]]
     verdicts = {r["verdict"] for r in judged}
-    cov = coverage(judged, min_coverage)
-    cov["scope"] = list(scope) if scope is not None else None
     confirmed = _confirmed_summary(judged, min_coverage, len(ets.confirmed))
+    # Read-confirmed octets are evidence too (issue #422): ETS read them from
+    # the device and kept them, so its image holds the value read. When every
+    # read-confirmed octet equals bussard's, they count toward the coverage
+    # next to the written ones; a page whose only placed octets were read and
+    # matched (the association table of a mask 0701 read-compare download) is
+    # then compared, not blind. One differing read-confirmed octet and the
+    # coverage is the written octets' alone, as before.
+    use_confirmed = bool(confirmed["octets"]) and not confirmed["diff_octets"]
+    written = coverage(judged, min_coverage)
+    if use_confirmed:
+        cov = coverage(
+            [dict(r.get("with_confirmed") or r, region=r["region"]) for r in judged], min_coverage
+        )
+    else:
+        cov = written
+    cov["written_compared"] = written["compared"]
+    cov["confirmed_counted"] = cov["compared"] - written["compared"]
+    cov["scope"] = list(scope) if scope is not None else None
     reason = ""
     if DIFFERS in verdicts:
         overall = DIFFERS
@@ -1365,6 +1473,15 @@ def compare_load_controls(plan: dict, image_dir: str) -> Dict[str, object]:
                 "reason": "no %s (re-run `knxtrace image`)" % LOAD_CONTROLS_FILE}
     with open(path, encoding="utf-8") as fh:
         ets_all = [dict(e, event=load_event_name(e["form"], e["data"])) for e in json.load(fh)]
+    return compare_load_control_records(ours_all, ets_all)
+
+
+def compare_load_control_records(
+    ours_all: List[Dict[str, object]], ets_all: List[Dict[str, object]]
+) -> Dict[str, object]:
+    """Compares two lists of load-control records (each with `form`, `data`,
+    `event` and `object` or `lsm`) per load-state object, by the rule in the
+    module doc. `ours_all` is bussard's side."""
     base = {"bussard_records": len(ours_all), "ets_records": len(ets_all)}
     if not ets_all:
         return dict(base, verdict=NOT_COMPARABLE, reason="ETS sent no load-control record",
@@ -1534,12 +1651,14 @@ def render(report: Dict[str, object]) -> List[str]:
     cov = report.get("coverage")
     if cov:
         blind = cov["blind_pages"]
+        counted = cov.get("confirmed_counted") or 0
         lines.append(
-            "  coverage %.1f %% (%d of %d placed octets compared; %d of %d page(s) uncompared%s)%s"
+            "  coverage %.1f %% (%d of %d placed octets compared%s; %d of %d page(s) uncompared%s)%s"
             % (
                 cov["percent"],
                 cov["compared"],
                 cov["placed"],
+                ", %d of them read-confirmed" % counted if counted else "",
                 len(blind),
                 cov["pages"],
                 ": " + ", ".join(blind[:8]) + (", ..." if len(blind) > 8 else "") if blind else "",

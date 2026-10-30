@@ -18,12 +18,14 @@ pub mod capabilities;
 pub mod change;
 pub mod checklist;
 pub mod codec;
+pub mod color_codec;
 pub mod declare;
 pub mod device_view;
 pub mod discover;
 pub mod doc;
 pub mod dotenv;
 pub mod dpt;
+mod dpt_tables;
 pub mod dynamic;
 pub mod dynamic_compact;
 mod emit;
@@ -63,7 +65,7 @@ pub use change::{
 };
 pub use codec::{
     DateTime, EncodeError, Float16RangeError, HvacMode, ParseValueError, Rgbw, TypedValue, decode,
-    encode, encode_float16, parse_value,
+    encode, encode_float16, encode_float16_raw, parse_value, validity_note,
 };
 pub use declare::{DeclaredGroup, declare_used_groups};
 pub use discover::{DEFAULT_MODEL_DIR, NESTED_MODEL_DIR, discover};
@@ -74,7 +76,7 @@ pub use files::{
     LOCK_SCHEMA_FINGERPRINT, LOCK_VERSION, hidden_mem_key, is_hidden_mem_key, label_mem_key,
     lock_written_by, param_mem_key, slug,
 };
-pub use flags::{Flags, FlagsParseError};
+pub use flags::{Flags, FlagsParseError, Priority};
 pub use history::{History, HistoryError, Snapshot, SnapshotId, SnapshotReason};
 pub use keyring_checks::{KeyringFacts, KeyringStatus, validate_keyring};
 pub use keystore_meta::{KEYSTORE_META_FILE, KeyStoreMeta, KeyStoreMetaError, KeyringExport};

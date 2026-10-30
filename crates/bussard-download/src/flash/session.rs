@@ -6,10 +6,11 @@
 //! primitives (load control, segment allocation, state and memory reads) across
 //! an unexpected connection death.
 
+use super::SegmentFill;
 use bussard_mgmt::connection::{L4Channel, Layer4Connection};
 use bussard_mgmt::load::{
     LoadControl, LoadState, WriteError, allocate_segment, is_connection_death, read_load_state,
-    write_load_control,
+    write_load_control, write_load_control_unless_absent,
 };
 use bussard_mgmt::tables::OT_APPLICATION_PROGRAM;
 use bussard_mgmt::{MgmtError, load};
@@ -323,6 +324,8 @@ impl<Ch: L4Channel> Session<SingleConnector<Ch>> {
             max_apdu: None,
             readiness: Vec::new(),
             pending_readiness: None,
+            verify: VerifyModeState::default(),
+            user_memory_above_64k: false,
         }
     }
 }
@@ -366,6 +369,10 @@ pub struct DeviceFacts {
     /// conservative chunks without reading it again (issue #215). An
     /// unanswered read does not set this: the write phase asks once more.
     pub max_apdu_absent: bool,
+    /// The property data type of the association table's `PID_TABLE` the
+    /// pre-flight read (`PDT_GENERIC_04` for format 1, `PDT_GENERIC_02` for
+    /// format 0, Resources §4.17.5.2.5), when the device described it.
+    pub association_pdt: Option<u8>,
 }
 
 impl DeviceFacts {
@@ -450,6 +457,49 @@ pub struct Session<C: Connector> {
     readiness: Vec<RebootReadiness>,
     /// The measurement of the confirmed restart being waited out, if any.
     pending_readiness: Option<PendingReadiness>,
+    /// Verify mode of a System 7 download (issue #524): whether the plan
+    /// switched it on, and whether the current connection has it.
+    verify: VerifyModeState,
+    /// Whether memory above `0xFFFF` goes over `A_UserMemory_*` (an
+    /// application without extended memory services, issue #472), set on
+    /// every connection the session adopts.
+    user_memory_above_64k: bool,
+}
+
+/// The verify-mode bookkeeping of a [`Session`] (issue #524).
+///
+/// The device clears verify mode whenever the transport connection closes
+/// (Resources 03_05_01 §4.2.14), so the session remembers that the download
+/// wants it and sets it again on the first write of every later connection.
+#[derive(Debug, Default)]
+struct VerifyModeState {
+    /// The plan switched verify mode on and the device took it.
+    wanted: bool,
+    /// The current connection has verify mode on. Cleared by every new
+    /// connection the session adopts.
+    on_connection: bool,
+    /// Echoes compared and memory chunks written while verify mode was wanted.
+    echoes: VerifyEchoes,
+}
+
+impl VerifyModeState {
+    /// Counts one re-enable on a new connection.
+    fn re_enabled_note(&mut self) {
+        self.echoes.re_enabled = self.echoes.re_enabled.saturating_add(1);
+    }
+}
+
+/// How many verify-mode echoes a System 7 download compared (issue #524),
+/// for `flash -v`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VerifyEchoes {
+    /// Plain memory-write chunks the download wrote while verify mode was on.
+    pub chunks_written: u64,
+    /// Echoes compared with the chunk they answer; equal to
+    /// [`chunks_written`](Self::chunks_written) on a download that verified.
+    pub echoes_compared: u64,
+    /// Times verify mode was set again on a new connection.
+    pub re_enabled: u32,
 }
 
 impl<C: Connector> Session<C> {
@@ -618,6 +668,8 @@ impl<C: Connector> Session<C> {
             max_apdu,
             readiness: Vec::new(),
             pending_readiness: None,
+            verify: VerifyModeState::default(),
+            user_memory_above_64k: false,
         })
     }
 
@@ -670,6 +722,16 @@ impl<C: Connector> Session<C> {
         }
         cache.insert(target, outcome);
         Ok(())
+    }
+
+    /// Sends memory above `0xFFFF` over the user-memory services on this and
+    /// every later connection of the session (issue #472), see
+    /// [`Layer4Connection::set_user_memory_above_64k`].
+    pub fn set_user_memory_above_64k(&mut self, user: bool) {
+        self.user_memory_above_64k = user;
+        if let Some(l4) = self.l4.as_mut() {
+            l4.set_user_memory_above_64k(user);
+        }
     }
 
     /// The open connection, for a step to drive.
@@ -799,8 +861,86 @@ impl<C: Connector> Session<C> {
         // round-trip, so scaling persists across the cycle without spending an
         // exchange against the tight per-connection budget (issue #58).
         l4.set_max_apdu(self.max_apdu);
+        l4.set_user_memory_above_64k(self.user_memory_above_64k);
         self.l4 = Some(l4);
+        // A new transport connection: the device cleared verify mode
+        // (Resources 03_05_01 §4.2.14); the next write sets it again.
+        self.verify.on_connection = false;
         Ok(())
+    }
+
+    /// Switches the device's verify mode on for the download (issue #524,
+    /// Management Procedures 03_05_02 §3.16.3) and remembers it, so every
+    /// later connection sets it again before its first write.
+    pub(super) async fn enable_verify_mode(
+        &mut self,
+    ) -> Result<bussard_mgmt::VerifyModeOutcome, WriteError> {
+        let outcome = bussard_mgmt::enable_verify_mode(self.l4()).await?;
+        let on = matches!(
+            outcome,
+            bussard_mgmt::VerifyModeOutcome::Enabled { .. }
+                | bussard_mgmt::VerifyModeOutcome::AlreadyOn(_)
+        );
+        self.verify.wanted = on;
+        self.verify.on_connection = on;
+        Ok(outcome)
+    }
+
+    /// Whether the next plain memory write must have its verify echo
+    /// compared. When the download wants verify mode and the current
+    /// connection is a new one, this sets it again first (Resources 03_05_01
+    /// §4.2.14: the device cleared it when the previous connection closed).
+    ///
+    /// # Errors
+    ///
+    /// The property exchange's error, or a [`MgmtError::MalformedResponse`]
+    /// when the device refuses verify mode on the new connection after taking
+    /// it on an earlier one: the writes would go out unverified.
+    pub(super) async fn ensure_verify_mode(&mut self) -> Result<bool, WriteError> {
+        if !self.verify.wanted {
+            return Ok(false);
+        }
+        if self.verify.on_connection {
+            return Ok(true);
+        }
+        let outcome = bussard_mgmt::enable_verify_mode(self.l4()).await?;
+        match outcome {
+            bussard_mgmt::VerifyModeOutcome::Enabled { .. }
+            | bussard_mgmt::VerifyModeOutcome::AlreadyOn(_) => {
+                self.verify.on_connection = true;
+                self.verify.re_enabled_note();
+                tracing::info!(
+                    "verify mode set again on the new connection to {}",
+                    self.target
+                );
+                Ok(true)
+            }
+            other => Err(WriteError::Mgmt(MgmtError::MalformedResponse {
+                address: self.target,
+                reason: format!(
+                    "the device took verify mode earlier in this download but not on the \
+                     new connection ({other:?}); the writes would go out unverified"
+                ),
+            })),
+        }
+    }
+
+    /// Counts `chunks` plain memory-write chunks, compared against their
+    /// echo when `echoed`.
+    pub(super) fn note_memory_chunks(&mut self, chunks: u64, echoed: bool) {
+        if !self.verify.wanted {
+            return;
+        }
+        self.verify.echoes.chunks_written += chunks;
+        if echoed {
+            self.verify.echoes.echoes_compared += chunks;
+        }
+    }
+
+    /// The verify-mode echo counts of the download, `None` when verify mode
+    /// was never switched on.
+    pub(super) fn verify_echoes(&self) -> Option<VerifyEchoes> {
+        (self.verify.wanted || self.verify.echoes.chunks_written > 0).then_some(self.verify.echoes)
     }
 
     /// Waits out a device reboot with a **bounded poll**, then re-establishes the
@@ -1093,7 +1233,7 @@ impl<C: Connector> Session<C> {
     /// The device answered the `A_Restart_Response` and is rebooting, so the old
     /// connection is dropped without a `T_Disconnect` (the ETS capture sends none
     /// after the factory reset either). The session then waits `process_wait`
-    /// (the device's own process time, already capped by
+    /// (the device's own process time, a minimum per
     /// [`bussard_mgmt::restart_process_wait`]; never shortened, issue #212),
     /// stays quiet for [`CONFIRMED_RESTART_QUIET`] and finishes with the bounded
     /// liveness poll and reconnect of
@@ -1221,6 +1361,8 @@ pub enum RestartKind {
     /// The confirmed restart (`A_Restart` master reset, erase code 1) that ends
     /// it.
     Restart,
+    /// A load procedure's `LdCtrlMasterReset`, sent in the confirmed form.
+    MasterReset,
 }
 
 impl std::fmt::Display for RestartKind {
@@ -1228,6 +1370,7 @@ impl std::fmt::Display for RestartKind {
         match self {
             RestartKind::FactoryReset => write!(f, "factory reset"),
             RestartKind::Restart => write!(f, "restart"),
+            RestartKind::MasterReset => write!(f, "master reset"),
         }
     }
 }
@@ -1242,7 +1385,7 @@ impl std::fmt::Display for RestartKind {
 pub struct RebootReadiness {
     /// Which restart.
     pub kind: RestartKind,
-    /// The process time the device reported (capped, see
+    /// The process time the device reported (see
     /// [`bussard_mgmt::restart_process_wait`]).
     pub process_time: std::time::Duration,
     /// From the accepted restart to the first answered probe; `None` when no
@@ -1315,17 +1458,16 @@ pub(super) async fn start_loading<Ch: L4Channel>(
 /// application). This folds the targeted object's discovered interface-object type
 /// and the full discovered object table into any such failure so it is actionable.
 ///
-/// `fill` mirrors the source `LdCtrlRelSegment`'s fill (`Mode`/`Fill`): `None` (the
-/// DA.tp default) asks for a no-fill allocation, byte-identical to before;
-/// `Some(b)` requests the device pre-fill the segment with `b`.
+/// `fill` is the source `LdCtrlRelSegment`'s `Mode` and `Fill` octets, sent
+/// verbatim ([`SegmentFill::NONE`], the DA.tp default, sends `00 00`).
 pub(super) async fn allocate_with_context<Ch: L4Channel>(
     l4: &mut Layer4Connection<Ch>,
     app_obj: u8,
     size: u32,
-    fill: Option<u8>,
+    fill: SegmentFill,
     object_table: &[(u8, u16)],
 ) -> Result<bussard_mgmt::SegmentAllocation, WriteError> {
-    match allocate_segment(l4, app_obj, size, fill).await {
+    match allocate_segment(l4, app_obj, size, fill.mode, fill.fill).await {
         Err(WriteError::UnexpectedLoadState {
             address,
             object_index,
@@ -1400,6 +1542,18 @@ pub(super) async fn write_load_control_resumable<C: Connector>(
     )
 }
 
+/// Session-aware, resume-on-drop [`write_load_control_unless_absent`].
+pub(super) async fn write_load_control_unless_absent_resumable<C: Connector>(
+    session: &mut Session<C>,
+    obj: u8,
+    control: LoadControl,
+) -> Result<Option<LoadState>, WriteError> {
+    resume!(
+        session,
+        write_load_control_unless_absent(session.l4(), obj, control).await
+    )
+}
+
 /// Session-aware, resume-on-drop [`start_loading`].
 pub(super) async fn start_loading_resumable<C: Connector>(
     session: &mut Session<C>,
@@ -1417,7 +1571,7 @@ pub(super) async fn allocate_with_context_resumable<C: Connector>(
     session: &mut Session<C>,
     obj: u8,
     size: u32,
-    fill: Option<u8>,
+    fill: SegmentFill,
     object_table: &[(u8, u16)],
 ) -> Result<bussard_mgmt::SegmentAllocation, WriteError> {
     resume!(

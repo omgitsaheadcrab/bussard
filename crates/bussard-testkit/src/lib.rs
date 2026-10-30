@@ -44,6 +44,9 @@
 //! KNXnet/IP:
 //! - CONNECT for a tunnel link-layer connection. The response hands out tunnel
 //!   IA 1.1.255 and carries a data HPAI of `127.0.0.1:port` *(native)*.
+//! - A distinct data port: the data HPAI names a second port that carries the
+//!   TUNNELLING_REQUESTs and ACKs ([`GatewayBuilder::data_port`],
+//!   [`RawGateway::bind_with_data_port`], issue #512) *(native)*.
 //! - CONNECT refusal with a status, e.g. `0x24` E_NO_MORE_CONNECTIONS or `0x22`
 //!   *(native)*.
 //! - CONNECTIONSTATE answered, or deliberately left unanswered *(native)*.
@@ -57,7 +60,7 @@
 //!   then the old channel is dropped and the next CONNECT gets a new channel id,
 //!   so the client re-establishes the tunnel ([`GatewayBuilder::outage`],
 //!   issue #177) *(native)*.
-//! - Protocol probes: duplicate, out-of-window and two-behind sequence numbers;
+//! - Protocol probes: seq-1 duplicate, out-of-window and two-behind sequence numbers;
 //!   unknown message codes; bursts during an ACK wait; a server-initiated
 //!   DISCONNECT; control HPAI checks. All use [`wire::RawGateway`].
 //!
@@ -135,8 +138,8 @@ pub mod sys7;
 pub mod wire;
 
 pub use device::{
-    ControlHook, Hook, MemoryWritePolicy, MockDevice, MockKnxnet, MockPropertyDescription,
-    Reaction, Step,
+    ControlHook, ExtWriteConfirmation, Hook, MemoryWritePolicy, MockDevice, MockKnxnet,
+    MockPropertyDescription, Reaction, Step,
 };
 pub use gateway::{
     AckPolicy, CONFIRMATION_DELAY, GatewayBuilder, GatewayStats, Inbound, MockGateway, Outage,

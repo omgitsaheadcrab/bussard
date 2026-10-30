@@ -85,6 +85,15 @@ jobs:
       - name: Changelog fragments
         run: python3 scripts/changelog.py check
 
+      # The synthetic product generator (epic #596): its unit tests, and
+      # `--check`, which fails when a product's committed xml/ or signed.toml
+      # no longer matches its product.toml. Both scripts are stdlib-only
+      # (Python >= 3.11, the runner has 3.12), so no uv setup is needed.
+      - name: Synthetic product generator
+        run: |
+          python3 tests-support/synthetic-products/test_generate.py
+          python3 tests-support/synthetic-products/generate.py --check
+
       # --all-targets makes clippy compile tests/benches/examples too, which
       # warms the exact same build graph the test job needs. Kept as its own
       # step so a clippy failure is clearly attributed.
@@ -97,8 +106,13 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false # report all platforms' failures, not just the first
+      # Pull requests gate on ubuntu alone; a push to main (and a manual
+      # dispatch) adds macOS and Windows. Windows has caught real bugs (stack
+      # size, CRLF fixtures, absolute paths), so a break there shows up on main
+      # right after the merge instead of blocking the PR. The repo ruleset
+      # requires only `test (ubuntu-latest)` for that reason.
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -133,6 +147,11 @@ jobs:
       # platform reports all its failures), retries flaky real-socket mock tests
       # a couple of times, and enforces a per-test slow-timeout so a hung test
       # cannot wedge the runner. It also emits junit.xml.
+      # Includes the ungated offline oracle over the synthetic captures
+      # (bussard-cli offline_oracle.rs, epic #596): it runs
+      # scripts/campaign/95-offline-oracle.sh, which needs bash and python3.
+      # tools/knxtrace is stdlib-only Python, so the runner's python3 is
+      # enough on ubuntu and macOS; Windows skips the test.
       - name: Test (nextest)
         run: cargo nextest run --workspace --profile ci
 
@@ -393,7 +412,9 @@ jobs:
       # (Jung M2 property LSM, Theben 0701 memory-mapped), the group runtime, and
       # the KNXnet/IP frontend. `ets_calibration` is listed too: it skips cleanly
       # without the git-ignored DA.tp fixture, but running it proves the skip
-      # path itself still compiles and passes.
+      # path itself still compiles and passes. `synthetic_calibration` replays
+      # the committed ETS captures of the synthetic products (epic #596,
+      # captures/synthetic/) ungated.
       - name: knx-sim conformance (calibration + replays)
         run: |
           cargo test --manifest-path knx-sim/Cargo.toml \
@@ -401,6 +422,7 @@ jobs:
             --test sys7_jung_m2_replay \
             --test sys7_theben_0701_replay \
             --test ets_calibration \
+            --test synthetic_calibration \
             --test group_runtime \
             --test knxnetip_server
 
@@ -416,6 +438,17 @@ jobs:
           BUSSARD_KNX_SIM_BIN="$PWD/knx-sim/target/debug/serve" \
             cargo nextest run -p bussard-cli --profile ci \
             -E 'binary(it) & test(/^sim_interface_(loop|secure)::/)'
+          # The flash-then-plan loop over the synthetic product catalogue
+          # (epic #596): committed product XML, no corpus needed. Four shards
+          # that nextest runs side by side (budget: .config/nextest.toml).
+          BUSSARD_KNX_SIM_BIN="$PWD/knx-sim/target/debug/serve" \
+            cargo nextest run -p bussard-cli --profile ci \
+            -E 'binary(it) & test(/^sim_catalog_loop::test_sim_catalog_loop_synthetic_catalogue_shard_/)'
+          # The transport connection timeout against the Style 3 sim
+          # (issue #575): an idle management connection reconnects.
+          BUSSARD_KNX_SIM_BIN="$PWD/knx-sim/target/debug/serve" \
+            cargo nextest run -p bussard-mgmt --profile ci \
+            -E 'binary(it) & test(/^sim_tl_idle::/)'
 
       # The bussard side: the mock-gateway flash suites that the example scripts
       # exercise for real against the simulator. Named explicitly (rather than

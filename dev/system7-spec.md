@@ -4,9 +4,10 @@
 > parallel from this document alone: (1) the bussard System 7 download path
 > (`bussard-download` lowering + `bussard-mgmt` primitives), and (2) the
 > knx-sim System 7 device model. Both must converge on the same wire bytes.
-> Grounded in `system7-research.md` (standards/clean-room research) and
-> `system7-corpus.md` + `system7-corpus.json` (49-app corpus archaeology).
-> Issue #49.
+> Grounded in a standards research pass and an archaeology of the 49 System 7
+> applications of the product corpus (issue #49); their notes were working
+> files and are not in the repository, so the claims below cite the KNX
+> Standard, the corpus counts and the captures directly (#482).
 
 ## 0. Confidence discipline (read first)
 
@@ -66,8 +67,8 @@ differs per mask**; they are NOT identical at the wire level. The profile
 0104h / B6EAh) on 0700 and 0701; memory-mapped is optional on 0705, property
 optional on 0700. Both are standard; ETS picks memory on 0701 and property on
 0705, which two real-ETS download captures show (superseding the earlier
-"0701==0705" claim). bussard drives 0700 property-based today, the optional
-realisation there (#526).
+"0701==0705" claim). bussard drives 0700 memory-mapped, the mandatory
+realisation there (#526; no 0700 capture exists).
 
 - **Jung `0705`** (M2 issue #70, plus the binaereingang / automitschalter /
   schaltaktor 0705 analysis captures) drives load control **property-based** over
@@ -77,7 +78,7 @@ realisation there (#526).
   status read at `0xB6EA + (lsm - 1)`, with ZERO PID-5 traffic; see §5.
 
 So the download-path realisation branches on the mask (0705 → property,
-0701 → memory-mapped) via `Sys7Profile::corpus_default_for_mask`. The status
+0700 and 0701 → memory-mapped) via `Sys7Profile::corpus_default_for_mask`. The status
 octets of the memory-mapped form are the load states of object types 1 to 4:
 B6EAh address table, B6EBh association table, B6ECh application program, B6EDh
 PEI program `[MP §3.31.2, p. 134]`, so the "0xB6EC read" in the ETS captures is
@@ -231,6 +232,20 @@ The LSM index is the object type of the loadable part `[MP §3.31.2, p. 134]`:
   `meteodata-1-1-202-new.pcapng`, `schaltaktor-8fach-1-1-49.pcapng`), and the
   2308.16REGHM has no object 5 (its `PID_LOAD_STATE_CONTROL` read answers count
   0). bussard cuts the procedure after the terminal restart (issue #178).
+  Some procedures name LSM 5 before the restart too: 98 corpus 0701
+  applications (Busch-Jaeger, such as `M-0002_A-A002-13`, and the house binary
+  input 1.1.44) carry an `LdCtrlTaskSegment LsmIdx="5"` inside LSM 3's load,
+  with no `Load` of LSM 5.
+  ETS sends no record for it: its download of the synthetic `syn-s7-lsm5`
+  (`captures/synthetic/syn-s7-lsm5/defaults/`, ETS 6.4.1) writes 18 records to
+  `0x0104`, none with high nibble 5, and 1.1.44's capture has none either. A
+  product variant that also loaded and completed LSM 5 failed inside ETS
+  ("System.ArgumentException: lsm"). **Rule (issue #489):** under the
+  memory-mapped realisation the planner sends no `TaskSegment` record for an
+  LSM outside 1 to 4 (`SYS7_MEMORY_MAPPED_LSMS` in `plan_sys7.rs`); knx-sim
+  leaves an unopened machine Unloaded on such a record (#529), which failed
+  bussard's flash. The property realisation (0705) keeps the record until
+  `syn-s7-lsm5-0705` (#604 row 32) shows what ETS does there.
 
 **Two ETS differences bussard keeps (issue #178, 2308.16REGHM `A-2088-11`).**
 The application declares `DynamicTableManagement="1"`, and ETS places the
@@ -274,9 +289,10 @@ connection:
    `A_Restart`. The device reboots and answers again on a fresh connection.
 3. *Procedure connection*: a second probe, then descriptor,
    `PID_MAX_APDU_LENGTH`, `A_Authorize`, `PID_SERIAL_NUMBER`, a one-octet read
-   of `0xB6EC` (answer `00`; on 0701 the reads of `0xB6EA..0xB6ED` are the
-   LSM status octets), `PID_MANUFACTURER_ID`, `PID_HARDWARE_TYPE`, then the
-   procedure.
+   of `0xB6EC`, the load state of the application program (object type 3,
+   `[MP §3.31.2, p. 134]`; answer `00`, Unloaded after the unload pass; on
+   0701 the reads of `0xB6EA..0xB6ED` are the load states of object types 1
+   to 4), `PID_MANUFACTURER_ID`, `PID_HARDWARE_TYPE`, then the procedure.
 
 **Verify mode (`PID_DEVICE_CONTROL`).** On every 0705 download ETS reads
 `obj0/PID_DEVICE_CONTROL` (PID 14, answer `00`) right after the first
@@ -290,8 +306,9 @@ bit lives in RAM; the device clears it whenever the TL connection closes, and
 a client shall set it again on every connection it opens `[Res §4.2.14.7.3,
 §4.2.14.7.4, p. 36]`. With it on, every `A_Memory_Write` is answered by an
 `A_Memory_Response` and the client treats a different or missing answer as an
-error `[MP §3.16.3 DMP_MemWrite_RCoV, p. 101-102]`; bussard drops the echo
-today and does not re-set the bit after a reconnect (#524). Verify Mode is
+error `[MP §3.16.3 DMP_MemWrite_RCoV, p. 101-102]`. bussard compares every
+echo with the chunk it wrote and sets the bit again on every new connection
+before its next write (#524). Verify Mode is
 mandatory on 0700, 0701 and 0705 alike `[Prof §4.2 row 3]`; that the 0701
 Meteodata gets no PID 14 access is ETS following the Hawk `VerifyMode` flag of
 MV-0701, not a device limitation, and ETS read-compare-writes it instead
@@ -303,8 +320,24 @@ MV-0701, not a device limitation, and ETS read-compare-writes it instead
   reboot, reconnect and re-authorize. It goes in front of the procedure's
   first state-changing step, after the vendor's read-only preconditions
   (`CompareProp`, `CompareMem`), so a device that fails them is refused before
-  its application is unloaded. bussard cannot tell the ETS full-download case
-  from the "same application" case (1.1.52), so every full flash unloads; a
+  its application is unloaded. The pass follows the device's resident state
+  (issue #488, `FlashPlan::fit_sys7_prelude`): a device whose every LSM the
+  pre-flight probe reads answers Unloaded, with no application id, gets no
+  pass at all; an LSM in Loaded, Loading or Error, a resident
+  `PID_PROGRAM_VERSION`, or a probe that read nothing keeps it. Evidence for
+  the fresh device: ETS runs no pass in all 31 System 7 sweep downloads and in
+  the synthetic captures `syn-s7-0705` and `syn-s7-0701` (`defaults`, a
+  factory-fresh knx-sim; after the connect come the identity reads and the
+  procedure's own unloads of LSMs 1 to 3, no unload of LSM 4, no restart). On
+  a programmed device the captures disagree, so the pass stays as before:
+  1.1.31 and 1.1.46 (`jung-1131`, `automitschalter-standard-110`) run the
+  full pass, 1.1.32 (`bad-eg-pm-1-1-18-new`, same application as 1.1.31) only
+  the restart, and the EK-E72 partial downloads on the sim
+  (`captures/ets-sweep/M-00B6_A-4537-03-DE59/b-*` to `d-*`) none; ETS decides
+  before reading anything from the device, so the trigger is project state.
+  The offline dry run has no device and keeps the pass, unless `--resident`
+  records the LSM states; the oracle's `state=fresh` row option records a
+  fresh device for a capture that reads none (the synthetic System 7 rows). A
   parameter-only flash restarts without unloading, like the Meteodata
   parameter capture. An LSM the device lacks (count 0) or that answers Error
   is skipped with a warning; the procedure's own unloads stay strict.
@@ -312,7 +345,13 @@ MV-0701, not a device limitation, and ETS read-compare-writes it instead
   write it back with bit 2 set, only when the bit is clear, keeping the other
   bits. It goes right after the first `StartLoading`, one record earlier than
   ETS (the allocation and its stream are one step in bussard; nothing depends
-  on the order). The connection drains the echoes, and `read_memory` skips a
+  on the order). Each segment write waits for its echo, which must name the
+  chunk's address and carry the octets written, or the step fails with both
+  values (#524); a missing echo is a silence the resume path retries on a new
+  connection. The session sets verify mode again on every connection it
+  opens after the step, before the next write; a device that refuses or lacks
+  PID 14 streams blind with a warning. An LSM record write (0701, memory-mapped)
+  is not echo-checked; its echo, if any, is drained, and `read_memory` skips a
   late echo whose address is not the one it asked for.
 - **State read-backs follow the realisation.** On the property realisation
   (0705) the state comes from each PID 5 write's answer, as for ETS, including
@@ -432,9 +471,9 @@ endian, total 10 octets `[XKNX, CONFIRMED]`:
 | AllocAbsDataSeg | 0x00 | `[start:2][length:2][access attributes:1][memory type:1][memory attributes:1]` |
 | AllocAbsStackSeg | 0x01 | same as 0x00 (#487: send the product's `SegType`) |
 | AllocAbsTaskSeg ("Segment Control Record") | 0x02 | `[start:2][PEI type:1][manufacturer:2][application id:2][version:1]` (§4.3) |
-| TaskPtr | 0x03 | `[init address:2][save address:2][PEI handler:2][reserved:2]` (#527) |
+| TaskPtr | 0x03 | `[init address:2][save address:2][PEI handler:2][reserved:2]` |
 | TaskCtrl1 | 0x04 | `[interface object table address:2][object count:1]` (§4.4) |
-| TaskCtrl2 | 0x05 | `[callback address:2][com-object pointer:2][com-object segment pointer 1:2][pointer 2:2]` (#527) |
+| TaskCtrl2 | 0x05 | `[callback address:2][com-object pointer:2][com-object segment pointer 1:2][pointer 2:2]` |
 
 The property form is the same record without the leading state-machine octet
 (10 octets); the segment ID octet is 00 in every capture. Access attributes:
@@ -442,7 +481,13 @@ bits 0–3 write level, bits 4–7 read level (16 levels on BIM M112, `[Prof §4
 row 12]`). Memory type bits 0–2: 1 = zero-page RAM, 2 = RAM, 3 = EEPROM.
 Memory attributes bit 7 = checksum control. The profile requires types 00, 02,
 03, 04 and 05 on 0701 and 0705 `[Prof Annex A.2.4.1, Table 7]`; bussard
-refuses 03 and 05 today (#527).
+lowers all five (`encode_task_ptr` and `encode_task_ctrl2` for 03 and 05, #527;
+`LdCtrlTaskPtr` `InitPtr`/`SavePtr`/`SerialPtr` are the init, save and PEI
+handler addresses, `LdCtrlTaskCtrl2` `Callback`/`Address`/`Seg0`/`Seg1` the
+callback, group-object pointer and the two segment pointers). In the local
+corpus the two ops appear only on masks 0020, 0021 and 0025 (and the
+knx_master procedures of 0020/0021), which bussard does not flash; no ETS
+capture of either record exists yet.
 
 ### 4.2 AbsSegment: allocation record + payload
 
@@ -450,7 +495,9 @@ refuses 03 and 05 today (#527).
 
 1. **Allocate:** an `AdditionalLoadControls` "Alloc absolute Data segment"
    (subtype 0x00) record for the LSM, filled
-   `[event=3][subtype=0][start:2 BE][length:2 BE][seg_flags][mem_type][checksum_ctrl][reserved]`.
+   `[event=3][subtype=0][start:2 BE][length:2 BE][access][mem_type][seg_flags][reserved]`
+   (`access`, `mem_type` and `seg_flags` are the op's `Access`, `MemType` and
+   `SegFlags`; `seg_flags` is the memory-attributes octet, bit 7 checksum control).
    **M2 CONFIRMED** (cross-checked against the Jung app M-0004_A-A011's declared
    AbsSegment addresses/sizes): the opcode/subtype, the big-endian `start` and
    `length` (= the declared segment size in octets), and `mem_type` at octet 7,
@@ -488,6 +535,27 @@ untouched, so the 0x4000 table region and the tail of `AS-4C00` behave as
 before. The planner folds this into the write mask once, so the blind writer,
 the read-compare writer, the parameter-only diff and its read-back verify all
 use the same set.
+
+**A segment allocated in parts (issues #413, #411).** A `<choose>` branch can
+allocate one absolute segment with several `LdCtrlAbsSegment` records that
+leave gaps: the MDT `A-0054-14` and `A-0255-21` with `P-203` (switching times
+in the device) = 1 allocate `0x47E4` and `0x4770` in three and two parts.
+`CONFIRMED` against the synthetic `syn-s7-choose-split` (`captures/synthetic/
+syn-s7-choose-split/defaults/ops.txt`, ETS 6.4.1, 2026-10-30): with `mode` = 1
+the branch allocates the 64-octet `AS-4440` as `0x4440` length 1 and `0x4443`
+length 61; ETS sends both records as declared, streams `0x4440` (1 octet)
+after the first and `0x4443..0x447F` after the second, and never writes or
+reads `0x4441..0x4442`, where the 16-bit parameter `delay` is placed. The
+download completes. The rule bussard follows (`plan_sys7.rs`,
+`sys7_kept_octets`): each record is sent as declared, each part of the image
+is streamed into the allocation that holds it, and the octets no allocation
+holds are kept on the device: masked off (so the read-compare, the
+parameter-only download and the diff never touch them), not placed, and named
+in the plan (`LSM 3 segment 0x4440 octets 1..3 kept`). A parameter placed in
+a gap is reported as kept on the device (the device's value and the model's,
+no verdict), never as a difference, by `flash`, `plan` and the read-back.
+System B has the same rule for a `<choose>` branch that writes part of a
+relative segment (`KeptOctets`, PR #647).
 
 **Amendment (issue #133): read-compare-write on masks without `VerifyMode`.**
 `CONFIRMED` against `meteodata-1-1-202-new.pcapng` (Theben Meteodata 140 S,
@@ -591,9 +659,40 @@ flash matches. `S7-CAL: PID78 value semantics and how the sim seeds it`.
 There is **no `WriteProp`** of the app id anywhere in System 7; the device
 derives run-state from the loaded tables, ETS only checks `[corpus §5]`.
 
+### 4.7 Parameters the configuration does not show (#448)
+
+A parameter the Dynamic walk does not reach is written at its default, or its
+octets keep the segment template, by
+`ApplicationProgram::downloads_invisible_parameters` (`bussard-ets`), the one
+predicate the image builder and the read-back decoder use on both systems.
+With `DownloadInvisibleParameters` (`None`, `Background`) or
+`PreferPartialDownloadIfApplicationLoaded="true"` the template stays. Without
+either, the schema version of the application file
+(`http://knx.org/xml/project/<N>`) decides on System 7:
+
+| capture | system | schema | `MinEtsVersion` | ETS at the hidden parameter |
+|---|---|---|---|---|
+| `syn-s7-hidden-default-p11` | 0705 | 11 | 4.0 | template |
+| sweep rows of #448 (Steinel, ekinex, B.E.G., Zennio, MDT, Elsner) | 0705/0701 | 11 | 4.0, 3.0d, none | template |
+| Busch-Jaeger `A-FF11-15` (sweep) | 0705 | 20 | 3.0d | template (14 octets differ when written) |
+| `syn-s7-hidden-default` | 0705 | 23 | 6.0 | default |
+| `syn-hidden-default` | 07B0 | 23 | 6.0 | default |
+| Busch-Wächter PRO 280 `A-6179-82` (sweep, #89) | 07B0 | 20 | 5.0 | default |
+
+The two synthetic System 7 products differ only in the namespace and
+`MinEtsVersion`. So System 7 writes the defaults from project/21 on and keeps
+the template through project/20; System B writes them at every schema. The
+schema alone does not decide (project/20 writes on the PRO 280 and keeps on
+`A-FF11-15`). Open: the System 7 boundary within 21 to 23 (no System 7 program
+in the corpus has project/21 or /22, so it changes no vendor product), System B
+below project/20 (no capture separates it), and whether ETS keys on
+`MinEtsVersion` instead (every capture that writes has 5.0 or later, every one
+that keeps has 4.0 or earlier, or none). `syn-s7-hidden-default` rendered in project/23
+with `MinEtsVersion="4.0"` would tell the two apart.
+
 ---
 
-## 5. LSM realisation, resolved: vendor / mask-family dependent
+## 5. LSM realisation, resolved: fixed per mask by the profile
 
 **This was the single most important open question. The profile answers it
 `[Prof §4.2 row 7, p. 37]`: Realisation Type 1 (property) is mandatory on 0701
@@ -620,14 +719,14 @@ real-ETS download captures show which one ETS picks where both are available.**
   [`LsmAccess::MemoryMapped`] is the `0701` default.
 
 The download path selects the realisation by mask family
-(`Sys7Profile::corpus_default_for_mask`: `0701` → memory-mapped, everything else
-→ property), overridable by `HawkConfigurationData` when a product carries a
+(`Sys7Profile::corpus_default_for_mask`: `0700` and `0701` → memory-mapped,
+`0705` → property), overridable by `HawkConfigurationData` when a product carries a
 usable block. This corrects the earlier claim that property was the default for
 ALL System 7; that regressed the memory-mapped Theben 0701.
 
 The two research inputs that disagreed before M2:
 
-- **Standards/clean-room research** (`system7-research.md` 2.1): System 7 is a
+- **Standards/clean-room research** (the issue #49 research pass): System 7 is a
   BCU2 descendant; the KNX LSM is property-based; load events written to
   `PID_LOAD_STATE_CONTROL` (PID 5) via `A_PropertyValue_Write`, state read back
   via `A_PropertyValue_Read`. **M2 confirmed this is correct for 0705.**
@@ -636,8 +735,9 @@ The two research inputs that disagreed before M2:
   `LoadControl_M112 @ StandardMemory 0x0104` block with status at `0xB6EA+`, read
   as evidence the LSM is a **12-octet memory record**. **M2 disproved this
   reading:** the `LoadControl_M112 @ 0x0104` Hawk block did NOT predict the wire,
-  control is property; `0xB6EA+` is a readable status region (the single read at
-  `0xB6EC`), not a control-write target. `sys7_profile_from_hawk` no longer feeds
+  control is property; `0xB6EA..0xB6ED` hold the load states of object types 1
+  to 4 (`0xB6EA + OT - 1`, `[MP §3.31.2, p. 134]`; the single read at `0xB6EC`
+  is the application program's), not a control-write target. `sys7_profile_from_hawk` no longer feeds
   the normal CLI flash path (it plans with the property corpus default); the
   helper stays only for the memory-mapped conformance harness.
 
@@ -674,9 +774,10 @@ e.g. `13 00 00 40 00 00 1d f2 03 80 00` (LSM1 alloc 0x4000 len 0x1D EEPROM),
 `bussard_mgmt::wrap_memory_lsm_record`, decoded by the sim's
 `decode_memory_lsm_record`.
 
-**Default:** mask-family dependent (`Sys7Profile::corpus_default_for_mask`):
-`0701` → `MemoryMapped { control 0x0104, status 0xB6EA }`; every other System 7
-mask → `Property`. A `HawkConfigurationData` block may still select `MemoryMapped`
+**Default:** the realisation the profile makes mandatory for the mask
+(`Sys7Profile::corpus_default_for_mask`): `0700` and `0701` →
+`MemoryMapped { control 0x0104, status 0xB6EA }`; `0705` → `Property`. knx-sim
+picks the same per mask when a device's config omits `lsm_access`. A `HawkConfigurationData` block may still select `MemoryMapped`
 for a product that carries a `StandardMemory` LoadControl (the 0701 Hawk block
 does; the 0705 Jung block also resolves there but is a pre-M2 false positive, so
 the normal Jung flash plans with the property default and does not feed a Hawk
@@ -746,7 +847,7 @@ record's octets 6 to 8 are the op's `Access`, `MemType` and `SegFlags` verbatim
   stream either by a read-back after each block (`DMP_MemWrite_RCo` with verify,
   `[MP §3.16.2]`, the 0701 read-compare-write) or by the echo Verify Mode
   produces for each write (`DMP_MemWrite_RCoV`, `[MP §3.16.3]`, the 0705 path,
-  where bussard still drops the echo, #524); a short or different answer is an
+  where bussard compares each echo since #524); a short or different answer is an
   error `[research 3.1, AL 03.03.07 §3.5, CONFIRMED]`. MCB is
   app-dependent on System 7: absent from the MDT-era corpus but demanded by
   Jung `A-A011` via `LoadImageProp` PID 27; see the section 2 amendment. **M2
@@ -832,11 +933,14 @@ descriptors like `07 5C DF 03`.
           (ETS "alarm"), 11 low [Res §4.18.3.1.2.1, p. 263]
   ```
   This on-device order differs from the ETS UI "C R W T U I"; I is not in this
-  byte, U is bit 7. The flash post-pass (`sys7_config_from_flags`) applies this;
-  the older public `sys7_config_byte` still forces bit 7 (#528).
+  byte, U is bit 7. `compute_sys7::sys7_config_byte(template, flags)` is the one
+  definition, used by the flash post-pass: the flag bits from the project,
+  bits 5, 1 and 0 from the product's template octet (#528).
 - **TYPE** = object size code `[Res §4.18.3.1.2.1, p. 264-265]`: 0..6 = 1..7
   bits, 7 = 1 octet, 8 = 2, 9 = 3, 10 = 4, 11 = 6, 12 = 8, 13 = 10, 14 = 14
-  octets; bits 7-6 reserved 0. `compute::size_code_from_object_size` matches.
+  octets; bits 7-6 reserved 0. `compute::object_size_code` matches and goes on
+  with Table 88 (`[Res §4.18.6.2.4.1.4]`, codes 15 to 255) for System B; a size
+  with no code refuses the plan (#545).
 - **RAM-flags table** `[Res §4.18.3.1.1.1, p. 262]`: four bits per object, two
   objects per octet (object 0 in the low nibble): bits 1-0 transmission status
   (00 idle/OK, 01 idle/error, 10 transmitting, 11 transmit request), bit 2

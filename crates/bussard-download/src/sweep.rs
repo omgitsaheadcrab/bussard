@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use bussard_prod::ApplicationProgram;
 use serde::{Deserialize, Serialize};
 
-use crate::flash::{PlanError, plan_flash};
+use crate::flash::PlanError;
 
 /// Outcome of reading a single `.knxprod` container.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,14 +328,28 @@ pub fn classify_application(app: &ApplicationProgram) -> AppSweep {
         },
         Some(device_mask) => {
             match catch_unwind(AssertUnwindSafe(|| {
-                plan_flash(
+                // The table images `flash` passes for a device without links
+                // (issue #614: a product procedure that writes the tables
+                // itself needs them to plan).
+                // One Dynamic evaluation serves both (issue #367).
+                let memo = bussard_prod::dynamic::DynamicMemo::new(app);
+                let tables = crate::build_table_images_with(
+                    None,
+                    bussard_model::IndividualAddress::from_raw(0x1101),
+                    app,
+                    &BTreeMap::new(),
+                    &memo,
+                );
+                crate::flash::plan_flash_with_memo(
                     app,
                     "1.1.1",
                     device_mask,
                     &BTreeMap::new(),
                     &BTreeMap::new(),
                     None,
+                    &tables,
                     &BTreeMap::new(),
+                    &memo,
                 )
             })) {
                 Ok(Ok(plan)) => PlanClass::Executable {
@@ -532,6 +546,8 @@ pub fn normalize_plan_error(e: &PlanError) -> String {
         // NotSystemB is bucketed as NotSupportedFamily before reaching here.
         PlanError::NotSystemB { .. } => "NotSupportedFamily".to_string(),
         PlanError::SecurityActivated { .. } => "SecurityActivated".to_string(),
+        PlanError::UnknownObjectSize { .. } => "UnknownObjectSize".to_string(),
+        PlanError::KnxnetIpUnsourced(_) => "KnxnetIpUnsourced".to_string(),
     }
 }
 
@@ -557,10 +573,12 @@ fn first_clause(s: &str) -> String {
 
 /// Collects the `.knxprod` files at or under `dir` (one level of nesting is
 /// enough: `bussard import-product` caches downloads under `<dir>/vendor/`).
+/// The extension matches in any case: some vendors ship `.KNXPROD`.
 /// Sorted and de-duplicated for stable output.
 pub fn knxprod_files(dir: &Path) -> Vec<PathBuf> {
     fn is_knxprod(p: &Path) -> bool {
-        p.extension().and_then(|e| e.to_str()) == Some("knxprod")
+        p.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("knxprod"))
     }
     let mut out: Vec<PathBuf> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -588,6 +606,21 @@ pub fn knxprod_files(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_knxprod_files_matches_extension_in_any_case() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        for name in ["a.knxprod", "B.KNXPROD", "c.zip", "d.knxprod.zip"] {
+            std::fs::write(dir.path().join(name), b"")?;
+        }
+        let got: Vec<String> = knxprod_files(dir.path())
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(got, ["B.KNXPROD", "a.knxprod"]);
+        Ok(())
+    }
 
     #[test]
     fn test_family_label_classifies_masks() {

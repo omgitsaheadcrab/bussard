@@ -40,15 +40,16 @@ use std::path::Path;
 pub use application::{
     ApplicationProgram, CodeSegment, ComObject, ComObjectRef, EnumValue, LoadOp, LoadProcedure,
     Memory, Parameter, ParameterRef, ParameterType, ParameterTypeDecl, ResolvedComObject,
-    ResolvedParameter, SegmentKind, parse_application_program,
+    ResolvedParameter, SecurityCapacity, SegmentFill, SegmentKind, parse_application_program,
 };
 /// Dynamic-section evaluation (what a device configuration shows), re-exported
 /// for the image and table builders.
 pub use bussard_ets::dynamic;
 pub use bussard_ets::master::{
-    HawkConfig, HawkResource, MaskLoadProcedure, MasterTemplate, parse_master_template,
+    BUILTIN_TEMPLATE_MASKS, HawkConfig, HawkResource, MaskLoadProcedure, MasterTemplate,
+    parse_master_template,
 };
-pub use container::{AppEntry, MAX_INNER_KNXPROD_SIZE};
+pub use container::{AppEntry, MAX_INNER_KNXPROD_SIZE, inner_knxprod_bytes};
 pub use error::{ProdError, Result};
 pub use extract::{Extracted, extract_from_project};
 pub use fetch::{DownloadConsent, MAX_DOWNLOAD_BYTES, fetch_entry};
@@ -57,7 +58,7 @@ pub use image::{
     ParameterSlot, PlacedOctets, PropertyObjectRef, PropertyValues, canonical_parameter_value,
     compute_dynamic_parameter_image, compute_parameter_image, compute_parameter_image_placed,
     compute_parameter_image_placed_with, compute_property_values, decode_parameter_value,
-    dynamic_parameter_slots, uses_dynamic_image, write_parameter_value,
+    dynamic_parameter_slots, module_argument, uses_dynamic_image, write_parameter_value,
 };
 pub use index::{IndexEntry, ProductIndex, normalize_order_number};
 
@@ -70,9 +71,12 @@ pub struct ProductData {
     pub hardware: HardwareCatalog,
     /// Every ApplicationProgram in the archive, sorted by id.
     pub applications: Vec<ApplicationProgram>,
-    /// The `knx_master.xml` load-procedure templates, when the archive carries a
-    /// master file. `None` for a self-contained archive without one — the flash
-    /// then stays on the single-object path (no template to splice against).
+    /// The mask load-procedure templates: the archive's `knx_master.xml`, with
+    /// bussard's built-in template filled in for every System B mask the
+    /// archive declares none for ([`MasterTemplate::fill_builtin`], issue
+    /// #607). A product without master data (or with a `<KNX/>` stub) still
+    /// plans the full download of a merged application. Always `Some` from
+    /// [`read_knxprod`] and its siblings.
     pub master: Option<MasterTemplate>,
     /// Whether the archive is an ETS project export (`.knxproj`) rather than
     /// vendor product data: it carries a top-level `P-XXXX` project folder or
@@ -441,9 +445,27 @@ fn assemble(
         manufacturers: catalog.manufacturers,
         hardware: catalog.hardware,
         applications,
-        master: catalog.master,
+        master: Some(with_builtin_templates(catalog.master)),
         is_project_export: catalog.is_project_export,
     })
+}
+
+/// The archive's master template with the built-in mask templates filled in
+/// where it declares none (issue #607). The one place a product's templates
+/// are attached, so `flash`, `plan` and the MCP tools all see the same ones.
+/// An archive's own template for a mask always wins.
+fn with_builtin_templates(master: Option<MasterTemplate>) -> MasterTemplate {
+    let from_archive = master.is_some();
+    let mut master = master.unwrap_or_default();
+    let filled = master.fill_builtin();
+    if !filled.is_empty() {
+        tracing::debug!(
+            masks = ?filled,
+            from_archive,
+            "using the built-in load-procedure template for masks the product's knx_master.xml does not declare"
+        );
+    }
+    master
 }
 
 #[cfg(test)]

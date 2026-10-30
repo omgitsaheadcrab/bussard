@@ -48,6 +48,13 @@ pub struct GatewayConfig {
     /// project, so an ETS run against a TP line sets e.g. `1.1.254`.
     #[serde(default)]
     pub tunnel_address: Option<String>,
+    /// Serve the data connection of plain UDP tunnels on this second UDP port
+    /// (`0` picks a free one), as KNXnet/IP Core 3/8/2 §8.6.3.1 allows
+    /// (bussard issue #512). The CONNECT_RESPONSE names it as the data
+    /// endpoint, and TUNNELLING_REQUEST/ACK travel through it only. Absent:
+    /// one port for control and data, as before.
+    #[serde(default)]
+    pub data_port: Option<u16>,
     /// Write every UDP datagram in and out to this pcap file (relative to
     /// the config file), so a tool run against the sim is captured without a
     /// sniffer. `tools/knxtrace` reads it.
@@ -55,8 +62,7 @@ pub struct GatewayConfig {
     pub pcap: Option<String>,
 }
 
-/// A KNXnet/IP Secure tunnelling interface: TCP (and optionally UDP) on the
-/// gateway port, the session handshake, SECURE_WRAPPER traffic. SYNTHETIC
+/// A KNXnet/IP Secure tunnelling interface: TCP on the gateway port, the session handshake, SECURE_WRAPPER traffic. SYNTHETIC
 /// credentials only.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IpSecureConfig {
@@ -75,16 +81,17 @@ pub struct IpSecureConfig {
     /// refused).
     #[serde(default = "default_true")]
     pub tcp: bool,
-    /// Also serve secure sessions over UDP on the gateway port (bussard issue
-    /// #197; INFERRED from the KNX specification, no real UDP-only interface
-    /// captured yet). Default `false`.
-    #[serde(default)]
-    pub udp: bool,
-    /// End a secure session after this many milliseconds without a frame from
-    /// the client, with a wrapped SESSION_STATUS `STATUS_TIMEOUT` (the KNX
-    /// specification names 60 s). Absent: sessions never time out.
+    /// End an authenticated secure session after this many milliseconds
+    /// without a valid frame from the client, with a wrapped SESSION_STATUS
+    /// `STATUS_TIMEOUT`. Default 60 000, `timeoutSession` of KNX IP Secure
+    /// 3/8/9 §2.2.3.5.2.1.1.
     #[serde(default)]
     pub session_timeout_ms: Option<u64>,
+    /// End a session that has not authenticated this many milliseconds after
+    /// its SESSION_RESPONSE, with a wrapped `STATUS_TIMEOUT`. Default 10 000,
+    /// `timeoutAuthentication` of 3/8/9 §2.2.3.5.2.1.1 (bussard issue #521).
+    #[serde(default)]
+    pub authentication_timeout_ms: Option<u64>,
     /// The tunnelling users.
     pub users: Vec<IpSecureUserConfig>,
 }
@@ -125,18 +132,17 @@ impl From<InitialState> for LoadState {
 
 /// How a System 7 device realises its load-state machines, as declared in
 /// config. Selects the device side the simulator presents so a tool can be
-/// conformance-tested against either realisation. Default: property-based (the
-/// M2 Jung 0705 capture, issue #70, showed the real device drives load control
-/// over `PID_LOAD_STATE_CONTROL`).
+/// conformance-tested against either realisation. When omitted, the mask picks
+/// it ([`crate::device::profile::default_lsm_access_for_mask`]): memory mapped
+/// on `0700` and `0701`, property on `0705` (KNX 6 Profiles §4.2 row 7).
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum LsmAccessConfig {
-    /// 12-octet record over `A_Memory_Write` to the LSM control address, status
-    /// polled via `A_Memory_Read`. The pre-M2 default, kept selectable for any
-    /// 0705 silicon whose product data drives the LSM this way.
+    /// 11-octet record over `A_Memory_Write` to the LSM control address, status
+    /// polled via `A_Memory_Read` (the `0700` / `0701` default).
     Memory,
     /// Load events over `PID_LOAD_STATE_CONTROL` (PID 5) via
-    /// `A_PropertyValue_Write/Read` (the default — M2 Jung 0705 capture).
+    /// `A_PropertyValue_Write/Read` (the `0705` default, M2 Jung capture).
     Property,
 }
 
@@ -147,10 +153,6 @@ impl From<LsmAccessConfig> for crate::device::LsmAccess {
             LsmAccessConfig::Property => crate::device::LsmAccess::Property,
         }
     }
-}
-
-fn default_lsm_access() -> LsmAccessConfig {
-    LsmAccessConfig::Property
 }
 
 /// Per-device KNX Data Secure configuration (spec §12.2). A device with a
@@ -249,10 +251,11 @@ pub struct DeviceConfig {
     #[serde(default)]
     pub mask: Option<String>,
     /// For a System 7 device, how its load-state machines are realised on the
-    /// wire (default: property-based, the M2 Jung 0705 capture). Ignored for
-    /// System B.
-    #[serde(default = "default_lsm_access")]
-    pub lsm_access: LsmAccessConfig,
+    /// wire. `None` (omitted) lets the mask pick the realisation the profile
+    /// makes mandatory (memory mapped on `0700`/`0701`, property on `0705`).
+    /// Ignored for System B.
+    #[serde(default)]
+    pub lsm_access: Option<LsmAccessConfig>,
     /// For a System 7 device, the BCU key (as a hex or decimal `u32`) required
     /// for memory access. Omit for free access (the default): any key unlocks.
     /// When set, memory/load writes before a successful `A_Authorize` with the
@@ -268,6 +271,17 @@ pub struct DeviceConfig {
     /// `KNX_SIM_L4_BUDGET` environment variable overrides this for every device.
     #[serde(default)]
     pub l4_exchange_budget: Option<u32>,
+    /// Drop an out-of-window numbered telegram silently instead of answering
+    /// it with `T_NAK` (default `false`, the Style 3 behaviour of 03_03_04
+    /// §5.4.3). Set it to reproduce a tool that stalls after a desync.
+    #[serde(default)]
+    pub l4_strict_drop: bool,
+    /// The largest segment (octets) a load-control allocation may ask for: a
+    /// larger one fails, the object goes to Error and its
+    /// `PID_TABLE_REFERENCE` to zero (Configuration Procedures §3.5.1.2).
+    /// Omit for no limit (the default).
+    #[serde(default)]
+    pub max_allocation: Option<u32>,
     /// Whether the device starts in KNX programming mode (default `false`). A
     /// device in programming mode answers the broadcast `A_IndividualAddress_Read`
     /// — the discovery step `bussard assign` and `bussard viz --watch-prog` use.
@@ -320,6 +334,11 @@ pub struct KnxnetSimConfig {
     /// maximum element count; default: as many as `tunnels` lists).
     #[serde(default)]
     pub tunnel_slots: Option<u16>,
+    /// PID 79, the tunnelling addresses: 0 the interface's own address, n the
+    /// n-th entry of `tunnels` (default `1..=n`, every tunnel; bussard issue
+    /// #520).
+    #[serde(default)]
+    pub tunnelling_addresses: Option<Vec<u8>>,
     /// Whether the object appears in the object-index walk (default `true`).
     /// `false` serves it by object type and instance only, through the
     /// extended property services, as the Jung IPS 300 SREG does.
@@ -364,6 +383,15 @@ impl KnxnetSimConfig {
         }
         if let Some(name) = &self.friendly_name {
             p.friendly_name = name.clone();
+        }
+        if let Some(list) = &self.tunnelling_addresses {
+            if list.iter().any(|&i| usize::from(i) > p.tunnels.len()) {
+                return Err(format!(
+                    "tunnelling_addresses {list:?}: an index past the {} tunnels",
+                    p.tunnels.len()
+                ));
+            }
+            p.tunnelling_addresses = list.clone();
         }
         if let Some(slots) = self.tunnel_slots {
             p.tunnel_slots = p.tunnel_slots.max(slots);
@@ -460,6 +488,11 @@ pub struct SimConfig {
     /// alive for observation. Empty (the default) means a quiet bus.
     #[serde(default)]
     pub stimulus: Vec<StimulusConfig>,
+    /// Captures whose tool requests are replayed into the devices, in order,
+    /// before the gateway opens (relative to the config file): the bus starts
+    /// in the state the recorded downloads left it in (`crate::replay`).
+    #[serde(default)]
+    pub replay: Vec<String>,
 }
 
 /// Errors from loading a config.
@@ -593,7 +626,16 @@ impl SimConfig {
             };
             let overrides = crate::device::ProfileOverrides {
                 mask: dc.mask.clone(),
-                lsm_access: dc.lsm_access.into(),
+                lsm_access: match dc.lsm_access {
+                    Some(access) => access.into(),
+                    None => crate::device::profile::default_lsm_access_for_mask(
+                        dc.mask
+                            .as_deref()
+                            .or(Some(product.mask_version.as_str()))
+                            .and_then(crate::device::profile::parse_mask)
+                            .unwrap_or(0x07B0),
+                    ),
+                },
                 bcu_key,
                 prog_mode: effective_prog_mode(&dc.address, dc.prog_mode),
                 secure,
@@ -609,7 +651,9 @@ impl SimConfig {
                 device: dc.address.clone(),
                 reason,
             })?
-            .with_l4_exchange_budget(effective_l4_budget(dc.l4_exchange_budget));
+            .with_l4_exchange_budget(effective_l4_budget(dc.l4_exchange_budget))
+            .with_strict_l4_drop(dc.l4_strict_drop)
+            .with_max_allocation(dc.max_allocation);
             let device = match &dc.security {
                 Some(sec) if sec.status == SecurityStatus::Factory => {
                     device.with_factory_security()
@@ -763,8 +807,8 @@ devices:
     #[test]
     fn test_parse_config_system7_options() -> Result<(), ConfigError> {
         // A System 7 device may declare a mask override, an lsm_access mode and a
-        // bcu_key. lsm_access defaults to `property` (M2 Jung 0705 capture); the
-        // memory-mapped variant stays selectable via `lsm_access: memory`.
+        // bcu_key. An omitted lsm_access stays `None` and the mask picks the
+        // realisation when the device is built.
         let yaml = r#"
 gateway:
   host: "127.0.0.1"
@@ -781,11 +825,11 @@ devices:
         let cfg = SimConfig::from_yaml(yaml)?;
         assert_eq!(cfg.devices[0].mask.as_deref(), Some("0705"));
         // The memory-mapped variant is still selectable.
-        assert_eq!(cfg.devices[0].lsm_access, LsmAccessConfig::Memory);
+        assert_eq!(cfg.devices[0].lsm_access, Some(LsmAccessConfig::Memory));
         assert_eq!(cfg.devices[0].bcu_key.as_deref(), Some("0x12345678"));
-        // Defaults on the second device: no mask, property-based LSM, no key.
+        // Defaults on the second device: no mask, the mask's LSM, no key.
         assert_eq!(cfg.devices[1].mask, None);
-        assert_eq!(cfg.devices[1].lsm_access, LsmAccessConfig::Property);
+        assert_eq!(cfg.devices[1].lsm_access, None);
         assert_eq!(cfg.devices[1].bcu_key, None);
         Ok(())
     }

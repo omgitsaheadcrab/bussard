@@ -4,6 +4,7 @@
 //! one per file saves a link against the full dependency graph per file;
 //! nextest still runs every test in its own process.
 
+mod al_negative_mock;
 mod assign_mock;
 mod io_list_mock;
 mod knxnet_mock;
@@ -12,5 +13,9 @@ mod max_apdu_mock;
 mod mem_write_mock;
 mod mock_device;
 mod property_ext_mock;
+mod sim_tl_idle;
 mod tables_memory_mock;
 mod tables_mock;
+mod tl_idle_mock;
+mod tl_style3_mock;
+mod user_memory_mock;

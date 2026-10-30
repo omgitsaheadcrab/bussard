@@ -19,8 +19,11 @@
 //! `--dir` as `#@` lines. Nothing touches the bus: the script runs `flash
 //! --dry-run` only.
 //!
-//! The ungated test runs the script's `--check` plumbing on a row whose
-//! capture does not exist, so a broken script fails every CI run.
+//! Two tests are ungated: one runs the script's `--check` plumbing on a row
+//! whose capture does not exist, so a broken script fails every CI run; the
+//! other runs `--check` over the synthetic products' committed rows
+//! (`captures/synthetic/rows.txt`, epic #596), a real bussard-versus-ETS
+//! comparison on every CI run.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -73,11 +76,38 @@ fn tools_available() -> bool {
         })
 }
 
+/// The interpreter behind `python3`, resolved once. The script starts Python
+/// about fifteen times per row; through a version-manager shim (pyenv) each
+/// start costs a second or more, which made a synthetic row take 18 s instead
+/// of 2 s locally. `None` leaves the script's own `python3` lookup alone.
+fn resolved_python() -> Option<&'static str> {
+    static PYTHON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PYTHON
+        .get_or_init(|| {
+            let out = Command::new("python3")
+                .args(["-c", "import sys; print(sys.executable)"])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()?;
+            let path = String::from_utf8(out.stdout).ok()?.trim().to_owned();
+            (out.status.success() && !path.is_empty()).then_some(path)
+        })
+        .as_deref()
+}
+
 /// Runs the oracle script in `cwd` with `args`; returns (success, stdout +
 /// stderr). No gateway is ever configured: the script only plans dry runs.
 fn oracle(cwd: &Path, args: &[&str]) -> std::io::Result<(bool, String)> {
     let script = workspace_root().join("scripts/campaign/95-offline-oracle.sh");
-    let out = Command::new("bash")
+    let mut command = Command::new("bash");
+    // A `PYTHON` the caller exported wins over the resolved interpreter.
+    if std::env::var_os("PYTHON").is_none()
+        && let Some(python) = resolved_python()
+    {
+        command.env("PYTHON", python);
+    }
+    let out = command
         .arg(script)
         .args(args)
         .current_dir(cwd)
@@ -173,5 +203,183 @@ fn test_offline_oracle_rows_pass_the_check() -> TestResult {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    Ok(())
+}
+
+/// Copies the files of `from` into `to` (one level; the synthetic model is a
+/// single `bussard.toml`, and the dry run writes its caches into the copy).
+fn copy_files(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let path = entry?.path();
+        if path.is_file()
+            && let Some(name) = path.file_name()
+        {
+            std::fs::copy(&path, to.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+/// How many synthetic rows run at once. One row is one script run of about
+/// 8 s that mostly waits on child processes (`knxtrace`, the bussard dry run),
+/// so a few workers cut the wall time without starving the other tests nextest
+/// runs next to this one.
+const SYNTHETIC_WORKERS: usize = 4;
+
+/// One synthetic row's outcome: the row line, whether it passed, how long it
+/// took, and the failure detail.
+struct RowOutcome {
+    line: String,
+    ok: bool,
+    secs: f64,
+    detail: String,
+}
+
+/// Runs one row of the synthetic rows file with `--check` in its own model
+/// copy and output directory, so rows can run side by side (the dry run writes
+/// `.bussard/` into the model).
+fn check_synthetic_row(
+    root: &Path,
+    tmp: &Path,
+    n: usize,
+    line: &str,
+    options: &[String],
+) -> Result<RowOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    let started = std::time::Instant::now();
+    let dir = tmp.join(n.to_string());
+    let model = dir.join("model");
+    copy_files(&root.join("captures/synthetic/model"), &model)?;
+    let out = dir.join("out");
+    let model_arg = model.to_string_lossy().into_owned();
+    let out_arg = out.to_string_lossy().into_owned();
+    let mut args: Vec<&str> = vec!["--row", line, "--dir", &model_arg, "--out", &out_arg];
+    args.extend(options.iter().map(String::as_str));
+    args.push("--check");
+    let (mut ok, text) = oracle(root, &args)?;
+    let mut detail = String::new();
+    if !ok {
+        detail = tail(&text, 40);
+    } else {
+        // The row ran: it was not skipped for a missing capture or product.
+        let mut ran = false;
+        for entry in std::fs::read_dir(&out)? {
+            let row = entry?.path().join("row.json");
+            if row.is_file() {
+                let row: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&row)?)?;
+                if !row["skipped"].is_null() {
+                    ok = false;
+                    detail = format!("skipped: {}", row["skipped"]);
+                }
+                ran = true;
+            }
+        }
+        if !ran {
+            ok = false;
+            detail = format!("no row.json written:\n{}", tail(&text, 20));
+        }
+    }
+    Ok(RowOutcome {
+        line: line.to_owned(),
+        ok,
+        secs: started.elapsed().as_secs_f64(),
+        detail,
+    })
+}
+
+/// The synthetic products' rows (epic #596): committed ETS captures of
+/// fabricated `M-00FA` products, the product XML zipped with the stub master
+/// by the script. Ungated: everything they need is committed, so every CI run
+/// on a POSIX host compares bussard's dry run with what ETS wrote.
+///
+/// The catalogue grows to about forty rows, so the rows run one script call
+/// each on [`SYNTHETIC_WORKERS`] threads, and a failure names every failing
+/// row with its time. The nextest budget for this test is an override in
+/// `.config/nextest.toml`.
+#[test]
+fn test_offline_oracle_synthetic_rows_pass_the_check() -> TestResult {
+    if !tools_available() {
+        eprintln!("SKIP: python3 or bash is not available");
+        return Ok(());
+    }
+    let root = workspace_root();
+    let tmp = TmpDir::new("synthetic")?;
+    let rows_file = std::fs::read_to_string(root.join("captures/synthetic/rows.txt"))?;
+    // `#@` options apply to every row; `--dir` is replaced by each row's copy.
+    let mut options = Vec::new();
+    for line in rows_file
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("#@"))
+    {
+        let mut words = line.split_whitespace();
+        while let Some(word) = words.next() {
+            if word == "--dir" {
+                words.next();
+            } else {
+                options.push(word.to_owned());
+            }
+        }
+    }
+    let rows: Vec<&str> = rows_file
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert!(!rows.is_empty(), "captures/synthetic/rows.txt has no row");
+
+    let started = std::time::Instant::now();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = SYNTHETIC_WORKERS.min(rows.len());
+    let outcomes = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let n = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(line) = rows.get(n) else { break };
+                        done.push(
+                            check_synthetic_row(&root, tmp.path(), n, line, &options)
+                                .map_err(|e| format!("{line}: {e}")),
+                        );
+                    }
+                    done
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| vec![Err("worker panicked".to_owned())])
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let mut timings = Vec::new();
+    let mut failures = Vec::new();
+    for outcome in outcomes.into_iter().flatten() {
+        match outcome {
+            Ok(row) => {
+                timings.push(format!("{:6.1} s  {}", row.secs, row.line));
+                if !row.ok {
+                    failures.push(format!("{} ({:.1} s):\n{}", row.line, row.secs, row.detail));
+                }
+            }
+            Err(e) => failures.push(e),
+        }
+    }
+    let summary = format!(
+        "{} rows on {workers} workers in {:.1} s:\n{}",
+        rows.len(),
+        started.elapsed().as_secs_f64(),
+        timings.join("\n")
+    );
+    eprintln!("{summary}");
+    assert!(
+        failures.is_empty(),
+        "synthetic rows failed the check:\n{}\n\n{summary}",
+        failures.join("\n\n")
+    );
     Ok(())
 }

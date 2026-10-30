@@ -629,11 +629,14 @@ def wait_busy(timeout: float = 300) -> float:
     raise RuntimeError(f"ETS still busy after {int(timeout)} s")
 
 
-def dismiss_password_dialog() -> bool:
+def dismiss_password_dialog(password: str | None = None) -> bool:
     """'Projektpasswort setzen': ETS asks for a project password the first
     time a KNX Secure capable product joins a project without one. The plain
-    sweep answers Abbrechen (no project security); the secure pass (part 4)
-    sets one instead. Without this the next keystrokes land in the field."""
+    sweep answers Abbrechen (no project security); the secure pass (part 4,
+    #423) passes `password` and sets it instead (`set_project_password`).
+    Without this the next keystrokes land in the field."""
+    if password:
+        return set_project_password(password)
     if not find_text("Projektpasswort setzen", (1300, 750, 2800, 900), min_ratio=0.8):
         return False
     hit = find_text("Abbrechen", (2200, 1600, 2800, 1760))
@@ -643,6 +646,208 @@ def dismiss_password_dialog() -> bool:
         keys("{ESC}")
     time.sleep(1.5)
     return True
+
+
+# ---------------------------------------------------------------- secure pass (#423)
+# UNVERIFIED against ETS: written offline on 2026-10-30 while a sweep held
+# the VM. Every step anchors on dialog text read by OCR and fails loudly with
+# what it saw; the sweep's repair loop keeps a screenshot. Keystrokes only
+# type text and press Tab, Enter or Escape (never Delete or Backspace).
+
+PASSWORD_DIALOG = (1200, 700, 3000, 1800)
+
+
+def set_project_password(password: str) -> bool:
+    """Answers ETS's project password dialog with `password`: 'Projektpasswort
+    setzen' (two fields, the second a confirmation) or a prompt for the
+    password of a protected project (one field). The first field holds the
+    focus when the dialog opens. Returns whether a dialog was answered."""
+    if re.search(r"[+^%~(){}\[\]]", password):
+        # pywinauto's send_keys reads these as modifiers and groups.
+        raise RuntimeError("the project password must not contain + ^ % ~ ( ) { } [ ]")
+    lines = ocr(PASSWORD_DIALOG)
+    text = " ".join(l["text"] for l in lines)
+    if "Projektpasswort" not in text and not ("Passwort" in text and "Projekt" in text):
+        return False
+    keys(password, pause=0.02)
+    if re.search(r"(bestätig|wiederhol|Bestätig|Wiederhol)", text):
+        keys("{TAB}")
+        keys(password, pause=0.02)
+    keys("{ENTER}")
+    time.sleep(2)
+    after = " ".join(l["text"] for l in ocr(PASSWORD_DIALOG))
+    if "Projektpasswort" in after:
+        keys("{ESC}")
+        raise RuntimeError(f"the project password dialog stayed open: {after[:200]}")
+    return True
+
+
+def enter_certificate(certificate: str) -> bool:
+    """Types the device certificate (the FDSK label, 36 characters in six
+    groups) into ETS's certificate prompt, when one is open: ETS asks for it
+    before the first secure download of a device it holds none for."""
+    text = " ".join(l["text"] for l in ocr(PASSWORD_DIALOG))
+    if "Zertifikat" not in text:
+        return False
+    keys(certificate, pause=0.02)
+    keys("{ENTER}")
+    time.sleep(2)
+    after = " ".join(l["text"] for l in ocr(PASSWORD_DIALOG))
+    if "Zertifikat" in after and re.search(r"(ungültig|Ungültig|falsch|Fehler)", after):
+        keys("{ESC}")
+        raise RuntimeError(f"ETS refused the device certificate: {after[:200]}")
+    return True
+
+
+def export_from_tab_menu(project: str, entry_re: str, path: str, password: str | None = None,
+                         wait: float = 120) -> dict:
+    """An export ETS offers in the project tab's context menu: the entry
+    matching `entry_re`, ETS's save dialog (a Win32 dialog, UI Automation:
+    the file name field set to `path`, then Enter), the export password when
+    one is asked for, and the file appearing at `path` in the VM."""
+    require_project(project)
+    hit = find_text(project, LAYOUT["tab_strip"])
+    if not hit:
+        raise RuntimeError(f"no tab for project {project!r}")
+    click(hit["x"] + hit["w"] // 2, hit["y"] + hit["h"] // 2, button="right")
+    time.sleep(1.5)
+    items = menu_items()
+    entry = next((i for i in items if re.search(entry_re, i, re.I)), None)
+    if entry is None:
+        keys("{ESC}")
+        raise RuntimeError(f"no entry like {entry_re!r} in the project tab's menu: {items[:16]}")
+    menu_click(entry)
+    time.sleep(2)
+    dialog = wait_popup(10)
+    edits = [e for e in dialog.descendants(control_type="Edit") if e.is_visible()]
+    if not edits:
+        keys("{ESC}")
+        raise RuntimeError(f"the save dialog has no file name field: {popup_tree(4, 3000)[:400]}")
+    edits[0].set_edit_text(path)
+    keys("{ENTER}")
+    time.sleep(2)
+    answered = set_project_password(password) if password else False
+    deadline = time.time() + wait
+    while time.time() < deadline and not os.path.exists(path):
+        time.sleep(1)
+    wait_busy()
+    return {"path": path, "exported": os.path.exists(path), "password_dialog": answered, "menu_entry": entry}
+
+
+@flow("export_keyring")
+def flow_export_keyring(req: dict) -> dict:
+    """Exports the project's keyring (`.knxkeys`) to `path` in the VM,
+    protected with `password` (#423)."""
+    return export_from_tab_menu(req["project"], r"(Schlüsselbund|Keyring|knxkeys)", req["path"], req["password"])
+
+
+@flow("export_project")
+def flow_export_project(req: dict) -> dict:
+    """Exports the project (`.knxproj`) to `path` in the VM (#424): `bussard
+    import` of it is the model state a parameter-set row compares against."""
+    return export_from_tab_menu(req["project"], r"^(Projekt )?export", req["path"], req.get("project_password"))
+
+
+# ---------------------------------------------------------------- parameter editor (#424)
+# UNVERIFIED against ETS (written offline, 2026-10-30). The parameter view is
+# part of the main window, so it is read by OCR: the page list on the left,
+# each parameter a row of label and control. Regions are first guesses of the
+# 4112-wide layout and are the first thing to correct from a screenshot.
+PARAM_PAGES = (680, 260, 1250, 2400)
+PARAM_AREA = (1250, 260, 3300, 2400)
+
+
+def open_device_parameters(ia: str) -> str:
+    """Opens the parameter view of device `ia`: its Topologie node's context
+    menu, the entry that names the parameters."""
+    from pywinauto import mouse
+
+    click(*line_1_1())
+    time.sleep(1)
+    tree = [l for l in ocr(LAYOUT["tree"]) if re.match(rf"^\W*{re.escape(ia)}\b", l["text"].strip())]
+    if not tree:
+        raise RuntimeError(f"device {ia} not in the Topologie tree")
+    t = tree[0]
+    s = scale()
+    mouse.right_click(coords=(int((t["x"] + t["w"] // 2) * s), int((t["y"] + t["h"] // 2) * s)))
+    time.sleep(1.2)
+    items = menu_items()
+    entry = next((i for i in items if re.match(r"^Parameter", i)), None)
+    if entry is None:
+        keys("{ESC}")
+        raise RuntimeError(f"no parameter entry in the device's menu: {items[:16]}")
+    menu_click(entry)
+    time.sleep(3)
+    wait_busy()
+    return entry
+
+
+def param_page_lines() -> list[dict]:
+    return [l for l in ocr(PARAM_PAGES) if len(l["text"].strip()) > 1]
+
+
+@flow("param_pages")
+def flow_param_pages(req: dict) -> dict:
+    """The pages of device `ia`'s parameter view, as ETS lists them."""
+    require_project(req["project"])
+    entry = open_device_parameters(req["ia"])
+    return {"pages": [l["text"].strip() for l in param_page_lines()], "menu_entry": entry}
+
+
+def _row_cells(label: dict, lines: list[dict]) -> list[dict]:
+    """The OCR lines on the label's row right of it (the control's text)."""
+    cy = label["y"] + label["h"] // 2
+    return sorted((l for l in lines if abs(l["y"] + l["h"] // 2 - cy) < 18 and l["x"] > label["x"] + label["w"]),
+                  key=lambda l: l["x"])
+
+
+@flow("set_param")
+def flow_set_param(req: dict) -> dict:
+    """Sets the parameter labelled `text` to `value` (as ETS shows it) on the
+    first page of `pages` that shows it. `kind` enum: the option of that name
+    on the label's row (radio buttons), else the row's dropdown (a popup,
+    UI Automation). `kind` int: the row's field, select all, type, Tab. The
+    row is read again afterwards. A label on no page: {"set": false}."""
+    require_project(req["project"])
+    want, value = _norm(req["text"]), str(req["value"])
+    seen: list[str] = []
+    for page in req.get("pages") or [None]:
+        if page is not None:
+            hit = next((l for l in param_page_lines() if l["text"].strip() == page), None)
+            if hit is None:
+                continue
+            click(hit["x"] + hit["w"] // 2, hit["y"] + hit["h"] // 2)
+            time.sleep(1.5)
+        lines = ocr(PARAM_AREA)
+        label = next((l for l in lines if _norm(l["text"]) == want), None) \
+            or next((l for l in lines if want and want in _norm(l["text"])), None)
+        if label is None:
+            seen += [l["text"] for l in lines[:6]]
+            continue
+        cells = _row_cells(label, lines)
+        if not cells:
+            raise RuntimeError(f"no control on the row of {req['text']!r} (page {page!r})")
+        option = next((c for c in cells if _norm(c["text"]) == _norm(value)), None)
+        if req.get("kind") == "enum" and option is not None and len(cells) > 1:
+            click(option["x"] - 30, option["y"] + option["h"] // 2)  # the radio button left of its text
+        elif req.get("kind") == "enum":
+            cell = cells[0]
+            click(cell["x"] + cell["w"] // 2, cell["y"] + cell["h"] // 2)
+            time.sleep(1)
+            choose(value, (cell["x"] - 50, cell["y"], cell["x"] + 1200, min(cell["y"] + 1400, 2484)))
+        else:
+            cell = cells[0]
+            click(cell["x"] + cell["w"] // 2, cell["y"] + cell["h"] // 2)
+            time.sleep(0.5)
+            keys("^a")
+            keys(value)
+            keys("{TAB}")
+        time.sleep(1.5)
+        wait_busy()
+        after = _row_cells(label, ocr(PARAM_AREA))
+        shown = " ".join(c["text"] for c in after)
+        return {"set": _norm(value) in _norm(shown), "page": page, "row": shown[:200]}
+    return {"set": False, "seen": seen[:24]}
 
 
 def _digits(t: str) -> str:
@@ -732,7 +937,7 @@ def flow_catalog_add(req: dict) -> dict:
     order number matches and whose application version is `version` (as ETS
     shows it, e.g. "2.3"), and add it to line 1.1. Returns the device list."""
     require_project(req["project"])
-    dismiss_password_dialog()
+    dismiss_password_dialog(req.get("project_password"))
     wait_busy()
     before = {d["ia"] for d in flow_devices(req)["devices"]}
     dy = catalog_dy()
@@ -757,9 +962,18 @@ def flow_catalog_add(req: dict) -> dict:
     want_version = _digits(req.get("version", ""))
 
     def pick(hits: list[dict], name: str = "") -> dict | None:
-        # Imported products only: an online-catalog row would make ETS fetch
-        # product data from the internet instead of our corpus file.
-        hits = [r for r in hits if not r.get("online")]
+        # Imported products first: an online-catalog row would make ETS fetch
+        # product data from the internet instead of our corpus file. ETS shows
+        # an imported product that also sits in its online catalog at the same
+        # version as one online row (MDT SCN-BWM55 4.4, 2026-10-29): take that
+        # row when no local one exists and order number and version match.
+        local = [r for r in hits if not r.get("online")]
+        if not local:
+            same = [r for r in hits if _canon(r["order"]) == order and want_version
+                    and _digits(r["version"]) == want_version]
+            if len(same) == 1:
+                return same[0]
+        hits = local
         # The order number exactly (ZPR1612 is not ZPR1612V2), else a prefix.
         exact = [r for r in hits if _canon(r["order"]) == order] or [r for r in hits if _canon(r["order"]).startswith(order)]
         if not exact and name:
@@ -835,7 +1049,7 @@ def flow_catalog_add(req: dict) -> dict:
         compat = decline_compat_mode()
         if compat:
             raise CompatModeRequired(f"ETS asked for compatibility mode on adding: {compat[:200]}")
-        if dismiss_password_dialog():
+        if dismiss_password_dialog(req.get("project_password")):
             password_dialog = True
             break
         time.sleep(1)
@@ -849,8 +1063,14 @@ def flow_catalog_add(req: dict) -> dict:
         new = [d for d in after if d["ia"] not in before]
         if new or time.time() - t0 > float(req.get("add_wait", 60)):
             break
-        if dismiss_password_dialog():
+        if dismiss_password_dialog(req.get("project_password")):
             password_dialog = True
+        # ETS asks for compatibility mode for some old products only once the
+        # add has run for a while (ABB A-A033, 2026-10-28); the next job then
+        # met the prompt and was charged with it.
+        compat = decline_compat_mode()
+        if compat:
+            raise CompatModeRequired(f"ETS asked for compatibility mode on adding: {compat[:200]}")
         time.sleep(2)
     return {"devices": after, "added": new, "row": row, "password_dialog": password_dialog}
 
@@ -889,14 +1109,31 @@ def flow_delete_device(req: dict) -> dict:
     r, g, b = Counter(light).most_common(1)[0][0] if light else (0, 0, 0)
     if not (b > r + 20 and b > 230):
         raise RuntimeError(f"delete: the row of {req['ia']} is not highlighted (rgb {r},{g},{b})")
-    mouse.right_click(coords=(int(1000 * s_), int(y * s_)))
-    time.sleep(1.2)
-    items = menu_items()
+    # The menu's entries come from UI Automation, or, when UIA shows none
+    # (after an ETS restart the popup opened but listed nothing, 2026-10-29),
+    # from OCR of the menu that opens right of and below the pointer.
+    items: list[str] = []
+    lines: list[dict] = []
+    for _ in range(3):
+        mouse.right_click(coords=(int(1000 * s_), int(y * s_)))
+        time.sleep(1.2)
+        items = menu_items()
+        if items:
+            break
+        lines = ocr((1000, y, 1800, y + 1300))
+        items = [re.sub(r"^\W*[XO]?\s+", "", l["text"]).strip() for l in lines]
+        if items:
+            break
+        time.sleep(2)
     # A device's menu offers 'Gerät neu starten'; a line's or area's does not.
     if "Gerät neu starten" not in items or "Löschen" not in items:
         keys("{ESC}")
         raise RuntimeError(f"delete: unexpected context menu for {req['ia']}: {items[:12]}")
-    menu_click("Löschen")
+    if lines:
+        hit = next(l for l in lines if l["text"].strip().endswith("Löschen") and l["x"] < 1300)
+        click(1100, hit["y"] + hit["h"] // 2)
+    else:
+        menu_click("Löschen")
     # The confirmation comes later for a larger product (over 2 s for an MDT
     # room actuator): wait for it, confirm, and check the device is gone.
     t0 = time.time()
@@ -1159,18 +1396,22 @@ def flow_download(req: dict) -> dict:
     t0 = time.time()
     kept = False
     password = False
+    certificate = False
     while time.time() - t0 < float(req.get("dialog_wait", 20)):
         if find_text("Schnittstellen-Prüfung", LAYOUT["medium_dialog"]):
             click(*LAYOUT["medium_keep"])
             kept = True
             break
-        if dismiss_password_dialog():
+        if dismiss_password_dialog(req.get("project_password")):
             password = True
+        if req.get("certificate") and enter_certificate(req["certificate"]):
+            certificate = True
         compat = decline_compat_mode()
         if compat:
             raise CompatModeRequired(f"ETS asked for compatibility mode on download: {compat[:200]}")
         time.sleep(1)
-    return {"ia": req["ia"], "mode": req.get("mode", "application"), "medium_dialog_kept": kept, "password_dialog": password}
+    return {"ia": req["ia"], "mode": req.get("mode", "application"), "medium_dialog_kept": kept, "password_dialog": password,
+            "certificate_dialog": certificate}
 
 
 @flow("history")
@@ -1194,13 +1435,33 @@ def dismiss_ets_error() -> str | None:
     joined = " ".join(l["text"] for l in lines)
     if "Fehler" not in joined:
         return None
-    ok = find_text("OK", (2400, 1180, 2800, 1260), min_ratio=0.6)
-    if ok:
+    # The dialog grows with its text: its OK sat at y=1226 once and y=1460
+    # another time (2026-10-29), so look for it in the whole lower half.
+    oks = [l for l in ocr((1300, 1100, 2800, 1700)) if l["text"].strip() == "OK"]
+    if oks:
+        ok = oks[0]
         click(ok["x"] + ok["w"] // 2, ok["y"] + ok["h"] // 2)
     else:
         click(2600, 1226)
     time.sleep(1.5)
     return joined[:400]
+
+
+def finish_language_dialog() -> bool:
+    """Answer a 'Produktsprache(n) auswählen' dialog an import left open (it
+    blocked every click and every later product failed, 2026-10-29): import
+    all languages and wait for that import to end."""
+    if not find_text("Produktsprache", (1700, 950, 2600, 1060), min_ratio=0.7):
+        return False
+    click_text("Alle Sprachen importieren", (1900, 1490, 2400, 1560))
+    t0 = time.time()
+    while time.time() - t0 < 900:
+        time.sleep(5)
+        text = " ".join(l["text"] for l in ocr((1500, 850, 2700, 1600)))
+        if not re.search(r"Konvertiere|Importiere|Signiere|Analysiere", text):
+            break
+    dismiss_ets_error()
+    return True
 
 
 @flow("ets_error")
@@ -1611,7 +1872,8 @@ class Handler(BaseHTTPRequestHandler):
                 compat = decline_compat_mode()
                 if compat:
                     raise CompatModeRequired(f"ETS asked for compatibility mode before {name}: {compat[:200]}")
-                watchdog = {"password_dialog": dismiss_password_dialog(), "ets_error": dismiss_ets_error(),
+                watchdog = {"language_dialog": finish_language_dialog(),
+                            "password_dialog": dismiss_password_dialog(req.get("project_password")), "ets_error": dismiss_ets_error(),
                             "ets_started": started}
                 out = fn(req)
                 out.setdefault("ok", True)

@@ -130,6 +130,110 @@ pub const A_MEMORY_EXTENDED_READ: u16 = 0x1FD;
 /// [`decode_memory_extended_response`].
 pub const A_MEMORY_EXTENDED_READ_RESPONSE: u16 = 0x1FE;
 
+/// `A_UserMemory_Read` — read memory at a **20-bit** address (03_03_07
+/// §3.5.6.2). Payload: `[ext:4|count:4][addr_hi, addr_lo]`.
+///
+/// ETS reads and writes a segment above `0xFFFF` with the user-memory services
+/// when the application does not announce `SupportsExtendedMemoryServices`
+/// (issue #472: Zennio DIMinBOX/DALIBOX, ABB Caldion, Busch-Jaeger Split Unit
+/// Gateway). Configuration Procedures 03_05_03 §3.5.1.4 Table 5 names it for
+/// memory above 64 KB.
+pub const A_USER_MEMORY_READ: u16 = 0x2C0;
+/// `A_UserMemory_Response` — the answer to an [`A_USER_MEMORY_READ`], and the
+/// verify-mode echo of an [`A_USER_MEMORY_WRITE`]. Payload:
+/// `[ext:4|count:4][addr_hi, addr_lo][data…]`; count 0 is the device's refusal.
+pub const A_USER_MEMORY_RESPONSE: u16 = 0x2C1;
+/// `A_UserMemory_Write` — write 1 to 15 octets at a **20-bit** address
+/// (03_03_07 §3.5.6.3). Payload: `[ext:4|count:4][addr_hi, addr_lo][data…]`.
+/// Acknowledged only, unless the device is in verify mode: then it answers
+/// with an [`A_USER_MEMORY_RESPONSE`] carrying the octets it stored.
+pub const A_USER_MEMORY_WRITE: u16 = 0x2C2;
+
+/// The largest address the user-memory services carry: 20 bits.
+pub const MAX_USER_MEMORY_ADDRESS: u32 = 0x000F_FFFF;
+
+/// The most data octets one user-memory request carries: the 4-bit count.
+pub const MAX_USER_MEMORY_LEN: u8 = 15;
+
+/// The fixed APDU overhead of a user-memory telegram on top of its data: the
+/// 2-octet APCI, the `[ext|count]` octet and the 2 address octets.
+const USER_MEMORY_APDU_OVERHEAD: u8 = 5;
+
+/// The user-memory data-octet cap for a device advertising `max_apdu` NPDU
+/// octets: `min(max_apdu - 5, 15)`, at least 1. The standard-frame floor (15)
+/// yields 10; ETS wrote 15 per request to the Zennio DIMinBOX (issue #472).
+pub fn user_memory_chunk_for_apdu(max_apdu: u16) -> u8 {
+    let usable = max_apdu.saturating_sub(u16::from(USER_MEMORY_APDU_OVERHEAD));
+    (usable.min(u16::from(MAX_USER_MEMORY_LEN)) as u8).max(1)
+}
+
+/// The `[ext:4|count:4][addr_hi, addr_lo]` header of a user-memory request.
+fn user_memory_header(addr: u32, count: u8) -> [u8; 3] {
+    let a = addr & MAX_USER_MEMORY_ADDRESS;
+    [
+        (((a >> 16) as u8) << 4) | (count & 0x0F),
+        (a >> 8) as u8,
+        a as u8,
+    ]
+}
+
+/// Encodes an `A_UserMemory_Read` request for `count` octets (clamped to
+/// [`MAX_USER_MEMORY_LEN`]) at the 20-bit `addr`.
+pub fn encode_user_memory_read(addr: u32, count: u8) -> (u16, Vec<u8>) {
+    let count = count.min(MAX_USER_MEMORY_LEN);
+    (A_USER_MEMORY_READ, user_memory_header(addr, count).to_vec())
+}
+
+/// Encodes an `A_UserMemory_Write` request; `data` beyond
+/// [`MAX_USER_MEMORY_LEN`] octets is cut off (callers chunk).
+pub fn encode_user_memory_write(addr: u32, data: &[u8]) -> (u16, Vec<u8>) {
+    let count = data.len().min(usize::from(MAX_USER_MEMORY_LEN)) as u8;
+    let mut payload = user_memory_header(addr, count).to_vec();
+    payload.extend_from_slice(&data[..usize::from(count)]);
+    (A_USER_MEMORY_WRITE, payload)
+}
+
+/// Encodes an `A_UserMemory_Response` (device side: mocks and tests).
+pub fn encode_user_memory_response(addr: u32, data: &[u8]) -> (u16, Vec<u8>) {
+    let count = data.len().min(usize::from(MAX_USER_MEMORY_LEN)) as u8;
+    let mut payload = user_memory_header(addr, count).to_vec();
+    payload.extend_from_slice(&data[..usize::from(count)]);
+    (A_USER_MEMORY_RESPONSE, payload)
+}
+
+/// A parsed user-memory APDU: the count, the 20-bit address and the data
+/// octets (empty for a read request or a refusal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserMemoryApdu {
+    /// The octet count of the header.
+    pub count: u8,
+    /// The 20-bit address.
+    pub addr: u32,
+    /// The data octets.
+    pub data: Vec<u8>,
+}
+
+/// Decodes the payload of an `A_UserMemory_Read`, `_Write` or `_Response`
+/// whose APCI is `apci`. `None` for another APCI, a payload shorter than the
+/// header, or (write, response) fewer data octets than the count.
+pub fn decode_user_memory(apci: u16, payload: &[u8]) -> Option<UserMemoryApdu> {
+    if !matches!(
+        apci,
+        A_USER_MEMORY_READ | A_USER_MEMORY_RESPONSE | A_USER_MEMORY_WRITE
+    ) {
+        return None;
+    }
+    let h = payload.get(..3)?;
+    let count = h[0] & 0x0F;
+    let addr = (u32::from(h[0] >> 4) << 16) | u32::from(u16::from_be_bytes([h[1], h[2]]));
+    let data = if apci == A_USER_MEMORY_READ {
+        Vec::new()
+    } else {
+        payload.get(3..3 + usize::from(count))?.to_vec()
+    };
+    Some(UserMemoryApdu { count, addr, data })
+}
+
 /// The largest memory address the extended memory service can carry: a 24-bit
 /// (3-octet) address, `0xFF_FFFF`. A write or read whose top address exceeds this
 /// is refused rather than truncated.
@@ -333,12 +437,14 @@ pub const MAX_MEMORY_WRITE_LEN: u8 = 63;
 /// `count` is 1–15; `start` is a 12-bit element index (usually 1 for the first
 /// element).
 ///
-/// A count larger than 15 is **clamped to 15**, not masked. Masking would turn a
-/// count of 16 into `0`, and `count == 0` is a different request — "read the
-/// property's element count" — so the device would answer a 2-octet element count
-/// where the caller expected 16 elements. Clamping asks for as many elements as
-/// the field can carry and lets the caller loop for the rest, which is what every
-/// chunked reader here already does.
+/// A count larger than 15 is **clamped to 15**, not masked: a count of 0 is
+/// not a request a reader means to send (in a response, `nr_of_elem == 0`
+/// signals a problem, 03_03_07 §3.4.4.1), so masking 16 to 0 would turn a
+/// chunked read into a refusal. Clamping asks for as many elements as the
+/// field can carry and lets the caller loop for the rest, which is what every
+/// chunked reader here already does. Reading the property's current number of
+/// elements is a different request: `start == 0` with a count of 1, which
+/// answers 2 octets (§3.4.4.1).
 pub fn encode_property_value_read(
     object_index: u8,
     property_id: u8,
@@ -667,9 +773,9 @@ pub fn encode_authorize_request(key: u32) -> Vec<u8> {
 /// Decodes an `A_Authorize_Response` payload into the granted access **level**
 /// octet.
 ///
-/// The response carries a single level octet (`0` = highest access; a non-zero
-/// level means the key granted only limited access). Returns `None` if the
-/// payload is empty. The captured free-access response was `[00]` (level 0). The
+/// The response carries a single level octet: `0` is the maximum access, `3`
+/// or `15` the minimum, which a device sets for an invalid key (03_03_07
+/// §3.5.7). Returns `None` if the payload is empty. The captured free-access response was `[00]` (level 0). The
 /// caller validates the response APCI is [`A_AUTHORIZE_RESPONSE`] separately.
 pub fn decode_authorize_response(payload: &[u8]) -> Option<u8> {
     payload.first().copied()
@@ -710,6 +816,15 @@ pub struct MemoryResponse {
     pub addr: u16,
     /// The memory octets.
     pub data: Vec<u8>,
+}
+
+impl MemoryResponse {
+    /// Whether this is the defined negative answer to an `A_Memory_Read` or
+    /// `A_Memory_Write`: number 0 and no data (03_03_07 §3.5.3, §3.5.4). The
+    /// memory is protected or not reachable, or the count was illegal.
+    pub fn is_refusal(&self) -> bool {
+        self.count == 0
+    }
 }
 
 /// Decodes an `A_Memory_Response`, given the response APCI and its payload.
@@ -966,6 +1081,35 @@ pub const A_INDIVIDUAL_ADDRESS_RESPONSE_LEN: usize = 0;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_user_memory_round_trip() {
+        // 0x010010 carries extension 1 in the high nibble of the first octet.
+        let (apci, payload) = encode_user_memory_write(0x01_0010, &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(apci, A_USER_MEMORY_WRITE);
+        assert_eq!(payload, vec![0x13, 0x00, 0x10, 0xAA, 0xBB, 0xCC]);
+        let parsed = decode_user_memory(apci, &payload);
+        assert_eq!(
+            parsed,
+            Some(UserMemoryApdu {
+                count: 3,
+                addr: 0x01_0010,
+                data: vec![0xAA, 0xBB, 0xCC]
+            })
+        );
+        let (apci, payload) = encode_user_memory_read(0x0F_FFFF, 20);
+        assert_eq!(
+            (apci, payload.clone()),
+            (A_USER_MEMORY_READ, vec![0xFF, 0xFF, 0xFF])
+        );
+        assert_eq!(
+            decode_user_memory(apci, &payload).map(|u| u.addr),
+            Some(0x0F_FFFF)
+        );
+        assert_eq!(decode_user_memory(A_MEMORY_WRITE, &payload), None);
+        assert_eq!(user_memory_chunk_for_apdu(15), 10);
+        assert_eq!(user_memory_chunk_for_apdu(254), 15);
+    }
+
     use super::*;
 
     #[test]

@@ -23,10 +23,14 @@
 //!     `device-authentication-code.1.secure.ip.knx.org` (same derivation;
 //!     dev/knx-secure-spec.md §3.4);
 //!   - `PID_TUNNELLING_USERS`: element 0 the count, then one 2-octet entry per
-//!     user, `user id, tunnelling address index` (the index into
-//!     `PID_ADDITIONAL_INDIVIDUAL_ADDRESSES`, 1-based), sorted by user id;
-//!     the 1.1.200 capture writes `02 01 03 02 .. 09 08`, the keyring pairs
-//!     user 2 with the first tunnel address;
+//!     user, `user id, tunnelling address index`, sorted by user id then
+//!     index (KNX IP Secure 3/8/9 §2.3.1.8.3). The index is 1-based into
+//!     `PID_TUNNELLING_ADDRESSES` (PID 79), whose element is 0 for the
+//!     interface's own address or the 1-based index into
+//!     `PID_ADDITIONAL_INDIVIDUAL_ADDRESSES` (PID 53; Device Management 3/8/3
+//!     §2.5.29; issue #520). The 1.1.200 capture writes `02 01 03 02 .. 09
+//!     08` and the keyring pairs user 2 with the first tunnel address: its
+//!     PID 79 is the identity `1..n`;
 //!   - the tool key write: the request goes under the key the device holds
 //!     (its FDSK in factory state), the confirmation already under the new
 //!     key ([`Layer4Connection::request_rekeyed`]).
@@ -55,8 +59,13 @@ pub const PID_DEVICE_AUTHENTICATION_CODE: u16 = 92;
 pub const PID_PASSWORD_HASHES: u16 = 93;
 /// `PID_SECURED_SERVICE_FAMILIES` (94, function property).
 pub const PID_SECURED_SERVICE_FAMILIES: u16 = 94;
-/// `PID_TUNNELLING_USERS` (97, array of `user id, address index`).
+/// `PID_TUNNELLING_USERS` (97, array of `user id, address index`; the index
+/// points into [`PID_TUNNELLING_ADDRESSES`]).
 pub const PID_TUNNELLING_USERS: u16 = 97;
+/// `PID_TUNNELLING_ADDRESSES` (79, read-only array of one octet: 0 the
+/// interface's own address, n the n-th `PID_ADDITIONAL_INDIVIDUAL_ADDRESSES`
+/// entry; Device Management 3/8/3 §2.5.29).
+pub const PID_TUNNELLING_ADDRESSES: u16 = 79;
 
 /// The length of one password hash or key.
 pub const KEY_OCTETS: usize = 16;
@@ -178,16 +187,36 @@ pub async fn write_tool_key<Ch: L4Channel>(
     Ok(())
 }
 
+/// The `PID_SEQUENCE_NUMBER_SENDING` value to write: the clock, or the
+/// device's own next sequence when that is higher (issue #535).
+///
+/// The standard never lowers a device's counter: the tool syncs first and then
+/// sets (KNX 3/3/7 §5.3.1), and every receiver that keeps the device's last
+/// valid sequence would drop its frames until a lower counter caught up.
+pub fn sequence_number_to_write(clock: u64, device_next: Option<u64>) -> u64 {
+    device_next.map_or(clock, |next| next.max(clock))
+}
+
 /// Writes the device's Data Secure send sequence (`PID_SEQUENCE_NUMBER_SENDING`,
-/// 6 octets), as ETS does right after the tool key.
+/// 6 octets), as ETS does right after the tool key, and returns the value
+/// written.
+///
+/// The value is [`sequence_number_to_write`] of `clock` and the sequence the
+/// device's Sync (and any frame since) reported. The device protects the
+/// confirmation of the write already with the new value (KNX 3/5/1
+/// §6.3.13.3 NOTE 110), so the connection's freshness floor for the device
+/// moves to it before the request goes out.
 ///
 /// # Errors
 ///
-/// As [`write_property_ext_con`].
+/// As [`write_property_ext_con`], and the Sync's errors.
 pub async fn write_sequence_number<Ch: L4Channel>(
     l4: &mut Layer4Connection<Ch>,
-    sequence: u64,
-) -> Result<()> {
+    clock: u64,
+) -> Result<u64> {
+    l4.ensure_synced().await?;
+    let sequence = sequence_number_to_write(clock, l4.device_next_sequence());
+    l4.expect_device_sequence(sequence);
     let octets = sequence.to_be_bytes();
     write_property_ext_con(
         l4,
@@ -196,7 +225,8 @@ pub async fn write_sequence_number<Ch: L4Channel>(
         1,
         &octets[2..],
     )
-    .await
+    .await?;
+    Ok(sequence)
 }
 
 /// Switches one KNXnet/IP service family secured or plain
@@ -289,6 +319,26 @@ pub async fn write_tunnelling_users<Ch: L4Channel>(
     write_property_ext_con(l4, addr, 1, 0, &u16::from(count).to_be_bytes()).await?;
     let data: Vec<u8> = users.iter().flat_map(|&(u, i)| [u, i]).collect();
     write_property_ext_con(l4, addr, count, 1, &data).await
+}
+
+/// Reads `PID_TUNNELLING_ADDRESSES` (PID 79): which addresses the interface
+/// uses for tunnelling connections, 0 for its own address and n for the n-th
+/// `PID_ADDITIONAL_INDIVIDUAL_ADDRESSES` entry (Device Management 3/8/3
+/// §2.5.29). `None` when the device refuses the read or holds no element (it
+/// does not serve the property).
+///
+/// # Errors
+///
+/// As [`read_property_ext_table`], except a refusal.
+pub async fn read_tunnelling_addresses<Ch: L4Channel>(
+    l4: &mut Layer4Connection<Ch>,
+) -> Result<Option<Vec<u8>>> {
+    match read_property_ext_table(l4, knxnet(PID_TUNNELLING_ADDRESSES), 1).await {
+        Ok(table) if table.is_empty() => Ok(None),
+        Ok(table) => Ok(Some(table)),
+        Err(MgmtError::ServiceRejected { .. }) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 /// Reads the tunnelling users back (`PID_TUNNELLING_USERS`).

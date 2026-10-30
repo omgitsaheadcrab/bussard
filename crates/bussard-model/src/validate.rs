@@ -325,6 +325,7 @@ fn value_error(kind: &ParamKind, value: &str) -> Option<String> {
                 Some(format!("value {value:?} is not a number"))
             }
         }
+        ParamKind::Color { space } => space.encode(value).err(),
         // No declared constraints to check.
         ParamKind::None | ParamKind::Other => None,
     }
@@ -1351,6 +1352,49 @@ parameters:
     }
 
     #[test]
+    fn test_validate_e004_between_status_byte_object_and_float_group() {
+        // 21.001 is one octet, 9.001 two (03_07_02 §2): the GA cannot carry
+        // both, which E004 only saw once 21.x had a size (#498).
+        let mut groups = BTreeMap::new();
+        groups.insert(ga("5/1/1"), group("Status", Some("9.001")));
+        let mut links_map = BTreeMap::new();
+        links_map.insert(
+            ia("1.1.1"),
+            vec![Link {
+                object: 1,
+                name: None,
+                send: Some(ga("5/1/1")),
+                listen: vec![],
+            }],
+        );
+        let mut devices = BTreeMap::new();
+        devices.insert(
+            ia("1.1.1"),
+            device(
+                "1.1.1",
+                "1.1.1",
+                vec![(1, com_object("Status", Some("21.001"), "CRT"))],
+            ),
+        );
+        let model = Model {
+            config: BussardConfig::default(),
+            groups: Groups {
+                project: None,
+                imported_from: None,
+                ranges: BTreeMap::new(),
+                groups,
+            },
+            links: Links { links: links_map },
+            devices,
+        };
+        let diags = validate(&model);
+        assert!(
+            diags.iter().any(|d| d.code == "E004"),
+            "21.001 against 9.001 must raise E004: {diags:#?}"
+        );
+    }
+
+    #[test]
     fn test_check_knxnet_mutations_raise_e043_to_e046() -> Result<(), Box<dyn std::error::Error>> {
         use crate::knxnet::{IpAssignment, KnxnetConfig};
         let model_with = |config: KnxnetConfig| {
@@ -1406,7 +1450,8 @@ parameters:
     }
 
     /// A text value is measured in the program's code page (issue #401):
-    /// MDT's `Scènario` fits eight octets in ISO 8859-15, not in UTF-8.
+    /// MDT's `Scènario` fits eight octets in ISO 8859-15 and in the ISO 8859-1
+    /// of an undeclared program (#416), not in UTF-8.
     #[test]
     fn test_parameter_value_error_text_in_the_declared_code_page() {
         let kind = |encoding: Option<&str>| ParamKind::Text {
@@ -1419,8 +1464,29 @@ parameters:
         );
         let utf8 = parameter_value_error(&kind(Some("utf-8")), "Scènario");
         assert!(utf8.is_some_and(|e| e.contains("9 octets")));
-        let undeclared = parameter_value_error(&kind(None), "Scènario");
-        assert!(undeclared.is_some_and(|e| e.contains("#401")));
+        // No declaration: ISO 8859-1, as ETS writes it (issue #416).
+        assert_eq!(parameter_value_error(&kind(None), "Scènario"), None);
+        let euro = parameter_value_error(&kind(None), "5€");
+        assert!(euro.is_some_and(|e| e.contains("#416")));
+        let unknown = parameter_value_error(&kind(Some("shift_jis")), "Scènario");
+        assert!(unknown.is_some_and(|e| e.contains("#401")));
         assert_eq!(parameter_value_error(&kind(None), "Scene"), None);
+    }
+
+    /// Issue #616: a colour parameter takes `#` and two hex digits per
+    /// component of its space.
+    #[test]
+    fn test_parameter_value_error_color() {
+        use crate::color_codec::ColorSpace;
+        let rgb = ParamKind::Color {
+            space: ColorSpace::Rgb,
+        };
+        assert_eq!(parameter_value_error(&rgb, "#FF0000"), None);
+        assert!(parameter_value_error(&rgb, "0").is_some());
+        assert!(parameter_value_error(&rgb, "#FF000000").is_some());
+        let rgbw = ParamKind::Color {
+            space: ColorSpace::Rgbw,
+        };
+        assert_eq!(parameter_value_error(&rgbw, "#FF000080"), None);
     }
 }
