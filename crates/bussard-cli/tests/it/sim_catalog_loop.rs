@@ -2,7 +2,7 @@
 //! #346).
 //!
 //! For every application of the product corpus that bussard can flash and
-//! knx-sim can simulate (masks `07B0`, `0705`, `0701`), the loop:
+//! knx-sim can simulate (masks `07B0`, `57B0`, `0705`, `0701`), the loop:
 //!
 //! 1. builds configurations: the vendor defaults, plus N seeded generated ones
 //!    that flip the parameters a `<choose>` of the Dynamic section tests (the
@@ -63,8 +63,9 @@ const SHARDS: usize = 8;
 /// The device's individual address on the simulated bus.
 const DEVICE: &str = "1.1.10";
 
-/// The masks knx-sim models and bussard flashes.
-const SIM_MASKS: [&str; 3] = ["07B0", "0705", "0701"];
+/// The masks knx-sim models and bussard flashes. 57B0 (System B on KNX IP)
+/// is a System B device behind the sim's tunnel (`syn-ip-57b0`, issue #389).
+const SIM_MASKS: [&str; 4] = ["07B0", "57B0", "0705", "0701"];
 
 /// How long one `bussard` command may run before it counts as hung.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
@@ -719,7 +720,12 @@ fn run_loop(
     }
     let mask_word =
         u16::from_str_radix(mask, 16).map_err(|e| Stop::Skip(format!("mask {mask}: {e}")))?;
-    // The corpus sweep's verdict: an application whose plan lowers.
+    // The corpus sweep's verdict: an application whose plan lowers. The
+    // tables are the empty ones of a device without links (count word 0), as
+    // `bussard flash` supplies them: a product procedure that writes the
+    // tables itself (07B0 `ProductProcedure`, issue #614) needs an image for
+    // objects 1 to 3 to lower at all.
+    let empty_tables: BTreeMap<u32, Vec<u8>> = (1..=3).map(|obj| (obj, vec![0, 0])).collect();
     if let Err(e) = plan_flash(
         app,
         DEVICE,
@@ -727,7 +733,7 @@ fn run_loop(
         &BTreeMap::new(),
         &BTreeMap::new(),
         None,
-        &BTreeMap::new(),
+        &empty_tables,
     ) {
         return Err(Stop::Skip(format!("bussard does not flash it: {e}")));
     }
@@ -737,11 +743,11 @@ fn run_loop(
     for k in 1..=settings.configs {
         configs.push(Configuration::generated(app, &mut rng, k));
     }
-    if configs.iter().all(|c| c.links.is_empty()) {
-        return Err(Stop::Skip(
-            "no configuration shows a com-object to link (plan needs links)".to_string(),
-        ));
-    }
+    // No configuration shows a com-object to link (every object behind a
+    // branch the defaults do not take, `syn-s7-no-comobjects`, issue #562):
+    // `plan` needs links, so the loop flashes the defaults to a fresh device
+    // and takes the flash's own read-back as the check.
+    let flash_only = configs.iter().all(|c| c.links.is_empty());
 
     let work = Work::create(settings, app, file).map_err(infra("setup"))?;
     seed(app, &work.model).map_err(infra("write the product model"))?;
@@ -753,6 +759,21 @@ fn run_loop(
         sim: None,
         gateway: String::new(),
     };
+
+    if flash_only {
+        bench.fresh_device(true)?;
+        bench.write_device(&configs[0]).map_err(infra("setup"))?;
+        bench.flash(&format!(
+            "flash[0] ({}, no com-object to link)",
+            configs[0].label
+        ))?;
+        *flashed += 1;
+        drop(bench);
+        if settings.work.is_none() {
+            let _ = std::fs::remove_dir_all(&work.root);
+        }
+        return Ok(());
+    }
 
     // Each configuration goes to a factory-fresh device: flash, then plan.
     let mut last: Option<Configuration> = None;

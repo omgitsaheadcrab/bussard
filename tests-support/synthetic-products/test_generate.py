@@ -432,6 +432,180 @@ class TaskPtrAndTaskCtrl2(unittest.TestCase):
             generate.Product("t", s)
 
 
+class PropertyParameter(unittest.TestCase):
+    """syn-property-param (#604 row 30): a parameter placed by `<Property>` and
+    the `LdCtrlWriteProp` that writes it."""
+
+    def prop_spec(self) -> dict:
+        s = spec()
+        s["parameter"] = s["parameter"] + [
+            {"name": "t", "type": "Mode", "text": "T", "default": 2,
+             "property": {"object_index": 4, "property_id": 201, "offset": 0, "bit_offset": 0}}]
+        s["load_procedure"][1]["ops"].append(
+            {"op": "LdCtrlWriteProp", "object": 4, "prop_id": 201, "start_element": 1, "count": 1,
+             "verify": False})
+        return s
+
+    def test_render_property_placement_and_write_prop(self) -> None:
+        xml = app_xml(self.prop_spec())
+        self.assertIn('Text="T" Value="2">\n'
+                      '                <Property ObjectIndex="4" PropertyId="201" Offset="0" BitOffset="0" />\n'
+                      '              </Parameter>', xml)
+        self.assertIn('<LdCtrlWriteProp ObjIdx="4" PropId="201" StartElement="1" Count="1" Verify="false" />', xml)
+
+    def test_write_prop_without_placed_parameter_refused(self) -> None:
+        s = self.prop_spec()
+        s["load_procedure"][1]["ops"][-1]["prop_id"] = 202
+        with self.assertRaisesRegex(generate.SpecError, "no parameter is placed in object 4 PID 202"):
+            generate.Product("test", s)
+
+    def test_property_and_memory_refused(self) -> None:
+        s = self.prop_spec()
+        s["parameter"][-1]["memory"] = {"segment": "main", "offset": 3, "bit_offset": 0}
+        with self.assertRaisesRegex(generate.SpecError, "exactly one of `memory`, `union` and `property`"):
+            generate.Product("test", s)
+
+
+class BitFields(unittest.TestCase):
+    """syn-union-bitfields (#604 row 29): a union of two member types and
+    sub-octet parameters packed into one octet by BitOffset."""
+
+    def bits_spec(self) -> dict:
+        s = spec()
+        s["parameter_type"] = s["parameter_type"] + [
+            {"name": "Three", "kind": "number", "size_bits": 3, "signed": False, "min": 0, "max": 7},
+            {"name": "Nibble", "kind": "number", "size_bits": 4, "signed": False, "min": 0, "max": 15}]
+        s["union"] = [{"name": "u", "size_bits": 16, "default": "wide",
+                       "memory": {"segment": "main", "offset": 3, "bit_offset": 0}}]
+        s["parameter"] = s["parameter"] + [
+            {"name": "wide", "type": "Delay", "text": "W", "default": 2571,
+             "union": {"name": "u", "offset": 0, "bit_offset": 0}},
+            {"name": "narrow", "type": "Nibble", "text": "N", "default": 6,
+             "union": {"name": "u", "offset": 1, "bit_offset": 4}},
+            {"name": "three", "type": "Three", "text": "T", "default": 5,
+             "memory": {"segment": "main", "offset": 5, "bit_offset": 1}},
+            {"name": "nibble", "type": "Nibble", "text": "Q", "default": 6,
+             "memory": {"segment": "main", "offset": 5, "bit_offset": 4}}]
+        return s
+
+    def test_render_union_of_two_types_and_bit_fields(self) -> None:
+        xml = app_xml(self.bits_spec())
+        self.assertIn('<Union SizeInBit="16">', xml)
+        self.assertIn('ParameterType="M-00FA_A-2700-10-0000_PT-Delay" Offset="0" BitOffset="0" Text="W" '
+                      'Value="2571" DefaultUnionParameter="true" />', xml)
+        self.assertIn('ParameterType="M-00FA_A-2700-10-0000_PT-Nibble" Offset="1" BitOffset="4" Text="N" '
+                      'Value="6" />', xml)
+        self.assertIn('<TypeNumber SizeInBit="3" Type="unsignedInt" minInclusive="0" maxInclusive="7" />', xml)
+        self.assertIn('<Memory CodeSegment="M-00FA_A-2700-10-0000_RS-04-00000" Offset="5" BitOffset="1" />', xml)
+        self.assertIn('<Memory CodeSegment="M-00FA_A-2700-10-0000_RS-04-00000" Offset="5" BitOffset="4" />', xml)
+
+    def test_bit_offset_beyond_the_octet_refused(self) -> None:
+        s = self.bits_spec()
+        s["parameter"][-1]["memory"] = {"segment": "main", "offset": 5, "bit_offset": 8}
+        with self.assertRaisesRegex(generate.SpecError, "bit_offset is 0 to 7"):
+            generate.Product("test", s)
+
+    def test_union_member_bit_offset_beyond_the_octet_refused(self) -> None:
+        s = self.bits_spec()
+        s["parameter"][3]["union"] = {"name": "u", "offset": 0, "bit_offset": 9}
+        with self.assertRaisesRegex(generate.SpecError, "bit_offset is 0 to 7"):
+            generate.Product("test", s)
+
+
+class Colour(unittest.TestCase):
+    """syn-color-param (#616): the `color` type kind, 24 bits in memory."""
+
+    def colour_spec(self, space: str = "RGB", offset: int = 3) -> dict:
+        s = spec()
+        s["parameter_type"] = s["parameter_type"] + [{"name": "C", "kind": "color", "space": space}]
+        s["parameter"] = s["parameter"] + [
+            {"name": "c", "type": "C", "text": "C", "default": "#FF0000",
+             "memory": {"segment": "main", "offset": offset, "bit_offset": 0}}]
+        return s
+
+    def test_render_colour_types(self) -> None:
+        self.assertIn('<TypeColor Space="RGB" />', app_xml(self.colour_spec()))
+        xml = app_xml(self.colour_spec("HSV"))
+        self.assertIn('<TypeColor Space="HSV" />', xml)
+        self.assertIn('Text="C" Value="#FF0000">', xml)
+
+    def test_colour_width_checked_against_segment(self) -> None:
+        with self.assertRaisesRegex(generate.SpecError, "does not fit"):
+            generate.Product("test", self.colour_spec(offset=254))
+
+    def test_colour_space_rgbw_not_yet(self) -> None:
+        with self.assertRaisesRegex(generate.SpecError, "no product uses it yet"):
+            generate.Product("test", self.colour_spec("RGBW"))
+
+
+class InitialValue(unittest.TestCase):
+    """syn-text-initialvalue (#473): a text parameter's InitialValue and its translation."""
+
+    def iv_spec(self) -> dict:
+        s = spec()
+        s["parameter_type"] = s["parameter_type"] + [{"name": "Name", "kind": "text", "size_octets": 20}]
+        s["parameter"] = s["parameter"] + [
+            {"name": "n", "type": "Name", "text": "N", "default": "Buzzard nest", "initial_value": "Buzzard nest",
+             "translations": {"de-DE": {"initial_value": "Bussardhorst Süd"}},
+             "memory": {"segment": "main", "offset": 3, "bit_offset": 0}}]
+        return s
+
+    def test_render_initial_value_and_translation(self) -> None:
+        xml = app_xml(self.iv_spec())
+        self.assertIn('Text="N" Value="Buzzard nest" InitialValue="Buzzard nest">', xml)
+        self.assertIn('<Translation AttributeName="Name" Text="Nestlichtschalter" />\n'
+                      '            </TranslationElement>\n'
+                      '            <TranslationElement RefId="M-00FA_A-2700-10-0000_P-3">\n'
+                      '              <Translation AttributeName="InitialValue" Text="Bussardhorst Süd" />', xml)
+
+    def test_parameter_translation_without_application_translation(self) -> None:
+        s = self.iv_spec()
+        del s["application"]["translations"]
+        xml = app_xml(s)
+        self.assertIn('<Language Identifier="de-DE">', xml)
+        self.assertNotIn('AttributeName="Name"', xml)
+
+    def test_initial_value_refused_on_non_text_parameter(self) -> None:
+        s = spec()
+        s["parameter"][1]["initial_value"] = "5"
+        with self.assertRaisesRegex(generate.SpecError, "belong to a text parameter"):
+            generate.Product("test", s)
+
+    def test_translated_text_attribute_not_yet(self) -> None:
+        s = self.iv_spec()
+        s["parameter"][-1]["translations"]["de-DE"]["text"] = "Nestname"
+        with self.assertRaisesRegex(generate.SpecError, "no product uses it yet"):
+            generate.Product("test", s)
+
+
+class IpAddress(unittest.TestCase):
+    """syn-ip-address-param (#457): the `ip_address` type kind, 32 bits in memory."""
+
+    def ip_spec(self, offset: int = 3) -> dict:
+        s = spec()
+        s["parameter_type"] = s["parameter_type"] + [
+            {"name": "Ip", "kind": "ip_address", "address_type": "HostAddress"}]
+        s["parameter"] = s["parameter"] + [
+            {"name": "ip", "type": "Ip", "text": "IP", "default": "192.168.27.21",
+             "memory": {"segment": "main", "offset": offset, "bit_offset": 0}}]
+        return s
+
+    def test_render_ip_address_type(self) -> None:
+        xml = app_xml(self.ip_spec())
+        self.assertIn('<TypeIPAddress AddressType="HostAddress" />', xml)
+        self.assertIn('Text="IP" Value="192.168.27.21">', xml)
+
+    def test_ip_address_width_checked_against_segment(self) -> None:
+        with self.assertRaisesRegex(generate.SpecError, "does not fit"):
+            generate.Product("test", self.ip_spec(offset=253))
+
+    def test_ip_address_unknown_address_type_refused(self) -> None:
+        s = self.ip_spec()
+        s["parameter_type"][-1]["address_type"] = "Gateway"
+        with self.assertRaisesRegex(generate.SpecError, "address_type is one of"):
+            generate.Product("test", s)
+
+
 class ParameterRefPerChoose(unittest.TestCase):
     """syn-choose-per-ref (#563): a second ParameterRef of a parameter, a
     `<when test>` branch, and a choose on the second ref."""
@@ -467,6 +641,340 @@ class ParameterRefPerChoose(unittest.TestCase):
         s = self.per_ref_spec()
         s["parameter_ref"][0]["name"] = "delay"
         with self.assertRaisesRegex(generate.SpecError, "already a parameter or a ref"):
+            generate.Product("test", s)
+
+
+class ChannelAndBlockChoose(unittest.TestCase):
+    """syn-dynamic-tests (#345): a `<Channel>` with a block whose chooses use
+    the `<when>` test forms, each branch showing refs directly."""
+
+    def channel_spec(self) -> dict:
+        s = spec()
+        s["dynamic"] = dict(s["dynamic"], channel=[{
+            "name": "c", "text": "C", "number": "1", "block": [{
+                "name": "cb", "text": "CB", "parameters": ["mode"], "com_objects": [],
+                "choose": [{"parameter": "mode", "when": [
+                    {"test": "1", "parameters": ["delay"], "com_objects": []},
+                    {"test": "0 2", "parameters": [], "com_objects": [1]},
+                    {"test": ">=2", "parameters": [], "com_objects": []},
+                    {"default": True, "parameters": [], "com_objects": [0]}]}]}]}])
+        return s
+
+    def test_render_channel_after_channel_independent_block(self) -> None:
+        xml = app_xml(self.channel_spec())
+        self.assertIn('            </ChannelIndependentBlock>\n'
+                      '            <Channel Id="M-00FA_A-2700-10-0000_CH-1" Name="c" Text="C" Number="1">\n'
+                      '              <ParameterBlock Id="M-00FA_A-2700-10-0000_PB-2" Name="cb" Text="CB">\n'
+                      '                <ParameterRefRef RefId="M-00FA_A-2700-10-0000_P-1_R-1" />\n'
+                      '                <choose ParamRefId="M-00FA_A-2700-10-0000_P-1_R-1">\n'
+                      '                  <when test="1">\n'
+                      '                    <ParameterRefRef RefId="M-00FA_A-2700-10-0000_P-2_R-2" />\n'
+                      '                  </when>\n'
+                      '                  <when test="0 2">\n'
+                      '                    <ComObjectRefRef RefId="M-00FA_A-2700-10-0000_O-1_R-2" />\n'
+                      '                  </when>\n'
+                      '                  <when test="&gt;=2">\n'
+                      '                  </when>\n'
+                      '                  <when default="true">\n', xml)
+        self.assertIn('              </ParameterBlock>\n            </Channel>\n          </Dynamic>', xml)
+
+    def test_block_choose_when_needs_test_or_default(self) -> None:
+        s = self.channel_spec()
+        del s["dynamic"]["channel"][0]["block"][0]["choose"][0]["when"][0]["test"]
+        with self.assertRaisesRegex(generate.SpecError, "either `test` or `default = true`"):
+            generate.Product("test", s)
+
+    def test_block_choose_unknown_com_object_refused(self) -> None:
+        s = self.channel_spec()
+        s["dynamic"]["channel"][0]["block"][0]["choose"][0]["when"][1]["com_objects"] = [9]
+        with self.assertRaisesRegex(generate.SpecError, "unknown com object 9"):
+            generate.Product("test", s)
+
+    def test_channel_missing_number_refused(self) -> None:
+        s = self.channel_spec()
+        del s["dynamic"]["channel"][0]["number"]
+        with self.assertRaisesRegex(generate.SpecError, "missing key `number`"):
+            generate.Product("test", s)
+
+
+class Assign(unittest.TestCase):
+    """syn-assign (#604 row 31): an `<Assign>` in a `<when>` of a block choose."""
+
+    def assign_spec(self) -> dict:
+        s = spec()
+        s["dynamic"]["block"][0]["choose"] = [{"parameter": "mode", "when": [
+            {"test": "1", "parameters": [], "com_objects": [],
+             "assign": [{"target": "delay", "source": "mode"}]}]}]
+        return s
+
+    def test_render_assign_after_refs_in_when(self) -> None:
+        xml = app_xml(self.assign_spec())
+        self.assertIn('<when test="1">\n'
+                      '                    <Assign TargetParamRefRef="M-00FA_A-2700-10-0000_P-2_R-2" '
+                      'SourceParamRefRef="M-00FA_A-2700-10-0000_P-1_R-1" />\n'
+                      '                  </when>', xml)
+
+    def test_assign_unknown_target_refused(self) -> None:
+        s = self.assign_spec()
+        s["dynamic"]["block"][0]["choose"][0]["when"][0]["assign"][0]["target"] = "nope"
+        with self.assertRaisesRegex(generate.SpecError, "unknown target parameter `nope`"):
+            generate.Product("test", s)
+
+    def test_assign_literal_value_not_yet(self) -> None:
+        s = self.assign_spec()
+        s["dynamic"]["block"][0]["choose"][0]["when"][0]["assign"][0]["value"] = "3"
+        with self.assertRaisesRegex(generate.SpecError, "no product uses it yet"):
+            generate.Product("test", s)
+
+
+class SystemBProductProcedure(unittest.TestCase):
+    """syn-product-07b0 (#614): a ProductProcedure on 07B0, the Siemens shape."""
+
+    OPS = [{"op": "LdCtrlConnect"}, {"op": "LdCtrlUnload", "lsm": 1}, {"op": "LdCtrlLoad", "lsm": 1},
+           {"op": "LdCtrlRelSegment", "lsm": 1, "size": 130, "mode": 0, "fill": 0},
+           {"op": "LdCtrlWriteRelMem", "object": 1, "offset": 0, "size": 130, "verify": False},
+           {"op": "LdCtrlWriteProp", "object": 4, "prop_id": 13, "verify": True, "inline_data": "00FA272510"},
+           {"op": "LdCtrlLoadCompleted", "lsm": 1}, {"op": "LdCtrlDisconnect"}]
+
+    def product_spec(self) -> dict:
+        s = spec(load_procedure=[{"ops": copy.deepcopy(self.OPS)}])
+        s["application"]["load_procedure_style"] = "ProductProcedure"
+        return s
+
+    def test_render_product_procedure_on_07b0(self) -> None:
+        xml = app_xml(self.product_spec())
+        self.assertIn('LoadProcedureStyle="ProductProcedure"', xml)
+        self.assertIn('              <LoadProcedure>\n'
+                      '                <LdCtrlConnect />\n'
+                      '                <LdCtrlUnload LsmIdx="1" />\n'
+                      '                <LdCtrlLoad LsmIdx="1" />\n'
+                      '                <LdCtrlRelSegment LsmIdx="1" Size="130" Mode="0" Fill="0" />\n'
+                      '                <LdCtrlWriteRelMem ObjIdx="1" Offset="0" Size="130" Verify="false" />\n'
+                      '                <LdCtrlWriteProp ObjIdx="4" PropId="13" Verify="true" InlineData="00FA272510" />\n'
+                      '                <LdCtrlLoadCompleted LsmIdx="1" />\n'
+                      '                <LdCtrlDisconnect />\n'
+                      '              </LoadProcedure>\n', xml)
+        self.assertIn("<ComObjectTable>", xml)
+        self.assertIn('<AddressTable MaxEntries="32" />', xml)
+
+    def test_product_procedure_ops_not_yet_in_a_merged_procedure(self) -> None:
+        s = spec()
+        # LdCtrlWriteProp is a merged-procedure op too since syn-property-param.
+        s["load_procedure"][1]["ops"].append({"op": "LdCtrlUnload", "lsm": 4})
+        with self.assertRaisesRegex(generate.SpecError, "`LdCtrlUnload` is part of the schema"):
+            generate.Product("test", s)
+
+    def test_product_procedure_on_07b0_refuses_system_7_ops(self) -> None:
+        s = self.product_spec()
+        s["load_procedure"][0]["ops"].append({"op": "LdCtrlTaskSegment", "lsm": 1, "address": 0x4000})
+        with self.assertRaisesRegex(generate.SpecError, "`LdCtrlTaskSegment` is part of the schema"):
+            generate.Product("test", s)
+
+    def test_render_map_error_around_unload(self) -> None:
+        s = self.product_spec()
+        s["load_procedure"][0]["ops"][1:1] = [
+            {"op": "LdCtrlMapError", "original_error": 3221498632, "mapped_error": 0},
+            {"op": "LdCtrlUnload", "lsm": 5},
+            {"op": "LdCtrlMapError", "original_error": 3221498632, "mapped_error": 3221498632}]
+        self.assertIn('<LdCtrlConnect />\n'
+                      '                <LdCtrlMapError OriginalError="3221498632" MappedError="0" />\n'
+                      '                <LdCtrlUnload LsmIdx="5" />\n'
+                      '                <LdCtrlMapError OriginalError="3221498632" MappedError="3221498632" />\n',
+                      app_xml(s))
+
+    def test_map_error_not_yet_in_a_merged_procedure(self) -> None:
+        s = spec()
+        s["load_procedure"][0]["ops"].append({"op": "LdCtrlMapError", "original_error": 1, "mapped_error": 0})
+        with self.assertRaisesRegex(generate.SpecError, "`LdCtrlMapError` is part of the schema"):
+            generate.Product("test", s)
+
+    def test_write_prop_without_value_refused(self) -> None:
+        s = self.product_spec()
+        del s["load_procedure"][0]["ops"][5]["inline_data"]
+        with self.assertRaisesRegex(generate.SpecError, "no parameter is placed in object 4 PID 13 and the op has "
+                                                        "no inline_data"):
+            generate.Product("test", s)
+
+
+
+class ComObjectSizes(unittest.TestCase):
+    """syn-com-objects (#604 row 27): ObjectSize values and an optional DPT."""
+
+    def test_render_object_without_dpt(self) -> None:
+        s = spec()
+        del s["com_object"][1]["dpt"]
+        s["com_object"][1]["size"] = "3 Bit"
+        xml = app_xml(s)
+        self.assertIn('ObjectSize="3 Bit" ReadFlag="Enabled" WriteFlag="Disabled" CommunicationFlag="Enabled" '
+                      'TransmitFlag="Enabled" UpdateFlag="Disabled" ReadOnInitFlag="Disabled" Priority="Low" />', xml)
+
+    def test_object_sizes_cover_type_codes_0_to_20(self) -> None:
+        self.assertEqual(len(generate.OBJECT_SIZES), 21)
+        self.assertEqual(generate.OBJECT_SIZES[14], "14 Bytes")
+
+    def test_unknown_object_size_refused(self) -> None:
+        s = spec()
+        s["com_object"][0]["size"] = "15 Bytes"
+        with self.assertRaisesRegex(generate.SpecError, "size is one of"):
+            generate.Product("test", s)
+
+
+class ModuleRepeat(unittest.TestCase):
+    """syn-module-repeat (#449): allocators, a ModuleDef and a `<Repeat>`."""
+
+    def module_spec(self) -> dict:
+        s = spec(allocator=[{"name": "pa", "start": 16, "max": 63}, {"name": "oa", "start": 2, "max": 9}],
+                 module_def=[{"name": "m", "arguments": [{"name": "pb", "allocates": 4}, {"name": "ob", "allocates": 1}],
+                              "parameter": [{"name": "mp", "type": "Delay", "text": "MP", "default": 7,
+                                             "memory": {"segment": "main", "offset": 0, "bit_offset": 0,
+                                                        "base": "pb"}}],
+                              "com_object": [{"number": 0, "base": "ob", "name": "mo", "text": "MO",
+                                              "function_text": "F", "size": "1 Bit", "dpt": "DPST-1-1",
+                                              "flags": ["C", "W"], "priority": "Low"}],
+                              "block": [{"name": "mb", "text": "MB", "parameters": ["mp"], "com_objects": [0]}]}])
+        s["dynamic"]["block"][0]["repeat"] = [{"name": "r", "parameter": "mode", "module": "m",
+                                              "args": {"pb": "pa", "ob": "oa"}}]
+        return s
+
+    def test_render_allocators_module_def_and_repeat(self) -> None:
+        xml = app_xml(self.module_spec())
+        a = "M-00FA_A-2700-10-0000"
+        self.assertIn(f'<Allocator Id="{a}_L-1" Name="pa" Start="16" maxInclusive="63" />', xml)
+        self.assertIn('            </Allocators>\n            <Options', xml)
+        self.assertIn(f'          </Static>\n          <ModuleDefs>\n            <ModuleDef Id="{a}_MD-1" Name="m">', xml)
+        self.assertIn(f'<Memory CodeSegment="{a}_RS-04-00000" Offset="0" BitOffset="0" BaseOffset="{a}_MD-1_A-1" />', xml)
+        self.assertIn(f'BaseNumber="{a}_MD-1_A-2" />', xml)
+        self.assertIn(f'<Repeat Id="{a}_X-1" Name="r" ParameterRefId="{a}_P-1_R-1">\n'
+                      f'                  <Module Id="{a}_MD-1_M-1" Name="r" RefId="{a}_MD-1">\n'
+                      f'                    <NumericArg RefId="{a}_MD-1_A-1" AllocatorRefId="{a}_L-1" />\n'
+                      f'                    <NumericArg RefId="{a}_MD-1_A-2" AllocatorRefId="{a}_L-2" />', xml)
+
+    def test_no_module_renders_nothing(self) -> None:
+        xml = app_xml(spec())
+        self.assertNotIn("Allocators", xml)
+        self.assertNotIn("ModuleDefs", xml)
+
+    def test_repeat_missing_argument_refused(self) -> None:
+        s = self.module_spec()
+        del s["dynamic"]["block"][0]["repeat"][0]["args"]["ob"]
+        with self.assertRaisesRegex(generate.SpecError, "args must name every argument"):
+            generate.Product("test", s)
+
+    def test_repeat_literal_count_not_yet(self) -> None:
+        s = self.module_spec()
+        s["dynamic"]["block"][0]["repeat"][0]["count"] = 3
+        with self.assertRaisesRegex(generate.SpecError, "no product uses it yet"):
+            generate.Product("test", s)
+
+    def test_module_parameter_unknown_base_refused(self) -> None:
+        s = self.module_spec()
+        s["module_def"][0]["parameter"][0]["memory"]["base"] = "nope"
+        with self.assertRaisesRegex(generate.SpecError, "unknown argument `nope`"):
+            generate.Product("test", s)
+
+
+class Delay(unittest.TestCase):
+    """syn-s7-delay (#615): LdCtrlDelay in a System 7 product procedure."""
+
+    def test_render_delay_before_restart(self) -> None:
+        s = product_spec("syn-s7-0701")
+        s["load_procedure"][0]["ops"][-2:-2] = [{"op": "LdCtrlDelay", "milliseconds": 200}]
+        x = app_xml(s)
+        self.assertIn('<LdCtrlLoadCompleted LsmIdx="3" />\n'
+                      '                <LdCtrlDelay MilliSeconds="200" />\n'
+                      '                <LdCtrlRestart />', x)
+
+    def test_delay_refused_on_system_b(self) -> None:
+        b = product_spec("syn-minimal")
+        b["load_procedure"][0]["ops"].append({"op": "LdCtrlDelay", "milliseconds": 200})
+        with self.assertRaisesRegex(generate.SpecError, "no product uses it yet"):
+            generate.Product("t", b)
+
+    def test_delay_missing_milliseconds_refused(self) -> None:
+        s = product_spec("syn-s7-0701")
+        s["load_procedure"][0]["ops"][-2:-2] = [{"op": "LdCtrlDelay"}]
+        with self.assertRaisesRegex(generate.SpecError, "missing key `milliseconds`"):
+            generate.Product("t", s)
+
+
+class MinEtsVersion(unittest.TestCase):
+    """syn-s7-hidden-default-ets4 (#448): MinEtsVersion apart from the schema."""
+
+    def test_render_min_ets_version_override(self) -> None:
+        s = spec()
+        s["application"]["min_ets_version"] = "4.0"
+        x = app_xml(s)
+        self.assertIn('MinEtsVersion="4.0"', x)
+        self.assertIn('xmlns="http://knx.org/xml/project/23"', x)
+
+    def test_min_ets_version_default_follows_schema(self) -> None:
+        self.assertIn('MinEtsVersion="6.0"', app_xml(spec()))
+
+    def test_min_ets_version_must_be_a_version_string(self) -> None:
+        s = spec()
+        s["application"]["min_ets_version"] = 4
+        with self.assertRaisesRegex(generate.SpecError, "min_ets_version is a version"):
+            generate.Product("test", s)
+
+
+class IpEnabled(unittest.TestCase):
+    """syn-ip-enabled-tp (#604 row 34, #455): IsIPEnabled hardware and the
+    application's AdditionalAddressesCount."""
+
+    def ip_spec(self) -> dict:
+        s = spec()
+        s["product"]["ip_enabled"] = True
+        s["application"]["additional_addresses_count"] = 2
+        return s
+
+    def test_render_ip_enabled_hardware_and_tunnel_count(self) -> None:
+        p = generate.Product("test", self.ip_spec())
+        files = generate.render(p)
+        self.assertIn('HasApplicationProgram="true" IsIPEnabled="true"', files["M-00FA/Hardware.xml"].decode())
+        self.assertIn('MinEtsVersion="6.0" AdditionalAddressesCount="2"', files[f"M-00FA/{p.app_file}"].decode())
+
+    def test_plain_product_has_neither(self) -> None:
+        p = generate.Product("test", spec())
+        files = generate.render(p)
+        self.assertNotIn("IsIPEnabled", files["M-00FA/Hardware.xml"].decode())
+        self.assertNotIn("AdditionalAddressesCount", files[f"M-00FA/{p.app_file}"].decode())
+
+    def test_ip_enabled_without_tunnel_count_refused(self) -> None:
+        s = self.ip_spec()
+        del s["application"]["additional_addresses_count"]
+        with self.assertRaisesRegex(generate.SpecError, "come together"):
+            generate.Product("test", s)
+
+
+class SystemBOnIp(unittest.TestCase):
+    """syn-ip-57b0 (#604 row 35, #389): mask 57B0 with MediumTypes MT-5."""
+
+    def test_render_57b0_with_medium_ip(self) -> None:
+        s = spec()
+        s["application"]["mask"] = "57B0"
+        p = generate.Product("test", s)
+        files = generate.render(p)
+        self.assertIn('MaskVersion="MV-57B0"', files[f"M-00FA/{p.app_file}"].decode())
+        self.assertIn('MediumTypes="MT-5"', files["M-00FA/Hardware.xml"].decode())
+        self.assertIn('MediumTypes="MT-0"', generate.render(generate.Product("t", spec()))["M-00FA/Hardware.xml"].decode())
+
+    def test_render_27b0_with_medium_rf(self) -> None:
+        s = spec()
+        s["application"]["mask"] = "27B0"
+        files = generate.render(generate.Product("test", s))
+        self.assertIn('MediumTypes="MT-2"', files["M-00FA/Hardware.xml"].decode())
+
+    def test_57b0_product_procedure_not_yet(self) -> None:
+        s = spec()
+        s["application"]["mask"] = "57B0"
+        s["application"]["load_procedure_style"] = "ProductProcedure"
+        with self.assertRaisesRegex(generate.SpecError, "no product uses it yet"):
+            generate.Product("test", s)
+
+    def test_other_masks_not_yet(self) -> None:
+        s = spec()
+        s["application"]["mask"] = "091A"
+        with self.assertRaisesRegex(generate.SpecError, "no product uses it yet"):
             generate.Product("test", s)
 
 

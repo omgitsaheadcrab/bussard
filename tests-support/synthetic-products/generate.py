@@ -148,19 +148,20 @@ class Product:
         w = name
         check_keys(w, spec, {"doc", "product", "application", "segment", "parameter_type",
                              "parameter", "com_object", "dynamic", "load_procedure"},
-                   {"union", "parameter_calculation", "parameter_ref"})
+                   {"union", "parameter_calculation", "parameter_ref", "allocator", "module_def"})
         self.doc = spec["doc"]
         check_keys(f"{w} [doc]", self.doc, {"purpose", "construct", "issues"})
         self.product = p = spec["product"]
         check_keys(f"{w} [product]", p, {"text", "order_number", "hardware_name", "hardware_serial",
-                                         "bus_current"}, {"hardware_version", "rail_mounted"})
+                                         "bus_current"}, {"hardware_version", "rail_mounted", "ip_enabled"})
         if not re.fullmatch(r"00FA[0-9A-F]{8}", p["hardware_serial"]):
             raise SpecError(f"{w} [product]: hardware_serial must be 00FA followed by 8 hex digits")
         self.app = a = spec["application"]
         check_keys(f"{w} [application]", a,
                    {"number", "version", "name", "mask", "load_procedure_style",
                     "address_table_max_entries", "association_table_max_entries"},
-                   {"options", "translations", "schema"} | SYS7_APP_KEYS)
+                   {"options", "translations", "schema", "min_ets_version", "additional_addresses_count"}
+                   | SYS7_APP_KEYS)
         if a["number"] not in APP_NUMBERS:
             raise SpecError(f"{w} [application]: number {a['number']:#06x} is outside the synthetic "
                             f"range {APP_NUMBERS.start:#06x}..{APP_NUMBERS.stop - 1:#06x}")
@@ -169,15 +170,18 @@ class Product:
         if a["load_procedure_style"] not in ("MergedProcedure", "ProductProcedure"):
             raise SpecError(f"{w} [application]: load_procedure_style is MergedProcedure or ProductProcedure")
         self.system7 = a["mask"] in SYS7_MASKS
+        # syn-product-07b0 (#604 row 37, #614): a ProductProcedure on 07B0.
+        self.b_product = not self.system7 and a["load_procedure_style"] == "ProductProcedure"
         if self.system7:
             check_system7_application(w, a)
         else:
-            if a["mask"] != "07B0":
+            if a["mask"] not in MEDIUM_TYPES:
                 raise not_yet(f"{w} [application]", f"mask {a['mask']} (System 7 and others)")
-            if a["load_procedure_style"] == "ProductProcedure":
-                raise not_yet(f"{w} [application]", "LoadProcedureStyle ProductProcedure on 07B0")
+            if a["mask"] != "07B0" and a["load_procedure_style"] != "MergedProcedure":
+                raise not_yet(f"{w} [application]", f"LoadProcedureStyle {a['load_procedure_style']} on mask {a['mask']}")
             for k in sorted(SYS7_APP_KEYS & a.keys()):
                 raise SpecError(f"{w} [application]: `{k}` belongs to a System 7 mask ({', '.join(SYS7_MASKS)})")
+        check_ip_enabled(w, p, a)
         for k in a.get("options", {}):
             if k not in OPTIONS:
                 raise SpecError(f"{w} [application.options]: unknown option `{k}`")
@@ -222,10 +226,26 @@ class Product:
             elif kind == "text":
                 check_keys(tw, t, {"name", "kind", "size_octets"})
                 t = dict(t, size_bits=8 * t["size_octets"])
-            elif kind in ("time", "ip_address", "raw"):
+            elif kind == "color":
+                # syn-color-param (#604 row 40, #616): a colour, one octet per
+                # component of its space, the default `#` and hex digits.
+                check_keys(tw, t, {"name", "kind", "space"})
+                if t["space"] == "RGBW":
+                    raise not_yet(tw, "colour space RGBW")
+                if t["space"] not in COLOR_SPACES:
+                    raise SpecError(f"{tw}: space is one of {', '.join(COLOR_SPACES)}")
+                t = dict(t, size_bits=COLOR_SPACES[t["space"]])
+            elif kind == "ip_address":
+                # syn-ip-address-param (#604 row 21, #457): an IPv4 address,
+                # four octets in memory, its default a dotted quad.
+                check_keys(tw, t, {"name", "kind", "address_type"})
+                if t["address_type"] not in IP_ADDRESS_TYPES:
+                    raise SpecError(f"{tw}: address_type is one of {', '.join(IP_ADDRESS_TYPES)}")
+                t = dict(t, size_bits=32)
+            elif kind in ("time", "raw"):
                 raise not_yet(tw, f"parameter type kind `{kind}`")
             else:
-                raise SpecError(f"{tw}: kind is one of enum, number, text, float, time, ip_address, raw")
+                raise SpecError(f"{tw}: kind is one of enum, number, text, float, color, time, ip_address, raw")
             self.types[t["name"]] = dict(t, id=f"{self.app_id}_PT-{ets_escape(t['name'])}")
 
         # Unions (#405): one <Union> with its <Memory>; its members are
@@ -241,9 +261,11 @@ class Product:
         for i, prm in enumerate(spec["parameter"]):
             pw = f"{w} [[parameter]] #{i + 1}"
             check_keys(pw, prm, {"name", "type", "text", "default"},
-                       {"memory", "union", "access", "virtual", "legacy_patch_always"}, {"translations"})
+                       {"memory", "union", "property", "access", "virtual", "legacy_patch_always", "initial_value",
+                        "translations"})
             if prm["type"] not in self.types:
                 raise SpecError(f"{pw}: unknown parameter type `{prm['type']}`")
+            self.check_initial_value(pw, prm)
             if prm.get("access", "ReadWrite") not in ("None", "Read", "ReadWrite"):
                 raise SpecError(f"{pw}: access is None, Read or ReadWrite")
             bits = self.types[prm["type"]]["size_bits"]
@@ -255,6 +277,17 @@ class Product:
                     raise SpecError(f"{pw}: a virtual parameter has no `memory` and no `union`")
                 self.params[prm["name"]] = dict(prm, id=f"{self.app_id}_P-{n}", ref=f"{self.app_id}_P-{n}_R-{n}")
                 continue
+            # syn-property-param (#604 row 30): `property = { object_index,
+            # property_id, offset, bit_offset }` places the parameter in an
+            # interface-object property instead of a segment.
+            if "property" in prm:
+                if "memory" in prm or "union" in prm:
+                    raise SpecError(f"{pw}: needs exactly one of `memory`, `union` and `property`")
+                check_keys(f"{pw} property", prm["property"], {"object_index", "property_id", "offset", "bit_offset"})
+                if not 0 <= prm["property"]["property_id"] <= 0xFF:
+                    raise SpecError(f"{pw} property: property_id must be one octet")
+                self.params[prm["name"]] = dict(prm, id=f"{self.app_id}_P-{n}", ref=f"{self.app_id}_P-{n}_R-{n}")
+                continue
             if ("memory" in prm) == ("union" in prm):
                 raise SpecError(f"{pw}: needs exactly one of `memory` and `union`")
             if "memory" in prm:
@@ -263,6 +296,8 @@ class Product:
                 continue
             m = prm["union"]
             check_keys(f"{pw} union", m, {"name", "offset", "bit_offset"})
+            if not 0 <= m["bit_offset"] <= 7:
+                raise SpecError(f"{pw} union: bit_offset is 0 to 7")
             un = self.unions.get(m["name"])
             if un is None:
                 raise SpecError(f"{pw}: unknown union `{m['name']}`")
@@ -296,8 +331,12 @@ class Product:
         self.objects = {}
         for i, o in enumerate(spec["com_object"]):
             ow = f"{w} [[com_object]] #{i + 1}"
-            check_keys(ow, o, {"number", "name", "text", "function_text", "size", "dpt", "flags", "priority"},
-                       set(), {"ref", "translations"})
+            # syn-com-objects (#604 row 27): `dpt` is optional (no DPT has
+            # 3, 5, 6 or 7 bits), `size` one of ETS's ObjectSize values.
+            check_keys(ow, o, {"number", "name", "text", "function_text", "size", "flags", "priority"},
+                       {"dpt"}, {"ref", "translations"})
+            if o["size"] not in OBJECT_SIZES:
+                raise SpecError(f"{ow}: size is one of {', '.join(OBJECT_SIZES)}")
             bad = set(o["flags"]) - set(FLAGS)
             if bad:
                 raise SpecError(f"{ow}: unknown flags {sorted(bad)}; use {list(FLAGS)}")
@@ -306,21 +345,28 @@ class Product:
             oid = f"{self.app_id}_O-{o['number']}"
             self.objects[o["number"]] = dict(o, id=oid, ref=f"{oid}_R-{i + 1}")
 
+        # syn-module-repeat (#604 row 19, #449): allocators and module
+        # definitions, before the Dynamic tree that instantiates them.
+        check_modules(w, self, spec)
+
         dyn = spec["dynamic"]
-        check_keys(f"{w} [dynamic]", dyn, {"block"}, {"choose"}, {"channel"})
-        self.blocks = []
-        for i, b in enumerate(dyn["block"]):
-            bw = f"{w} [[dynamic.block]] #{i + 1}"
-            check_keys(bw, b, {"name", "text", "parameters", "com_objects"}, set(), {"choose", "inline"})
-            for pn in b["parameters"]:
-                if pn not in self.params and pn not in self.extra_refs:
-                    raise SpecError(f"{bw}: unknown parameter `{pn}`")
-            for on in b["com_objects"]:
-                if on not in self.objects:
-                    raise SpecError(f"{bw}: unknown com object {on}")
-            self.blocks.append(dict(b, id=f"{self.app_id}_PB-{i + 1}"))
+        check_keys(f"{w} [dynamic]", dyn, {"block"}, {"choose", "channel"})
+        self.blocks = [self.check_block(f"{w} [[dynamic.block]] #{i + 1}", b, i + 1)
+                       for i, b in enumerate(dyn["block"])]
         self.dynamic_chooses = [self.check_dynamic_choose(f"{w} [[dynamic.choose]] #{i + 1}", c)
                                 for i, c in enumerate(dyn.get("choose", []))]
+        # syn-dynamic-tests (#604 row 28, #345): `<Channel>`s after the
+        # ChannelIndependentBlock, their blocks numbered after every other.
+        self.channels = []
+        numbered = len(self.blocks) + getattr(self, "choose_blocks", 0)
+        for i, ch in enumerate(dyn.get("channel", [])):
+            cw = f"{w} [[dynamic.channel]] #{i + 1}"
+            check_keys(cw, ch, {"name", "text", "number", "block"})
+            blocks = []
+            for j, b in enumerate(ch["block"]):
+                numbered += 1
+                blocks.append(self.check_block(f"{cw} block #{j + 1}", b, numbered))
+            self.channels.append(dict(ch, id=f"{self.app_id}_CH-{i + 1}", block=blocks))
 
         self.load_procedures = []
         for i, lp in enumerate(spec["load_procedure"]):
@@ -337,15 +383,51 @@ class Product:
             check_system7_tables(w, self)
 
     def check_block(self, bw: str, b: dict, number: int) -> dict:
-        """A parameter block of the Dynamic tree, given its `_PB-<number>`."""
-        check_keys(bw, b, {"name", "text", "parameters", "com_objects"}, set(), {"choose", "inline"})
+        """A parameter block of the Dynamic tree, given its `_PB-<number>`;
+        its `choose`s (#345) follow its refs."""
+        check_keys(bw, b, {"name", "text", "parameters", "com_objects"}, {"choose", "repeat"}, {"inline"})
+        self.check_refs(bw, b)
+        chooses = [self.check_block_choose(f"{bw} choose #{k + 1}", c) for k, c in enumerate(b.get("choose", []))]
+        repeats = [check_repeat(f"{bw} repeat #{k + 1}", self, r) for k, r in enumerate(b.get("repeat", []))]
+        return dict(b, id=f"{self.app_id}_PB-{number}", choose=chooses, repeat=repeats)
+
+    def check_refs(self, where: str, b: dict) -> None:
+        """The `parameters` (or `[[parameter_ref]]`s) and `com_objects` a block
+        or a `when` shows."""
         for pn in b["parameters"]:
             if pn not in self.params and pn not in self.extra_refs:
-                raise SpecError(f"{bw}: unknown parameter `{pn}`")
+                raise SpecError(f"{where}: unknown parameter `{pn}`")
         for on in b["com_objects"]:
             if on not in self.objects:
-                raise SpecError(f"{bw}: unknown com object {on}")
-        return dict(b, id=f"{self.app_id}_PB-{number}")
+                raise SpecError(f"{where}: unknown com object {on}")
+
+    def check_block_choose(self, cw: str, c: dict) -> dict:
+        """syn-dynamic-tests (#604 row 28, #345): a `<choose ParamRefId>`
+        inside a parameter block, each `<when>` (`test` as ETS writes it, or
+        `default = true`) showing refs and com objects directly."""
+        check_keys(cw, c, {"parameter", "when"})
+        if c["parameter"] not in self.params and c["parameter"] not in self.extra_refs:
+            raise SpecError(f"{cw}: unknown parameter `{c['parameter']}`")
+        if not c["when"]:
+            raise SpecError(f"{cw}: a choose needs at least one `when`")
+        for k, branch in enumerate(c["when"]):
+            bw = f"{cw} when #{k + 1}"
+            check_keys(bw, branch, {"parameters", "com_objects"}, {"test", "default", "assign"})
+            if ("test" in branch) == (branch.get("default") is True) or branch.get("default") is False:
+                raise SpecError(f"{bw}: give either `test` or `default = true`")
+            self.check_refs(bw, branch)
+            for k, a in enumerate(branch.get("assign", [])):
+                self.check_assign(f"{bw} assign #{k + 1}", a)
+        return c
+
+    def check_assign(self, aw: str, a: dict) -> None:
+        """syn-assign (#604 row 31): `<Assign TargetParamRefRef
+        SourceParamRefRef>` in a `<when>`, where the corpus has nearly all of
+        them; a literal `Value` is part of the schema but unused yet."""
+        check_keys(aw, a, {"target", "source"}, set(), {"value"})
+        for side in ("target", "source"):
+            if a[side] not in self.params and a[side] not in self.extra_refs:
+                raise SpecError(f"{aw}: unknown {side} parameter `{a[side]}`")
 
     def check_dynamic_choose(self, cw: str, c: dict) -> dict:
         """syn-choose-never-shown (#604 row 14, #474): a `<choose ParamRefId>`
@@ -391,9 +473,27 @@ class Product:
                     raise SpecError(f"{cw} {side} #{k + 1}: unknown parameter `{ref['parameter']}`")
         return dict(c, id=f"{self.app_id}_PC-{n}")
 
+    def check_initial_value(self, pw: str, prm: dict) -> None:
+        """syn-text-initialvalue (#604 row 24, #473): a text parameter's
+        `initial_value` (the `InitialValue` attribute) and its per-language
+        `translations = { "de-DE" = { initial_value = "..." } }`. Other
+        translated attributes of a parameter are part of the schema but unused."""
+        if "initial_value" not in prm and "translations" not in prm:
+            return
+        if self.types[prm["type"]]["kind"] != "text":
+            raise SpecError(f"{pw}: `initial_value` and `translations` belong to a text parameter")
+        if "translations" in prm and "initial_value" not in prm:
+            raise SpecError(f"{pw}: a translated InitialValue needs the untranslated `initial_value`")
+        for lang, t in prm.get("translations", {}).items():
+            check_keys(f"{pw} translations.{lang}", t, {"initial_value"}, set(), {"text"})
+
     def check_memory(self, where: str, m: dict, bits: int) -> None:
         """A `memory = { segment, offset, bit_offset }` that fits its segment."""
         check_keys(f"{where} memory", m, {"segment", "offset", "bit_offset"})
+        # syn-union-bitfields (#604 row 29): BitOffset counts the bits of the
+        # octet at Offset from its most significant one, 0 to 7.
+        if not 0 <= m["bit_offset"] <= 7:
+            raise SpecError(f"{where}: bit_offset is 0 to 7")
         seg = self.segments.get(m["segment"])
         if seg is None:
             raise SpecError(f"{where}: unknown segment `{m['segment']}`")
@@ -410,11 +510,30 @@ class Product:
                 self.check_load_choose(ow, op)
                 continue
             table = LOAD_OPS | SYS7_LOAD_OPS if self.system7 else LOAD_OPS
+            if self.b_product:
+                table = LOAD_OPS | B_PRODUCT_LOAD_OPS
             if name not in table:
-                if name in LOAD_OPS_LATER or name in SYS7_LOAD_OPS:
+                if name in LOAD_OPS_LATER or name in SYS7_LOAD_OPS or name in B_PRODUCT_LOAD_OPS:
                     raise not_yet(ow, f"`{name}`")
                 raise SpecError(f"{ow}: unknown op `{name}`")
+            if name == "LdCtrlWriteProp":
+                self.check_write_prop(ow, op)
+                continue
             check_keys(ow, op, {"op"} | set(table[name]))
+
+    def check_write_prop(self, ow: str, op: dict) -> None:
+        """`LdCtrlWriteProp`: `object` and `prop_id`, optional `start_element`,
+        `count`, `verify`; its value is `inline_data` (hex, syn-product-07b0's
+        program version) or, without it, what the parameters placed in that
+        property compose (syn-property-param, #604 row 30), so one must be."""
+        check_keys(ow, op, {"op", "object", "prop_id"}, {"start_element", "count", "verify", "inline_data"})
+        if "inline_data" in op:
+            return
+        placed = {(prm["property"]["object_index"], prm["property"]["property_id"])
+                  for prm in self.params.values() if "property" in prm}
+        if (op["object"], op["prop_id"]) not in placed:
+            raise SpecError(f"{ow}: no parameter is placed in object {op['object']} PID {op['prop_id']} "
+                            "and the op has no inline_data, so the write has no value")
 
     def check_load_choose(self, ow: str, op: dict) -> None:
         """syn-choose-partial-segment (#604 row 8, #411): `<choose ParamRefId>`
@@ -444,6 +563,10 @@ class Product:
 
 FLAGS = {"C": "CommunicationFlag", "R": "ReadFlag", "W": "WriteFlag", "T": "TransmitFlag",
          "U": "UpdateFlag", "I": "ReadOnInitFlag"}
+# `<ComObject ObjectSize>` values from 1 bit to 14 octets, in KNX type-code
+# order (codes 0 to 20).
+OBJECT_SIZES = tuple([f"{n} Bit" for n in range(1, 8)] + ["1 Byte"]
+                     + [f"{n} Bytes" for n in (2, 3, 4, 6, 8, 10, 14, 5, 7, 9, 11, 12, 13)])
 # <Options> attributes the KNX schema defines that a spec may set.
 OPTIONS = ("PreferPartialDownloadIfApplicationLoaded", "EasyCtrlModeModeStyleEmptyGroupComTables",
            "SetObjectTableLengthAlwaysToMax", "TextParameterEncoding", "SupportsExtendedMemoryServices",
@@ -452,6 +575,11 @@ OPTIONS = ("PreferPartialDownloadIfApplicationLoaded", "EasyCtrlModeModeStyleEmp
 # `<TypeFloat Encoding>` values and their width in bits (the KNX 2-octet float
 # of DPT 9 and the IEEE-754 formats).
 FLOAT_BITS = {"DPT 9": 16, "IEEE-754 Single": 32, "IEEE-754 Double": 64}
+# `<TypeIPAddress AddressType>` values of the KNX schema (#457).
+IP_ADDRESS_TYPES = ("HostAddress", "SubnetMask", "DefaultGateway")
+# `<TypeColor Space>` values the products use and their width (#616); RGBW is
+# part of the schema but unused yet.
+COLOR_SPACES = {"RGB": 24, "HSV": 24}
 # Implemented load ops: spec key -> XML attribute, in XML order.
 LOAD_OPS = {
     "LdCtrlRelSegment": {"lsm": "LsmIdx", "size": "Size", "mode": "Mode", "fill": "Fill"},
@@ -459,8 +587,12 @@ LOAD_OPS = {
     # syn-master-reset (#604 row 10, #546, #611): a Master Reset in the
     # application's procedure, as KNX Virtual's DA.tp has it.
     "LdCtrlMasterReset": {"erase_code": "EraseCode", "channel": "ChannelNumber"},
+    # syn-property-param (#604 row 30): a property write without InlineData,
+    # whose value the parameters placed in that property compose.
+    "LdCtrlWriteProp": {"object": "ObjIdx", "prop_id": "PropId", "start_element": "StartElement",
+                        "count": "Count", "verify": "Verify", "inline_data": "InlineData"},
 }
-LOAD_OPS_LATER = {"LdCtrlLoadImageProp", "LdCtrlWriteProp", "LdCtrlCompareProp",
+LOAD_OPS_LATER = {"LdCtrlLoadImageProp", "LdCtrlCompareProp",
                   "LdCtrlAbsSegment", "LdCtrlConnect", "LdCtrlDisconnect", "LdCtrlRestart",
                   "LdCtrlUnload", "LdCtrlLoad", "LdCtrlLoadCompleted", "LdCtrlTaskSegment"}
 
@@ -492,8 +624,61 @@ SYS7_LOAD_OPS = {
     "LdCtrlTaskPtr": {"lsm": "LsmIdx", "init_ptr": "InitPtr", "save_ptr": "SavePtr", "serial_ptr": "SerialPtr"},
     "LdCtrlTaskCtrl2": {"lsm": "LsmIdx", "callback": "Callback", "address": "Address", "seg0": "Seg0",
                         "seg1": "Seg1"},
+    # syn-s7-delay (#604 row 39, #615): a pause in the procedure, as 16 0701
+    # applications have it before LdCtrlRestart.
+    "LdCtrlDelay": {"milliseconds": "MilliSeconds"},
 }
 MEMORY_TYPES = ("EEPROM", "RAM")
+
+
+# -------------------------------- System B product procedure (#604 row 37)
+# syn-product-07b0 (#614): a 07B0 application with LoadProcedureStyle
+# ProductProcedure spells out the whole download as one procedure, the Siemens
+# shape: the unloads, a Load and an LdCtrlRelSegment per LSM (the tables as
+# relative segments on LSM 1 to 3, which the application declares no code
+# segment for), the WriteRelMems, the program version by LdCtrlWriteProp
+# (PID 13, InlineData in hex), the LoadCompleteds.
+B_PRODUCT_LOAD_OPS = {
+    "LdCtrlConnect": {},
+    "LdCtrlDisconnect": {},
+    "LdCtrlUnload": {"lsm": "LsmIdx"},
+    "LdCtrlLoad": {"lsm": "LsmIdx"},
+    "LdCtrlLoadCompleted": {"lsm": "LsmIdx"},
+    "LdCtrlWriteProp": LOAD_OPS["LdCtrlWriteProp"],
+    # syn-map-error (#604 row 38, #614): an ETS error code mapped to another
+    # (0 = success) for the ops that follow, until mapped back to itself.
+    "LdCtrlMapError": {"original_error": "OriginalError", "mapped_error": "MappedError"},
+}
+# Every op table, for rendering (each spec is checked against its own table).
+ALL_LOAD_OPS = LOAD_OPS | SYS7_LOAD_OPS | B_PRODUCT_LOAD_OPS
+
+
+# ------------------------------- IP-enabled TP hardware (#604 row 34, #455)
+# syn-ip-enabled-tp: a TP device with a KNX IP interface built in, the shape of
+# the Zennio ALLinBOX family: `IsIPEnabled` on the Hardware, and the tunnelling
+# addresses the interface offers as the application's AdditionalAddressesCount.
+
+def check_ip_enabled(w: str, p: dict, a: dict) -> None:
+    """`[product] ip_enabled` and `[application] additional_addresses_count`
+    come together, on a 07B0 application (the corpus shape; #455)."""
+    if bool(p.get("ip_enabled")) != ("additional_addresses_count" in a):
+        raise SpecError(f"{w}: `[product] ip_enabled = true` and `[application] additional_addresses_count` "
+                        "come together (an IP-enabled TP device offers tunnelling addresses)")
+    if "additional_addresses_count" not in a:
+        return
+    if a["mask"] != "07B0":
+        raise not_yet(f"{w} [application]", f"an IP-enabled device on mask {a['mask']}")
+    if not 1 <= a["additional_addresses_count"] <= 255:
+        raise SpecError(f"{w} [application]: additional_addresses_count is 1 to 255")
+
+
+# ------------------------------------- System B on other media (#604 row 35)
+# The System B masks a product may name, with the medium its
+# Hardware2Program declares: 07B0 on TP (MT-0), and 57B0, System B on KNX IP
+# (MT-5; syn-ip-57b0, #389), merged procedure only, as the one corpus 57B0
+# application (M-0002_A-A0C8-10-B22C-O01B8), and 27B0, System B on KNX RF
+# (MT-2; syn-rf-27b0, #604 row 36).
+MEDIUM_TYPES = {"07B0": "MT-0", "57B0": "MT-5", "27B0": "MT-2"}
 
 
 def check_system7_application(w: str, a: dict) -> None:
@@ -561,11 +746,178 @@ SCHEMAS = {
 }
 
 
+def min_ets_version(p: "Product") -> str:
+    """`MinEtsVersion`: the schema's, or `[application] min_ets_version`.
+
+    syn-s7-hidden-default-ets4 (#448): the project/23 product with
+    MinEtsVersion 4.0 tells whether ETS keys the hidden-default rule on the
+    schema or on MinEtsVersion."""
+    return p.app.get("min_ets_version", SCHEMAS[p.schema]["min_ets"])
+
+
 def check_schema(w: str, a: dict) -> int:
     schema = a.get("schema", 23)
+    if "min_ets_version" in a and not re.fullmatch(r"[0-9]+\.[0-9]+[a-z]?", str(a["min_ets_version"])):
+        raise SpecError(f"{w} [application]: min_ets_version is a version like \"4.0\" (a string)")
     if schema not in SCHEMAS:
         raise SpecError(f"{w} [application]: schema is one of {sorted(SCHEMAS)}")
     return schema
+
+
+# ------------------------------- module definitions (#604 row 19, #449)
+# syn-module-repeat: `[[allocator]]`s (`<Allocator Id Name Start
+# maxInclusive>` after the load procedures), `[[module_def]]`s (`<ModuleDef>`
+# with `<Arguments>`, its own parameters and com objects placed relative to an
+# argument (`BaseOffset`, `BaseNumber`) and its own parameter blocks), and a
+# block's `repeat`, a `<Repeat ParameterRefId>` instantiating one module whose
+# arguments draw on allocators (`<NumericArg AllocatorRefId>`), the shape of
+# the corpus (Repeat inside a ParameterBlock, counted by a parameter).
+
+def check_modules(w: str, p: "Product", spec: dict) -> None:
+    p.allocators = {}
+    for i, al in enumerate(spec.get("allocator", [])):
+        aw = f"{w} [[allocator]] #{i + 1}"
+        check_keys(aw, al, {"name", "start", "max"})
+        if not 0 <= al["start"] <= al["max"]:
+            raise SpecError(f"{aw}: needs 0 <= start <= max")
+        p.allocators[al["name"]] = dict(al, id=f"{p.app_id}_L-{i + 1}")
+    p.module_defs = {}
+    for i, md in enumerate(spec.get("module_def", [])):
+        mw = f"{w} [[module_def]] #{i + 1}"
+        check_keys(mw, md, {"name", "arguments", "parameter", "com_object", "block"})
+        mid = f"{p.app_id}_MD-{i + 1}"
+        args = {}
+        for k, arg in enumerate(md["arguments"]):
+            check_keys(f"{mw} arguments #{k + 1}", arg, {"name", "allocates"})
+            args[arg["name"]] = dict(arg, id=f"{mid}_A-{k + 1}")
+        params = {}
+        for k, prm in enumerate(md["parameter"]):
+            pw = f"{mw} parameter #{k + 1}"
+            check_keys(pw, prm, {"name", "type", "text", "default", "memory"})
+            if prm["type"] not in p.types:
+                raise SpecError(f"{pw}: unknown parameter type `{prm['type']}`")
+            m = prm["memory"]
+            check_keys(f"{pw} memory", m, {"segment", "offset", "bit_offset", "base"})
+            if m["segment"] not in p.segments:
+                raise SpecError(f"{pw}: unknown segment `{m['segment']}`")
+            if m["base"] not in args:
+                raise SpecError(f"{pw}: unknown argument `{m['base']}`")
+            pid = f"{mid}_P-{k + 1}"
+            params[prm["name"]] = dict(prm, id=pid, ref=f"{pid}_R-{k + 1}")
+        objects = {}
+        for k, o in enumerate(md["com_object"]):
+            ow = f"{mw} com_object #{k + 1}"
+            check_keys(ow, o, {"number", "base", "name", "text", "function_text", "size", "dpt", "flags",
+                               "priority"})
+            if o["base"] not in args:
+                raise SpecError(f"{ow}: unknown argument `{o['base']}`")
+            if set(o["flags"]) - set(FLAGS) or o["priority"] not in ("Low", "High", "Alert"):
+                raise SpecError(f"{ow}: flags are of {list(FLAGS)}, priority is Low, High or Alert")
+            oid = f"{mid}_O-{o['number']}"
+            objects[o["number"]] = dict(o, id=oid, ref=f"{oid}_R-{k + 1}")
+        blocks = []
+        for k, b in enumerate(md["block"]):
+            bw = f"{mw} block #{k + 1}"
+            check_keys(bw, b, {"name", "text", "parameters", "com_objects"})
+            for pn in b["parameters"]:
+                if pn not in params:
+                    raise SpecError(f"{bw}: unknown module parameter `{pn}`")
+            for on in b["com_objects"]:
+                if on not in objects:
+                    raise SpecError(f"{bw}: unknown module com object {on}")
+            blocks.append(dict(b, id=f"{mid}_PB-{k + 1}"))
+        p.module_defs[md["name"]] = dict(md, id=mid, args=args, params=params, objects=objects, blocks=blocks)
+
+
+def check_repeat(rw: str, p: "Product", r: dict) -> dict:
+    """A block's `repeat`: `name`, `parameter` (the count), `module` and
+    `args` (argument name -> allocator name); a literal `Count` is part of
+    the schema but unused yet."""
+    check_keys(rw, r, {"name", "parameter", "module", "args"}, set(), {"count"})
+    if r["parameter"] not in p.params:
+        raise SpecError(f"{rw}: unknown parameter `{r['parameter']}`")
+    md = p.module_defs.get(r["module"])
+    if md is None:
+        raise SpecError(f"{rw}: unknown module_def `{r['module']}`")
+    if set(r["args"]) != set(md["args"]):
+        raise SpecError(f"{rw}: args must name every argument of `{r['module']}`: {sorted(md['args'])}")
+    for arg, al in r["args"].items():
+        if al not in p.allocators:
+            raise SpecError(f"{rw}: argument `{arg}` names unknown allocator `{al}`")
+    p.repeats = getattr(p, "repeats", 0) + 1
+    return dict(r, id=f"{p.app_id}_X-{p.repeats}", module_id=f"{md['id']}_M-{p.repeats}")
+
+
+def render_repeat(x: "Xml", p: "Product", r: dict) -> None:
+    md = p.module_defs[r["module"]]
+    x.open("Repeat", [("Id", r["id"]), ("Name", r["name"]), ("ParameterRefId", p.ref_id(r["parameter"]))])
+    x.open("Module", [("Id", r["module_id"]), ("Name", r["name"]), ("RefId", md["id"])])
+    for name, arg in md["args"].items():
+        x.empty("NumericArg", [("RefId", arg["id"]), ("AllocatorRefId", p.allocators[r["args"][name]]["id"])])
+    x.close("Module")
+    x.close("Repeat")
+
+
+def render_allocators(x: "Xml", p: "Product") -> None:
+    if not p.allocators:
+        return
+    x.open("Allocators")
+    for al in p.allocators.values():
+        x.empty("Allocator", [("Id", al["id"]), ("Name", al["name"]), ("Start", al["start"]),
+                              ("maxInclusive", al["max"])])
+    x.close("Allocators")
+
+
+def render_module_defs(x: "Xml", p: "Product") -> None:
+    """`<ModuleDefs>` between the application's Static and Dynamic sections."""
+    if not p.module_defs:
+        return
+    x.open("ModuleDefs")
+    for md in p.module_defs.values():
+        x.open("ModuleDef", [("Id", md["id"]), ("Name", md["name"])])
+        x.open("Arguments")
+        for arg in md["args"].values():
+            x.empty("Argument", [("Id", arg["id"]), ("Name", arg["name"]), ("Allocates", arg["allocates"])])
+        x.close("Arguments")
+        x.open("Static")
+        x.open("Parameters")
+        for prm in md["params"].values():
+            m = prm["memory"]
+            x.open("Parameter", [("Id", prm["id"]), ("Name", prm["name"]),
+                                 ("ParameterType", p.types[prm["type"]]["id"]), ("Text", prm["text"]),
+                                 ("Value", prm["default"])])
+            x.empty("Memory", [("CodeSegment", p.segments[m["segment"]]["id"]), ("Offset", m["offset"]),
+                               ("BitOffset", m["bit_offset"]), ("BaseOffset", md["args"][m["base"]]["id"])])
+            x.close("Parameter")
+        x.close("Parameters")
+        x.open("ParameterRefs")
+        for prm in md["params"].values():
+            x.empty("ParameterRef", [("Id", prm["ref"]), ("RefId", prm["id"])])
+        x.close("ParameterRefs")
+        x.open("ComObjects")
+        for o in md["objects"].values():
+            x.empty("ComObject", [("Id", o["id"]), ("Name", o["name"]), ("Text", o["text"]), ("Number", o["number"]),
+                                  ("FunctionText", o["function_text"]), ("ObjectSize", o["size"])]
+                    + [(FLAGS[f], flag(f in o["flags"])) for f in ("R", "W", "C", "T", "U", "I")]
+                    + [("DatapointType", o["dpt"]), ("Priority", o["priority"]),
+                       ("BaseNumber", md["args"][o["base"]]["id"])])
+        x.close("ComObjects")
+        x.open("ComObjectRefs")
+        for o in md["objects"].values():
+            x.empty("ComObjectRef", [("Id", o["ref"]), ("RefId", o["id"])])
+        x.close("ComObjectRefs")
+        x.close("Static")
+        x.open("Dynamic")
+        for b in md["blocks"]:
+            x.open("ParameterBlock", [("Id", b["id"]), ("Name", b["name"]), ("Text", b["text"])])
+            for pn in b["parameters"]:
+                x.empty("ParameterRefRef", [("RefId", md["params"][pn]["ref"])])
+            for on in b["com_objects"]:
+                x.empty("ComObjectRefRef", [("RefId", md["objects"][on]["ref"])])
+            x.close("ParameterBlock")
+        x.close("Dynamic")
+        x.close("ModuleDef")
+    x.close("ModuleDefs")
 
 
 # ------------------------------------------------------------------ rendering
@@ -595,6 +947,7 @@ def render_hardware(p: Product) -> bytes:
     x.open("Hardware", [("Id", p.hw_id), ("Name", pr["hardware_name"]), ("SerialNumber", pr["hardware_serial"]),
                         ("VersionNumber", pr.get("hardware_version", 1)), ("BusCurrent", pr["bus_current"]),
                         ("HasIndividualAddress", True), ("HasApplicationProgram", True),
+                        ("IsIPEnabled", True if pr.get("ip_enabled") else None),  # #455
                         ("NonRegRelevantDataVersion", 0)])
     x.open("Products")
     x.open("Product", [("Id", p.product_id), ("Text", pr["text"]), ("OrderNumber", pr["order_number"]),
@@ -604,7 +957,7 @@ def render_hardware(p: Product) -> bytes:
     x.close("Product")
     x.close("Products")
     x.open("Hardware2Programs")
-    x.open("Hardware2Program", [("Id", p.h2p_id), ("MediumTypes", "MT-0")])
+    x.open("Hardware2Program", [("Id", p.h2p_id), ("MediumTypes", MEDIUM_TYPES.get(p.app["mask"], "MT-0"))])
     x.empty("ApplicationProgramRef", [("RefId", p.app_id)])
     x.empty("RegistrationInfo", [("RegistrationStatus", "Registered")])
     x.close("Hardware2Program")
@@ -625,6 +978,10 @@ def render_type(x: Xml, t: dict) -> None:
         x.close("TypeRestriction")
     elif t["kind"] == "text":
         x.empty("TypeText", [("SizeInBit", t["size_bits"])])
+    elif t["kind"] == "ip_address":  # #457
+        x.empty("TypeIPAddress", [("AddressType", t["address_type"])])
+    elif t["kind"] == "color":  # #616
+        x.empty("TypeColor", [("Space", t["space"])])
     elif t["kind"] == "float":
         x.empty("TypeFloat", [("Encoding", t["encoding"]), ("minInclusive", t["min"]),
                               ("maxInclusive", t["max"])])
@@ -662,7 +1019,33 @@ def render_load_ops(x: Xml, p: Product, ops: list[dict]) -> None:
                 x.close("when")
             x.close("choose")
         else:
-            x.empty(op["op"], [(attr, op[key]) for key, attr in (LOAD_OPS | SYS7_LOAD_OPS)[op["op"]].items()])
+            x.empty(op["op"], [(attr, op.get(key)) for key, attr in ALL_LOAD_OPS[op["op"]].items()])
+
+
+def render_block(x: Xml, p: Product, b: dict) -> None:
+    """`<ParameterBlock>`: its refs, its com objects, then its chooses (#345),
+    each `<when>` holding refs and com objects directly."""
+    x.open("ParameterBlock", [("Id", b["id"]), ("Name", b["name"]), ("Text", b["text"])])
+    for pn in b["parameters"]:
+        x.empty("ParameterRefRef", [("RefId", p.ref_id(pn))])
+    for on in b["com_objects"]:
+        x.empty("ComObjectRefRef", [("RefId", p.objects[on]["ref"])])
+    for c in b.get("choose", []):
+        x.open("choose", [("ParamRefId", p.ref_id(c["parameter"]))])
+        for branch in c["when"]:
+            x.open("when", [("test", branch["test"])] if "test" in branch else [("default", True)])
+            for pn in branch["parameters"]:
+                x.empty("ParameterRefRef", [("RefId", p.ref_id(pn))])
+            for on in branch["com_objects"]:
+                x.empty("ComObjectRefRef", [("RefId", p.objects[on]["ref"])])
+            for a in branch.get("assign", []):  # syn-assign
+                x.empty("Assign", [("TargetParamRefRef", p.ref_id(a["target"])),
+                                   ("SourceParamRefRef", p.ref_id(a["source"]))])
+            x.close("when")
+        x.close("choose")
+    for r in b.get("repeat", []):  # #449
+        render_repeat(x, p, r)
+    x.close("ParameterBlock")
 
 
 def render_dynamic_choose(x: Xml, p: Product, c: dict) -> None:
@@ -672,12 +1055,7 @@ def render_dynamic_choose(x: Xml, p: Product, c: dict) -> None:
     for branch in c["when"]:
         x.open("when", [("test", branch["test"])] if "test" in branch else [("default", True)])
         for b in branch["block"]:
-            x.open("ParameterBlock", [("Id", b["id"]), ("Name", b["name"]), ("Text", b["text"])])
-            for pn in b["parameters"]:
-                x.empty("ParameterRefRef", [("RefId", p.ref_id(pn))])
-            for on in b["com_objects"]:
-                x.empty("ComObjectRefRef", [("RefId", p.objects[on]["ref"])])
-            x.close("ParameterBlock")
+            render_block(x, p, b)
         x.close("when")
     x.close("choose")
 
@@ -709,7 +1087,8 @@ def render_application(p: Product) -> bytes:
         ("Id", p.app_id), ("ApplicationNumber", a["number"]), ("ApplicationVersion", a["version"]),
         ("ProgramType", "ApplicationProgram"), ("MaskVersion", f"MV-{a['mask']}"), ("Name", a["name"]),
         ("LoadProcedureStyle", a["load_procedure_style"]), ("PeiType", a.get("pei_type", 0)), ("DefaultLanguage", "en-US"),
-        ("DynamicTableManagement", False), ("Linkable", False), ("MinEtsVersion", SCHEMAS[p.schema]["min_ets"]),
+        ("DynamicTableManagement", False), ("Linkable", False), ("MinEtsVersion", min_ets_version(p)),
+        ("AdditionalAddressesCount", a.get("additional_addresses_count")),  # #455
         ("NonRegRelevantDataVersion", 0)])
     x.open("Static")
     x.open("Code")
@@ -737,7 +1116,14 @@ def render_application(p: Product) -> bytes:
             continue
         x.open("Parameter", [("Id", prm["id"]), ("Name", prm["name"]), ("ParameterType", p.types[prm["type"]]["id"]),
                              ("Text", prm["text"]), ("Access", prm.get("access")), ("Value", prm["default"]),
+                             ("InitialValue", prm.get("initial_value")),
                              ("LegacyPatchAlways", True if prm.get("legacy_patch_always") else None)])
+        if "property" in prm:  # syn-property-param (#604 row 30)
+            pr = prm["property"]
+            x.empty("Property", [("ObjectIndex", pr["object_index"]), ("PropertyId", pr["property_id"]),
+                                 ("Offset", pr["offset"]), ("BitOffset", pr["bit_offset"])])
+            x.close("Parameter")
+            continue
         m = prm["memory"]
         x.empty("Memory", [("CodeSegment", p.segments[m["segment"]]["id"]), ("Offset", m["offset"]),
                            ("BitOffset", m["bit_offset"])])
@@ -757,7 +1143,7 @@ def render_application(p: Product) -> bytes:
         x.empty("ComObject", [("Id", o["id"]), ("Name", o["name"]), ("Text", o["text"]), ("Number", o["number"]),
                               ("FunctionText", o["function_text"]), ("ObjectSize", o["size"])]
                 + [(FLAGS[f], flag(f in o["flags"])) for f in ("R", "W", "C", "T", "U", "I")]
-                + [("DatapointType", o["dpt"]), ("Priority", o["priority"])])
+                + [("DatapointType", o.get("dpt")), ("Priority", o["priority"])])
     x.close("ComObjectTable")
     x.open("ComObjectRefs")
     for o in p.objects.values():
@@ -773,32 +1159,45 @@ def render_application(p: Product) -> bytes:
         render_load_ops(x, p, lp["ops"])
         x.close("LoadProcedure")
     x.close("LoadProcedures")
+    render_allocators(x, p)
     x.empty("Options", [(k, v) for k, v in a.get("options", {}).items()])
     x.close("Static")
+    render_module_defs(x, p)
     x.open("Dynamic")
     x.open("ChannelIndependentBlock")
     for b in p.blocks:
-        x.open("ParameterBlock", [("Id", b["id"]), ("Name", b["name"]), ("Text", b["text"])])
-        for pn in b["parameters"]:
-            x.empty("ParameterRefRef", [("RefId", p.ref_id(pn))])
-        for on in b["com_objects"]:
-            x.empty("ComObjectRefRef", [("RefId", p.objects[on]["ref"])])
-        x.close("ParameterBlock")
+        render_block(x, p, b)
     for c in p.dynamic_chooses:
         render_dynamic_choose(x, p, c)
     x.close("ChannelIndependentBlock")
+    for ch in p.channels:  # #345
+        x.open("Channel", [("Id", ch["id"]), ("Name", ch["name"]), ("Text", ch["text"]), ("Number", ch["number"])])
+        for b in ch["block"]:
+            render_block(x, p, b)
+        x.close("Channel")
     x.close("Dynamic")
     x.close("ApplicationProgram")
     x.close("ApplicationPrograms")
     translations = a.get("translations", {})
-    if translations:
+    # syn-text-initialvalue (#473): a parameter's translated InitialValue,
+    # one TranslationElement per parameter after the application's.
+    param_langs = {lang for prm in p.params.values() for lang in prm.get("translations", {})}
+    if translations or param_langs:
         x.open("Languages")
-        for lang, text in sorted(translations.items()):
+        for lang in sorted(set(translations) | param_langs):
             x.open("Language", [("Identifier", lang)])
             x.open("TranslationUnit", [("RefId", p.app_id), ("Version", 0)])
-            x.open("TranslationElement", [("RefId", p.app_id)])
-            x.empty("Translation", [("AttributeName", "Name"), ("Text", text)])
-            x.close("TranslationElement")
+            if lang in translations:
+                x.open("TranslationElement", [("RefId", p.app_id)])
+                x.empty("Translation", [("AttributeName", "Name"), ("Text", translations[lang])])
+                x.close("TranslationElement")
+            for prm in p.params.values():
+                t = prm.get("translations", {}).get(lang)
+                if t is None:
+                    continue
+                x.open("TranslationElement", [("RefId", prm["id"])])
+                x.empty("Translation", [("AttributeName", "InitialValue"), ("Text", t["initial_value"])])
+                x.close("TranslationElement")
             x.close("TranslationUnit")
             x.close("Language")
         x.close("Languages")

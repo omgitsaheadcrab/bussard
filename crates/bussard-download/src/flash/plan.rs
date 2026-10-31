@@ -467,6 +467,9 @@ pub fn plan_flash_with_memo(
     // #614). Only `MAPPED_UNLOAD_ERROR` to success is lowered, and only over
     // an `Unload`.
     let mut error_maps: BTreeMap<u32, u32> = BTreeMap::new();
+    // The values of the properties the program's parameters live in, composed
+    // on the first `LdCtrlWriteProp` without `InlineData` (issue #669).
+    let mut property_values: Option<bussard_prod::PropertyValues> = None;
 
     for (i, op) in ops.iter().enumerate() {
         let step_no = i + 1;
@@ -944,14 +947,32 @@ pub fn plan_flash_with_memo(
                             start_element,
                             count: 1,
                             verify: false,
+                            from_parameters: false,
                         });
                     }
                     _ => {
-                        // A bare LdCtrlWriteProp carries no value: the device seeds
-                        // the standard interface-object properties itself on
-                        // LoadCompleted, so there is genuinely nothing to write. It
-                        // is intentionally NOT lowered to a step, so it can never be
-                        // rendered in the plan/trace as an executed write.
+                        // A write without `InlineData` writes the value the
+                        // program's property-located parameters compose, as ETS
+                        // does (issue #669: `syn-property-param`, `5A` to object
+                        // 4 PID 201), with the op's `Count` and `Verify`. A write
+                        // no parameter supplies a value for is refused: skipping
+                        // it would report a flash whose device does not hold
+                        // the model's property.
+                        let values = match property_values {
+                            Some(ref values) => values,
+                            None => property_values.insert(
+                                bussard_prod::compute_property_values(app, &config).map_err(
+                                    |e| PlanError::UnsupportedWriteProp {
+                                        step: step_no,
+                                        reason: format!(
+                                            "composing the property values from the \
+                                             parameters: {e}"
+                                        ),
+                                    },
+                                )?,
+                            ),
+                        };
+                        steps.push(super::plan_props::lower_write_prop(step_no, op, values)?);
                     }
                 }
             }
@@ -1509,9 +1530,10 @@ fn kept_from(
 /// read-back and the plan, which decode a device's parameters without a
 /// [`FlashPlan`] at hand. System B: the octets of a segment the taken
 /// `<choose>` branch writes in part; System 7: the octets of a segment the
-/// taken branch allocates in parts and leaves between or after them
+/// procedure allocates in parts (in a taken branch or outside any
+/// `<choose>`) and leaves between or after them
 /// ([`super::plan_sys7::sys7_kept_octets`]). Empty for a property-only
-/// application, for a procedure without a `<choose>`, and when the load
+/// application, for a System B procedure without a `<choose>`, and when the load
 /// procedure cannot be decided (the planner refuses such a plan on its own).
 pub fn kept_octets(
     app: &ApplicationProgram,
@@ -1526,9 +1548,8 @@ pub fn kept_octets(
     else {
         return Vec::new();
     };
-    if app.load_procedures.iter().all(|p| p.chooses.is_empty()) {
-        return Vec::new();
-    }
+    // System 7: a procedure may split a segment outside any `<choose>` too
+    // (issue #657, the Jung `A-5015-13`), so the check runs without one.
     if profile.is_system_7() {
         let config = memo.evaluate_for(app, overrides);
         return match super::plan_props::guarded_ops(app, &config) {
@@ -1543,7 +1564,7 @@ pub fn kept_octets(
             Err(_) => Vec::new(),
         };
     }
-    if !profile.capabilities().flash {
+    if !profile.capabilities().flash || app.load_procedures.iter().all(|p| p.chooses.is_empty()) {
         return Vec::new();
     }
     let config = memo.evaluate_for(app, overrides);
@@ -3255,11 +3276,12 @@ mod tests {
     }
 
     #[test]
-    fn plan_skips_bare_write_prop_without_emitting_a_step() -> Result<(), Box<dyn std::error::Error>>
-    {
-        // A bare WriteProp (no InlineData) carries no value: the device seeds the
-        // property on LoadCompleted. It must NOT lower to a WriteProp step, so it
-        // can never be rendered as an executed write.
+    fn test_plan_flash_refuses_a_bare_write_prop_no_parameter_supplies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A bare WriteProp (no InlineData) writes the value the property-located
+        // parameters compose (issue #669). With no such parameter there is no
+        // value: the plan refuses instead of skipping a write ETS makes, which
+        // would report a flash whose device does not hold the model.
         let xml = r#"<KNX xmlns="http://knx.org/xml/project/23">
          <ApplicationProgram Id="M-1_A-B" MaskVersion="MV-07B0" Name="BareWriteProp">
           <Static>
@@ -3281,15 +3303,13 @@ mod tests {
             &BTreeMap::new(),
             None,
             &BTreeMap::new(),
-        )?;
-        assert!(
-            !plan
-                .steps
-                .iter()
-                .any(|s| matches!(s, FlashStep::WriteProp { .. })),
-            "a bare WriteProp must not lower to an executed step: {:?}",
-            plan.steps
         );
+        match plan {
+            Err(PlanError::UnsupportedWriteProp { reason, .. }) => {
+                assert!(reason.contains("no parameter"), "{reason}");
+            }
+            other => return Err(format!("expected UnsupportedWriteProp, got {other:?}").into()),
+        }
         Ok(())
     }
 

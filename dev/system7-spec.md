@@ -240,12 +240,15 @@ The LSM index is the object type of the loadable part `[MP §3.31.2, p. 134]`:
   (`captures/synthetic/syn-s7-lsm5/defaults/`, ETS 6.4.1) writes 18 records to
   `0x0104`, none with high nibble 5, and 1.1.44's capture has none either. A
   product variant that also loaded and completed LSM 5 failed inside ETS
-  ("System.ArgumentException: lsm"). **Rule (issue #489):** under the
-  memory-mapped realisation the planner sends no `TaskSegment` record for an
-  LSM outside 1 to 4 (`SYS7_MEMORY_MAPPED_LSMS` in `plan_sys7.rs`); knx-sim
-  leaves an unopened machine Unloaded on such a record (#529), which failed
-  bussard's flash. The property realisation (0705) keeps the record until
-  `syn-s7-lsm5-0705` (#604 row 32) shows what ETS does there.
+  ("System.ArgumentException: lsm"). On 0705 (property realisation) ETS
+  sends none either: its download of `syn-s7-lsm5-0705`
+  (`captures/synthetic/syn-s7-lsm5-0705/defaults/`, 44 operations) has no
+  operation on object 5 and equals `syn-s7-0705`'s apart from the application
+  number. **Rule (issues #489, #680):** on every realisation (0700 and 0701
+  memory-mapped, 0705 property) the planner sends no `TaskSegment` record for
+  an LSM outside 1 to 4 (`SYS7_LSMS` in `plan_sys7.rs`); knx-sim leaves an
+  unopened machine Unloaded on such a record (#529) and refuses the property
+  write with a T_NAK, both of which failed bussard's flash.
 
 **Two ETS differences bussard keeps (issue #178, 2308.16REGHM `A-2088-11`).**
 The application declares `DynamicTableManagement="1"`, and ETS places the
@@ -554,6 +557,13 @@ parameter-only download and the diff never touch them), not placed, and named
 in the plan (`LSM 3 segment 0x4440 octets 1..3 kept`). A parameter placed in
 a gap is reported as kept on the device (the device's value and the model's,
 no verdict), never as a difference, by `flash`, `plan` and the read-back.
+The same holds for allocations outside any `<choose>` (issue #657):
+`CONFIRMED` against the synthetic `syn-s7-static-split` (`captures/synthetic/
+syn-s7-static-split/defaults/ops.txt`, ETS 6.4.1, 2026-10-31), which is
+`syn-s7-choose-split` with the `<choose>` removed. ETS sends the same records
+and writes, leaves `0x4441..0x4442` alone, and the sequence and image equal
+the `<choose>` case's. The Jung `M-0004_A-5015-13-7E56-O00F4` (4 of the 14
+octets of `AS-5DAF` allocated, parameters at octets 12 and 13) plans this way.
 System B has the same rule for a `<choose>` branch that writes part of a
 relative segment (`KeptOctets`, PR #647).
 
@@ -667,28 +677,33 @@ octets keep the segment template, by
 predicate the image builder and the read-back decoder use on both systems.
 With `DownloadInvisibleParameters` (`None`, `Background`) or
 `PreferPartialDownloadIfApplicationLoaded="true"` the template stays. Without
-either, the schema version of the application file
-(`http://knx.org/xml/project/<N>`) decides on System 7:
+either, the application's `MinEtsVersion` decides on System 7:
 
 | capture | system | schema | `MinEtsVersion` | ETS at the hidden parameter |
 |---|---|---|---|---|
 | `syn-s7-hidden-default-p11` | 0705 | 11 | 4.0 | template |
+| `syn-s7-hidden-default-ets4` | 0705 | 23 | 4.0 | template |
 | sweep rows of #448 (Steinel, ekinex, B.E.G., Zennio, MDT, Elsner) | 0705/0701 | 11 | 4.0, 3.0d, none | template |
 | Busch-Jaeger `A-FF11-15` (sweep) | 0705 | 20 | 3.0d | template (14 octets differ when written) |
+| MDT leakage sensor `M-0083_A-014F-10` (sweep) | 0705 | 20 | 5.0 | default (1 octet differs when kept) |
 | `syn-s7-hidden-default` | 0705 | 23 | 6.0 | default |
 | `syn-hidden-default` | 07B0 | 23 | 6.0 | default |
 | Busch-Wächter PRO 280 `A-6179-82` (sweep, #89) | 07B0 | 20 | 5.0 | default |
 
-The two synthetic System 7 products differ only in the namespace and
-`MinEtsVersion`. So System 7 writes the defaults from project/21 on and keeps
-the template through project/20; System B writes them at every schema. The
-schema alone does not decide (project/20 writes on the PRO 280 and keeps on
-`A-FF11-15`). Open: the System 7 boundary within 21 to 23 (no System 7 program
-in the corpus has project/21 or /22, so it changes no vendor product), System B
-below project/20 (no capture separates it), and whether ETS keys on
-`MinEtsVersion` instead (every capture that writes has 5.0 or later, every one
-that keeps has 4.0 or earlier, or none). `syn-s7-hidden-default` rendered in project/23
-with `MinEtsVersion="4.0"` would tell the two apart.
+`syn-s7-hidden-default` and `syn-s7-hidden-default-ets4` differ only in
+`MinEtsVersion` (both project/23), and ETS writes the default on the first and
+keeps the template on the second. So System 7 writes the defaults when
+`MinEtsVersion` is 5 or later and keeps the template below 5 or without one
+(`FIRST_SYSTEM7_MIN_ETS_WITH_HIDDEN_DEFAULTS`); System B writes them at every
+schema and `MinEtsVersion`. The schema does not decide (PR #654 keyed the rule
+on project/21; the project/23 twin with 4.0 keeps and the project/20 leakage
+sensor with 5.0 writes). Of 5.x only 5.0 is observed, and the corpus has no
+System 7 program between 4.0 and 5.0. The switch makes the corpus's System 7
+programs with `MinEtsVersion` 5.0 and neither attribute (81, project/14 and
+/20; 42 of `M-00C9`, 29 of `M-0083`, 10 of five others) write their hidden
+defaults; of the sweep's 249 System 7 rows only the leakage sensor changes
+(differs to identical), the other 248 compare as before.
+System B below project/20 is still unseparated by a capture.
 
 ---
 

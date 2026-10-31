@@ -7,6 +7,7 @@
 mod apply_mock;
 mod apply_object_table_mock;
 mod builtin_template;
+mod com_object_descriptors;
 mod compare_rel_mem;
 mod enum_default_plan;
 mod ets_golden;
@@ -22,6 +23,7 @@ mod param_readback_roundtrip;
 mod partial_segment;
 mod property_procedure;
 mod sweep_fixtures;
+mod syn_property_param;
 mod sys7_jung_m2_plan;
 mod sys7_lsm5_plan;
 mod sys7_split_segment;
