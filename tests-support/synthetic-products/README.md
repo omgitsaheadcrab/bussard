@@ -27,6 +27,7 @@ next to it, and zips it on demand.
 | [`syn-choose-per-ref`](syn-choose-per-ref/product.toml) | `NEST-TWIN` | 07B0 | choose on the unreached second ParameterRef of a reached parameter | #563 |
 | [`syn-color-param`](syn-color-param/product.toml) | `NEST-COLOUR` | 07B0 | TypeColor RGB parameter in memory | #616 |
 | [`syn-color-param-hsv`](syn-color-param-hsv/product.toml) | `NEST-COLHSV` | 07B0 | TypeColor HSV parameter in memory | #616 |
+| [`syn-com-objects`](syn-com-objects/product.toml) | `NEST-CHIRP` | 07B0 | one com object per size code, every flag combination, three priorities, ReadOnInit | #541, #545, #540, #686 |
 | [`syn-dynamic-tests`](syn-dynamic-tests/product.toml) | `NEST-WORM` | 07B0 | Channel and ParameterBlock with choose on single, list, comparison and default tests | #345 |
 | [`syn-hidden-default`](syn-hidden-default/product.toml) | `NEST-EGGHEAT` | 07B0 | hidden parameter, default differs from template | #448 |
 | [`syn-ip-address-param`](syn-ip-address-param/product.toml) | `NEST-HOMING` | 07B0 | TypeIPAddress parameter in memory | #457 |
@@ -108,7 +109,7 @@ One `product.toml` per directory. Tables and keys:
 | `[[parameter_ref]]` | `name`, `parameter` | a further `ParameterRef` of the parameter (`_P-<n>_R-<k>`, numbered after every parameter's own ref); blocks and chooses name it like a parameter (#563) |
 | `[[union]]` | `name`, `size_bits`, `memory = { segment, offset, bit_offset }`; optional `default` (the member that is `DefaultUnionParameter`) | `Union` with its `Memory`, after the plain parameters |
 | `[[parameter_calculation]]` | `name`, `language` (`JavaScript`), `inputs` and `outputs` (`[{ parameter, alias }]`), `lr_script`, `rl_script` | a `ParameterCalculation` (`_PC-<n>`) in the inline form: `RLTransformation`, `LRTransformation`, `LParameters`, `RParameters` with `AliasName`s (#427) |
-| `[[com_object]]` | `number`, `name`, `text`, `function_text`, `size` (`"1 Bit"`), `dpt` (`"DPST-1-1"`), `flags` (of `C R W T U I`), `priority` (`Low`, `High`, `Alert`) | `ComObject`, one `ComObjectRef` each |
+| `[[com_object]]` | `number`, `name`, `text`, `function_text`, `size` (`"1 Bit"` to `"7 Bit"`, `"1 Byte"`, `"2 Bytes"` to `"14 Bytes"`), optional `dpt` (`"DPST-1-1"`), `flags` (of `C R W T U I`), `priority` (`Low`, `High`, `Alert`) | `ComObject`, one `ComObjectRef` each |
 | `[[dynamic.block]]` | `name`, `text`, `parameters` (names), `com_objects` (numbers) | a `ParameterBlock` in the `ChannelIndependentBlock`; a parameter no block names is never shown (#448) |
 | `choose` of a block | `[{ parameter, when = [{ test or default = true, parameters, com_objects, assign }] }]`; `assign = [{ target, source }]` (parameter names) | a `<choose ParamRefId>` inside the `ParameterBlock` after its refs, each `<when>` holding refs and com objects directly (#345), then its `<Assign TargetParamRefRef SourceParamRefRef>`s (#604 row 31) |
 | `[[dynamic.channel]]` | `name`, `text`, `number` (a string), `[[dynamic.channel.block]]` (keys as `[[dynamic.block]]`) | a `<Channel>` (`_CH-<n>`) after the `ChannelIndependentBlock`, its blocks numbered after every other (#345) |
