@@ -257,7 +257,7 @@ class Product:
         for i, prm in enumerate(spec["parameter"]):
             pw = f"{w} [[parameter]] #{i + 1}"
             check_keys(pw, prm, {"name", "type", "text", "default"},
-                       {"memory", "union", "access", "virtual", "legacy_patch_always", "initial_value",
+                       {"memory", "union", "property", "access", "virtual", "legacy_patch_always", "initial_value",
                         "translations"})
             if prm["type"] not in self.types:
                 raise SpecError(f"{pw}: unknown parameter type `{prm['type']}`")
@@ -271,6 +271,17 @@ class Product:
             if prm.get("virtual"):
                 if "memory" in prm or "union" in prm:
                     raise SpecError(f"{pw}: a virtual parameter has no `memory` and no `union`")
+                self.params[prm["name"]] = dict(prm, id=f"{self.app_id}_P-{n}", ref=f"{self.app_id}_P-{n}_R-{n}")
+                continue
+            # syn-property-param (#604 row 30): `property = { object_index,
+            # property_id, offset, bit_offset }` places the parameter in an
+            # interface-object property instead of a segment.
+            if "property" in prm:
+                if "memory" in prm or "union" in prm:
+                    raise SpecError(f"{pw}: needs exactly one of `memory`, `union` and `property`")
+                check_keys(f"{pw} property", prm["property"], {"object_index", "property_id", "offset", "bit_offset"})
+                if not 0 <= prm["property"]["property_id"] <= 0xFF:
+                    raise SpecError(f"{pw} property: property_id must be one octet")
                 self.params[prm["name"]] = dict(prm, id=f"{self.app_id}_P-{n}", ref=f"{self.app_id}_P-{n}_R-{n}")
                 continue
             if ("memory" in prm) == ("union" in prm):
@@ -492,7 +503,24 @@ class Product:
                 if name in LOAD_OPS_LATER or name in SYS7_LOAD_OPS or name in B_PRODUCT_LOAD_OPS:
                     raise not_yet(ow, f"`{name}`")
                 raise SpecError(f"{ow}: unknown op `{name}`")
+            if name == "LdCtrlWriteProp":
+                self.check_write_prop(ow, op)
+                continue
             check_keys(ow, op, {"op"} | set(table[name]))
+
+    def check_write_prop(self, ow: str, op: dict) -> None:
+        """`LdCtrlWriteProp`: `object` and `prop_id`, optional `start_element`,
+        `count`, `verify`; its value is `inline_data` (hex, syn-product-07b0's
+        program version) or, without it, what the parameters placed in that
+        property compose (syn-property-param, #604 row 30), so one must be."""
+        check_keys(ow, op, {"op", "object", "prop_id"}, {"start_element", "count", "verify", "inline_data"})
+        if "inline_data" in op:
+            return
+        placed = {(prm["property"]["object_index"], prm["property"]["property_id"])
+                  for prm in self.params.values() if "property" in prm}
+        if (op["object"], op["prop_id"]) not in placed:
+            raise SpecError(f"{ow}: no parameter is placed in object {op['object']} PID {op['prop_id']} "
+                            "and the op has no inline_data, so the write has no value")
 
     def check_load_choose(self, ow: str, op: dict) -> None:
         """syn-choose-partial-segment (#604 row 8, #411): `<choose ParamRefId>`
@@ -542,8 +570,12 @@ LOAD_OPS = {
     # syn-master-reset (#604 row 10, #546, #611): a Master Reset in the
     # application's procedure, as KNX Virtual's DA.tp has it.
     "LdCtrlMasterReset": {"erase_code": "EraseCode", "channel": "ChannelNumber"},
+    # syn-property-param (#604 row 30): a property write without InlineData,
+    # whose value the parameters placed in that property compose.
+    "LdCtrlWriteProp": {"object": "ObjIdx", "prop_id": "PropId", "start_element": "StartElement",
+                        "count": "Count", "verify": "Verify", "inline_data": "InlineData"},
 }
-LOAD_OPS_LATER = {"LdCtrlLoadImageProp", "LdCtrlWriteProp", "LdCtrlCompareProp",
+LOAD_OPS_LATER = {"LdCtrlLoadImageProp", "LdCtrlCompareProp",
                   "LdCtrlAbsSegment", "LdCtrlConnect", "LdCtrlDisconnect", "LdCtrlRestart",
                   "LdCtrlUnload", "LdCtrlLoad", "LdCtrlLoadCompleted", "LdCtrlTaskSegment"}
 
@@ -592,7 +624,7 @@ B_PRODUCT_LOAD_OPS = {
     "LdCtrlUnload": {"lsm": "LsmIdx"},
     "LdCtrlLoad": {"lsm": "LsmIdx"},
     "LdCtrlLoadCompleted": {"lsm": "LsmIdx"},
-    "LdCtrlWriteProp": {"object": "ObjIdx", "prop_id": "PropId", "verify": "Verify", "inline_data": "InlineData"},
+    "LdCtrlWriteProp": LOAD_OPS["LdCtrlWriteProp"],
 }
 # Every op table, for rendering (each spec is checked against its own table).
 ALL_LOAD_OPS = LOAD_OPS | SYS7_LOAD_OPS | B_PRODUCT_LOAD_OPS
@@ -768,7 +800,7 @@ def render_load_ops(x: Xml, p: Product, ops: list[dict]) -> None:
                 x.close("when")
             x.close("choose")
         else:
-            x.empty(op["op"], [(attr, op[key]) for key, attr in ALL_LOAD_OPS[op["op"]].items()])
+            x.empty(op["op"], [(attr, op.get(key)) for key, attr in ALL_LOAD_OPS[op["op"]].items()])
 
 
 def render_block(x: Xml, p: Product, b: dict) -> None:
@@ -864,6 +896,12 @@ def render_application(p: Product) -> bytes:
                              ("Text", prm["text"]), ("Access", prm.get("access")), ("Value", prm["default"]),
                              ("InitialValue", prm.get("initial_value")),
                              ("LegacyPatchAlways", True if prm.get("legacy_patch_always") else None)])
+        if "property" in prm:  # syn-property-param (#604 row 30)
+            pr = prm["property"]
+            x.empty("Property", [("ObjectIndex", pr["object_index"]), ("PropertyId", pr["property_id"]),
+                                 ("Offset", pr["offset"]), ("BitOffset", pr["bit_offset"])])
+            x.close("Parameter")
+            continue
         m = prm["memory"]
         x.empty("Memory", [("CodeSegment", p.segments[m["segment"]]["id"]), ("Offset", m["offset"]),
                            ("BitOffset", m["bit_offset"])])

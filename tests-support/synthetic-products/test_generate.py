@@ -432,6 +432,40 @@ class TaskPtrAndTaskCtrl2(unittest.TestCase):
             generate.Product("t", s)
 
 
+class PropertyParameter(unittest.TestCase):
+    """syn-property-param (#604 row 30): a parameter placed by `<Property>` and
+    the `LdCtrlWriteProp` that writes it."""
+
+    def prop_spec(self) -> dict:
+        s = spec()
+        s["parameter"] = s["parameter"] + [
+            {"name": "t", "type": "Mode", "text": "T", "default": 2,
+             "property": {"object_index": 4, "property_id": 201, "offset": 0, "bit_offset": 0}}]
+        s["load_procedure"][1]["ops"].append(
+            {"op": "LdCtrlWriteProp", "object": 4, "prop_id": 201, "start_element": 1, "count": 1,
+             "verify": False})
+        return s
+
+    def test_render_property_placement_and_write_prop(self) -> None:
+        xml = app_xml(self.prop_spec())
+        self.assertIn('Text="T" Value="2">\n'
+                      '                <Property ObjectIndex="4" PropertyId="201" Offset="0" BitOffset="0" />\n'
+                      '              </Parameter>', xml)
+        self.assertIn('<LdCtrlWriteProp ObjIdx="4" PropId="201" StartElement="1" Count="1" Verify="false" />', xml)
+
+    def test_write_prop_without_placed_parameter_refused(self) -> None:
+        s = self.prop_spec()
+        s["load_procedure"][1]["ops"][-1]["prop_id"] = 202
+        with self.assertRaisesRegex(generate.SpecError, "no parameter is placed in object 4 PID 202"):
+            generate.Product("test", s)
+
+    def test_property_and_memory_refused(self) -> None:
+        s = self.prop_spec()
+        s["parameter"][-1]["memory"] = {"segment": "main", "offset": 3, "bit_offset": 0}
+        with self.assertRaisesRegex(generate.SpecError, "exactly one of `memory`, `union` and `property`"):
+            generate.Product("test", s)
+
+
 class BitFields(unittest.TestCase):
     """syn-union-bitfields (#604 row 29): a union of two member types and
     sub-octet parameters packed into one octet by BitOffset."""
@@ -725,9 +759,9 @@ class SystemBProductProcedure(unittest.TestCase):
 
     def test_product_procedure_ops_not_yet_in_a_merged_procedure(self) -> None:
         s = spec()
-        s["load_procedure"][1]["ops"].append({"op": "LdCtrlWriteProp", "object": 4, "prop_id": 13,
-                                              "verify": True, "inline_data": "00"})
-        with self.assertRaisesRegex(generate.SpecError, "`LdCtrlWriteProp` is part of the schema"):
+        # LdCtrlWriteProp is a merged-procedure op too since syn-property-param.
+        s["load_procedure"][1]["ops"].append({"op": "LdCtrlUnload", "lsm": 4})
+        with self.assertRaisesRegex(generate.SpecError, "`LdCtrlUnload` is part of the schema"):
             generate.Product("test", s)
 
     def test_product_procedure_on_07b0_refuses_system_7_ops(self) -> None:
@@ -736,10 +770,11 @@ class SystemBProductProcedure(unittest.TestCase):
         with self.assertRaisesRegex(generate.SpecError, "`LdCtrlTaskSegment` is part of the schema"):
             generate.Product("test", s)
 
-    def test_write_prop_missing_key_refused(self) -> None:
+    def test_write_prop_without_value_refused(self) -> None:
         s = self.product_spec()
         del s["load_procedure"][0]["ops"][5]["inline_data"]
-        with self.assertRaisesRegex(generate.SpecError, "missing key `inline_data`"):
+        with self.assertRaisesRegex(generate.SpecError, "no parameter is placed in object 4 PID 13 and the op has "
+                                                        "no inline_data"):
             generate.Product("test", s)
 
 

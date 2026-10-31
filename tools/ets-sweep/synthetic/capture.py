@@ -287,10 +287,15 @@ def oracle_verdict(product: str, app: str, variant: str = VARIANT, extra: str = 
         raise SystemExit(f"oracle row of {product} gave no summary:\n{text[-1500:]}")
     lc = next((json.loads(l[len("@loadctl "):]) for l in text.splitlines() if l.startswith("@loadctl ")), {})
     confirmed = next((l.split()[1] for l in text.splitlines() if l.startswith("@confirmed ")), None)
-    out = {"verdict": m.group(2), "coverage": m.group(3), "regions": m.group(5).strip(),
-           "loadctl": lc.get("verdict")}
+    regions = m.group(5).strip()
+    out = {"verdict": m.group(2), "coverage": m.group(3), "regions": regions, "loadctl": lc.get("verdict")}
     if confirmed:
         out["confirmed"] = confirmed
+    # The headline verdict does not count the property writes (a row is
+    # `identical` with `props=differs`), so a property difference is recorded
+    # on its own and held by the row's `props=` (syn-property-param).
+    if "props=differs" in regions:
+        out["props"] = "differs"
     return out
 
 
@@ -326,6 +331,8 @@ def row_options(oracle: dict) -> str:
         opts.append(f"confirmed={oracle['confirmed']}")
     if oracle.get("loadctl") in ("identical", "differs"):
         opts.append(f"loadctl={oracle['loadctl']}")
+    if oracle.get("props") == "differs":
+        opts.append("props=differs")
     return " ".join(opts)
 
 
@@ -670,7 +677,7 @@ def capture_variant(product: str, variant: str, args) -> int:
         "steps": [{"product": s["product"], "mode": s["mode"], "ets": s.get("ets"), "ops": s.get("ops")}
                   for s in result["steps"]],
         "row_options": extra,
-        "oracle": {k: verdict[k] for k in ("verdict", "coverage", "confirmed", "loadctl") if k in verdict},
+        "oracle": {k: verdict[k] for k in ("verdict", "coverage", "confirmed", "loadctl", "props") if k in verdict},
     }
     for p in involved:
         if p != product:
@@ -734,7 +741,8 @@ def main() -> int:
         "product": product, "variant": VARIANT, "order_number": order, "application": app, "signed_id": sid,
         "xml_sha256": xml_sha256(product), "ets": ets, "knx_sim": build, "captured": when,
         "ops": result.get("ops"), "requests": requests,
-        "oracle": {"verdict": verdict["verdict"], "coverage": verdict["coverage"], "loadctl": verdict["loadctl"]},
+        "oracle": {"verdict": verdict["verdict"], "coverage": verdict["coverage"], "loadctl": verdict["loadctl"],
+                   **({"props": verdict["props"]} if "props" in verdict else {})},
     }
     entries.append(entry)
     write_manifest(entries)

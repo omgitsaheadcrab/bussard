@@ -37,6 +37,7 @@ next to it, and zips it on demand.
 | [`syn-minimal`](syn-minimal/product.toml) | `NEST-LIGHT` | 07B0 | baseline | #596 |
 | [`syn-param-calculation`](syn-param-calculation/product.toml) | `NEST-CALC` | 07B0 | JavaScript ParameterCalculation, one output LegacyPatchAlways | #427, #450 |
 | [`syn-product-07b0`](syn-product-07b0/product.toml) | `NEST-PLAN` | 07B0 | ProductProcedure on 07B0 with the tables as RelSegments | #614 |
+| [`syn-property-param`](syn-property-param/product.toml) | `NEST-TERR` | 07B0 | parameter placed in a property, written by LdCtrlWriteProp | #669 |
 | [`syn-relseg-fill`](syn-relseg-fill/product.toml) | `NEST-FILL` | 07B0 | RelSegment Mode 0 with Fill 255 | #480 |
 | [`syn-s7-0701`](syn-s7-0701/product.toml) | `NEST-BKDOOR` | 0701 | System 7 baseline (0701, memory-mapped LSM) | #596, #488, #481 |
 | [`syn-s7-0705`](syn-s7-0705/product.toml) | `NEST-DOOR` | 0705 | System 7 baseline (0705, property LSM) | #596, #488, #479, #588, #487 |
@@ -97,7 +98,7 @@ One `product.toml` per directory. Tables and keys:
 | `[application.options]` | any `Options` attribute of the KNX schema, e.g. `SupportsExtendedMemoryServices = true`, `ParameterByteOrder = "LittleEndian"` | `Options` |
 | `[[segment]]` | `name`, `kind` (`relative`), `lsm`, `size`; optional `fill` (the initial octet, 0) | `RelativeSegment` with its `Data` |
 | `[[parameter_type]]` | `name`, `kind`; `enum`: `size_bits`, `values = [{ value, text }]`; `number`: `size_bits`, `signed`, `min`, `max`; `float`: `encoding` (`DPT 9`, `IEEE-754 Single`, `IEEE-754 Double`; 16, 32, 64 bits), `min`, `max`; `text`: `size_octets`; `ip_address`: `address_type` (`HostAddress`, `SubnetMask`, `DefaultGateway`; 32 bits, the default a dotted quad); `color`: `space` (`RGB`, `HSV`; 24 bits, the default `#` and six hex digits) | `TypeRestriction`, `TypeNumber`, `TypeFloat`, `TypeText`, `TypeIPAddress`, `TypeColor` |
-| `[[parameter]]` | `name`, `type`, `text`, `default`, and either `memory = { segment, offset, bit_offset }`, `union = { name, offset, bit_offset }` (a member at its offset in the union) or `virtual = true` (no memory, it only steers the Dynamic tree; #474); `bit_offset` counts from the octet's most significant bit, 0 to 7, so sub-octet parameters share an octet; optional `access` (`None`, `Read`, `ReadWrite`) and `legacy_patch_always` (#450); a text parameter also `initial_value` and `translations = { "de-DE" = { initial_value } }` (#473) | `Parameter` (`_P-<n>`, a union member `_UP-<n>`), one `ParameterRef` each; a translated `InitialValue` is a `TranslationElement` of the parameter in `Languages` |
+| `[[parameter]]` | `name`, `type`, `text`, `default`, and either `memory = { segment, offset, bit_offset }`, `union = { name, offset, bit_offset }` (a member at its offset in the union), `property = { object_index, property_id, offset, bit_offset }` (placed in an interface-object property, #604 row 30) or `virtual = true` (no memory, it only steers the Dynamic tree; #474); `bit_offset` counts from the octet's most significant bit, 0 to 7, so sub-octet parameters share an octet; optional `access` (`None`, `Read`, `ReadWrite`) and `legacy_patch_always` (#450); a text parameter also `initial_value` and `translations = { "de-DE" = { initial_value } }` (#473) | `Parameter` (`_P-<n>`, a union member `_UP-<n>`), one `ParameterRef` each; a translated `InitialValue` is a `TranslationElement` of the parameter in `Languages` |
 | `[[parameter_ref]]` | `name`, `parameter` | a further `ParameterRef` of the parameter (`_P-<n>_R-<k>`, numbered after every parameter's own ref); blocks and chooses name it like a parameter (#563) |
 | `[[union]]` | `name`, `size_bits`, `memory = { segment, offset, bit_offset }`; optional `default` (the member that is `DefaultUnionParameter`) | `Union` with its `Memory`, after the plain parameters |
 | `[[parameter_calculation]]` | `name`, `language` (`JavaScript`), `inputs` and `outputs` (`[{ parameter, alias }]`), `lr_script`, `rl_script` | a `ParameterCalculation` (`_PC-<n>`) in the inline form: `RLTransformation`, `LRTransformation`, `LParameters`, `RParameters` with `AliasName`s (#427) |
@@ -109,16 +110,19 @@ One `product.toml` per directory. Tables and keys:
 | `[[load_procedure]]` | `merge_id`, `ops = [{ op = "...", ... }]` | `LoadProcedure` |
 
 Load ops: `LdCtrlRelSegment` (`lsm`, `size`, `mode`, `fill`),
-`LdCtrlWriteRelMem` (`object`, `offset`, `size`, `verify`) and
-`LdCtrlMasterReset` (`erase_code`, `channel`). A System 7 product procedure
+`LdCtrlWriteRelMem` (`object`, `offset`, `size`, `verify`),
+`LdCtrlMasterReset` (`erase_code`, `channel`) and
+`LdCtrlWriteProp` (`object`, `prop_id`, optional `start_element`, `count`, `verify`,
+`inline_data` in hex; without `inline_data` the value is what the parameters
+placed in that property compose, so a parameter must be placed there). A System 7 product procedure
 also takes `LdCtrlTaskPtr` (`lsm`, `init_ptr`, `save_ptr`, `serial_ptr`) and
 `LdCtrlTaskCtrl2` (`lsm`, `callback`, `address`, `seg0`, `seg1`). `{ op = "choose", parameter,
 when = [{ test, ops }, { default = true, ops }] }` renders a `<choose
 ParamRefId>` with its `<when>` branches inside the procedure (#411).
 A 07B0 product procedure (#614) also takes `LdCtrlConnect`,
 `LdCtrlDisconnect`, `LdCtrlUnload`, `LdCtrlLoad` and `LdCtrlLoadCompleted`
-(`lsm`) and `LdCtrlWriteProp` (`object`, `prop_id`, `verify`, `inline_data`
-in hex); its tables are relative segments the procedure allocates and writes
+(`lsm`), and writes the program version by `LdCtrlWriteProp` with
+`inline_data`; its tables are relative segments the procedure allocates and writes
 on LSM 1 to 3, with no code segment declared for them.
 
 The schema reaches further than the generator does. These are reserved for
@@ -129,7 +133,7 @@ type kinds `time`, `raw`, VBScript calculations and the
 `LRTransformationFunc` form with a `<Script>`, explicit com
 object refs, and the load
 ops `LdCtrlLoadImageProp`, `LdCtrlCompareProp` and `LdCtrlAbsSegment`, and
-`LdCtrlWriteProp` and the connection and state ops in a merged procedure. An unknown key or op stops with an error naming it.
+the connection and state ops in a merged procedure. An unknown key or op stops with an error naming it.
 
 Ids follow ETS: `M-00FA_A-<number>-<version>-0000` for the application, its
 parts prefixed with it (`_RS-04-00000`, `_PT-<name>`, `_P-<n>`, `_P-<n>_R-<n>`,
