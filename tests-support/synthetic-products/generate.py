@@ -667,6 +667,9 @@ SYS7_LOAD_OPS = {
     # syn-s7-delay (#604 row 39, #615): a pause in the procedure, as 16 0701
     # applications have it before LdCtrlRestart.
     "LdCtrlDelay": {"milliseconds": "MilliSeconds"},
+    # syn-s7-master-reset (#1065): Master Resets before the load, as the Hager
+    # 0701 `M-0009_A-E0ED-10-0B6F` has them (erase codes 6 and 5).
+    "LdCtrlMasterReset": LOAD_OPS["LdCtrlMasterReset"],
 }
 MEMORY_TYPES = ("EEPROM", "RAM")
 

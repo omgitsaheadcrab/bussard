@@ -19,6 +19,58 @@ pub(super) struct LabelCtx<'a> {
     /// The segments whose MCB a check reads without comparing: the device
     /// keeps octets of them no parameter occupies (issue #1084).
     pub uncompared: &'a [String],
+    /// A System 7 plan (what a capture confirms differs, issue #1065).
+    pub sys7: bool,
+}
+
+/// Where a Master Reset of a product procedure runs, for
+/// [`master_reset_captured`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResetContext {
+    /// A System B download.
+    SystemB,
+    /// A System 7 download.
+    System7,
+    /// A System B parameter-only download by the mask's `par` procedure.
+    SystemBParameterOnly,
+}
+
+/// Whether an ETS capture shows a product procedure's Master Reset with
+/// `erase_code` on `channel_number` in `context` (issue #1065). Every
+/// master reset in the sweep, house and synthetic captures (grep of
+/// `ops.txt` for `master-reset`, 2026-11-14) is on channel 0. System B: 1
+/// (the closing confirmed restart of the Data Secure and many sweep
+/// programs, `syn-master-reset`), 4 (`syn-master-reset-code4`, KNX Virtual
+/// `M-00FA_A-2500-10-51CB`), 6 then 5 (the Hager 07B0 programs
+/// `M-0009_A-E0D0..E0D3`, `A-E0EE`, `A-E0F1`, `A-E0F2`, `A-E801`, `A-E802`,
+/// `syn-property-nopar`). System 7: 6 then 5 (the 0701
+/// `M-0009_A-E0ED-10-0B6F` and `A-20B6-11-52E9`, `syn-s7-master-reset`). A
+/// System B parameter-only download: 5 (the E802 and E804 partial
+/// captures, issue #1052). The plan names any other reset "not confirmed by
+/// a capture".
+pub(super) fn master_reset_captured(
+    erase_code: u8,
+    channel_number: u8,
+    context: ResetContext,
+) -> bool {
+    use bussard_mgmt::apci::{
+        ERASE_CODE_CONFIRMED_RESTART, ERASE_CODE_RESET_AP, ERASE_CODE_RESET_LINKS,
+        ERASE_CODE_RESET_PARAM,
+    };
+    channel_number == 0
+        && match context {
+            ResetContext::SystemB => matches!(
+                erase_code,
+                ERASE_CODE_CONFIRMED_RESTART
+                    | ERASE_CODE_RESET_AP
+                    | ERASE_CODE_RESET_PARAM
+                    | ERASE_CODE_RESET_LINKS
+            ),
+            ResetContext::System7 => {
+                matches!(erase_code, ERASE_CODE_RESET_PARAM | ERASE_CODE_RESET_LINKS)
+            }
+            ResetContext::SystemBParameterOnly => erase_code == ERASE_CODE_RESET_PARAM,
+        }
 }
 
 /// A `" (LsmIdx/ObjIdx N)"` suffix for a step label, naming the object index the
@@ -361,7 +413,20 @@ pub(super) fn step_label(step: &FlashStep, ctx: &LabelCtx<'_>) -> String {
             erase_code,
             channel_number,
         } => format!(
-            "master reset (erase code {erase_code}, channel {channel_number}) — reconnect and resume"
+            "master reset (erase code {erase_code}, channel {channel_number}{}) — reconnect and resume",
+            if master_reset_captured(
+                *erase_code,
+                *channel_number,
+                if ctx.sys7 {
+                    ResetContext::System7
+                } else {
+                    ResetContext::SystemB
+                },
+            ) {
+                ""
+            } else {
+                ", not confirmed by a capture"
+            }
         ),
         FlashStep::Sys7Unload { lsm } => format!("[S7] unload LSM {lsm}"),
         FlashStep::Sys7StartLoading { lsm } => format!("[S7] open LSM {lsm} for loading"),

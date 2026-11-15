@@ -132,6 +132,18 @@ struct DeviceState {
     memory_writes_seen: usize,
     /// Count of basic restarts seen (the terminal step).
     restarts_seen: usize,
+    /// The master resets seen: erase code and the memory writes stored
+    /// before it (issue #1065).
+    master_resets: Vec<(u8, usize)>,
+    /// The property values written, by (object, PID, start element), read
+    /// back by `A_PropertyValue_Read` (issue #1065).
+    properties: HashMap<(u8, u8, u16), Vec<u8>>,
+    /// How many master resets the device had seen at each
+    /// `PID_DEVICE_CONTROL` write (issue #1065).
+    device_control_after_resets: Vec<usize>,
+    /// The values a reset of the parameters (erase codes 2, 5, 7) restores:
+    /// the program's `LoadedImage`, by (object, PID, start element).
+    factory_properties: HashMap<(u8, u8, u16), Vec<u8>>,
     /// If set, the device goes silent after this many numbered exchanges on one
     /// connection, modelling a mid-download L4 drop the tool must resume across.
     /// Only the first `deaths_remaining` connections die; later ones serve fully,
@@ -318,6 +330,10 @@ fn fresh_device(mode: LsmMode, fault: Fault) -> Shared {
         authorizes_seen: 0,
         memory_writes_seen: 0,
         restarts_seen: 0,
+        master_resets: Vec::new(),
+        properties: HashMap::new(),
+        device_control_after_resets: Vec::new(),
+        factory_properties: HashMap::new(),
         die_after_exchanges: None,
         deaths_remaining: 0,
         exchanges_this_connection: 0,
@@ -510,6 +526,44 @@ fn handle_request(state: &Shared, req_apci: u16, payload: &[u8]) -> Reaction {
             A_DEVICE_DESCRIPTOR_RESPONSE,
             MASK_0705.to_be_bytes().to_vec(),
         );
+    }
+
+    // Master reset: answered with error code 0 and no process time, then the
+    // device reboots like on a restart when it models reboots (issue #1065).
+    if req_apci == bussard_mgmt::apci::A_RESTART_MASTER_RESET {
+        let mut s = lock(state);
+        let writes = s.memory_writes_seen;
+        let code = payload.first().copied().unwrap_or(0);
+        s.master_resets.push((code, writes));
+        // The reset erases what its erase code names (KNX 3/5/2 Table 4):
+        // the links (LSM 1 and 2) for 6, the application (LSM 3) for 4 and
+        // the parameters for 5, everything for 2 and 7, nothing for 1. An
+        // erased machine is back to Unloaded and its memory gone; a reset of
+        // the parameters puts the LoadedImage values back. PID_DEVICE_CONTROL
+        // (RAM) loses its verify mode, as on a restart.
+        let erased: &[u8] = match code {
+            1 => &[],
+            4 | 5 => &[3],
+            6 => &[1, 2],
+            _ => &[1, 2, 3],
+        };
+        for lsm in erased {
+            if let Some(v) = s.lsm_states.get_mut(lsm) {
+                *v = LS_UNLOADED;
+            }
+        }
+        if !erased.is_empty() {
+            s.memory.clear();
+        }
+        if matches!(code, 2 | 5 | 7) {
+            let factory = s.factory_properties.clone();
+            s.properties.extend(factory);
+        }
+        s.device_control = 0;
+        if s.reboot_on_restart {
+            s.rebooting = true;
+        }
+        return Reaction::Answer(bussard_mgmt::apci::A_RESTART_RESPONSE, vec![0, 0, 0]);
     }
 
     // Basic restart (terminal): fire-and-forget — just T_ACK, no response NDT.
@@ -770,6 +824,13 @@ fn handle_request(state: &Shared, req_apci: u16, payload: &[u8]) -> Reaction {
                 prop_response(obj, pid, 1, start, &entry),
             );
         }
+        // A value written or restored: read back.
+        if let Some(value) = s.properties.get(&(obj, pid, start)) {
+            return Reaction::Answer(
+                A_PROPERTY_VALUE_RESPONSE,
+                prop_response(obj, pid, 1, start, value),
+            );
+        }
         // Anything else: count 0 (absent).
         return Reaction::Answer(
             A_PROPERTY_VALUE_RESPONSE,
@@ -828,8 +889,11 @@ fn handle_request(state: &Shared, req_apci: u16, payload: &[u8]) -> Reaction {
             s.device_control_at.push(at);
             let events = s.lsm_events.len();
             s.device_control_after_events.push(events);
+            let resets = s.master_resets.len();
+            s.device_control_after_resets.push(resets);
         }
-        // Echo any other property write.
+        // Store and echo any other property write.
+        s.properties.insert((obj, pid, start), value.to_vec());
         return Reaction::Answer(
             A_PROPERTY_VALUE_RESPONSE,
             prop_response(obj, pid, 1, start, value),
@@ -844,6 +908,21 @@ fn handle_request(state: &Shared, req_apci: u16, payload: &[u8]) -> Reaction {
         let mut answer: Vec<u8> = payload.iter().take(2).copied().collect();
         answer.extend_from_slice(&s.function_answer);
         return Reaction::Answer(A_FUNCTION_PROPERTY_STATE_RESPONSE, answer);
+    }
+
+    // A_PropertyDescription_Read of a property the device stores (issue
+    // #1065: the description ETS reads of a property it leaves out after
+    // the parameter reset): writable, one element of one octet.
+    if req_apci == bussard_mgmt::apci::A_PROPERTY_DESCRIPTION_READ
+        && let [obj, pid, ..] = payload
+    {
+        let s = lock(state);
+        if s.properties.keys().any(|(o, p, _)| o == obj && p == pid) {
+            return Reaction::Answer(
+                bussard_mgmt::apci::A_PROPERTY_DESCRIPTION_RESPONSE,
+                vec![*obj, *pid, 0, 0x80 | 0x11, 0x00, 0x01, 0x33],
+            );
+        }
     }
 
     Reaction::Nak
@@ -3924,6 +4003,74 @@ async fn run_parameters_only_refuses_unloaded_lsm3(
     Ok(())
 }
 
+/// A closing confirmed restart (`LdCtrlMasterReset EraseCode="1"`) stays in
+/// the System 7 parameter-only cut as its closing restart and goes out
+/// (issue #1065): the device restarts and the download verifies.
+#[tokio::test]
+async fn test_parameters_only_sys7_keeps_a_closing_confirmed_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    use bussard_product::application::LoadOp;
+    set_sys7_lsm_env(LsmMode::MemoryMapped);
+    let state = fresh_device(LsmMode::MemoryMapped, Fault::None);
+    let (_app, _) = parameters_only_fixture(&state, LS_LOADED)?;
+    lock(&state).reboot_on_restart = true;
+    let mut app = mdt_app_with_parameters()?;
+    for op in &mut app.load_procedures[0].ops {
+        if matches!(op, LoadOp::Restart) {
+            *op = LoadOp::MasterReset {
+                erase_code: Some(1),
+                channel_number: Some(0),
+            };
+        }
+    }
+    let overrides = BTreeMap::from([("P-1_R-2".to_string(), "9".to_string())]);
+    let full = plan_flash_default(
+        &app,
+        "1.1.99",
+        MASK_0705,
+        &overrides,
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    let (mut session, gw) = reconnecting_session(&state).await?;
+    let regions = bussard_download::read_parameter_regions(session.l4(), &full, &[]).await;
+    let partial = full.parameters_only(&regions)?;
+    assert!(
+        matches!(
+            partial.steps.last(),
+            Some(FlashStep::MasterReset {
+                erase_code: 1,
+                channel_number: 0
+            })
+        ),
+        "{:?}",
+        partial.steps
+    );
+    // SAFETY: nextest runs each test in its own process, so this
+    // process-global env write races with no other thread.
+    unsafe {
+        std::env::set_var("BUSSARD_FLASH_REBOOT_WAIT_MS", "50");
+    }
+    let outcome = flash(
+        &mut session,
+        &partial,
+        bussard_download::FlashOptions::default(),
+        |_| {},
+    )
+    .await?;
+    drop(gw);
+    let _ = session.into_disconnect().await;
+    assert!(outcome.ok(), "{outcome:?}");
+    let s = lock(&state);
+    assert_eq!(
+        s.master_resets.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1],
+        "the closing restart went out"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_parameters_only_sys7_memory_mapped_refuses_unloaded_lsm3()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -5151,6 +5298,471 @@ async fn test_invoke_function_property_refuses_a_target_that_does_not_fit()
             .any(|(apci, _)| *apci == A_FUNCTION_PROPERTY_COMMAND
                 || *apci == bussard_mgmt::property_ext::A_FUNCTION_PROPERTY_EXT_COMMAND),
         "nothing sent: {requests:?}"
+    );
+    Ok(())
+}
+
+/// `mdt_canonical_app` with the Hager 0701 `M-0009_A-E0ED-10-0B6F` resets
+/// right after its connect: erase code 6 (links), then 5 (parameters)
+/// (issue #1065).
+fn app_with_master_resets() -> Result<ApplicationProgram, Box<dyn std::error::Error>> {
+    use bussard_product::application::LoadOp;
+    let mut app = mdt_canonical_app()?;
+    let ops = &mut app.load_procedures[0].ops;
+    let connect = ops
+        .iter()
+        .position(|op| matches!(op, LoadOp::Connect))
+        .ok_or("the procedure connects")?;
+    for (i, code) in [6, 5].into_iter().enumerate() {
+        ops.insert(
+            connect + 1 + i,
+            LoadOp::MasterReset {
+                erase_code: Some(code),
+                channel_number: Some(0),
+            },
+        );
+    }
+    Ok(app)
+}
+
+#[test]
+fn test_plan_flash_sys7_master_reset_before_the_load() -> Result<(), Box<dyn std::error::Error>> {
+    set_sys7_lsm_env(LsmMode::MemoryMapped);
+    let plan = plan_flash_default(
+        &app_with_master_resets()?,
+        "1.1.99",
+        MASK_0705,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    let resets: Vec<(usize, u8)> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| match s {
+            FlashStep::MasterReset {
+                erase_code,
+                channel_number: 0,
+            } => Some((i, *erase_code)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(resets.iter().map(|r| r.1).collect::<Vec<_>>(), vec![6, 5]);
+    let first_load = plan
+        .steps
+        .iter()
+        .position(|s| matches!(s, FlashStep::Sys7StartLoading { .. }))
+        .ok_or("the plan loads")?;
+    assert!(resets.iter().all(|r| r.0 < first_load), "{:?}", plan.steps);
+    Ok(())
+}
+
+#[test]
+fn test_plan_flash_sys7_master_reset_after_the_load_began_refused()
+-> Result<(), Box<dyn std::error::Error>> {
+    use bussard_product::application::LoadOp;
+    let mut app = mdt_canonical_app()?;
+    let ops = &mut app.load_procedures[0].ops;
+    let load = ops
+        .iter()
+        .position(|op| matches!(op, LoadOp::Load { .. }))
+        .ok_or("the procedure loads")?;
+    ops.insert(
+        load + 1,
+        LoadOp::MasterReset {
+            erase_code: Some(5),
+            channel_number: Some(0),
+        },
+    );
+    set_sys7_lsm_env(LsmMode::MemoryMapped);
+    let err = plan_flash_default(
+        &app,
+        "1.1.99",
+        MASK_0705,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )
+    .err()
+    .ok_or("a reset inside the load planned")?;
+    assert!(
+        err.to_string().contains("after a step it would undo"),
+        "{err}"
+    );
+    // A function property call is not read back: a reset after it is
+    // refused as well.
+    let mut app = app_with_function_call()?;
+    let ops = &mut app.load_procedures[0].ops;
+    let call = ops
+        .iter()
+        .position(|op| matches!(op, LoadOp::InvokeFunctionProp { .. }))
+        .ok_or("the procedure calls a function")?;
+    ops.insert(
+        call + 1,
+        LoadOp::MasterReset {
+            erase_code: Some(5),
+            channel_number: Some(0),
+        },
+    );
+    let err = plan_flash_default(
+        &app,
+        "1.1.99",
+        MASK_0705,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )
+    .err()
+    .ok_or("a reset after a function call planned")?;
+    assert!(err.to_string().contains("InvokeFunctionProp"), "{err}");
+    Ok(())
+}
+
+/// The resets go out confirmed, before any memory write, the device
+/// reboots after each and the download that follows verifies (issue #1065).
+#[tokio::test]
+async fn test_flash_sys7_master_reset_reconnects_and_verifies()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state = fresh_device(LsmMode::MemoryMapped, Fault::None);
+    lock(&state).reboot_on_restart = true;
+    let (mut session, gw) = reconnecting_session(&state).await?;
+    set_sys7_lsm_env(LsmMode::MemoryMapped);
+    let plan = plan_flash_default(
+        &app_with_master_resets()?,
+        "1.1.99",
+        MASK_0705,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    assert!(
+        plan.steps
+            .iter()
+            .any(|s| matches!(s, FlashStep::Sys7PreDownloadRestart { .. })),
+        "the plan carries the pre-download pass"
+    );
+    // SAFETY: nextest runs each test in its own process, so this
+    // process-global env write races with no other thread.
+    unsafe {
+        std::env::set_var("BUSSARD_FLASH_REBOOT_WAIT_MS", "50");
+    }
+    let outcome = flash(
+        &mut session,
+        &plan,
+        bussard_download::FlashOptions::default(),
+        |_| {},
+    )
+    .await?;
+    drop(gw);
+    let _ = session.into_disconnect().await;
+    assert!(outcome.ok(), "the flash verifies: {outcome:?}");
+    let s = lock(&state);
+    assert_eq!(s.master_resets, vec![(6, 0), (5, 0)]);
+    assert!(s.memory_writes_seen > 0);
+    // One authorized connection at the start, one after the pre-download
+    // pass's restart and one after each reset.
+    assert_eq!(s.authorizes_seen, 4, "connections authorized");
+    // Verify mode is switched on after the last reset, which cleared it,
+    // and before the first memory write.
+    let switch = s
+        .device_control_writes
+        .iter()
+        .position(|v| v & DEVICE_CONTROL_VERIFY_MODE != 0)
+        .ok_or("verify mode switched on")?;
+    assert_eq!(
+        s.device_control_after_resets.get(switch),
+        Some(&2),
+        "after both resets"
+    );
+    assert_eq!(
+        s.device_control_at.get(switch).map(|at| at.1),
+        Some(0),
+        "before the first memory write"
+    );
+    for lsm in 1..=3 {
+        assert_eq!(s.lsm_states.get(&lsm), Some(&LS_LOADED), "LSM {lsm}");
+    }
+    Ok(())
+}
+
+/// A property written before a Master Reset is read back after the flash
+/// (issue #1065): the routing-count write of the Hager 0701 shape is a
+/// `written_range`, which `ExpectedProperty::from_flash_plan` compares. A
+/// load-state control written as a property before a reset is refused.
+#[test]
+fn test_plan_flash_sys7_property_write_before_a_reset_is_read_back()
+-> Result<(), Box<dyn std::error::Error>> {
+    use bussard_product::application::LoadOp;
+    let write = |obj: u32, pid: u32, data: Vec<u8>| LoadOp::WriteProp {
+        obj_idx: Some(obj),
+        obj_type: None,
+        prop_id: Some(pid),
+        inline_data: Some(data),
+        start_element: None,
+        count: Some(1),
+        verify: Some(false),
+        occurrence: None,
+    };
+    let plan_with_image =
+        |op: LoadOp, image: Option<Vec<u8>>| -> Result<_, Box<dyn std::error::Error>> {
+            let mut app = app_with_master_resets()?;
+            if let Some(data) = image {
+                app.factory_properties
+                    .push(bussard_product::application::FactoryProperty {
+                        object: 0,
+                        prop_id: 51,
+                        start: 0,
+                        data,
+                        mask: Vec::new(),
+                    });
+            }
+            let ops = &mut app.load_procedures[0].ops;
+            let connect = ops
+                .iter()
+                .position(|op| matches!(op, LoadOp::Connect))
+                .ok_or("the procedure connects")?;
+            ops.insert(connect + 1, op);
+            set_sys7_lsm_env(LsmMode::MemoryMapped);
+            Ok(plan_flash_default(
+                &app,
+                "1.1.99",
+                MASK_0705,
+                &no_overrides(),
+                &BTreeMap::new(),
+                None,
+                &BTreeMap::new(),
+            ))
+        };
+    let plan_with = |op: LoadOp| plan_with_image(op, None);
+    // The routing count (object 0 PID 51 here), before the resets. The
+    // program's LoadedImage describes no value for it, so what the reset
+    // does to it is not known: kept, and read back after the flash.
+    let plan = plan_with(write(0, 51, vec![0x60]))??;
+    let reset = plan
+        .steps
+        .iter()
+        .position(|s| matches!(s, FlashStep::MasterReset { .. }))
+        .ok_or("a reset")?;
+    let before: Vec<_> = plan.steps[..reset]
+        .iter()
+        .filter(|s| matches!(s, FlashStep::WriteProp { .. }))
+        .collect();
+    assert_eq!(before.len(), 1, "{:?}", plan.steps);
+    assert!(
+        before[0].written_range().is_some(),
+        "read back after the flash"
+    );
+    // The LoadedImage restores another value after the parameter reset
+    // (erase code 5): the write would be undone, refused at plan time.
+    let err = plan_with_image(write(0, 51, vec![0x60]), Some(vec![0x06]))?
+        .err()
+        .ok_or("a write the reset undoes planned")?;
+    assert!(
+        err.to_string()
+            .contains("EraseCode 5 (step 4) resets the parameters and so undoes"),
+        "{err}"
+    );
+    // The LoadedImage holds the value written: the reset keeps it.
+    assert!(plan_with_image(write(0, 51, vec![0x60]), Some(vec![0x60]))?.is_ok());
+    // A load-state control written as a property: refused.
+    let unload = bussard_mgmt::LoadControl::Unload.encode_full().to_vec();
+    let err = plan_with(write(1, 5, unload))?
+        .err()
+        .ok_or("a load-state write before a reset planned")?;
+    assert!(
+        err.to_string().contains("after a step it would undo"),
+        "{err}"
+    );
+    Ok(())
+}
+
+/// A session over the System 7 mock that can reconnect after a reset.
+async fn reconnecting_session(
+    state: &Shared,
+) -> Result<(Session<LeaseConnector>, MockGateway), Box<dyn std::error::Error>> {
+    let gw = start_gateway(state).await?;
+    let (handle, _actor) = bussard_transport::bus::Bus::connect(
+        ConnectionConfig::tunnel(gw.addr())
+            .with_reconnect(bussard_transport::TunnelReconnect::disabled()),
+    );
+    handle.wait_connected(Duration::from_secs(5)).await;
+    let connector = LeaseConnector {
+        handle: handle.clone(),
+        target: "1.1.99".parse()?,
+        source: "0.0.255".parse()?,
+        timeouts: None,
+    };
+    Ok((Session::open(connector, None, None).await?, gw))
+}
+
+/// A property write after the parameter reset whose value the program's
+/// LoadedImage holds is left out, as ETS leaves the Hager 0701 writes out
+/// after its resets (issue #1065, #951): the mock's reset with erase code 5
+/// puts the LoadedImage value back, and the read-back after the flash finds
+/// it there.
+#[tokio::test]
+async fn test_flash_sys7_write_held_after_the_parameter_reset()
+-> Result<(), Box<dyn std::error::Error>> {
+    use bussard_product::application::LoadOp;
+    let mut app = app_with_master_resets()?;
+    app.factory_properties
+        .push(bussard_product::application::FactoryProperty {
+            object: 3,
+            prop_id: 60,
+            start: 0,
+            data: vec![7],
+            mask: Vec::new(),
+        });
+    let ops = &mut app.load_procedures[0].ops;
+    let after_resets = ops
+        .iter()
+        .rposition(|op| matches!(op, LoadOp::MasterReset { .. }))
+        .ok_or("the resets")?;
+    ops.insert(
+        after_resets + 1,
+        LoadOp::WriteProp {
+            obj_idx: Some(3),
+            obj_type: None,
+            prop_id: Some(60),
+            inline_data: Some(vec![7]),
+            start_element: None,
+            count: Some(1),
+            verify: Some(false),
+            occurrence: None,
+        },
+    );
+    set_sys7_lsm_env(LsmMode::MemoryMapped);
+    let plan = plan_flash_default(
+        &app,
+        "1.1.99",
+        MASK_0705,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    assert!(
+        plan.steps.iter().any(|s| matches!(
+            s,
+            FlashStep::FactoryHeldProp {
+                object: bussard_download::PropObject::Index(3),
+                prop_id: 60,
+                ..
+            }
+        )),
+        "{:?}",
+        plan.steps
+    );
+    let state = fresh_device(LsmMode::MemoryMapped, Fault::None);
+    {
+        let mut s = lock(&state);
+        s.reboot_on_restart = true;
+        // A value from before the download, which the reset replaces.
+        s.properties.insert((3, 60, 1), vec![9]);
+        s.factory_properties.insert((3, 60, 1), vec![7]);
+    }
+    let (mut session, gw) = reconnecting_session(&state).await?;
+    // SAFETY: nextest runs each test in its own process, so this
+    // process-global env write races with no other thread.
+    unsafe {
+        std::env::set_var("BUSSARD_FLASH_REBOOT_WAIT_MS", "50");
+    }
+    let outcome = flash(
+        &mut session,
+        &plan,
+        bussard_download::FlashOptions::default(),
+        |_| {},
+    )
+    .await?;
+    drop(gw);
+    let _ = session.into_disconnect().await;
+    assert!(outcome.ok(), "the flash verifies: {outcome:?}");
+    let s = lock(&state);
+    assert_eq!(s.properties.get(&(3, 60, 1)), Some(&vec![7]));
+    Ok(())
+}
+
+/// A Master Reset on a session that could not reconnect after the reboot
+/// is refused before the reset goes out (issue #1065,
+/// `master_reset_confirmed`).
+#[tokio::test]
+async fn test_flash_sys7_master_reset_refused_without_a_reconnect()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut bus, state, _handle) = setup(LsmMode::MemoryMapped, Fault::None).await?;
+    set_sys7_lsm_env(LsmMode::MemoryMapped);
+    let mut plan = plan_flash_default(
+        &app_with_master_resets()?,
+        "1.1.99",
+        MASK_0705,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )?;
+    // The pre-download pass restarts and reconnects too; this test is about
+    // the reset.
+    plan.skip_sys7_prelude();
+    let l4 = Layer4Connection::connect(
+        &mut bus,
+        "1.1.99".parse()?,
+        "0.0.255".parse()?,
+        bussard_mgmt::ConnectOptions::default(),
+    )
+    .await?;
+    let mut session = authed_session(l4).await?;
+    let result = flash(
+        &mut session,
+        &plan,
+        bussard_download::FlashOptions::default(),
+        |_| {},
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(bussard_mgmt::load::WriteError::Mgmt(
+                bussard_mgmt::MgmtError::Transport(bussard_transport::TransportError::Closed)
+            ))
+        ),
+        "{result:?}"
+    );
+    assert!(lock(&state).master_resets.is_empty(), "no reset went out");
+    Ok(())
+}
+
+/// A procedure that does not load every machine to LoadCompleted after its
+/// Master Reset is refused (issue #1065).
+#[test]
+fn test_plan_flash_sys7_master_reset_needs_every_load_completed()
+-> Result<(), Box<dyn std::error::Error>> {
+    use bussard_product::application::LoadOp;
+    let mut app = app_with_master_resets()?;
+    let ops = &mut app.load_procedures[0].ops;
+    let completed = ops
+        .iter()
+        .position(|op| matches!(op, LoadOp::LoadCompleted { .. }))
+        .ok_or("a completion")?;
+    ops.remove(completed);
+    set_sys7_lsm_env(LsmMode::MemoryMapped);
+    let err = plan_flash_default(
+        &app,
+        "1.1.99",
+        MASK_0705,
+        &no_overrides(),
+        &BTreeMap::new(),
+        None,
+        &BTreeMap::new(),
+    )
+    .err()
+    .ok_or("a reset without every completion planned")?;
+    assert!(
+        err.to_string().contains("not loaded to LoadCompleted"),
+        "{err}"
     );
     Ok(())
 }

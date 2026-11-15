@@ -699,6 +699,9 @@ fn plan_flash_as(
     // a reset of every channel's parameters the catalogue's `LoadedImage`
     // values, until a write touches them (issue #951).
     let mut device_image = super::factory::DeviceImage::default();
+    // Each Master Reset's step index and procedure step number (issue #1065,
+    // [`super::factory::reverted_write`]).
+    let mut resets: Vec<(usize, usize)> = Vec::new();
 
     // ETS switches verify mode on before the first `Verify="true"` relative
     // memory write it sends over the plain memory services (issue #705).
@@ -935,17 +938,14 @@ fn plan_flash_as(
                 erase_code,
                 channel_number,
             } => {
-                // The EraseCode/ChannelNumber are single octets on the wire; a
-                // value beyond a u8 is corrupt vendor input. Default the erase
-                // code to 1 ("Confirmed Restart") and the channel to 0 (the whole
-                // device) when the attribute is absent, and clamp to u8.
-                let erase_code = erase_code.unwrap_or(1).min(u32::from(u8::MAX)) as u8;
-                let channel_number = channel_number.unwrap_or(0).min(u32::from(u8::MAX)) as u8;
-                device_image.master_reset(erase_code, channel_number);
-                steps.push(FlashStep::MasterReset {
-                    erase_code,
-                    channel_number,
-                });
+                resets.push((steps.len(), step_no));
+                steps.push(lower_master_reset(
+                    step_no,
+                    *erase_code,
+                    *channel_number,
+                    &mut device_image,
+                    false,
+                )?);
             }
 
             // A master-template merge marker that survived (no matching app
@@ -1721,6 +1721,11 @@ fn plan_flash_as(
     // (partial.rs); it is planned beside a complete download that checks.
     if download == Download::Full {
         super::declare::check_parameter_coverage(&steps, &property_params, &changed, app)?;
+    }
+    // A parameter reset that undoes a property write before it (issue
+    // #1065): refused, instead of failing the read-back after every download.
+    if let Some(why) = super::factory::reverted_write(&steps, &resets, app) {
+        return Err(PlanError::UnsupportedOp { op: why });
     }
     // The description reads ETS makes before it first touches a property it
     // has no type for (issue #1014).
@@ -2904,6 +2909,58 @@ fn declares_segment_on(segments: &HashMap<String, CodeSegment>, lsm: u32) -> boo
         .any(|s| s.kind == SegmentKind::Relative && s.load_state_machine == Some(lsm))
 }
 
+/// Lowers an `LdCtrlMasterReset` to [`FlashStep::MasterReset`], on System B
+/// and System 7 alike (issue #1065), and records it in `device_image` (a
+/// reset of the parameters makes the device hold its `LoadedImage` values,
+/// issue #951).
+///
+/// The erase code defaults to 1 (confirmed restart) and the channel to 0
+/// (the whole device) when the attribute is absent. Each is one octet on the
+/// wire: a larger value is corrupt product data and refused. Erase codes 2
+/// (factory reset) and 3 (reset the individual address) leave the device at
+/// another address (KNX 3/5/2 §3.7.1.2.3, Table 4), so the flash could not
+/// reconnect, verify or restore it: refused. On System 7 (`sys7`) a code
+/// Table 4 does not define (00h, 08h to FFh) is refused too: what it erases
+/// is not known, so what to load again after it is not either.
+pub(super) fn lower_master_reset(
+    step_no: usize,
+    erase_code: Option<u32>,
+    channel_number: Option<u32>,
+    device_image: &mut super::factory::DeviceImage,
+    sys7: bool,
+) -> Result<FlashStep, PlanError> {
+    let octet = |what: &str, v: u32| {
+        u8::try_from(v).map_err(|_| PlanError::UnsupportedOp {
+            op: format!("LdCtrlMasterReset with {what} {v}, more than one octet (step {step_no})"),
+        })
+    };
+    let erase_code = octet("EraseCode", erase_code.unwrap_or(1))?;
+    let channel_number = octet("ChannelNumber", channel_number.unwrap_or(0))?;
+    let code = bussard_mgmt::apci::EraseCode::from_code(erase_code);
+    if code.is_some_and(bussard_mgmt::apci::EraseCode::resets_individual_address) {
+        return Err(PlanError::UnsupportedOp {
+            op: format!(
+                "LdCtrlMasterReset with EraseCode {erase_code} (step {step_no}): it resets the \
+                 individual address, so the flash could not reconnect to verify or restore the device"
+            ),
+        });
+    }
+    if sys7 && code.is_none() {
+        return Err(PlanError::UnsupportedOp {
+            op: format!(
+                "LdCtrlMasterReset with EraseCode {erase_code} (step {step_no}): KNX 3/5/2 \
+                 Table 4 does not define what it erases, so what to load again after it on \
+                 System 7 is not known"
+            ),
+        });
+    }
+    device_image.master_reset(erase_code, channel_number);
+    Ok(FlashStep::MasterReset {
+        erase_code,
+        channel_number,
+    })
+}
+
 /// A write cut short of its image whose tail a complete download's
 /// allocation fills: the octets the step writes (the op's `Size`) and that
 /// fill ([`bound_write_rel_mem`]).
@@ -3969,11 +4026,13 @@ mod tests {
     /// the application (the `par` procedure of a same-application device),
     /// for a product whose procedure has a Master Reset with erase code 4,
     /// erases resident objects, so the executor takes no resident-MCB skip.
-    /// The confirmed restart (1) and the address reset (3) erase no object.
+    /// The confirmed restart (1) erases no object. Codes 2 and 3 reset the
+    /// individual address and are refused at plan time (issue #1065,
+    /// `test_lower_master_reset_refuses_an_address_reset`).
     #[test]
     fn test_erases_resident_objects_master_reset_erase_code_4_over_same_application()
     -> Result<(), Box<dyn std::error::Error>> {
-        for (code, erases) in [(4u8, true), (2, true), (6, true), (1, false), (3, false)] {
+        for (code, erases) in [(4u8, true), (6, true), (7, true), (1, false)] {
             let xml = format!(
                 r#"<KNX xmlns="http://knx.org/xml/project/23">
          <ApplicationProgram Id="M-1_A-MR" MaskVersion="MV-07B0" Name="MR"
@@ -4012,6 +4071,40 @@ mod tests {
             assert_eq!(plan.erases_resident_objects(), erases, "erase code {code}");
         }
         Ok(())
+    }
+
+    /// Issue #1065: a Master Reset that resets the individual address (2,
+    /// 3) or carries a value beyond one octet is refused, not clamped.
+    #[test]
+    fn test_lower_master_reset_refuses_an_address_reset() {
+        let mut image = super::super::factory::DeviceImage::default();
+        for code in [2, 3] {
+            let err = lower_master_reset(7, Some(code), Some(0), &mut image, false)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(
+                err.contains("resets the individual address"),
+                "{code}: {err}"
+            );
+        }
+        let err = lower_master_reset(7, Some(300), None, &mut image, false)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("EraseCode 300"), "{err}");
+        let err = lower_master_reset(7, Some(5), Some(256), &mut image, false)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("ChannelNumber 256"), "{err}");
+        assert_eq!(
+            lower_master_reset(7, None, None, &mut image, false).ok(),
+            Some(FlashStep::MasterReset {
+                erase_code: 1,
+                channel_number: 0
+            })
+        );
     }
 
     #[test]

@@ -257,10 +257,6 @@ impl std::fmt::Display for PropObject {
 /// [`is_knx_virtual_application`].
 pub const KNX_VIRTUAL_MANUFACTURER: u16 = 0x00FA;
 
-/// The Master Reset erase code "ResetIA" (KNX 3/5/2 §3.7.1.2.3 Table 4): it
-/// resets the individual address and no loaded object.
-const ERASE_CODE_RESET_IA: u8 = 0x03;
-
 /// The high octet of every KNX Virtual application number: the `A-25xx`
 /// programs of [`KNX_VIRTUAL_MANUFACTURER`] (DA.tp `A-2500`, KliX `A-2504`),
 /// the KNX Virtual catalogue section `M-00FA_CS-25` ("KNX Virtual", number 25).
@@ -1583,25 +1579,27 @@ impl FlashPlan {
     /// instead would change the product's procedure, which no capture
     /// supports.
     ///
-    /// The erase codes are those of KNX 3/5/2 §3.7.1.2.3 Table 4. Only the
-    /// confirmed restart (01h, "No Resource value shall be reset") and the
-    /// individual-address reset (03h) leave every object as it is. Codes
-    /// 04h to 06h reset the application program, its parameters or the
-    /// links, 02h and 07h are factory resets, and which objects 08h and the
-    /// reserved codes touch is implementation dependent, so all of those
-    /// count as erasing. Which objects a partial reset hits on a real device
-    /// is not captured (no vendor product uses `LdCtrlMasterReset`), so the
-    /// skip is dropped for the whole plan rather than per object; the cost
-    /// is a full download, the result of a fresh one. Evidence: the
-    /// synthetic product `syn-master-reset-code4` re-flashed onto knx-sim,
-    /// whose erase code 4 unloads the loaded application object (#600).
+    /// The erase codes are those of KNX 3/5/2 §3.7.1.2.3 Table 4
+    /// ([`bussard_mgmt::apci::EraseCode::erases_objects`]). The confirmed
+    /// restart (01h, "No Resource value shall be reset") and the
+    /// individual-address reset (03h) leave every object as it is; a
+    /// product procedure's 02h and 03h are refused at plan time anyway.
+    /// Codes 04h to 06h reset the application program, its parameters or
+    /// the links, 07h is a factory reset, and which objects 00h, 08h and the
+    /// reserved codes touch is implementation dependent, so those count as
+    /// erasing. Which objects a partial reset hits on a real device is not
+    /// captured, so the skip is dropped for the whole plan rather than per
+    /// object; the cost is a full download, the result of a fresh one.
+    /// Evidence: the synthetic product `syn-master-reset-code4` re-flashed
+    /// onto knx-sim, whose erase code 4 unloads the loaded application
+    /// object (#600).
     pub fn erases_resident_objects(&self) -> bool {
         self.steps.iter().any(|s| match s {
             FlashStep::FactoryReset { .. } => true,
-            FlashStep::MasterReset { erase_code, .. } => !matches!(
-                *erase_code,
-                bussard_mgmt::apci::ERASE_CODE_CONFIRMED_RESTART | ERASE_CODE_RESET_IA
-            ),
+            FlashStep::MasterReset { erase_code, .. } => {
+                bussard_mgmt::apci::EraseCode::from_code(*erase_code)
+                    .is_none_or(bussard_mgmt::apci::EraseCode::erases_objects)
+            }
             _ => false,
         })
     }
@@ -1661,13 +1659,39 @@ impl FlashPlan {
         if self.is_property_only() || self.knxnet_ip().is_some() {
             return;
         }
-        let at = self
-            .steps
-            .iter()
-            .rposition(|s| matches!(s, FlashStep::Restart | FlashStep::MasterReset { .. }))
-            .unwrap_or(self.steps.len());
+        let at = self.terminal_restart().unwrap_or(self.steps.len());
         self.steps
             .insert(at, FlashStep::KnxnetIpParameters { program });
+    }
+
+    /// The index of the plan's closing restart: the last `Restart` or
+    /// `MasterReset`, when it comes after every load step, whatever drives
+    /// the load states (a load-state control, a System 7 record, a typed
+    /// control, or a `WriteProp` of `PID_LOAD_STATE_CONTROL`, #947). A
+    /// Master Reset before the load (the Hager 0701 shape, issue #1065) is
+    /// not one. `None` when the plan ends without such a restart.
+    fn terminal_restart(&self) -> Option<usize> {
+        // A load step: one that sends a load-state record (the dump's load
+        // controls, [`FlashPlan::load_control_records`]), an allocation or a
+        // memory write.
+        let last_load = self.steps.iter().rposition(|s| {
+            !self.load_control_records(s).is_empty()
+                || matches!(
+                    s,
+                    FlashStep::AllocateSegment { .. }
+                        | FlashStep::WriteRelMem { .. }
+                        | FlashStep::WriteMem { .. }
+                        | FlashStep::Sys7AbsSegment { .. }
+                )
+        });
+        let last_restart = self
+            .steps
+            .iter()
+            .rposition(|s| matches!(s, FlashStep::Restart | FlashStep::MasterReset { .. }))?;
+        match last_load {
+            Some(load) if load > last_restart => None,
+            _ => Some(last_restart),
+        }
     }
 
     /// The KNXnet/IP parameter writes the plan carries (issue #455).
@@ -1886,6 +1910,7 @@ impl FlashPlan {
                 sys7_read_compare: self.sys7_read_compare(),
                 parameters_only: self.is_parameters_only(),
                 baseline_address: Some(&self.baseline_address),
+                sys7: self.is_sys7(),
             },
         );
         // The held tail of a write (issue #1065): named, so a download that
@@ -2464,6 +2489,97 @@ mod tests {
             .filter(|s| matches!(s, FlashStep::KnxnetIpParameters { .. }))
             .count();
         assert_eq!(blocks, 1);
+        Ok(())
+    }
+
+    /// The closing restart after load-state controls written as properties
+    /// (#947, issue #1065): the KNXnet/IP writes go before it.
+    #[test]
+    fn test_add_knxnet_ip_anchors_after_property_driven_loads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{FlashStep, KnxnetIpProgram, PropObject};
+        let app = fabricated_app();
+        let mut plan = plan_flash_default(
+            &app,
+            "1.1.4",
+            0x07B0,
+            &no_overrides(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        let completed = bussard_mgmt::LoadControl::LoadCompleted
+            .encode_full()
+            .to_vec();
+        plan.steps.retain(|s| {
+            !matches!(
+                s,
+                FlashStep::LoadCompleted { .. }
+                    | FlashStep::StartLoading { .. }
+                    | FlashStep::Unload { .. }
+                    | FlashStep::Restart
+                    | FlashStep::MasterReset { .. }
+            )
+        });
+        plan.steps.push(FlashStep::WriteProp {
+            object: PropObject::Index(8),
+            prop_id: 5,
+            value: completed,
+            start_element: 1,
+            count: 1,
+            verify: false,
+            from_parameters: false,
+        });
+        plan.steps.push(FlashStep::Restart);
+        plan.add_knxnet_ip(KnxnetIpProgram {
+            object: PropObject::Index(6),
+            writes: Vec::new(),
+        });
+        let n = plan.steps.len();
+        assert!(matches!(
+            plan.steps[n - 2],
+            FlashStep::KnxnetIpParameters { .. }
+        ));
+        assert!(matches!(plan.steps[n - 1], FlashStep::Restart));
+        Ok(())
+    }
+
+    /// A Master Reset before the load is not the closing restart (issue
+    /// #1065): without a closing restart the KNXnet/IP writes go last, after
+    /// the load, never before the reset.
+    #[test]
+    fn test_add_knxnet_ip_skips_a_master_reset_before_the_load()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{FlashStep, KnxnetIpProgram, PropObject};
+        let app = fabricated_app();
+        let mut plan = plan_flash_default(
+            &app,
+            "1.1.4",
+            0x07B0,
+            &no_overrides(),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+        )?;
+        plan.steps
+            .retain(|s| !matches!(s, FlashStep::Restart | FlashStep::MasterReset { .. }));
+        plan.steps.insert(
+            0,
+            FlashStep::MasterReset {
+                erase_code: 5,
+                channel_number: 0,
+            },
+        );
+        let program = KnxnetIpProgram {
+            object: PropObject::Index(6),
+            writes: Vec::new(),
+        };
+        plan.add_knxnet_ip(program);
+        assert!(matches!(
+            plan.steps.last(),
+            Some(FlashStep::KnxnetIpParameters { .. })
+        ));
+        assert!(matches!(plan.steps[0], FlashStep::MasterReset { .. }));
         Ok(())
     }
 

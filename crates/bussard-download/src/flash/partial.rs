@@ -279,6 +279,19 @@ impl FlashPlan {
                         occurrence: *occurrence,
                     }
                 ),
+                // A Master Reset on System 7 (issue #1065): the parameter-only
+                // cut writes only the parameter segments back, so it would
+                // drop or not restore what the reset erases. Refused, never
+                // dropped. The confirmed restart (1) erases nothing.
+                FlashStep::MasterReset { erase_code, .. }
+                    if self.is_sys7()
+                        && *erase_code != bussard_mgmt::apci::ERASE_CODE_CONFIRMED_RESTART =>
+                {
+                    format!(
+                        "a master reset with erase code {erase_code} (LdCtrlMasterReset) on System \
+                         7, which the parameter-only download cannot restore"
+                    )
+                }
                 FlashStep::DeclareProp {
                     object, prop_id, ..
                 } if self.is_sys7() => format!(
@@ -1041,7 +1054,11 @@ impl FlashPlan {
         }
         if steps.iter().any(|s| {
             matches!(s, FlashStep::MasterReset { erase_code, channel_number }
-                if (*erase_code, *channel_number) != (5, 0))
+            if !super::labels::master_reset_captured(
+                *erase_code,
+                *channel_number,
+                super::labels::ResetContext::SystemBParameterOnly,
+            ))
         }) {
             out.push("a master reset other than erase code 5 on channel 0");
         }
@@ -1239,6 +1256,14 @@ impl FlashPlan {
                 FlashStep::Restart | FlashStep::Delay { .. } => {
                     steps.push(step.clone());
                 }
+                // A confirmed restart (erase code 1) erases nothing: the
+                // planner allows it before the load or after the last
+                // LoadCompleted, so the cut keeps it as the closing restart
+                // (issue #1065); an erasing reset is refused above.
+                FlashStep::MasterReset {
+                    erase_code: bussard_mgmt::apci::ERASE_CODE_CONFIRMED_RESTART,
+                    ..
+                } => steps.push(step.clone()),
                 // No pre-download pass (issue #488): ETS's partial download
                 // into a loaded device sends no unload and no restart before
                 // the procedure (the EK-E72 series,
@@ -1352,14 +1377,11 @@ fn bound_writes(steps: &[FlashStep]) -> Vec<(String, Option<u32>)> {
 /// restart) and 5 (the parameters, every one of which the procedure writes
 /// after it). KNX 3/5/2 §3.7.1.2.3, Table 4.
 fn erased_and_not_restored(erase_code: u8) -> Option<&'static str> {
-    match erase_code {
-        1 | 5 => None,
-        2 => Some("the application, its parameters, the links and the individual address"),
-        3 => Some("the individual address"),
-        4 => Some("the application program"),
-        6 => Some("the links (address and association tables)"),
-        7 => Some("the application, its parameters and the links"),
-        _ => Some("what KNX 3/5/2 does not define for that code"),
+    match bussard_mgmt::apci::EraseCode::from_code(erase_code) {
+        // The parameters: every one is written again after the reset.
+        Some(bussard_mgmt::apci::EraseCode::ResetParam) => None,
+        Some(code) => code.erased(),
+        None => Some("what KNX 3/5/2 does not define for that code"),
     }
 }
 

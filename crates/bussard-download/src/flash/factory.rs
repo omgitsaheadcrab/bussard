@@ -47,12 +47,15 @@ use super::{FlashStep, PropObject};
 use bussard_product::application::ApplicationProgram;
 
 /// Whether a master reset with `erase_code` on `channel` resets every
-/// channel's parameters to their default: the factory resets (2, and 7
-/// without the individual address) and ResetParam (5) on channel 0, KNX
+/// channel's parameters to their default: the factory reset without the
+/// individual address (7) and ResetParam (5) on channel 0 (the factory reset
+/// 2 is refused at plan time, issue #1065), KNX
 /// 3/5/2 §3.7.1.2.3, Table 4 (a channel other than 0 resets that channel
 /// only).
 pub(super) fn resets_parameters(erase_code: u8, channel: u8) -> bool {
-    channel == 0 && matches!(erase_code, 2 | 5 | 7)
+    channel == 0
+        && bussard_mgmt::apci::EraseCode::from_code(erase_code)
+            .is_some_and(bussard_mgmt::apci::EraseCode::resets_parameters)
 }
 
 /// What the procedure has done to the device's properties so far, as the
@@ -135,6 +138,118 @@ impl DeviceImage {
             describe: !declared,
         };
     }
+}
+
+/// The first property value a parameter reset of `steps` undoes (issue
+/// #1065), in words with its reset's step: `resets` lists each Master
+/// Reset's index in `steps` and its procedure step number. A reset of every
+/// channel's parameters ([`resets_parameters`]) puts what the program's
+/// `LoadedImage` defines back. So the last value a sent write gave an
+/// element before the reset (since the previous parameter reset) is undone
+/// when an octet of it overlaps a `LoadedImage` entry and differs in a bit
+/// the entry defines (its mask), and no write after the reset sends the
+/// element again. Element `e` of a write of `count` elements spans the
+/// octets `(e - 1) * size` on, `size` = value length / count, as the
+/// coverage check counts them; a write whose value does not split into its
+/// elements is left out. Equal octets, undefined bits and octets no entry
+/// covers do not count: what a reset does to those is not known, and the
+/// flash's read-back compares them.
+pub(super) fn reverted_write(
+    steps: &[FlashStep],
+    resets: &[(usize, usize)],
+    app: &ApplicationProgram,
+) -> Option<String> {
+    let elements = |step: &FlashStep| -> Vec<((u32, u32, u32), Vec<u8>)> {
+        let FlashStep::WriteProp {
+            object: PropObject::Index(index),
+            prop_id,
+            value,
+            start_element,
+            count,
+            ..
+        } = step
+        else {
+            return Vec::new();
+        };
+        let count = usize::from(*count);
+        if count == 0 || value.is_empty() || !value.len().is_multiple_of(count) {
+            return Vec::new();
+        }
+        value
+            .chunks(value.len() / count)
+            .enumerate()
+            .map(|(k, octets)| {
+                (
+                    (*index, *prop_id, u32::from(*start_element) + k as u32),
+                    octets.to_vec(),
+                )
+            })
+            .collect()
+    };
+    let mut since = 0usize;
+    for &(at, step_no) in resets {
+        let Some(FlashStep::MasterReset {
+            erase_code,
+            channel_number,
+        }) = steps.get(at)
+        else {
+            continue;
+        };
+        if !resets_parameters(*erase_code, *channel_number) {
+            continue;
+        }
+        let mut last: BTreeMap<(u32, u32, u32), Vec<u8>> = BTreeMap::new();
+        for step in steps.get(since..at).unwrap_or_default() {
+            last.extend(elements(step));
+        }
+        since = at + 1;
+        let rewritten: BTreeSet<(u32, u32, u32)> = steps
+            .get(at + 1..)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|s| elements(s).into_iter().map(|(k, _)| k))
+            .collect();
+        for ((index, prop_id, element), octets) in &last {
+            if rewritten.contains(&(*index, *prop_id, *element)) {
+                continue;
+            }
+            let size = octets.len();
+            let first = (*element as usize).saturating_sub(1) * size;
+            let undone = app
+                .factory_properties
+                .iter()
+                .filter(|f| f.object == *index && f.prop_id == *prop_id)
+                .any(|f| {
+                    let entry = usize::try_from(f.start)
+                        .unwrap_or(usize::MAX)
+                        .saturating_mul(size);
+                    octets.iter().enumerate().any(|(k, written)| {
+                        let Some(at) = (first + k).checked_sub(entry) else {
+                            return false;
+                        };
+                        let Some(held) = f.data.get(at) else {
+                            return false;
+                        };
+                        let defined = match f.mask.get(at) {
+                            Some(m) => *m,
+                            None if f.mask.is_empty() => 0xFF,
+                            None => 0,
+                        };
+                        (held ^ written) & defined != 0
+                    })
+                });
+            if undone {
+                let hex: String = octets.iter().map(|b| format!("{b:02X}")).collect();
+                return Some(format!(
+                    "the Master Reset with EraseCode {erase_code} (step {step_no}) resets the \
+                     parameters and so undoes the property write before it (object {index} PID \
+                     {prop_id} element {element} = {hex}): the program's LoadedImage restores \
+                     another value there"
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// A property write of a plan, sent or held, borrowed
@@ -242,6 +357,118 @@ mod tests {
     use super::*;
     use bussard_product::FactoryProperty;
 
+    /// A write of `value` (`count` elements from `start`) to object 9 PID 60.
+    fn write_60(start: u16, count: u16, value: &[u8]) -> FlashStep {
+        FlashStep::WriteProp {
+            object: PropObject::Index(9),
+            prop_id: 60,
+            value: value.to_vec(),
+            start_element: start,
+            count,
+            verify: false,
+            from_parameters: false,
+        }
+    }
+
+    fn reset(erase_code: u8) -> FlashStep {
+        FlashStep::MasterReset {
+            erase_code,
+            channel_number: 0,
+        }
+    }
+
+    /// The program whose LoadedImage holds `data` for object 9 PID 60 from
+    /// element 1, with `mask`.
+    fn image(data: &[u8], mask: &[u8]) -> ApplicationProgram {
+        ApplicationProgram {
+            factory_properties: vec![FactoryProperty {
+                object: 9,
+                prop_id: 60,
+                start: 0,
+                data: data.to_vec(),
+                mask: mask.to_vec(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// `steps` with every Master Reset numbered by its index.
+    fn reverted(steps: &[FlashStep], app: &ApplicationProgram) -> Option<String> {
+        let resets: Vec<(usize, usize)> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| matches!(s, FlashStep::MasterReset { .. }))
+            .map(|(i, _)| (i, i + 1))
+            .collect();
+        reverted_write(steps, &resets, app)
+    }
+
+    /// A parameter reset undoes a written octet that overlaps a
+    /// `LoadedImage` entry and differs in a bit it defines (issue #1065),
+    /// also inside a longer entry; equal, undefined and uncovered octets do
+    /// not count.
+    #[test]
+    fn test_reverted_write_compares_overlapping_defined_octets() {
+        let full = image(&[1, 2, 3, 4], &[]);
+        assert_eq!(reverted(&[write_60(3, 1, &[3]), reset(5)], &full), None);
+        let err = reverted(&[write_60(3, 1, &[9]), reset(5)], &full).unwrap_or_default();
+        assert!(err.contains("object 9 PID 60 element 3 = 09"), "{err}");
+        assert!(err.contains("EraseCode 5 (step 2)"), "{err}");
+        // Past the entry: not described, kept.
+        assert_eq!(reverted(&[write_60(5, 1, &[9]), reset(5)], &full), None);
+        // A bit the entry leaves undefined does not count.
+        let low = image(&[1, 2, 3, 4], &[0xFF, 0xFF, 0x0F, 0xFF]);
+        assert_eq!(reverted(&[write_60(3, 1, &[0x93]), reset(5)], &low), None);
+        assert!(reverted(&[write_60(3, 1, &[0x94]), reset(5)], &low).is_some());
+        // A reset of the links resets no parameter.
+        assert_eq!(reverted(&[write_60(3, 1, &[9]), reset(6)], &full), None);
+    }
+
+    /// Element 2 of a property with 2-octet elements spans octets 2 and 3.
+    #[test]
+    fn test_reverted_write_scales_by_the_element_size() {
+        let app = image(&[0, 0, 0xAB, 0xCD], &[]);
+        assert_eq!(
+            reverted(&[write_60(2, 1, &[0xAB, 0xCD]), reset(5)], &app),
+            None
+        );
+        assert!(reverted(&[write_60(2, 1, &[0x11, 0x22]), reset(5)], &app).is_some());
+        // A value that does not split into its elements is left out.
+        assert_eq!(
+            reverted(&[write_60(2, 2, &[0x11, 0x22, 0x33]), reset(5)], &app),
+            None
+        );
+    }
+
+    /// What the writes leave counts, not each write (issue #1065): a later
+    /// write of the LoadedImage value before the reset, or a write of the
+    /// element after it, keeps the plan.
+    #[test]
+    fn test_reverted_write_judges_what_the_writes_leave() {
+        let app = image(&[0x0F], &[]);
+        assert_eq!(
+            reverted(
+                &[write_60(1, 1, &[0x0A]), write_60(1, 1, &[0x0F]), reset(5)],
+                &app
+            ),
+            None
+        );
+        assert_eq!(
+            reverted(
+                &[write_60(1, 1, &[0x0A]), reset(5), write_60(1, 1, &[0x0A])],
+                &app
+            ),
+            None
+        );
+        assert!(
+            reverted(
+                &[write_60(1, 1, &[0x0F]), write_60(1, 1, &[0x0A]), reset(5)],
+                &app
+            )
+            .is_some()
+        );
+    }
+
     fn app(held: &[(u32, u32, u32, &[u8])]) -> ApplicationProgram {
         ApplicationProgram {
             factory_properties: held
@@ -287,6 +514,8 @@ mod tests {
     #[test]
     fn test_resets_parameters_names_the_factory_and_parameter_resets() {
         let resets: Vec<u8> = (0..=8).filter(|c| resets_parameters(*c, 0)).collect();
+        // 2 resets the parameters too, but never reaches a plan (refused,
+        // issue #1065).
         assert_eq!(resets, vec![2, 5, 7]);
         assert!(!resets_parameters(5, 1));
     }
