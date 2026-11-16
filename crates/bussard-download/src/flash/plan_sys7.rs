@@ -970,6 +970,8 @@ pub(super) fn plan_flash_sys7(
         confirmed_restart: false,
         baseline: BTreeMap::new(),
         placed,
+        managed: None,
+        force_managed: false,
         unwritten: BTreeMap::new(),
         baseline_address: BTreeMap::new(),
         security_capacity: Default::default(),

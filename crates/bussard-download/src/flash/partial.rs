@@ -390,6 +390,8 @@ impl FlashPlan {
             confirmed_restart: self.confirmed_restart,
             baseline,
             placed: self.placed.clone(),
+            managed: self.managed.clone(),
+            force_managed: true,
             unwritten,
             baseline_address,
             security_capacity: self.security_capacity,
@@ -498,22 +500,23 @@ impl FlashPlan {
 
     /// This parameter-only download rewritten to put `wanted` back (a
     /// parameter backup's memory, segment id to octets): each placed octet
-    /// not in `skip` takes the backup's byte, every other octet keeps what the
+    /// not device-managed takes the backup's byte, every other octet keeps what the
     /// device holds (issue #290, `bussard restore --parameters`). A segment
     /// `wanted` does not name is left as the device holds it.
     ///
     /// The restore writes the same octets an `apply` of the model may write
     /// (the ones a parameter is placed in under the model's configuration),
     /// so it puts back everything an apply changed, and nothing ETS's
-    /// download would leave alone. `skip` names the device-managed octets
-    /// (`Access="None"` values the application owns at runtime).
-    pub fn restoring(
-        &self,
-        wanted: &BTreeMap<String, Vec<u8>>,
-        skip: &bussard_product::PlacedOctets,
-    ) -> FlashPlan {
+    /// download would leave alone. The plan's device-managed octets
+    /// ([`FlashPlan::device_managed`], `Access="None"` values the application
+    /// owns at runtime) keep what the device holds, and the restore never
+    /// forces them (issue #1168): it writes none of them.
+    pub fn restoring(&self, wanted: &BTreeMap<String, Vec<u8>>) -> FlashPlan {
         let mut plan = self.clone();
         plan.unwritten = BTreeMap::new();
+        plan.force_managed = false;
+        let skip = self.managed.clone().unwrap_or_default();
+        let skip = &skip;
         for (segment, current) in &self.baseline {
             let Some(image) = plan.images.get_mut(segment) else {
                 continue;
@@ -1309,6 +1312,54 @@ impl FlashPlan {
             .filter(|(_, changed)| !changed.is_empty())
             .collect()
     }
+
+    /// The device-managed octets ([`FlashPlan::device_managed`]) this
+    /// parameter-only download writes although the baseline already holds
+    /// the model's value there (issue #1168), per code segment, as offsets
+    /// into the segment image. The device application may rewrite such an
+    /// octet after the baseline read (the Jung download flag), so the write
+    /// sends it again, as a complete download does. These octets are not in
+    /// [`FlashPlan::changed_octets`] and never cause a download on their
+    /// own (#289); a kept octet ([`FlashPlan::kept`]) is never among them.
+    pub fn forced_octets(&self) -> BTreeMap<String, Vec<usize>> {
+        let mut out: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+        for step in &self.steps {
+            use super::execute::WriteKind;
+            let sys7 = |kind| {
+                if self.is_sys7() {
+                    WriteKind::System7
+                } else {
+                    kind
+                }
+            };
+            let (image, kind) = match step {
+                FlashStep::WriteMem { image, .. } => (image, sys7(WriteKind::Absolute)),
+                FlashStep::WriteRelMem { image, .. } => (image, WriteKind::Relative),
+                FlashStep::Sys7AbsSegment {
+                    image: Some(image), ..
+                } => (image, WriteKind::System7),
+                _ => continue,
+            };
+            let (Some(desired), Some(current)) = (
+                self.images.get(&image.segment_id),
+                self.baseline.get(&image.segment_id),
+            ) else {
+                continue;
+            };
+            let len = super::execute::image_part(desired, image).len();
+            let equal = super::execute::forced_in_part(self, image, len, kind)
+                .into_iter()
+                .map(|i| i + image.offset)
+                .filter(|&o| desired.get(o).is_some() && current.get(o) == desired.get(o));
+            out.entry(image.segment_id.clone())
+                .or_default()
+                .extend(equal);
+        }
+        out.into_iter()
+            .filter(|(_, octets)| !octets.is_empty())
+            .map(|(segment, octets)| (segment, octets.into_iter().collect()))
+            .collect()
+    }
 }
 
 /// Whether an octet of `segment` is unoccupied in `kept` (see
@@ -1674,7 +1725,7 @@ mod tests {
         let partial = full.parameters_only(&regions)?;
         let wanted = BTreeMap::from([(segment.to_string(), vec![9u8])]);
 
-        let restore = partial.restoring(&wanted, &bussard_product::PlacedOctets::new());
+        let restore = partial.restoring(&wanted);
         assert_eq!(restore.changed_octets(), 1);
         assert_eq!(restore.image_bytes(segment), Some(&[9u8][..]));
         assert!(restore.unwritten_bits().is_empty());
@@ -1683,7 +1734,9 @@ mod tests {
             segment.to_string(),
             std::collections::BTreeSet::from([0usize]),
         )]);
-        let restore = partial.restoring(&wanted, &skip);
+        let mut managed = partial.clone();
+        managed.managed = Some(skip);
+        let restore = managed.restoring(&wanted);
         assert_eq!(restore.changed_octets(), 0);
         assert_eq!(restore.image_bytes(segment), Some(&[7u8][..]));
         assert_eq!(
