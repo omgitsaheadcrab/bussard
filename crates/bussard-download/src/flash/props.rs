@@ -488,6 +488,7 @@ pub async fn compare_property_value<Ch: L4Channel>(
         return bussard_mgmt::compare_property(l4, index, pid, start, expected, mask).await;
     }
     let held = read_property_value(l4, object, prop_id, start, 1, expected.len().max(1)).await?;
+    let expected = bussard_mgmt::zero_padded_prefix(expected, held.len());
     let actual: Vec<u8> = held.iter().take(expected.len()).copied().collect();
     if masked_equal(expected, &actual, mask) {
         Ok(())
