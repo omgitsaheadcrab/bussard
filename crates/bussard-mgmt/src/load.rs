@@ -1106,8 +1106,10 @@ pub fn zero_padded_prefix(expected: &[u8], held: usize) -> &[u8] {
 ///
 /// A device that answers a zero-count response, or fewer octets than `expected`,
 /// is a mismatch too (the precondition property is not readable / not present as
-/// declared). Reading the property itself failing surfaces the underlying
-/// [`MgmtError`].
+/// declared), unless every octet of `expected` past the answer is zero: such
+/// `InlineData` is the property padded with trailing zeros, and only the octets
+/// the device returned are compared (see [`zero_padded_prefix`]). Reading the
+/// property itself failing surfaces the underlying [`MgmtError`].
 pub async fn compare_property<Ch: L4Channel>(
     l4: &mut Layer4Connection<Ch>,
     object_index: u8,
